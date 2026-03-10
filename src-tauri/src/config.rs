@@ -45,6 +45,8 @@ impl Default for ProxyConfig {
 pub struct AppConfig {
     pub last_used_template: Option<String>,
     pub proxy: ProxyConfig,
+    #[serde(default)]
+    pub okp_executable_path: String,
     pub templates: HashMap<String, Template>,
 }
 
@@ -118,6 +120,13 @@ pub fn get_proxy(app: AppHandle) -> ProxyConfig {
     load_config(&app).proxy
 }
 
+#[tauri::command]
+pub fn save_okp_executable_path(app: AppHandle, okp_executable_path: String) {
+    let mut config = load_config(&app);
+    config.okp_executable_path = okp_executable_path;
+    save_config_to_disk(&app, &config);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,6 +136,7 @@ mod tests {
         let config = AppConfig::default();
         assert!(config.templates.is_empty());
         assert_eq!(config.proxy.proxy_type, "none");
+        assert!(config.okp_executable_path.is_empty());
         assert!(config.last_used_template.is_none());
     }
 

@@ -17,6 +17,7 @@ pub fn run() {
             config::delete_template,
             config::save_proxy,
             config::get_proxy,
+            config::save_okp_executable_path,
             profile::get_profiles,
             profile::get_profile_list,
             profile::save_profile,
@@ -27,6 +28,7 @@ pub fn run() {
             cookies::start_cookie_capture,
             cookies::finish_cookie_capture,
             cookies::cancel_cookie_capture,
+            cookies::test_site_login,
             publish::publish,
         ])
         .run(tauri::generate_context!())

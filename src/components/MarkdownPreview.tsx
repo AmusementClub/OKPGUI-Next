@@ -1,6 +1,10 @@
 import { Dialog, Transition } from '@headlessui/react';
 import { Fragment } from 'react';
 import { Eye, X } from 'lucide-react';
+import ReactMarkdown from 'react-markdown';
+import rehypeRaw from 'rehype-raw';
+import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
+import remarkGfm from 'remark-gfm';
 
 interface MarkdownPreviewProps {
     isOpen: boolean;
@@ -8,47 +12,26 @@ interface MarkdownPreviewProps {
     content: string;
 }
 
-/** Simple markdown to HTML conversion for preview */
-function markdownToHtml(md: string): string {
-    let html = md;
-
-    // Headers
-    html = html.replace(/^### (.+)$/gm, '<h3 class="text-lg font-semibold mt-4 mb-2">$1</h3>');
-    html = html.replace(/^## (.+)$/gm, '<h2 class="text-xl font-bold mt-4 mb-2">$1</h2>');
-    html = html.replace(/^# (.+)$/gm, '<h1 class="text-2xl font-bold mt-4 mb-2">$1</h1>');
-
-    // Bold & italic
-    html = html.replace(/\*\*\*(.+?)\*\*\*/g, '<strong><em>$1</em></strong>');
-    html = html.replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>');
-    html = html.replace(/\*(.+?)\*/g, '<em>$1</em>');
-
-    // Inline code
-    html = html.replace(/`([^`]+)`/g, '<code class="bg-slate-700 px-1 py-0.5 rounded text-sm text-emerald-300">$1</code>');
-
-    // Links
-    html = html.replace(
-        /\[([^\]]+)\]\(([^)]+)\)/g,
-        '<a href="$2" class="text-cyan-400 hover:underline" target="_blank" rel="noopener noreferrer">$1</a>'
-    );
-
-    // Images
-    html = html.replace(
-        /!\[([^\]]*)\]\(([^)]+)\)/g,
-        '<img src="$2" alt="$1" class="max-w-full rounded mt-2 mb-2" />'
-    );
-
-    // Unordered lists
-    html = html.replace(/^- (.+)$/gm, '<li class="ml-4 list-disc">$1</li>');
-
-    // Line breaks (double newline = paragraph)
-    html = html.replace(/\n\n/g, '</p><p class="mb-2">');
-    html = `<p class="mb-2">${html}</p>`;
-
-    // Single line break
-    html = html.replace(/\n/g, '<br />');
-
-    return html;
-}
+const previewSchema = {
+    ...defaultSchema,
+    tagNames: [
+        ...(defaultSchema.tagNames || []),
+        'div',
+        'span',
+        'details',
+        'summary',
+        'kbd',
+        'sub',
+        'sup',
+    ],
+    attributes: {
+        ...defaultSchema.attributes,
+        a: [...(defaultSchema.attributes?.a || []), 'target', 'rel'],
+        img: [...(defaultSchema.attributes?.img || []), 'loading'],
+        div: [...(defaultSchema.attributes?.div || []), 'align'],
+        span: [...(defaultSchema.attributes?.span || []), 'align'],
+    },
+};
 
 export default function MarkdownPreview({ isOpen, onClose, content }: MarkdownPreviewProps) {
     return (
@@ -97,12 +80,50 @@ export default function MarkdownPreview({ isOpen, onClose, content }: MarkdownPr
                                 {/* Preview content */}
                                 <div className="p-6 max-h-96 overflow-y-auto">
                                     {content.trim() ? (
-                                        <div
-                                            className="prose prose-invert prose-sm max-w-none text-slate-300"
-                                            dangerouslySetInnerHTML={{
-                                                __html: markdownToHtml(content),
+                                        <ReactMarkdown
+                                            remarkPlugins={[remarkGfm]}
+                                            rehypePlugins={[rehypeRaw, [rehypeSanitize, previewSchema]]}
+                                            components={{
+                                                h1: ({ node: _node, ...props }) => <h1 className="text-2xl font-bold mt-4 mb-3 text-slate-100" {...props} />,
+                                                h2: ({ node: _node, ...props }) => <h2 className="text-xl font-bold mt-4 mb-3 text-slate-100" {...props} />,
+                                                h3: ({ node: _node, ...props }) => <h3 className="text-lg font-semibold mt-4 mb-2 text-slate-100" {...props} />,
+                                                p: ({ node: _node, ...props }) => <p className="mb-3 leading-7 text-slate-300" {...props} />,
+                                                ul: ({ node: _node, ...props }) => <ul className="mb-3 list-disc pl-6 text-slate-300" {...props} />,
+                                                ol: ({ node: _node, ...props }) => <ol className="mb-3 list-decimal pl-6 text-slate-300" {...props} />,
+                                                li: ({ node: _node, ...props }) => <li className="mb-1" {...props} />,
+                                                a: ({ node: _node, ...props }) => <a className="text-cyan-400 hover:text-cyan-300 hover:underline" target="_blank" rel="noreferrer" {...props} />,
+                                                img: ({ node: _node, ...props }) => <img className="my-3 max-w-full rounded-lg border border-slate-700" {...props} />,
+                                                div: ({ node: _node, ...props }) => <div className="text-slate-300" {...props} />,
+                                                span: ({ node: _node, ...props }) => <span className="text-slate-300" {...props} />,
+                                                blockquote: ({ node: _node, ...props }) => <blockquote className="mb-3 border-l-4 border-emerald-500/60 pl-4 italic text-slate-400" {...props} />,
+                                                details: ({ node: _node, ...props }) => <details className="mb-3 rounded-lg border border-slate-700 bg-slate-900/40 p-3 text-slate-300" {...props} />,
+                                                summary: ({ node: _node, ...props }) => <summary className="cursor-pointer font-medium text-slate-100" {...props} />,
+                                                code: ({ node: _node, className, children, ...props }) => {
+                                                    const isInline = !className;
+                                                    if (isInline) {
+                                                        return (
+                                                            <code className="rounded bg-slate-700 px-1.5 py-0.5 text-sm text-emerald-300" {...props}>
+                                                                {children}
+                                                            </code>
+                                                        );
+                                                    }
+
+                                                    return (
+                                                        <code className="block overflow-x-auto rounded-lg bg-slate-900 p-4 text-sm text-slate-200" {...props}>
+                                                            {children}
+                                                        </code>
+                                                    );
+                                                },
+                                                pre: ({ node: _node, ...props }) => <pre className="mb-3 overflow-x-auto" {...props} />,
+                                                hr: ({ node: _node, ...props }) => <hr className="my-4 border-slate-700" {...props} />,
+                                                table: ({ node: _node, ...props }) => <div className="mb-3 overflow-x-auto"><table className="min-w-full border-collapse text-left text-sm text-slate-300" {...props} /></div>,
+                                                thead: ({ node: _node, ...props }) => <thead className="bg-slate-700/40" {...props} />,
+                                                th: ({ node: _node, ...props }) => <th className="border border-slate-700 px-3 py-2 font-semibold text-slate-100" {...props} />,
+                                                td: ({ node: _node, ...props }) => <td className="border border-slate-700 px-3 py-2" {...props} />,
                                             }}
-                                        />
+                                        >
+                                            {content}
+                                        </ReactMarkdown>
                                     ) : (
                                         <p className="text-slate-500 text-center py-8">
                                             暂无内容

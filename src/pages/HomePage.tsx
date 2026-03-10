@@ -77,6 +77,7 @@ export default function HomePage() {
     // Profile state
     const [profileList, setProfileList] = useState<string[]>([]);
     const [selectedProfile, setSelectedProfile] = useState('');
+    const [okpExecutablePath, setOkpExecutablePath] = useState('');
 
     // Torrent state
     const [torrentPath, setTorrentPath] = useState('');
@@ -86,6 +87,7 @@ export default function HomePage() {
     const [showConsole, setShowConsole] = useState(false);
     const [showPreview, setShowPreview] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
+    const [isPublishing, setIsPublishing] = useState(false);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -116,8 +118,10 @@ export default function HomePage() {
         try {
             const config = await invoke<{
                 last_used_template: string | null;
+                okp_executable_path: string;
                 templates: Record<string, Template>;
             }>('get_config');
+            setOkpExecutablePath(config.okp_executable_path || '');
             if (config.last_used_template && config.templates[config.last_used_template]) {
                 setCurrentTemplateName(config.last_used_template);
                 setTemplate(config.templates[config.last_used_template]);
@@ -197,6 +201,36 @@ export default function HomePage() {
         }
     };
 
+    
+    const saveOkpExecutablePath = async (path: string) => {
+        try {
+            await invoke('save_okp_executable_path', {
+                okpExecutablePath: path,
+            });
+            setOkpExecutablePath(path);
+        } catch (e) {
+            console.error('保存 OKP 可执行文件路径失败:', e);
+        }
+    };
+
+    const selectOkpExecutable = async () => {
+        try {
+            const file = await open({
+                filters: [{ name: '可执行文件', extensions: ['exe'] }],
+            });
+            const selectedPath = Array.isArray(file) ? file[0] : file;
+            if (selectedPath) {
+                await saveOkpExecutablePath(selectedPath);
+            }
+        } catch (e) {
+            console.error('选择 OKP 可执行文件失败:', e);
+        }
+    };
+
+    const clearOkpExecutablePath = async () => {
+        await saveOkpExecutablePath('');
+    };
+
     const matchTitle = async (filename?: string) => {
         const name = filename || torrentInfo?.name;
         if (!name || !template.ep_pattern || !template.title_pattern) return;
@@ -211,12 +245,14 @@ export default function HomePage() {
             console.error('匹配标题失败:', e);
         }
     };
-
     // Publish
     const handlePublish = async () => {
         if (!torrentPath) return;
         if (!selectedProfile) return;
+        if (!okpExecutablePath) return;
+        if (isPublishing) return;
         setShowConsole(true);
+        setIsPublishing(true);
         try {
             await invoke('publish', {
                 request: {
@@ -227,9 +263,10 @@ export default function HomePage() {
             });
         } catch (e) {
             console.error('发布失败:', e);
+        } finally {
+            setIsPublishing(false);
         }
     };
-
     // Drag and drop handlers
     const handleDragOver = useCallback((e: React.DragEvent) => {
         e.preventDefault();
@@ -463,6 +500,38 @@ export default function HomePage() {
                         </div>
                     </div>
                     <div className="mt-3">
+                        <label className="text-xs text-slate-500 mb-1 block">OKP 可执行文件</label>
+                        <div className="flex gap-2">
+                            <input
+                                type="text"
+                                value={okpExecutablePath}
+                                readOnly
+                                placeholder="请选择 OKP.Core.exe"
+                                className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none"
+                            />
+                            <button
+                                type="button"
+                                onClick={selectOkpExecutable}
+                                className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                            >
+                                <FolderOpen size={14} />
+                                浏览
+                            </button>
+                            <button
+                                type="button"
+                                onClick={clearOkpExecutablePath}
+                                disabled={!okpExecutablePath}
+                                className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                            >
+                                <Trash2 size={14} />
+                                清空
+                            </button>
+                        </div>
+                        <p className="mt-1 text-xs text-slate-500">
+                            未选择 OKP 可执行文件时，无法点击一键发布。
+                        </p>
+                    </div>
+                    <div className="mt-3">
                         <label className="text-xs text-slate-500 mb-2 block">站点选择</label>
                         <div className="flex flex-wrap gap-3">
                             {siteLabels.map(({ key, label }) => (
@@ -487,7 +556,7 @@ export default function HomePage() {
                 <section>
                     <button
                         onClick={handlePublish}
-                        disabled={!torrentPath || !selectedProfile}
+                        disabled={!torrentPath || !selectedProfile || !okpExecutablePath || isPublishing}
                         className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-600 hover:to-cyan-600 disabled:from-slate-600 disabled:to-slate-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-all shadow-lg shadow-emerald-500/20"
                     >
                         <Send size={18} />

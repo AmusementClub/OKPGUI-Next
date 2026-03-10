@@ -76,6 +76,16 @@ interface CookiePanelSummary {
     remainingText: string;
 }
 
+interface SiteLoginTestResult {
+    success: boolean;
+    message: string;
+}
+
+interface SiteLoginTestState {
+    status: 'testing' | 'success' | 'error';
+    message: string;
+}
+
 const emptySiteCookies = (): SiteCookies => ({
     dmhy: { raw_text: '' },
     nyaa: { raw_text: '' },
@@ -412,6 +422,45 @@ function getCookiePanelSummary(rawText: string): CookiePanelSummary {
     };
 }
 
+function getSiteLoginStateBadgeClass(status: SiteLoginTestState['status']): string {
+    switch (status) {
+        case 'testing':
+            return 'border-cyan-400/40 bg-cyan-500/10 text-cyan-200';
+        case 'success':
+            return 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200';
+        case 'error':
+            return 'border-red-400/40 bg-red-500/10 text-red-200';
+        default:
+            return 'border-slate-600 bg-slate-700/40 text-slate-300';
+    }
+}
+
+function getSiteLoginStateLabel(status: SiteLoginTestState['status']): string {
+    switch (status) {
+        case 'testing':
+            return '测试中';
+        case 'success':
+            return '通过';
+        case 'error':
+            return '失败';
+        default:
+            return '';
+    }
+}
+
+function getSiteLoginMessageClass(status: SiteLoginTestState['status']): string {
+    switch (status) {
+        case 'success':
+            return 'text-emerald-300';
+        case 'error':
+            return 'text-red-300';
+        case 'testing':
+            return 'text-cyan-300';
+        default:
+            return 'text-slate-400';
+    }
+}
+
 function normalizeProfile(profile?: Partial<Profile>): Profile {
     const mergedFallbackCookies = typeof profile?.cookies === 'string' ? profile.cookies : '';
     const mergedFallbackSiteCookies = buildSiteCookiesFromMergedCookieText(mergedFallbackCookies);
@@ -450,6 +499,7 @@ export default function IdentityPage() {
     const [profile, setProfile] = useState<Profile>(defaultProfile);
     const [loginSite, setLoginSite] = useState<string | null>(null);
     const [cookieDialog, setCookieDialog] = useState<CookieDialogState | null>(null);
+    const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
 
     const captureRequestIdRef = useRef(0);
     const captureSessionIdRef = useRef<string | null>(null);
@@ -506,6 +556,7 @@ export default function IdentityPage() {
             if (initialProfileName && store.profiles[initialProfileName]) {
                 setCurrentProfileName(initialProfileName);
                 setProfile(normalizeProfile(store.profiles[initialProfileName]));
+                setSiteLoginTests({});
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -521,6 +572,7 @@ export default function IdentityPage() {
             if (store.profiles[name]) {
                 setCurrentProfileName(name);
                 setProfile(normalizeProfile(store.profiles[name]));
+                setSiteLoginTests({});
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -569,10 +621,23 @@ export default function IdentityPage() {
             await invoke('delete_profile', { name: currentProfileName });
             setCurrentProfileName('');
             setProfile(defaultProfile);
+            setSiteLoginTests({});
             await loadProfileList();
         } catch (error) {
             console.error('删除配置失败:', error);
         }
+    };
+
+    const clearSiteLoginTest = (siteCode: string) => {
+        setSiteLoginTests((current) => {
+            if (!(siteCode in current)) {
+                return current;
+            }
+
+            const nextState = { ...current };
+            delete nextState[siteCode];
+            return nextState;
+        });
     };
 
     const closeCookieDialog = () => {
@@ -775,6 +840,7 @@ export default function IdentityPage() {
 
         const nextProfile = updateProfileSiteCookies(profile, cookieDialog.siteCode, nextSiteRawText);
         setProfile(nextProfile);
+        clearSiteLoginTest(cookieDialog.siteCode);
         void persistProfileToDisk(nextProfile);
 
         closeCookieDialog();
@@ -785,7 +851,61 @@ export default function IdentityPage() {
     };
 
     const updateSiteCookieText = (siteCode: string, rawText: string) => {
+        clearSiteLoginTest(siteCode);
         setProfile((current) => updateProfileSiteCookies(current, siteCode, rawText));
+    };
+
+    const handleSiteLoginTest = async (siteCode: string) => {
+        const site = cookieSites.find((item) => item.code === siteCode);
+        if (!site) {
+            return;
+        }
+
+        const rawText = getSiteCookieText(profile.site_cookies, siteCode);
+        if (!rawText.trim()) {
+            setSiteLoginTests((current) => ({
+                ...current,
+                [siteCode]: {
+                    status: 'error',
+                    message: `请先添加 ${site.label} 的 Cookie。`,
+                },
+            }));
+            return;
+        }
+
+        setSiteLoginTests((current) => ({
+            ...current,
+            [siteCode]: {
+                status: 'testing',
+                message: `正在测试 ${site.label} 登录状态...`,
+            },
+        }));
+
+        try {
+            const expectedName = String(profile[site.nameField] ?? '').trim();
+            const result = await invoke<SiteLoginTestResult>('test_site_login', {
+                site: siteCode,
+                cookieText: rawText,
+                userAgent: profile.user_agent.trim() || null,
+                expectedName: expectedName || null,
+            });
+
+            setSiteLoginTests((current) => ({
+                ...current,
+                [siteCode]: {
+                    status: result.success ? 'success' : 'error',
+                    message: result.message,
+                },
+            }));
+        } catch (error) {
+            setSiteLoginTests((current) => ({
+                ...current,
+                [siteCode]: {
+                    status: 'error',
+                    message: getErrorMessage(error),
+                },
+            }));
+        }
     };
 
     return (
@@ -942,7 +1062,10 @@ export default function IdentityPage() {
                                 <Disclosure key={site.code} defaultOpen={index === 0}>
                                     {({ open }) => (
                                         <div className="overflow-hidden rounded-lg border border-slate-700 bg-slate-800/50">
-                                            <Disclosure.Button className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-800/80">
+                                            <Disclosure.Button
+                                                as="div"
+                                                className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-800/80"
+                                            >
                                                 <div className="flex min-w-0 flex-1 flex-col gap-1 md:flex-row md:items-center md:gap-4">
                                                     <span className="text-sm font-medium text-slate-100">
                                                         {site.label}
@@ -956,16 +1079,53 @@ export default function IdentityPage() {
                                                         {summary.remainingText}
                                                     </span>
                                                 </div>
-                                                <ChevronDown
-                                                    size={16}
-                                                    className={`shrink-0 text-slate-500 transition-transform ${open ? 'rotate-180' : ''}`}
-                                                />
+                                                <div className="flex shrink-0 items-center gap-2">
+                                                    {siteLoginTests[site.code] && (
+                                                        <span
+                                                            className={`rounded-full border px-2 py-0.5 text-[11px] font-medium ${getSiteLoginStateBadgeClass(siteLoginTests[site.code].status)}`}
+                                                            title={siteLoginTests[site.code].message}
+                                                        >
+                                                            {getSiteLoginStateLabel(siteLoginTests[site.code].status)}
+                                                        </span>
+                                                    )}
+                                                    <button
+                                                        type="button"
+                                                        onMouseDown={(event) => event.stopPropagation()}
+                                                        onClick={(event) => {
+                                                            event.stopPropagation();
+                                                            void handleSiteLoginTest(site.code);
+                                                        }}
+                                                        disabled={siteLoginTests[site.code]?.status === 'testing'}
+                                                        title={siteLoginTests[site.code]?.message ?? `测试 ${site.label} 登录`}
+                                                        className="flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                                    >
+                                                        {siteLoginTests[site.code]?.status === 'testing' ? (
+                                                            <>
+                                                                <Loader2 size={12} className="animate-spin" />
+                                                                测试中...
+                                                            </>
+                                                        ) : (
+                                                            '测试登录'
+                                                        )}
+                                                    </button>
+                                                    <ChevronDown
+                                                        size={16}
+                                                        className={`shrink-0 text-slate-500 transition-transform ${open ? 'rotate-180' : ''}`}
+                                                    />
+                                                </div>
                                             </Disclosure.Button>
                                             <Disclosure.Panel className="space-y-3 border-t border-slate-700 px-4 py-4">
                                                 <div className="flex items-center gap-2 text-xs text-slate-500">
                                                     <CalendarClock size={14} />
                                                     共 {summary.cookieCount} 条 Cookie
                                                 </div>
+                                                {siteLoginTests[site.code]?.message && (
+                                                    <p
+                                                        className={`text-xs ${getSiteLoginMessageClass(siteLoginTests[site.code].status)}`}
+                                                    >
+                                                        {siteLoginTests[site.code].message}
+                                                    </p>
+                                                )}
                                                 <textarea
                                                     value={rawText}
                                                     onChange={(event) =>
