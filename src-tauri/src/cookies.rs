@@ -2,6 +2,7 @@
 use crate::profile::build_site_cookie_header;
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsStr;
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -552,36 +553,138 @@ fn filter_site_cookies(cookies: Vec<Cookie>, site: &SiteConfig) -> Vec<CapturedC
     filtered
 }
 
-fn find_browser_executable() -> Result<PathBuf, String> {
-    let candidates = [
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+fn push_browser_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) && path.is_file() {
+        candidates.push(path);
+    }
+}
+
+fn browser_path_candidates(path_env: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(path_env) = path_env else {
+        return Vec::new();
+    };
+
+    #[cfg(target_os = "windows")]
+    let commands = ["chrome.exe", "msedge.exe", "chromium.exe"];
+    #[cfg(target_os = "macos")]
+    let commands = ["Google Chrome", "Microsoft Edge", "Chromium"];
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    let commands = [
+        "google-chrome",
+        "google-chrome-stable",
+        "chromium",
+        "chromium-browser",
+        "microsoft-edge",
+        "microsoft-edge-stable",
     ];
 
-    for path in &candidates {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Ok(path);
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    for directory in std::env::split_paths(path_env) {
+        for command in &commands {
+            push_browser_candidate(&mut candidates, &mut seen, directory.join(command));
         }
     }
 
-    if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        let chrome_path =
-            PathBuf::from(&local_app_data).join(r"Google\Chrome\Application\chrome.exe");
-        if chrome_path.exists() {
-            return Ok(chrome_path);
+    candidates
+}
+
+fn collect_browser_executable_candidates(
+    path_env: Option<&OsStr>,
+    _home_dir: Option<&Path>,
+    local_app_data: Option<&Path>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = HashSet::new();
+
+    #[cfg(target_os = "windows")]
+    {
+        for path in [
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        ] {
+            push_browser_candidate(&mut candidates, &mut seen, PathBuf::from(path));
         }
 
-        let edge_path =
-            PathBuf::from(&local_app_data).join(r"Microsoft\Edge\Application\msedge.exe");
-        if edge_path.exists() {
-            return Ok(edge_path);
+        if let Some(local_app_data) = local_app_data {
+            push_browser_candidate(
+                &mut candidates,
+                &mut seen,
+                local_app_data.join(r"Google\Chrome\Application\chrome.exe"),
+            );
+            push_browser_candidate(
+                &mut candidates,
+                &mut seen,
+                local_app_data.join(r"Microsoft\Edge\Application\msedge.exe"),
+            );
         }
     }
 
-    Err("未找到 Chrome 或 Edge 浏览器，请确认已经安装 Chrome 或 Edge".to_string())
+    #[cfg(target_os = "macos")]
+    {
+        for path in [
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        ] {
+            push_browser_candidate(&mut candidates, &mut seen, PathBuf::from(path));
+        }
+
+        if let Some(home_dir) = _home_dir {
+            push_browser_candidate(
+                &mut candidates,
+                &mut seen,
+                home_dir.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            );
+            push_browser_candidate(
+                &mut candidates,
+                &mut seen,
+                home_dir.join("Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            );
+            push_browser_candidate(
+                &mut candidates,
+                &mut seen,
+                home_dir.join("Applications/Chromium.app/Contents/MacOS/Chromium"),
+            );
+        }
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    {
+        for path in [
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+            "/usr/bin/microsoft-edge",
+            "/usr/bin/microsoft-edge-stable",
+            "/snap/bin/chromium",
+        ] {
+            push_browser_candidate(&mut candidates, &mut seen, PathBuf::from(path));
+        }
+    }
+
+    for path in browser_path_candidates(path_env) {
+        push_browser_candidate(&mut candidates, &mut seen, path);
+    }
+
+    candidates
+}
+
+fn find_browser_executable() -> Result<PathBuf, String> {
+    collect_browser_executable_candidates(
+        std::env::var_os("PATH").as_deref(),
+        std::env::var_os("HOME").as_deref().map(Path::new),
+        std::env::var_os("LOCALAPPDATA").as_deref().map(Path::new),
+    )
+    .into_iter()
+    .next()
+    .ok_or_else(|| {
+        "未找到可用的 Chromium 内核浏览器，请确认已经安装 Chrome、Chromium 或 Edge。".to_string()
+    })
 }
 
 fn create_cookie_capture_profile_dir(site: &str) -> Result<PathBuf, String> {
@@ -1117,6 +1220,7 @@ pub async fn test_site_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsString;
 
     #[test]
     fn test_get_login_url() {
@@ -1139,5 +1243,102 @@ mod tests {
         assert!(matches_site_domain("upload.nyaa.si", NYAA_COOKIE_DOMAINS));
         assert!(!matches_site_domain("example.com", NYAA_COOKIE_DOMAINS));
         assert!(!matches_site_domain("totallynotnyaa.si", NYAA_COOKIE_DOMAINS));
+    }
+
+    fn create_temp_browser_file(file_name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui-next-browser-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("expected browser temp dir to be created");
+        let browser_path = root.join(file_name);
+        std::fs::write(&browser_path, "browser").expect("expected browser file to be created");
+        (root, browser_path)
+    }
+
+    #[test]
+    fn test_browser_path_candidates_detect_path_entry() {
+        #[cfg(target_os = "windows")]
+        let command_name = "chrome.exe";
+        #[cfg(target_os = "macos")]
+        let command_name = "Google Chrome";
+        #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+        let command_name = "google-chrome";
+
+        let (root, browser_path) = create_temp_browser_file(command_name);
+        let path_env = OsString::from(root.as_os_str());
+        let candidates = browser_path_candidates(Some(path_env.as_os_str()));
+
+        assert!(candidates.contains(&browser_path));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn test_collect_browser_candidates_include_local_app_data_paths() {
+        let (root, browser_path) = create_temp_browser_file("chrome.exe");
+        let local_app_data = root.join("LocalAppData");
+        let chrome_dir = local_app_data.join(r"Google\Chrome\Application");
+        std::fs::create_dir_all(&chrome_dir).expect("expected local app data browser dir");
+        let local_browser = chrome_dir.join("chrome.exe");
+        std::fs::write(&local_browser, "browser").expect("expected local browser file");
+
+        let candidates = collect_browser_executable_candidates(
+            None,
+            None,
+            Some(local_app_data.as_path()),
+        );
+
+        assert!(candidates.contains(&local_browser));
+        assert!(!candidates.contains(&browser_path));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn test_collect_browser_candidates_include_home_applications() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui-next-macos-browser-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let browser_path = root.join("Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+        std::fs::create_dir_all(
+            browser_path
+                .parent()
+                .expect("expected browser parent directory"),
+        )
+        .expect("expected macOS browser dir");
+        std::fs::write(&browser_path, "browser").expect("expected macOS browser file");
+
+        let candidates = collect_browser_executable_candidates(None, Some(root.as_path()), None);
+        assert!(candidates.contains(&browser_path));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
+    #[test]
+    fn test_collect_browser_candidates_include_linux_path_entries() {
+        let (root, browser_path) = create_temp_browser_file("google-chrome");
+        let path_env = OsString::from(root.as_os_str());
+        let candidates = collect_browser_executable_candidates(
+            Some(path_env.as_os_str()),
+            None,
+            None,
+        );
+
+        assert!(candidates.contains(&browser_path));
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }

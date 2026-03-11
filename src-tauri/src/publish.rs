@@ -56,9 +56,16 @@ pub struct PublishComplete {
 }
 
 #[derive(Debug, Clone)]
+enum OkpLaunchMode {
+    Direct,
+    DotnetDll,
+}
+
+#[derive(Debug, Clone)]
 struct ResolvedOkpExecutable {
     executable_path: PathBuf,
     working_dir: PathBuf,
+    launch_mode: OkpLaunchMode,
 }
 
 #[derive(Debug, Clone)]
@@ -182,10 +189,49 @@ fn decode_publish_output(buffer: &[u8]) -> String {
     }
 }
 
+fn okp_selection_label() -> &'static str {
+    "OKP.Core 可执行文件或 DLL"
+}
+
+impl ResolvedOkpExecutable {
+    fn preview_parts(&self, arguments: &[String]) -> Vec<String> {
+        match self.launch_mode {
+            OkpLaunchMode::Direct => std::iter::once(self.executable_path.display().to_string())
+                .chain(arguments.iter().cloned())
+                .collect(),
+            OkpLaunchMode::DotnetDll => std::iter::once("dotnet".to_string())
+                .chain(std::iter::once(self.executable_path.display().to_string()))
+                .chain(arguments.iter().cloned())
+                .collect(),
+        }
+    }
+
+    fn configure_command(&self, command: &mut Command, arguments: &[String]) {
+        match self.launch_mode {
+            OkpLaunchMode::Direct => {
+                command.args(arguments);
+            }
+            OkpLaunchMode::DotnetDll => {
+                command.arg(&self.executable_path).args(arguments);
+            }
+        }
+    }
+
+    fn program(&self) -> &Path {
+        match self.launch_mode {
+            OkpLaunchMode::Direct => &self.executable_path,
+            OkpLaunchMode::DotnetDll => Path::new("dotnet"),
+        }
+    }
+}
+
 fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpExecutable, String> {
     let configured_path = configured_path.trim();
     if configured_path.is_empty() {
-        return Err("未选择 OKP 可执行文件，请先在首页选择 OKP.Core.exe。".to_string());
+        return Err(format!(
+            "未选择 OKP 可执行文件，请先在首页选择 {}。",
+            okp_selection_label()
+        ));
     }
 
     let configured = PathBuf::from(configured_path);
@@ -201,19 +247,34 @@ fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpE
 
     if !metadata.is_file() {
         return Err(format!(
-            "已选择的 OKP 可执行文件不是文件：{}，请重新选择 OKP.Core.exe。",
-            configured.display()
+            "已选择的 OKP 文件不是文件：{}，请重新选择 {}。",
+            configured.display(),
+            okp_selection_label()
         ));
     }
 
+    let extension = configured
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default();
+
+    let launch_mode = if extension.eq_ignore_ascii_case("dll") {
+        OkpLaunchMode::DotnetDll
+    } else {
+        OkpLaunchMode::Direct
+    };
+
     #[cfg(target_os = "windows")]
     {
-        let extension = configured
-            .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or_default();
-        if !extension.eq_ignore_ascii_case("exe") {
-            return Err("已选择的 OKP 可执行文件不是 .exe 文件，请重新选择 OKP.Core.exe。".to_string());
+        if !extension.eq_ignore_ascii_case("exe") && !extension.eq_ignore_ascii_case("dll") {
+            return Err("Windows 仅支持选择 OKP.Core.exe 或 OKP.Core.dll。".to_string());
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        if extension.eq_ignore_ascii_case("exe") {
+            return Err("当前系统不能直接运行 Windows .exe，请选择当前平台的 OKP.Core 可执行文件，或选择 OKP.Core.dll 并安装 dotnet 运行时。".to_string());
         }
     }
 
@@ -241,6 +302,7 @@ fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpE
     Ok(ResolvedOkpExecutable {
         executable_path: configured,
         working_dir,
+        launch_mode,
     })
 }
 
@@ -574,7 +636,6 @@ fn build_failure_message(status_code: Option<i32>, log_path: &Path) -> String {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
 fn format_command_argument(argument: &str) -> String {
     if argument.is_empty() {
         return "\"\"".to_string();
@@ -585,30 +646,6 @@ fn format_command_argument(argument: &str) -> String {
     } else {
         argument.to_string()
     }
-}
-
-fn quote_file_path(path: &Path) -> String {
-    format!("\"{}\"", path.display().to_string().replace('"', "\\\""))
-}
-
-#[cfg(target_os = "windows")]
-fn build_windows_command_preview(executable_path: &Path, arguments: &[String]) -> String {
-    let quoted_arguments = arguments
-        .iter()
-        .enumerate()
-        .map(|(index, argument)| {
-            if matches!(index, 0 | 2 | 5 | 7) {
-                format!("\"{}\"", argument.replace('"', "\\\""))
-            } else {
-                argument.clone()
-            }
-        })
-        .collect::<Vec<_>>();
-
-    std::iter::once(quote_file_path(executable_path))
-        .chain(quoted_arguments)
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 fn run_site_publish(
@@ -656,12 +693,9 @@ fn run_site_publish(
             artifacts.cookies_path.display().to_string(),
         ];
 
-        #[cfg(target_os = "windows")]
-        let command_preview = build_windows_command_preview(&okp_core.executable_path, &command_arguments);
-
-        #[cfg(not(target_os = "windows"))]
-        let command_preview = std::iter::once(okp_core.executable_path.display().to_string())
-            .chain(command_arguments.iter().cloned())
+        let command_preview = okp_core
+            .preview_parts(&command_arguments)
+            .into_iter()
             .map(|argument| format_command_argument(&argument))
             .collect::<Vec<_>>()
             .join(" ");
@@ -674,9 +708,8 @@ fn run_site_publish(
             false,
         );
 
-        let mut command = Command::new(&okp_core.executable_path);
+        let mut command = Command::new(okp_core.program());
         command
-            .args(&command_arguments)
             .current_dir(&okp_core.working_dir)
             .env("DOTNET_CLI_FORCE_UTF8_ENCODING", "1")
             .env("DOTNET_SYSTEM_CONSOLE_OUTPUT_ENCODING", "utf-8")
@@ -684,6 +717,8 @@ fn run_site_publish(
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+
+        okp_core.configure_command(&mut command, &command_arguments);
 
         let mut child = command
             .spawn()
@@ -921,5 +956,66 @@ mod tests {
         let error =
             resolve_selected_okp_executable("   ").expect_err("expected empty configured path to error");
         assert!(error.contains("未选择 OKP 可执行文件"));
+    }
+
+    fn create_test_okp_layout(file_name: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui-next-publish-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let tags_dir = root.join("config").join("tags");
+        std::fs::create_dir_all(&tags_dir).expect("expected tags dir to be created");
+
+        for file in REQUIRED_OKP_TAG_FILES {
+            std::fs::write(tags_dir.join(file), "{}")
+                .expect("expected required OKP tag file to be created");
+        }
+
+        let executable_path = root.join(file_name);
+        std::fs::write(&executable_path, "test").expect("expected dummy executable to be created");
+        executable_path
+    }
+
+    #[test]
+    fn test_find_okp_executable_allows_dll() {
+        let executable_path = create_test_okp_layout("OKP.Core.dll");
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected dll OKP path to resolve");
+
+        match resolved.launch_mode {
+            OkpLaunchMode::DotnetDll => {}
+            OkpLaunchMode::Direct => panic!("expected dll OKP path to use dotnet launch mode"),
+        }
+
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent")
+                .to_path_buf(),
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn test_find_okp_executable_allows_non_windows_binary() {
+        let executable_path = create_test_okp_layout("OKP.Core");
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected unix OKP path to resolve");
+
+        match resolved.launch_mode {
+            OkpLaunchMode::Direct => {}
+            OkpLaunchMode::DotnetDll => panic!("expected direct launch mode for native binary"),
+        }
+
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent")
+                .to_path_buf(),
+        );
     }
 }

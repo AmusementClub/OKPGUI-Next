@@ -117,7 +117,7 @@ export default function MiscPage() {
                                 <p>
                                     <span className="text-slate-500">运行时:</span>{' '}
                                     <span className="text-slate-300">
-                                        需要 OKP.Core.exe 和 Chrome/Edge
+                                        需要 OKP.Core 可执行文件或 DLL，以及 Chrome、Chromium 或 Edge
                                     </span>
                                 </p>
                             </div>

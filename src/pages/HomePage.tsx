@@ -495,9 +495,7 @@ export default function HomePage() {
 
     const selectOkpExecutable = async () => {
         try {
-            const file = await open({
-                filters: [{ name: '可执行文件', extensions: ['exe'] }],
-            });
+            const file = await open();
             const selectedPath = Array.isArray(file) ? file[0] : file;
             if (selectedPath) {
                 await saveOkpExecutablePath(selectedPath);
@@ -1047,7 +1045,7 @@ export default function HomePage() {
                                 type="text"
                                 value={okpExecutablePath}
                                 readOnly
-                                placeholder="请选择 OKP.Core.exe"
+                                placeholder="请选择 OKP.Core 可执行文件或 DLL"
                                 className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none"
                             />
                             <button
@@ -1069,7 +1067,7 @@ export default function HomePage() {
                             </button>
                         </div>
                         <p className="mt-1 text-xs text-slate-500">
-                            未选择 OKP 可执行文件时，无法点击一键发布。
+                            Windows 请选择 OKP.Core.exe 或 OKP.Core.dll，Linux/macOS 请选择当前平台的 OKP.Core 可执行文件，或选择 OKP.Core.dll 并安装 dotnet 运行时。
                         </p>
                     </div>
                     <div className="mt-3">
