@@ -5,7 +5,6 @@ import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open } from '@tauri-apps/plugin-dialog';
 import {
     FolderOpen,
-    Save,
     Trash2,
     Eye,
     Send,
@@ -100,6 +99,18 @@ const defaultTemplate: Template = {
         acgnx_global: false,
     },
 };
+
+function normalizeTemplate(template?: Partial<Template>): Template {
+    return {
+        ...defaultTemplate,
+        ...template,
+        tags: typeof template?.tags === 'string' ? template.tags : defaultTemplate.tags,
+        sites: {
+            ...defaultTemplate.sites,
+            ...template?.sites,
+        },
+    };
+}
 
 const siteDefinitions: SiteDefinition[] = [
     { key: 'dmhy', label: '動漫花園', loginEnabled: true, nameField: 'dmhy_name' },
@@ -297,10 +308,14 @@ export default function HomePage() {
                 templates: Record<string, Template>;
             }>('get_config');
             setOkpExecutablePath(config.okp_executable_path || '');
-            if (config.last_used_template && config.templates[config.last_used_template]) {
-                setCurrentTemplateName(config.last_used_template);
-                setTemplate(config.templates[config.last_used_template]);
-                setSelectedProfile(config.templates[config.last_used_template].profile || '');
+            const initialTemplateName =
+                config.last_used_template ?? (config.templates.default ? 'default' : null);
+
+            if (initialTemplateName && config.templates[initialTemplateName]) {
+                const nextTemplate = normalizeTemplate(config.templates[initialTemplateName]);
+                setCurrentTemplateName(initialTemplateName);
+                setTemplate(nextTemplate);
+                setSelectedProfile(nextTemplate.profile || '');
             }
         } catch (e) {
             console.error('加载配置失败:', e);
@@ -313,9 +328,11 @@ export default function HomePage() {
                 templates: Record<string, Template>;
             }>('get_config');
             if (config.templates[name]) {
+                const nextTemplate = normalizeTemplate(config.templates[name]);
                 setCurrentTemplateName(name);
-                setTemplate(config.templates[name]);
-                setSelectedProfile(config.templates[name].profile || '');
+                setNewTemplateName('');
+                setTemplate(nextTemplate);
+                setSelectedProfile(nextTemplate.profile || '');
             }
         } catch (e) {
             console.error('加载模板失败:', e);
@@ -327,7 +344,7 @@ export default function HomePage() {
             .map((value) => value?.trim() || '')
             .filter((value) => value.length > 0);
 
-        return candidates[0] || '';
+        return candidates[0] || 'default';
     };
 
     const withSelectedProfile = (templateValue: Template, profileName: string = selectedProfile) => ({
@@ -336,13 +353,10 @@ export default function HomePage() {
     });
 
     const persistTemplateToDisk = async (
-        templateToSave: Template = withSelectedProfile(template),
+        templateToSave: Template = withSelectedProfile(templateRef.current),
         explicitName?: string,
     ) => {
         const name = getTemplateName(explicitName);
-        if (!name) {
-            return false;
-        }
 
         try {
             await invoke('save_template', { name, template: templateToSave });
@@ -357,12 +371,8 @@ export default function HomePage() {
         }
     };
 
-    const autosaveTemplate = (templateToSave: Template = withSelectedProfile(template), explicitName?: string) => {
+    const autosaveTemplate = (templateToSave: Template = withSelectedProfile(templateRef.current), explicitName?: string) => {
         void persistTemplateToDisk(templateToSave, explicitName);
-    };
-
-    const saveTemplate = async () => {
-        await persistTemplateToDisk(withSelectedProfile(template));
     };
 
     const deleteTemplate = async () => {
@@ -370,7 +380,10 @@ export default function HomePage() {
         try {
             await invoke('delete_template', { name: currentTemplateName });
             setCurrentTemplateName('');
+            setNewTemplateName('');
             setTemplate(defaultTemplate);
+            setSelectedProfile('');
+            setSiteLoginTests({});
             await loadTemplateList();
         } catch (e) {
             console.error('删除模板失败:', e);
@@ -797,6 +810,9 @@ export default function HomePage() {
         setTemplate((t) => ({ ...t, [field]: value }));
     };
 
+    const getTemplateWithFieldValue = (field: keyof Template, value: string): Template =>
+        withSelectedProfile({ ...templateRef.current, [field]: value } as Template);
+
     const toggleSite = (site: keyof SiteSelection) => {
         const targetSiteRow = siteRows.find((row) => row.site.key === site);
         if (!targetSiteRow?.selectable) {
@@ -838,22 +854,15 @@ export default function HomePage() {
                             type="text"
                             value={newTemplateName}
                             onChange={(e) => setNewTemplateName(e.target.value)}
-                                onBlur={(e) => {
-                                    const trimmedName = e.target.value.trim();
-                                    if (!currentTemplateName && trimmedName) {
-                                        autosaveTemplate(withSelectedProfile(templateRef.current), trimmedName);
-                                    }
-                                }}
-                            placeholder="新模板名称"
+                            onBlur={(e) => {
+                                const trimmedName = e.target.value.trim();
+                                if (trimmedName) {
+                                    autosaveTemplate(withSelectedProfile(templateRef.current), trimmedName);
+                                }
+                            }}
+                            placeholder="新模板名称（失焦自动创建）"
                             className="w-40 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         />
-                        <button
-                            onClick={saveTemplate}
-                            className="flex items-center gap-1.5 px-3 py-2 bg-emerald-600 hover:bg-emerald-700 text-white text-sm rounded-lg transition-colors"
-                        >
-                            <Save size={14} />
-                            保存
-                        </button>
                         <button
                             onClick={deleteTemplate}
                             disabled={!currentTemplateName}
@@ -939,10 +948,7 @@ export default function HomePage() {
                             type="text"
                             value={template.title}
                             onChange={(e) => updateField('title', e.target.value)}
-                                onBlur={(e) => autosaveTemplate(withSelectedProfile({
-                                    ...templateRef.current,
-                                    title: e.target.value,
-                                }))}
+                            onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('title', e.target.value))}
                             placeholder="标题将自动生成或手动输入"
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         />
@@ -959,10 +965,7 @@ export default function HomePage() {
                                 type="text"
                                 value={template.poster}
                                 onChange={(e) => updateField('poster', e.target.value)}
-                                onBlur={(e) => autosaveTemplate(withSelectedProfile({
-                                    ...templateRef.current,
-                                    poster: e.target.value,
-                                }))}
+                                onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('poster', e.target.value))}
                                 placeholder="海报图片 URL"
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
@@ -973,10 +976,7 @@ export default function HomePage() {
                                 type="text"
                                 value={template.about}
                                 onChange={(e) => updateField('about', e.target.value)}
-                                onBlur={(e) => autosaveTemplate(withSelectedProfile({
-                                    ...templateRef.current,
-                                    about: e.target.value,
-                                }))}
+                                onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('about', e.target.value))}
                                 placeholder="简介或联系方式"
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
@@ -988,10 +988,7 @@ export default function HomePage() {
                             value={template.tags}
                             placeholder=""
                             onChange={(nextTags) => updateField('tags', nextTags)}
-                            onBlur={(nextTags) => autosaveTemplate(withSelectedProfile({
-                                ...templateRef.current,
-                                tags: nextTags,
-                            }))}
+                            onBlur={(nextTags) => autosaveTemplate(getTemplateWithFieldValue('tags', nextTags))}
                         />
                         <p className="mt-1 text-xs text-slate-500">
                             使用 OKP 的分类标签，不是 bangumi.moe 原生 tag。按回车完成tag输入
@@ -1011,10 +1008,7 @@ export default function HomePage() {
                         <textarea
                             value={template.description}
                             onChange={(e) => updateField('description', e.target.value)}
-                            onBlur={(e) => autosaveTemplate(withSelectedProfile({
-                                ...templateRef.current,
-                                description: e.target.value,
-                            }))}
+                            onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('description', e.target.value))}
                             placeholder="使用 Markdown 格式编写发布描述..."
                             rows={6}
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono resize-y"
