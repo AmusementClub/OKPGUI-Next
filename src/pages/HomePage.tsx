@@ -76,6 +76,12 @@ interface SiteDefinition {
     tokenField?: keyof Profile;
 }
 
+interface PublishContentValidationIssue {
+    siteCode: keyof SiteSelection;
+    siteLabel: string;
+    message: string;
+}
+
 interface TorrentInfo {
     name: string;
     total_size: number;
@@ -139,6 +145,38 @@ const siteDefinitions: SiteDefinition[] = [
         tokenField: 'acgnx_global_token',
     },
 ];
+
+const htmlPreferredSiteKeys = new Set<keyof SiteSelection>(['dmhy', 'bangumi', 'acgnx_asia', 'acgnx_global']);
+const markdownRequiredSiteKeys = new Set<keyof SiteSelection>(['nyaa', 'acgrip']);
+
+function validatePublishContentForSites(
+    template: Template,
+    selectedSites: SiteDefinition[],
+): PublishContentValidationIssue[] {
+    const markdown = template.description.trim();
+    const html = template.description_html.trim();
+    const convertedHtml = markdown ? renderMarkdownToHtml(template.description).trim() : '';
+
+    return selectedSites.flatMap((site) => {
+        if (markdownRequiredSiteKeys.has(site.key) && !markdown) {
+            return [{
+                siteCode: site.key,
+                siteLabel: site.label,
+                message: `${site.label} 需要 Markdown 发布内容，请先填写 Markdown。`,
+            }];
+        }
+
+        if (htmlPreferredSiteKeys.has(site.key) && !html && !convertedHtml) {
+            return [{
+                siteCode: site.key,
+                siteLabel: site.label,
+                message: `${site.label} 需要 HTML 内容，或可转换为 HTML 的 Markdown 发布内容。`,
+            }];
+        }
+
+        return [];
+    });
+}
 
 const getTorrentPathFromUriList = (uriList: string): string | null => {
     const candidate = uriList
@@ -744,11 +782,43 @@ export default function HomePage() {
         if (selectedSiteKeys.length === 0) return;
         if (isPublishing) return;
 
+        const selectedSites = siteDefinitions.filter((site) => template.sites[site.key]);
+        const contentValidationIssues = validatePublishContentForSites(template, selectedSites);
+        if (contentValidationIssues.length > 0) {
+            const issueMessageMap = new Map(
+                contentValidationIssues.map((issue) => [issue.siteCode, issue.message]),
+            );
+            const combinedMessage = contentValidationIssues.map((issue) => issue.message).join('；');
+
+            setPublishSites(
+                Object.fromEntries(
+                    selectedSites.map((site) => {
+                        const siteMessage = issueMessageMap.get(site.key) ?? '发布已取消：发布内容校验未通过。';
+                        return [
+                            site.key,
+                            {
+                                siteCode: site.key,
+                                siteLabel: site.label,
+                                lines: [{ text: siteMessage, isError: true }],
+                                status: 'error' as const,
+                                message: siteMessage,
+                            },
+                        ];
+                    }),
+                ),
+            );
+            setIsPublishComplete(true);
+            setPublishResult({
+                success: false,
+                message: combinedMessage,
+            });
+            setShowConsole(true);
+            return;
+        }
+
         setPublishSites(
             Object.fromEntries(
-                siteDefinitions
-                    .filter((site) => template.sites[site.key])
-                    .map((site) => [
+                selectedSites.map((site) => [
                         site.key,
                         {
                             siteCode: site.key,

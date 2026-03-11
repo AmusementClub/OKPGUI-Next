@@ -491,15 +491,29 @@ fn select_publish_content_path<'a>(
     site: &SitePublishConfig,
     artifacts: &'a PublishArtifacts,
 ) -> Result<&'a Path, String> {
-    if matches!(site.code, "nyaa" | "acgrip") && template.description.trim().is_empty() {
+    let markdown = template.description.trim();
+    let html = template.description_html.trim();
+
+    if matches!(site.code, "nyaa" | "acgrip") && markdown.is_empty() {
         return Err(format!(
             "{} 需要 Markdown 发布内容，请先填写 Markdown，或不要只保留 HTML。",
             site.label
         ));
     }
 
-    if site_prefers_html_content(site.code) && !template.description_html.trim().is_empty() {
-        return Ok(&artifacts.html_description_path);
+    if site_prefers_html_content(site.code) {
+        if !html.is_empty() {
+            return Ok(&artifacts.html_description_path);
+        }
+
+        if !markdown.is_empty() {
+            return Ok(&artifacts.markdown_description_path);
+        }
+
+        return Err(format!(
+            "{} 需要 HTML 内容，或可转换为 HTML 的 Markdown 发布内容，请先填写 HTML 或 Markdown。",
+            site.label
+        ));
     }
 
     Ok(&artifacts.markdown_description_path)
@@ -1058,6 +1072,36 @@ mod tests {
             .expect_err("expected bbcode site to require markdown input");
 
         assert!(error.contains("ACG.RIP"));
+    }
+
+    #[test]
+    fn test_select_publish_content_path_requires_any_content_for_html_sites() {
+        let template = Template {
+            description: String::new(),
+            description_html: String::new(),
+            ..Template::default()
+        };
+        let site = SitePublishConfig {
+            code: "dmhy",
+            label: "动漫花园",
+            account_name: "Team".to_string(),
+            token: None,
+            enabled: true,
+            uses_cookie: true,
+        };
+        let artifacts = PublishArtifacts {
+            workspace_dir: PathBuf::from("workspace"),
+            template_path: PathBuf::from("template.toml"),
+            cookies_path: PathBuf::from("cookies.txt"),
+            markdown_description_path: PathBuf::from("description.md"),
+            html_description_path: PathBuf::from("description.html"),
+            log_path: PathBuf::from("okp.log"),
+        };
+
+        let error = select_publish_content_path(&template, &site, &artifacts)
+            .expect_err("expected html-first site to require html or markdown content");
+
+        assert!(error.contains("动漫花园"));
     }
 
     fn create_test_okp_layout(file_name: &str) -> PathBuf {
