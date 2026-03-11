@@ -1,0 +1,127 @@
+name: Draft Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: Git tag to create or use for the draft release
+        required: true
+        type: string
+      release_name:
+        description: Optional release title
+        required: false
+        default: ''
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform.name }} asset
+    runs-on: ${{ matrix.platform.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - name: Windows
+            os: windows-latest
+            slug: windows-x64
+            binary_name: okpgui-next.exe
+            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-windows-x64.zip
+          - name: macOS
+            os: macos-latest
+            slug: macos-universal
+            binary_name: okpgui-next
+            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-universal.tar.gz
+          - name: Linux
+            os: ubuntu-22.04
+            slug: linux-x64
+            binary_name: okpgui-next
+            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-linux-x64.tar.gz
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 20
+          cache: pnpm
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm build
+
+      - name: Build Tauri application binary
+        run: pnpm tauri build -- --bundles none
+
+      - name: Package Windows asset
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $stagingDir = Join-Path $env:RUNNER_TEMP 'release-windows'
+          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
+          Copy-Item "src-tauri/target/release/${{ matrix.platform.binary_name }}" (Join-Path $stagingDir '${{ matrix.platform.binary_name }}')
+          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath "${{ matrix.platform.archive_name }}" -Force
+
+      - name: Package Unix asset
+        if: runner.os != 'Windows'
+        run: |
+          staging_dir="${RUNNER_TEMP}/release-${{ matrix.platform.slug }}"
+          mkdir -p "$staging_dir"
+          cp "src-tauri/target/release/${{ matrix.platform.binary_name }}" "$staging_dir/${{ matrix.platform.binary_name }}"
+          tar -C "$staging_dir" -czf "${{ matrix.platform.archive_name }}" .
+
+      - name: Upload packaged asset
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.platform.slug }}-release-asset
+          if-no-files-found: error
+          path: ${{ matrix.platform.archive_name }}
+
+  release:
+    name: Create draft GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download packaged assets
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+
+      - name: Create draft release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.inputs.tag_name }}
+          name: ${{ github.event.inputs.release_name != '' && github.event.inputs.release_name || github.event.inputs.tag_name }}
+          target_commitish: ${{ github.sha }}
+          draft: true
+          generate_release_notes: true
+          files: |
+            release-assets/**/*.zip
+            release-assets/**/*.tar.gz

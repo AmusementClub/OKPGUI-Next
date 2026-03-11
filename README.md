@@ -44,6 +44,12 @@ Build the frontend:
 pnpm build
 ```
 
+## Releases
+
+GitHub Actions includes a manual `Draft Release` workflow that builds Windows, macOS, and Linux artifacts and attaches them to a draft GitHub release.
+
+Trigger it from the Actions tab with a `tag_name` such as `v0.1.0`. The workflow builds the Tauri binary for each platform, packages the result, and creates a draft release with those archives attached.
+
 ## Notes
 
 - The frontend lives in `src/`.
