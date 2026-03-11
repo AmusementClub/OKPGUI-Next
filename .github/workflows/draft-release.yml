@@ -78,7 +78,7 @@ jobs:
         run: pnpm build
 
       - name: Build Tauri application binary
-        run: pnpm tauri build -- --bundles none
+        run: pnpm tauri build --no-bundle
 
       - name: Package Windows asset
         if: runner.os == 'Windows'
