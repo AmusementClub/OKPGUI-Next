@@ -44,6 +44,8 @@ Build the frontend:
 pnpm build
 ```
 
+Version management uses `package.json` as the source of truth. Update its `version` field, then run `pnpm dev`, `pnpm build`, or `pnpm tauri dev` and the matching values in `src-tauri/Cargo.toml` and `src-tauri/tauri.conf.json` will be synchronized automatically.
+
 ## Releases
 
 GitHub Actions includes a manual `Draft Release` workflow that builds Windows, macOS, and Linux artifacts and attaches them to a draft GitHub release.

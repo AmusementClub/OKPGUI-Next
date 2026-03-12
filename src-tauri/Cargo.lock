@@ -2445,7 +2445,7 @@ dependencies = [
 
 [[package]]
 name = "okpgui-next"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "chromiumoxide",
  "encoding_rs",

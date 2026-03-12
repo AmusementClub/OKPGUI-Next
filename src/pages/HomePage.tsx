@@ -2,9 +2,11 @@ import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { open } from '@tauri-apps/plugin-dialog';
+import { open, save } from '@tauri-apps/plugin-dialog';
 import {
     FolderOpen,
+    Download,
+    Upload,
     Trash2,
     Send,
     Loader2,
@@ -18,6 +20,7 @@ import ConsoleModal, {
 } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
+import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
@@ -42,7 +45,39 @@ interface Template {
     description_html: string;
     profile: string;
     title: string;
+    publish_history: SitePublishHistory;
     sites: SiteSelection;
+}
+
+interface SitePublishHistoryEntry {
+    last_published_at: string;
+    last_published_episode: string;
+}
+
+type SitePublishHistory = Record<keyof SiteSelection, SitePublishHistoryEntry>;
+
+interface ConfigPayload {
+    last_used_template: string | null;
+    okp_executable_path: string;
+    templates: Record<string, Partial<Template>>;
+}
+
+interface ImportedTemplatePayload {
+    name: string;
+    template: Partial<Template>;
+}
+
+interface PublishAttemptContext {
+    templateName: string;
+    publishedAt: string;
+    publishedEpisode: string;
+    siteKeys: (keyof SiteSelection)[];
+}
+
+interface TemplatePublishHistoryUpdate {
+    site_key: keyof SiteSelection;
+    last_published_at: string;
+    last_published_episode: string;
 }
 
 interface Profile {
@@ -88,6 +123,133 @@ interface TorrentInfo {
     file_tree: FileTreeNodeData;
 }
 
+const siteKeys: (keyof SiteSelection)[] = [
+    'dmhy',
+    'nyaa',
+    'acgrip',
+    'bangumi',
+    'acgnx_asia',
+    'acgnx_global',
+];
+
+const publishTimestampFormatter = new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+});
+
+const createDefaultPublishHistory = (): SitePublishHistory => ({
+    dmhy: { last_published_at: '', last_published_episode: '' },
+    nyaa: { last_published_at: '', last_published_episode: '' },
+    acgrip: { last_published_at: '', last_published_episode: '' },
+    bangumi: { last_published_at: '', last_published_episode: '' },
+    acgnx_asia: { last_published_at: '', last_published_episode: '' },
+    acgnx_global: { last_published_at: '', last_published_episode: '' },
+});
+
+const normalizePublishHistory = (history?: Partial<SitePublishHistory>): SitePublishHistory => {
+    const defaultHistory = createDefaultPublishHistory();
+
+    return siteKeys.reduce((accumulator, siteKey) => {
+        const entry = history?.[siteKey];
+        accumulator[siteKey] = {
+            last_published_at:
+                typeof entry?.last_published_at === 'string'
+                    ? entry.last_published_at
+                    : defaultHistory[siteKey].last_published_at,
+            last_published_episode:
+                typeof entry?.last_published_episode === 'string'
+                    ? entry.last_published_episode
+                    : defaultHistory[siteKey].last_published_episode,
+        };
+        return accumulator;
+    }, {} as SitePublishHistory);
+};
+
+const formatPublishTimestamp = (value: string) => {
+    if (!value.trim()) {
+        return '未发布';
+    }
+
+    const parsedTimestamp = Date.parse(value);
+    if (Number.isNaN(parsedTimestamp)) {
+        return value;
+    }
+
+    return publishTimestampFormatter.format(new Date(parsedTimestamp)).replace(/\//g, '-');
+};
+
+const getPublishTimestampSortValue = (value: string) => {
+    if (!value.trim()) {
+        return Number.NEGATIVE_INFINITY;
+    }
+
+    const parsedTimestamp = Date.parse(value);
+    return Number.isNaN(parsedTimestamp) ? Number.NEGATIVE_INFINITY : parsedTimestamp;
+};
+
+const getLatestTemplatePublishAt = (templateValue: Template) => {
+    let latestPublishedAt = '';
+    let latestPublishedAtSortValue = Number.NEGATIVE_INFINITY;
+
+    for (const siteKey of siteKeys) {
+        const publishedAt = templateValue.publish_history[siteKey].last_published_at;
+        const sortValue = getPublishTimestampSortValue(publishedAt);
+        if (sortValue > latestPublishedAtSortValue) {
+            latestPublishedAt = publishedAt;
+            latestPublishedAtSortValue = sortValue;
+        }
+    }
+
+    return latestPublishedAt;
+};
+
+const buildTemplateOptions = (templates: Record<string, Partial<Template>>): TemplateSelectOption[] =>
+    Object.entries(templates)
+        .map(([name, templateValue]) => {
+            const normalizedTemplate = normalizeTemplate(templateValue);
+            const latestPublishedAt = getLatestTemplatePublishAt(normalizedTemplate);
+
+            return {
+                name,
+                label: name,
+                latestPublishedAtLabel: formatPublishTimestamp(latestPublishedAt),
+                sortValue: getPublishTimestampSortValue(latestPublishedAt),
+            };
+        })
+        .sort((left, right) => {
+            if (left.sortValue !== right.sortValue) {
+                return left.sortValue - right.sortValue;
+            }
+
+            return left.label.localeCompare(right.label, 'zh-CN');
+        })
+        .map(({ sortValue: _sortValue, ...option }) => option);
+
+const getPublishedEpisodeLabel = (value: string) => value.trim() || '不适用';
+
+const mergePublishHistory = (
+    templateValue: Template,
+    updates: TemplatePublishHistoryUpdate[],
+): Template => {
+    const nextPublishHistory = normalizePublishHistory(templateValue.publish_history);
+
+    for (const update of updates) {
+        nextPublishHistory[update.site_key] = {
+            last_published_at: update.last_published_at,
+            last_published_episode: update.last_published_episode,
+        };
+    }
+
+    return {
+        ...templateValue,
+        publish_history: nextPublishHistory,
+    };
+};
+
 const defaultTemplate: Template = {
     ep_pattern: '',
     title_pattern: '',
@@ -98,6 +260,7 @@ const defaultTemplate: Template = {
     description_html: '',
     profile: '',
     title: '',
+    publish_history: createDefaultPublishHistory(),
     sites: {
         dmhy: false,
         nyaa: false,
@@ -118,6 +281,7 @@ function normalizeTemplate(template?: Partial<Template>): Template {
             typeof template?.description_html === 'string'
                 ? template.description_html
                 : defaultTemplate.description_html,
+        publish_history: normalizePublishHistory(template?.publish_history),
         sites: {
             ...defaultTemplate.sites,
             ...template?.sites,
@@ -197,7 +361,7 @@ const getTorrentPathFromUriList = (uriList: string): string | null => {
 
 export default function HomePage() {
     // Template state
-    const [templateList, setTemplateList] = useState<string[]>([]);
+    const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
     const [currentTemplateName, setCurrentTemplateName] = useState('');
     const [newTemplateName, setNewTemplateName] = useState('');
     const [template, setTemplate] = useState<Template>(defaultTemplate);
@@ -221,12 +385,14 @@ export default function HomePage() {
     const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
     const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
     const templateRef = useRef(template);
+    const currentTemplateNameRef = useRef(currentTemplateName);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
+    const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
+    const publishSiteSuccessRef = useRef<Partial<Record<keyof SiteSelection, boolean>>>({});
 
     // Load templates and profiles on mount
     useEffect(() => {
-        loadTemplateList();
         loadProfileList();
         loadLastConfig();
     }, []);
@@ -234,6 +400,10 @@ export default function HomePage() {
     useEffect(() => {
         templateRef.current = template;
     }, [template]);
+
+    useEffect(() => {
+        currentTemplateNameRef.current = currentTemplateName;
+    }, [currentTemplateName]);
 
     useEffect(() => {
         const hasPendingDescriptionSave =
@@ -298,6 +468,8 @@ export default function HomePage() {
             });
 
             siteCompleteUnlisten = await listen<PublishSiteComplete>('publish-site-complete', (event) => {
+                publishSiteSuccessRef.current[event.payload.site_code as keyof SiteSelection] = event.payload.success;
+
                 setPublishSites((current) => {
                     const existing = current[event.payload.site_code] ?? {
                         siteCode: event.payload.site_code,
@@ -321,6 +493,7 @@ export default function HomePage() {
             completeUnlisten = await listen<PublishComplete>('publish-complete', (event) => {
                 setIsPublishComplete(true);
                 setPublishResult(event.payload);
+                void finalizePublishHistory();
             });
         };
 
@@ -333,12 +506,16 @@ export default function HomePage() {
         };
     }, []);
 
-    const loadTemplateList = async () => {
+    const fetchConfig = () => invoke<ConfigPayload>('get_config');
+
+    const refreshTemplateOptions = async (config?: ConfigPayload) => {
         try {
-            const list = await invoke<string[]>('get_template_list');
-            setTemplateList(list);
+            const nextConfig = config ?? await fetchConfig();
+            setTemplateOptions(buildTemplateOptions(nextConfig.templates));
+            return nextConfig;
         } catch (e) {
             console.error('加载模板列表失败:', e);
+            return null;
         }
     };
 
@@ -366,11 +543,11 @@ export default function HomePage() {
 
     const loadLastConfig = async () => {
         try {
-            const config = await invoke<{
-                last_used_template: string | null;
-                okp_executable_path: string;
-                templates: Record<string, Template>;
-            }>('get_config');
+            const config = await refreshTemplateOptions();
+            if (!config) {
+                return;
+            }
+
             setOkpExecutablePath(config.okp_executable_path || '');
             const initialTemplateName =
                 config.last_used_template ?? (config.templates.default ? 'default' : null);
@@ -390,9 +567,8 @@ export default function HomePage() {
 
     const loadTemplate = async (name: string) => {
         try {
-            const config = await invoke<{
-                templates: Record<string, Template>;
-            }>('get_config');
+            const config = await fetchConfig();
+            await refreshTemplateOptions(config);
             if (config.templates[name]) {
                 const nextTemplate = normalizeTemplate(config.templates[name]);
                 lastPersistedDescriptionRef.current = nextTemplate.description;
@@ -433,7 +609,7 @@ export default function HomePage() {
             setTemplate(templateToSave);
             setCurrentTemplateName(name);
             setNewTemplateName('');
-            await loadTemplateList();
+            await refreshTemplateOptions();
             return true;
         } catch (e) {
             console.error('保存模板失败:', e);
@@ -456,7 +632,7 @@ export default function HomePage() {
             setTemplate(defaultTemplate);
             setSelectedProfile('');
             setSiteLoginTests({});
-            await loadTemplateList();
+            await refreshTemplateOptions();
         } catch (e) {
             console.error('删除模板失败:', e);
         }
@@ -579,6 +755,133 @@ export default function HomePage() {
 
     const clearOkpExecutablePath = async () => {
         await saveOkpExecutablePath('');
+    };
+
+    const handleImportTemplate = async () => {
+        try {
+            const selectedFile = await open({
+                filters: [{ name: '模板文件', extensions: ['json'] }],
+                multiple: false,
+            });
+
+            const importPath = Array.isArray(selectedFile) ? selectedFile[0] : selectedFile;
+            if (!importPath) {
+                return;
+            }
+
+            const imported = await invoke<ImportedTemplatePayload>('import_template_from_file', {
+                path: importPath,
+            });
+            const nextTemplate = normalizeTemplate(imported.template);
+
+            lastPersistedDescriptionRef.current = nextTemplate.description;
+            lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+            setCurrentTemplateName(imported.name);
+            setNewTemplateName('');
+            setTemplate(nextTemplate);
+            setSelectedProfile(nextTemplate.profile || '');
+            await refreshTemplateOptions();
+        } catch (e) {
+            console.error('导入模板失败:', e);
+        }
+    };
+
+    const handleExportTemplate = async () => {
+        const candidateName = currentTemplateName.trim() || newTemplateName.trim();
+        if (!candidateName) {
+            return;
+        }
+
+        try {
+            const templateToExport = withSelectedProfile(templateRef.current);
+            const persisted = await persistTemplateToDisk(templateToExport, candidateName);
+            if (!persisted) {
+                return;
+            }
+
+            const selectedPath = await save({
+                defaultPath: `${candidateName}.json`,
+                filters: [{ name: '模板文件', extensions: ['json'] }],
+            });
+
+            if (!selectedPath) {
+                return;
+            }
+
+            await invoke('export_template_to_file', {
+                name: candidateName,
+                path: selectedPath,
+            });
+        } catch (e) {
+            console.error('导出模板失败:', e);
+        }
+    };
+
+    const resolvePublishEpisode = async (templateToPublish: Template, filename?: string) => {
+        if (!filename || !templateToPublish.ep_pattern || !templateToPublish.title_pattern) {
+            return '不适用';
+        }
+
+        try {
+            const title = await invoke<string>('match_title', {
+                filename,
+                epPattern: templateToPublish.ep_pattern,
+                titlePattern: templateToPublish.title_pattern,
+            });
+
+            if (!title.trim()) {
+                return '不适用';
+            }
+
+            const episode = await invoke<string>('extract_episode_value', {
+                filename,
+                epPattern: templateToPublish.ep_pattern,
+            });
+
+            return getPublishedEpisodeLabel(episode);
+        } catch (e) {
+            console.error('提取发布集数失败:', e);
+            return '不适用';
+        }
+    };
+
+    const finalizePublishHistory = async () => {
+        const publishAttempt = publishAttemptRef.current;
+        publishAttemptRef.current = null;
+
+        if (!publishAttempt) {
+            publishSiteSuccessRef.current = {};
+            return;
+        }
+
+        const updates = publishAttempt.siteKeys
+            .filter((siteKey) => publishSiteSuccessRef.current[siteKey])
+            .map((siteKey) => ({
+                site_key: siteKey,
+                last_published_at: publishAttempt.publishedAt,
+                last_published_episode: publishAttempt.publishedEpisode,
+            }));
+
+        publishSiteSuccessRef.current = {};
+
+        if (updates.length === 0) {
+            return;
+        }
+
+        try {
+            await invoke('update_template_publish_history', {
+                name: publishAttempt.templateName,
+                updates,
+            });
+
+            if (currentTemplateNameRef.current === publishAttempt.templateName) {
+                setTemplate((current) => mergePublishHistory(current, updates));
+            }
+
+            await refreshTemplateOptions();
+        } catch (e) {
+            console.error('保存模板发布历史失败:', e);
+        }
     };
 
     const handlePatternBlur = async (field: 'ep_pattern' | 'title_pattern', value: string) => {
@@ -737,7 +1040,7 @@ export default function HomePage() {
                     publishState,
                 };
             }),
-        [publishSites, selectedProfileData, siteLoginTests, template.sites],
+        [publishSites, selectedProfileData, siteLoginTests, template.publish_history],
     );
 
     const selectedSiteKeys = useMemo(
@@ -752,20 +1055,21 @@ export default function HomePage() {
         const selectableSiteKeys = new Set(
             siteRows.filter((row) => row.selectable).map((row) => row.site.key),
         );
-        const hasInvalidSelection = Object.entries(template.sites).some(
-            ([siteKey, enabled]) => enabled && !selectableSiteKeys.has(siteKey as keyof SiteSelection),
-        );
-
-        if (!hasInvalidSelection) {
-            return;
-        }
 
         setTemplate((current) => {
             const nextSites = { ...current.sites };
+            let hasChanges = false;
+
             for (const siteKey of Object.keys(nextSites) as (keyof SiteSelection)[]) {
-                if (nextSites[siteKey] && !selectableSiteKeys.has(siteKey)) {
-                    nextSites[siteKey] = false;
+                const shouldBeSelected = selectableSiteKeys.has(siteKey);
+                if (nextSites[siteKey] !== shouldBeSelected) {
+                    nextSites[siteKey] = shouldBeSelected;
+                    hasChanges = true;
                 }
+            }
+
+            if (!hasChanges) {
+                return current;
             }
 
             const nextTemplate = { ...current, sites: nextSites };
@@ -782,8 +1086,10 @@ export default function HomePage() {
         if (selectedSiteKeys.length === 0) return;
         if (isPublishing) return;
 
+        const publishTemplateName = getTemplateName();
+        const templateToPublish = withSelectedProfile(template, selectedProfile);
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key]);
-        const contentValidationIssues = validatePublishContentForSites(template, selectedSites);
+        const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);
         if (contentValidationIssues.length > 0) {
             const issueMessageMap = new Map(
                 contentValidationIssues.map((issue) => [issue.siteCode, issue.message]),
@@ -816,6 +1122,19 @@ export default function HomePage() {
             return;
         }
 
+        const saved = await persistTemplateToDisk(templateToPublish, publishTemplateName);
+        if (!saved) {
+            return;
+        }
+
+        publishAttemptRef.current = {
+            templateName: publishTemplateName,
+            publishedAt: new Date().toISOString(),
+            publishedEpisode: await resolvePublishEpisode(templateToPublish, torrentInfo?.name),
+            siteKeys: selectedSites.map((site) => site.key),
+        };
+        publishSiteSuccessRef.current = {};
+
         setPublishSites(
             Object.fromEntries(
                 selectedSites.map((site) => [
@@ -839,12 +1158,9 @@ export default function HomePage() {
             await invoke('publish', {
                 request: {
                     torrent_path: torrentPath,
-                    template_name: currentTemplateName,
+                    template_name: publishTemplateName,
                     profile_name: selectedProfile,
-                    template: {
-                        ...template,
-                        profile: selectedProfile,
-                    },
+                    template: templateToPublish,
                 },
             });
         } catch (e) {
@@ -908,6 +1224,15 @@ export default function HomePage() {
         }
     }, [parseTorrent]);
 
+    const handleTorrentPickerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+        if (e.key !== 'Enter' && e.key !== ' ') {
+            return;
+        }
+
+        e.preventDefault();
+        void selectTorrentFile();
+    };
+
     const updateField = (field: keyof Template, value: string) => {
         setTemplate((t) => ({ ...t, [field]: value }));
     };
@@ -947,18 +1272,13 @@ export default function HomePage() {
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">模板管理</h2>
                     <div className="flex gap-2">
-                        <select
-                            value={currentTemplateName}
-                            onChange={(e) => loadTemplate(e.target.value)}
-                            className="flex-1 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                        >
-                            <option value="">选择模板...</option>
-                            {templateList.map((name) => (
-                                <option key={name} value={name}>
-                                    {name}
-                                </option>
-                            ))}
-                        </select>
+                        <div className="flex-1">
+                            <TemplateSelect
+                                options={templateOptions}
+                                value={currentTemplateName}
+                                onChange={loadTemplate}
+                            />
+                        </div>
                         <input
                             type="text"
                             value={newTemplateName}
@@ -970,7 +1290,7 @@ export default function HomePage() {
                                 }
                             }}
                             placeholder="新模板名称（失焦自动创建）"
-                            className="w-40 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            className="w-56 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         />
                         <button
                             onClick={deleteTemplate}
@@ -980,6 +1300,27 @@ export default function HomePage() {
                             <Trash2 size={14} />
                             删除
                         </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                void handleImportTemplate();
+                            }}
+                            className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                        >
+                            <Download size={14} />
+                            导入
+                        </button>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                void handleExportTemplate();
+                            }}
+                            disabled={!currentTemplateName.trim() && !newTemplateName.trim()}
+                            className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                        >
+                            <Upload size={14} />
+                            导出
+                        </button>
                     </div>
                 </section>
 
@@ -987,32 +1328,34 @@ export default function HomePage() {
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">种子文件</h2>
                     <div
+                        role="button"
+                        tabIndex={0}
+                        aria-label="选择种子文件"
+                        onClick={() => {
+                            void selectTorrentFile();
+                        }}
+                        onKeyDown={handleTorrentPickerKeyDown}
                         onDragOver={handleDragOver}
                         onDragLeave={handleDragLeave}
                         onDrop={handleDrop}
-                        className={`border-2 border-dashed rounded-lg p-4 text-center transition-colors ${
+                        className={`border-2 border-dashed rounded-lg p-4 text-center transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 ${
                             isDragging
                                 ? 'border-emerald-400 bg-emerald-400/10'
                                 : 'border-slate-700 hover:border-slate-600'
                         }`}
                     >
                         {torrentPath ? (
-                            <div className="text-sm text-slate-300">
+                            <div className="text-sm text-slate-300 space-y-1">
                                 <p className="truncate">{torrentPath}</p>
+                                <p className="text-xs text-slate-500">点击或拖放其他种子文件以替换</p>
                             </div>
                         ) : (
-                            <p className="text-sm text-slate-500">
-                                拖放种子文件到此处，或点击下方按钮选择
-                            </p>
+                            <div className="space-y-1">
+                                <p className="text-sm text-slate-400">拖放种子文件到此处，或点击选择</p>
+                                <p className="text-xs text-slate-500">支持直接拖拽 .torrent 文件</p>
+                            </div>
                         )}
                     </div>
-                    <button
-                        onClick={selectTorrentFile}
-                        className="mt-2 flex items-center gap-1.5 px-3 py-2 bg-slate-700 hover:bg-slate-600 text-white text-sm rounded-lg transition-colors"
-                    >
-                        <FolderOpen size={14} />
-                        选择种子文件
-                    </button>
                     {torrentInfo && (
                         <div className="mt-2">
                             <FileTree root={torrentInfo.file_tree} totalSize={torrentInfo.total_size} />
@@ -1025,7 +1368,7 @@ export default function HomePage() {
                     <h2 className="text-sm font-medium text-slate-400 mb-2">标题匹配</h2>
                     <div className="grid grid-cols-2 gap-3">
                         <div>
-                            <label className="text-xs text-slate-500 mb-1 block">集数匹配正则</label>
+                            <label className="text-xs text-slate-500 mb-1 block">标题模板匹配正则</label>
                             <input
                                 type="text"
                                 value={template.ep_pattern}
@@ -1179,6 +1522,8 @@ export default function HomePage() {
                                         <tr>
                                             <th className="w-16 px-4 py-3 font-medium">选择</th>
                                             <th className="px-4 py-3 font-medium">站点</th>
+                                            <th className="w-40 px-4 py-3 font-medium">最后发布时间</th>
+                                            <th className="w-28 px-4 py-3 font-medium">最后发布集数</th>
                                             <th className="px-4 py-3 font-medium">身份状态</th>
                                             <th className="w-36 px-4 py-3 font-medium">Cookie 测试</th>
                                             <th className="w-44 px-4 py-3 font-medium">发布状态</th>
@@ -1199,6 +1544,12 @@ export default function HomePage() {
                                                 </td>
                                                 <td className="px-4 py-3 align-middle font-medium text-slate-100">
                                                     {site.label}
+                                                </td>
+                                                <td className="px-4 py-3 align-middle text-xs text-slate-400">
+                                                    {formatPublishTimestamp(template.publish_history[site.key].last_published_at)}
+                                                </td>
+                                                <td className="px-4 py-3 align-middle text-slate-300">
+                                                    {getPublishedEpisodeLabel(template.publish_history[site.key].last_published_episode)}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle">
                                                     <div className={identityClass} title={identityTitle}>

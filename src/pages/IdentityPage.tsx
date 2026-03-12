@@ -1,4 +1,4 @@
-﻿import { Disclosure } from '@headlessui/react';
+﻿import { Disclosure, Transition } from '@headlessui/react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -803,10 +803,18 @@ export default function IdentityPage() {
                             {cookiePanels.map(({ site, rawText, summary }, index) => (
                                 <Disclosure key={site.code} defaultOpen={index === 0}>
                                     {({ open }) => (
-                                        <div className="overflow-hidden rounded-lg border border-slate-700 bg-slate-800/50">
+                                        <div
+                                            className={`overflow-hidden rounded-lg border bg-slate-800/50 transition-[border-color,background-color,box-shadow] duration-200 ease-out ${
+                                                open
+                                                    ? 'border-slate-600 bg-slate-800/70 shadow-[0_18px_36px_rgba(2,6,23,0.18)]'
+                                                    : 'border-slate-700'
+                                            }`}
+                                        >
                                             <Disclosure.Button
                                                 as="div"
-                                                className="flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-colors hover:bg-slate-800/80"
+                                                className={`flex w-full items-center justify-between gap-3 px-4 py-3 text-left transition-[background-color,padding] duration-200 ease-out ${
+                                                    open ? 'bg-slate-800/60' : 'hover:bg-slate-800/80'
+                                                }`}
                                             >
                                                 <div className="flex min-w-0 flex-1 flex-col gap-1 md:flex-row md:items-center md:gap-4">
                                                     <span className="text-sm font-medium text-slate-100">
@@ -852,41 +860,56 @@ export default function IdentityPage() {
                                                     </button>
                                                     <ChevronDown
                                                         size={16}
-                                                        className={`shrink-0 text-slate-500 transition-transform ${open ? 'rotate-180' : ''}`}
+                                                        className={`shrink-0 text-slate-500 transition-transform duration-180 ease-[cubic-bezier(0.22,1,0.36,1)] ${open ? 'rotate-180' : ''}`}
                                                     />
                                                 </div>
                                             </Disclosure.Button>
-                                            <Disclosure.Panel className="space-y-3 border-t border-slate-700 px-4 py-4">
-                                                <div className="flex items-center gap-2 text-xs text-slate-500">
-                                                    <CalendarClock size={14} />
-                                                    共 {summary.cookieCount} 条 Cookie
-                                                </div>
-                                                {siteLoginTests[site.code]?.message && (
-                                                    <p
-                                                        className={`text-xs ${getSiteLoginMessageClass(siteLoginTests[site.code].status)}`}
-                                                    >
-                                                        {siteLoginTests[site.code].message}
-                                                    </p>
-                                                )}
-                                                <textarea
-                                                    value={rawText}
-                                                    onChange={(event) =>
-                                                        updateSiteCookieText(site.code, event.target.value)
-                                                    }
-                                                    onBlur={(event) =>
-                                                        autosaveProfile(
-                                                            updateProfileSiteCookies(
-                                                                profile,
-                                                                site.code,
-                                                                event.target.value,
-                                                            ),
-                                                        )
-                                                    }
-                                                    placeholder={`在这里查看或粘贴 ${site.label} 的 Cookie 内容...`}
-                                                    rows={8}
-                                                    className="w-full resize-y rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                                                />
-                                            </Disclosure.Panel>
+                                            <Transition
+                                                show={open}
+                                                as="div"
+                                                enter="transition duration-180 ease-[cubic-bezier(0.22,1,0.36,1)]"
+                                                enterFrom="opacity-0 -translate-y-1"
+                                                enterTo="opacity-100 translate-y-0"
+                                                leave="transition duration-150 ease-[cubic-bezier(0.4,0,0.2,1)]"
+                                                leaveFrom="opacity-100 translate-y-0"
+                                                leaveTo="opacity-0 -translate-y-1"
+                                                className="overflow-hidden"
+                                            >
+                                                <Disclosure.Panel
+                                                    static
+                                                    className="space-y-3 border-t border-slate-700 px-4 py-4"
+                                                >
+                                                    <div className="flex items-center gap-2 text-xs text-slate-500">
+                                                        <CalendarClock size={14} />
+                                                        共 {summary.cookieCount} 条 Cookie
+                                                    </div>
+                                                    {siteLoginTests[site.code]?.message && (
+                                                        <p
+                                                            className={`text-xs ${getSiteLoginMessageClass(siteLoginTests[site.code].status)}`}
+                                                        >
+                                                            {siteLoginTests[site.code].message}
+                                                        </p>
+                                                    )}
+                                                    <textarea
+                                                        value={rawText}
+                                                        onChange={(event) =>
+                                                            updateSiteCookieText(site.code, event.target.value)
+                                                        }
+                                                        onBlur={(event) =>
+                                                            autosaveProfile(
+                                                                updateProfileSiteCookies(
+                                                                    profile,
+                                                                    site.code,
+                                                                    event.target.value,
+                                                                ),
+                                                            )
+                                                        }
+                                                        placeholder={`在这里查看或粘贴 ${site.label} 的 Cookie 内容...`}
+                                                        rows={8}
+                                                        className="w-full resize-y rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 font-mono text-xs text-slate-300 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                                    />
+                                                </Disclosure.Panel>
+                                            </Transition>
                                         </div>
                                     )}
                                 </Disclosure>

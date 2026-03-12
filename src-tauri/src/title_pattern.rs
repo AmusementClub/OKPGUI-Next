@@ -23,6 +23,23 @@ pub fn match_title(filename: String, ep_pattern: String, title_pattern: String) 
     Ok(result)
 }
 
+#[tauri::command]
+pub fn extract_episode_value(filename: String, ep_pattern: String) -> Result<String, String> {
+    if ep_pattern.is_empty() {
+        return Ok(String::new());
+    }
+
+    let re = Regex::new(&ep_pattern).map_err(|e| format!("正则表达式错误: {}", e))?;
+    let caps = re
+        .captures(&filename)
+        .ok_or_else(|| "未匹配到内容".to_string())?;
+
+    Ok(caps
+        .name("ep")
+        .map(|matched| matched.as_str().to_string())
+        .unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -64,5 +81,16 @@ mod tests {
             "title".to_string(),
         );
         assert_eq!(result.unwrap(), "");
+    }
+
+    #[test]
+    fn test_extract_episode_value() {
+        let result = extract_episode_value(
+            "[Group] Title - 12 [1080p].mkv".to_string(),
+            r"\[(?P<group>.+?)\]\s*(?P<title>.+?)\s*-\s*(?P<ep>\d+)\s*\[(?P<res>\d+p)\]"
+                .to_string(),
+        );
+
+        assert_eq!(result.unwrap(), "12");
     }
 }

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe, Info, ExternalLink } from 'lucide-react';
+import { useAppVersion } from '../utils/appVersion';
 
 interface ProxyConfig {
     proxy_type: string;
@@ -11,6 +12,7 @@ export default function MiscPage() {
     const [proxyType, setProxyType] = useState('none');
     const [proxyHost, setProxyHost] = useState('');
     const [saved, setSaved] = useState(false);
+    const appVersion = useAppVersion();
 
     useEffect(() => {
         loadProxy();
@@ -106,7 +108,7 @@ export default function MiscPage() {
                             <div className="text-sm text-slate-400 space-y-1">
                                 <p>
                                     <span className="text-slate-500">版本:</span>{' '}
-                                    <span className="text-slate-300">v0.1.0 Phase 1</span>
+                                    <span className="text-slate-300">{appVersion}</span>
                                 </p>
                                 <p>
                                     <span className="text-slate-500">技术栈:</span>{' '}

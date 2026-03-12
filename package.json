@@ -1,12 +1,16 @@
 {
   "name": "okpgui-next",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
+    "version:sync": "node scripts/sync-version.mjs",
+    "predev": "node scripts/sync-version.mjs",
     "dev": "vite",
+    "prebuild": "node scripts/sync-version.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
+    "pretauri": "node scripts/sync-version.mjs",
     "tauri": "tauri"
   },
   "dependencies": {
