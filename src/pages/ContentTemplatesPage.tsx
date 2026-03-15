@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import { Copy, FileText, Plus, Save, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Copy, FileText, Plus, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import PublishContentEditor from '../components/PublishContentEditor';
 import {
     ContentTemplate,
@@ -36,6 +36,24 @@ function formatTimestamp(value: string) {
         .replace(/\//g, '-');
 }
 
+function serializeAutosaveTemplate(template: ContentTemplate) {
+    return JSON.stringify({
+        ...template,
+        updated_at: '',
+    });
+}
+
+function buildPersistableTemplate(template: ContentTemplate) {
+    const name = template.name.trim() || '未命名公共正文模板';
+
+    return normalizeContentTemplate({
+        ...template,
+        id: template.id.trim() || createTemplateIdFromName(name, 'content'),
+        name,
+        updated_at: createUpdatedAtTimestamp(),
+    });
+}
+
 export default function ContentTemplatesPage() {
     const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
@@ -43,6 +61,11 @@ export default function ContentTemplatesPage() {
     const [draft, setDraft] = useState<ContentTemplate>(createDefaultContentTemplate());
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+    const [hasPendingAutosave, setHasPendingAutosave] = useState(false);
+    const latestDraftRef = useRef(draft);
+    const lastPersistedSnapshotRef = useRef(serializeAutosaveTemplate(createDefaultContentTemplate()));
+
+    latestDraftRef.current = draft;
 
     const sortedTemplates = useMemo(
         () =>
@@ -68,6 +91,18 @@ export default function ContentTemplatesPage() {
     useEffect(() => {
         void loadData();
     }, []);
+
+    useEffect(() => {
+        if (!hasPendingAutosave) {
+            return undefined;
+        }
+
+        const autosaveTimer = window.setTimeout(() => {
+            void persistDraft(latestDraftRef.current);
+        }, 700);
+
+        return () => window.clearTimeout(autosaveTimer);
+    }, [draft, hasPendingAutosave]);
 
     const loadData = async (preferredId?: string) => {
         const config = await invoke<QuickPublishConfigPayload>('get_config');
@@ -96,24 +131,75 @@ export default function ContentTemplatesPage() {
 
         if (!resolvedId) {
             setSelectedTemplateId('');
-            setDraft(createDefaultContentTemplate());
+            const emptyDraft = createDefaultContentTemplate();
+            setDraft(emptyDraft);
+            lastPersistedSnapshotRef.current = serializeAutosaveTemplate(emptyDraft);
+            setHasPendingAutosave(false);
             return;
         }
 
         setSelectedTemplateId(resolvedId);
         setDraft(nextContentTemplates[resolvedId]);
+        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(nextContentTemplates[resolvedId]);
+        setHasPendingAutosave(false);
+    };
+
+    const updateDraft = (updater: (current: ContentTemplate) => ContentTemplate) => {
+        setDraft((current) => updater(current));
+        setHasPendingAutosave(true);
+        setStatusMessage('');
+        setErrorMessage('');
+    };
+
+    const persistDraft = async (sourceDraft: ContentTemplate) => {
+        const sourceSnapshot = serializeAutosaveTemplate(sourceDraft);
+        const templateToSave = buildPersistableTemplate(sourceDraft);
+        const persistedSnapshot = serializeAutosaveTemplate(templateToSave);
+
+        if (persistedSnapshot === lastPersistedSnapshotRef.current) {
+            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
+                setHasPendingAutosave(false);
+            }
+            return;
+        }
+
+        try {
+            await invoke('save_content_template', { template: templateToSave });
+            lastPersistedSnapshotRef.current = persistedSnapshot;
+            setContentTemplates((current) => ({
+                ...current,
+                [templateToSave.id]: templateToSave,
+            }));
+            setSelectedTemplateId(templateToSave.id);
+            setDraft((current) =>
+                serializeAutosaveTemplate(current) === sourceSnapshot ? templateToSave : current,
+            );
+            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
+                setHasPendingAutosave(false);
+            }
+            setStatusMessage(`公共正文模板“${templateToSave.name}”已自动保存。`);
+            setErrorMessage('');
+        } catch (error) {
+            setErrorMessage(typeof error === 'string' ? error : '自动保存公共正文模板失败。');
+            setStatusMessage('');
+        }
     };
 
     const selectTemplate = (id: string) => {
         setSelectedTemplateId(id);
-        setDraft(contentTemplates[id] ?? createDefaultContentTemplate());
+        const nextDraft = contentTemplates[id] ?? createDefaultContentTemplate();
+        setDraft(nextDraft);
+        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(nextDraft);
+        setHasPendingAutosave(false);
         setStatusMessage('');
         setErrorMessage('');
     };
 
     const createTemplate = () => {
+        const emptyDraft = createDefaultContentTemplate();
         setSelectedTemplateId('');
-        setDraft(createDefaultContentTemplate());
+        setDraft(emptyDraft);
+        setHasPendingAutosave(false);
         setStatusMessage('已创建空白公共正文模板草稿。');
         setErrorMessage('');
     };
@@ -129,28 +215,9 @@ export default function ContentTemplatesPage() {
 
         setSelectedTemplateId('');
         setDraft(duplicated);
+        setHasPendingAutosave(false);
         setStatusMessage('已基于当前公共正文模板创建副本草稿。');
         setErrorMessage('');
-    };
-
-    const saveTemplate = async () => {
-        const name = draft.name.trim() || '未命名公共正文模板';
-        const templateToSave: ContentTemplate = {
-            ...draft,
-            id: draft.id.trim() || createTemplateIdFromName(name, 'content'),
-            name,
-            updated_at: createUpdatedAtTimestamp(),
-        };
-
-        try {
-            await invoke('save_content_template', { template: templateToSave });
-            await loadData(templateToSave.id);
-            setStatusMessage(`公共正文模板“${templateToSave.name}”已保存。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '保存公共正文模板失败。');
-            setStatusMessage('');
-        }
     };
 
     const importTemplate = async () => {
@@ -281,16 +348,6 @@ export default function ContentTemplatesPage() {
                             <Trash2 size={16} />
                             删除
                         </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void saveTemplate();
-                            }}
-                            className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20"
-                        >
-                            <Save size={16} />
-                            保存公共正文模板
-                        </button>
                     </div>
                 </header>
 
@@ -364,7 +421,7 @@ export default function ContentTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.name}
-                                            onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, name: event.target.value }))}
                                             placeholder="例如：字幕组通用尾巴"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -374,7 +431,7 @@ export default function ContentTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.id}
-                                            onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, id: event.target.value }))}
                                             placeholder="留空则按名称自动生成"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -386,7 +443,7 @@ export default function ContentTemplatesPage() {
                                     <textarea
                                         rows={3}
                                         value={draft.summary}
-                                        onChange={(event) => setDraft((current) => ({ ...current, summary: event.target.value }))}
+                                        onChange={(event) => updateDraft((current) => ({ ...current, summary: event.target.value }))}
                                         placeholder="简要说明这份公共正文模板适用于什么场景。"
                                         className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                     />
@@ -397,7 +454,7 @@ export default function ContentTemplatesPage() {
                                     <textarea
                                         rows={4}
                                         value={draft.site_notes}
-                                        onChange={(event) => setDraft((current) => ({ ...current, site_notes: event.target.value }))}
+                                        onChange={(event) => updateDraft((current) => ({ ...current, site_notes: event.target.value }))}
                                         placeholder="例如：ACG.RIP 会转成 BBCode，Bangumi 优先使用 HTML。"
                                         className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                     />
@@ -455,8 +512,8 @@ export default function ContentTemplatesPage() {
                                     contentKey={draft.id || 'content-template'}
                                     markdown={draft.markdown}
                                     html={draft.html}
-                                    onMarkdownChange={(markdown) => setDraft((current) => ({ ...current, markdown }))}
-                                    onHtmlChange={(html) => setDraft((current) => ({ ...current, html }))}
+                                    onMarkdownChange={(markdown) => updateDraft((current) => ({ ...current, markdown }))}
+                                    onHtmlChange={(html) => updateDraft((current) => ({ ...current, html }))}
                                 />
                             </div>
                         </div>

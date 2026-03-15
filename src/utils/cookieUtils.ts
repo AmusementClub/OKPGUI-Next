@@ -305,9 +305,12 @@ function formatDaysRemaining(epochSeconds: number | null): string {
     }
 
     const millisecondsRemaining = epochSeconds * 1000 - Date.now();
-    const days = Math.max(1, Math.ceil(Math.abs(millisecondsRemaining) / 86400000));
+    const totalDays = Math.max(1, Math.ceil(Math.abs(millisecondsRemaining) / 86400000));
+    const years = Math.floor(totalDays / 365);
+    const days = totalDays % 365;
+    const durationText = years > 0 ? `${years} 年${days > 0 ? ` ${days} 天` : ''}` : `${totalDays} 天`;
 
-    return millisecondsRemaining >= 0 ? `剩余 ${days} 天` : `已过期 ${days} 天`;
+    return millisecondsRemaining >= 0 ? `剩余 ${durationText}` : `已过期 ${durationText}`;
 }
 
 export function getRemainingTextClass(earliestExpiry: number | null): string {

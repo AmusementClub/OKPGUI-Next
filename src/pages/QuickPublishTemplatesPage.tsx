@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
-import { Copy, Layers3, Plus, Save, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useState } from 'react';
+import { Copy, Layers3, Plus, Trash2 } from 'lucide-react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import MarkdownContentView from '../components/MarkdownContentView';
 import PublishContentEditor from '../components/PublishContentEditor';
 import {
@@ -84,14 +84,37 @@ function buildHtmlPreviewDocument(html: string) {
 </html>`;
 }
 
+function serializeAutosaveTemplate(template: QuickPublishTemplate) {
+    return JSON.stringify({
+        ...template,
+        updated_at: '',
+    });
+}
+
+function buildPersistableTemplate(template: QuickPublishTemplate) {
+    const name = template.name.trim() || '未命名发布模板';
+
+    return normalizeQuickPublishTemplate({
+        ...template,
+        id: template.id.trim() || createTemplateIdFromName(name, 'quick-publish'),
+        name,
+        updated_at: createUpdatedAtTimestamp(),
+    });
+}
+
 export default function QuickPublishTemplatesPage() {
     const [templates, setTemplates] = useState<Record<string, QuickPublishTemplate>>({});
-        const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
+    const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
     const [profileList, setProfileList] = useState<string[]>([]);
     const [selectedTemplateId, setSelectedTemplateId] = useState('');
     const [draft, setDraft] = useState<QuickPublishTemplate>(createDefaultQuickPublishTemplate());
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+    const [hasPendingAutosave, setHasPendingAutosave] = useState(false);
+    const latestDraftRef = useRef(draft);
+    const lastPersistedSnapshotRef = useRef(serializeAutosaveTemplate(createDefaultQuickPublishTemplate()));
+
+    latestDraftRef.current = draft;
 
     const sortedTemplates = useMemo(
         () =>
@@ -139,6 +162,18 @@ export default function QuickPublishTemplatesPage() {
         void Promise.all([loadData(), loadProfiles()]);
     }, []);
 
+    useEffect(() => {
+        if (!hasPendingAutosave) {
+            return undefined;
+        }
+
+        const autosaveTimer = window.setTimeout(() => {
+            void persistDraft(latestDraftRef.current);
+        }, 700);
+
+        return () => window.clearTimeout(autosaveTimer);
+    }, [draft, hasPendingAutosave]);
+
     const loadProfiles = async () => {
         const nextProfiles = await invoke<string[]>('get_profile_list');
         setProfileList(nextProfiles);
@@ -173,24 +208,74 @@ export default function QuickPublishTemplatesPage() {
 
         if (!resolvedId) {
             setSelectedTemplateId('');
-            setDraft(createDefaultQuickPublishTemplate());
+            const emptyDraft = createDefaultQuickPublishTemplate();
+            setDraft(emptyDraft);
+            lastPersistedSnapshotRef.current = serializeAutosaveTemplate(emptyDraft);
+            setHasPendingAutosave(false);
             return;
         }
 
         setSelectedTemplateId(resolvedId);
         setDraft(nextTemplates[resolvedId]);
+        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(nextTemplates[resolvedId]);
+        setHasPendingAutosave(false);
+    };
+
+    const updateDraft = (updater: (current: QuickPublishTemplate) => QuickPublishTemplate) => {
+        setDraft((current) => updater(current));
+        setHasPendingAutosave(true);
+        setStatusMessage('');
+        setErrorMessage('');
+    };
+
+    const persistDraft = async (sourceDraft: QuickPublishTemplate) => {
+        const sourceSnapshot = serializeAutosaveTemplate(sourceDraft);
+        const templateToSave = buildPersistableTemplate(sourceDraft);
+        const persistedSnapshot = serializeAutosaveTemplate(templateToSave);
+
+        if (persistedSnapshot === lastPersistedSnapshotRef.current) {
+            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
+                setHasPendingAutosave(false);
+            }
+            return;
+        }
+
+        try {
+            await invoke('save_quick_publish_template', { template: templateToSave });
+            lastPersistedSnapshotRef.current = persistedSnapshot;
+            setTemplates((current) => ({
+                ...current,
+                [templateToSave.id]: templateToSave,
+            }));
+            setSelectedTemplateId(templateToSave.id);
+            setDraft((current) =>
+                serializeAutosaveTemplate(current) === sourceSnapshot ? templateToSave : current,
+            );
+            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
+                setHasPendingAutosave(false);
+            }
+            setStatusMessage(`发布模板“${templateToSave.name}”已自动保存。`);
+            setErrorMessage('');
+        } catch (error) {
+            setErrorMessage(typeof error === 'string' ? error : '自动保存发布模板失败。');
+            setStatusMessage('');
+        }
     };
 
     const selectTemplate = (id: string) => {
         setSelectedTemplateId(id);
         setDraft(templates[id] ?? createDefaultQuickPublishTemplate());
+        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(templates[id] ?? createDefaultQuickPublishTemplate());
+        setHasPendingAutosave(false);
         setStatusMessage('');
         setErrorMessage('');
     };
 
     const createTemplate = () => {
+        const emptyDraft = createDefaultQuickPublishTemplate();
         setSelectedTemplateId('');
-        setDraft(createDefaultQuickPublishTemplate());
+        setDraft(emptyDraft);
+        setHasPendingAutosave(false);
         setStatusMessage('已创建空白发布模板草稿。');
         setErrorMessage('');
     };
@@ -204,28 +289,9 @@ export default function QuickPublishTemplatesPage() {
             name: duplicatedName,
             updated_at: '',
         });
+        setHasPendingAutosave(false);
         setStatusMessage('已基于当前发布模板创建副本草稿。');
         setErrorMessage('');
-    };
-
-    const saveTemplate = async () => {
-        const name = draft.name.trim() || '未命名发布模板';
-        const templateToSave: QuickPublishTemplate = {
-            ...draft,
-            id: draft.id.trim() || createTemplateIdFromName(name, 'quick-publish'),
-            name,
-            updated_at: createUpdatedAtTimestamp(),
-        };
-
-        try {
-            await invoke('save_quick_publish_template', { template: templateToSave });
-            await loadData(templateToSave.id);
-            setStatusMessage(`发布模板“${templateToSave.name}”已保存。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '保存发布模板失败。');
-            setStatusMessage('');
-        }
     };
 
     const importTemplate = async () => {
@@ -303,7 +369,7 @@ export default function QuickPublishTemplatesPage() {
     };
 
     const updateDefaultSite = (siteKey: keyof SiteSelection, enabled: boolean) => {
-        setDraft((current) => ({
+        updateDraft((current) => ({
             ...current,
             default_sites: {
                 ...current.default_sites,
@@ -365,16 +431,6 @@ export default function QuickPublishTemplatesPage() {
                         >
                             <Trash2 size={16} />
                             删除模板
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void saveTemplate();
-                            }}
-                            className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20"
-                        >
-                            <Save size={16} />
-                            保存模板
                         </button>
                     </div>
                 </header>
@@ -449,7 +505,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.name}
-                                            onChange={(event) => setDraft((current) => ({ ...current, name: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, name: event.target.value }))}
                                             placeholder="例如：季度新番周更模板"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -459,7 +515,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.id}
-                                            onChange={(event) => setDraft((current) => ({ ...current, id: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, id: event.target.value }))}
                                             placeholder="留空则按名称自动生成"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -471,7 +527,7 @@ export default function QuickPublishTemplatesPage() {
                                     <textarea
                                         rows={3}
                                         value={draft.summary}
-                                        onChange={(event) => setDraft((current) => ({ ...current, summary: event.target.value }))}
+                                        onChange={(event) => updateDraft((current) => ({ ...current, summary: event.target.value }))}
                                         placeholder="说明这份模板适用于哪类作品或发布场景。"
                                         className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                     />
@@ -483,7 +539,7 @@ export default function QuickPublishTemplatesPage() {
                                         <select
                                             value={draft.shared_content_template_id ?? ''}
                                             onChange={(event) =>
-                                                setDraft((current) => ({
+                                                updateDraft((current) => ({
                                                     ...current,
                                                     shared_content_template_id: event.target.value || null,
                                                 }))
@@ -503,7 +559,7 @@ export default function QuickPublishTemplatesPage() {
                                         <select
                                             value={draft.default_profile}
                                             onChange={(event) =>
-                                                setDraft((current) => ({ ...current, default_profile: event.target.value }))
+                                                updateDraft((current) => ({ ...current, default_profile: event.target.value }))
                                             }
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         >
@@ -526,7 +582,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.title}
-                                            onChange={(event) => setDraft((current) => ({ ...current, title: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, title: event.target.value }))}
                                             placeholder="模板发布页默认填充的最终标题"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -536,7 +592,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.poster}
-                                            onChange={(event) => setDraft((current) => ({ ...current, poster: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, poster: event.target.value }))}
                                             placeholder="海报图片 URL"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -546,7 +602,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.about}
-                                            onChange={(event) => setDraft((current) => ({ ...current, about: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, about: event.target.value }))}
                                             placeholder="发布备注"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -556,7 +612,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.tags}
-                                            onChange={(event) => setDraft((current) => ({ ...current, tags: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, tags: event.target.value }))}
                                             placeholder="多个标签使用英文逗号分隔"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -579,10 +635,10 @@ export default function QuickPublishTemplatesPage() {
                                         markdown={draft.body_markdown}
                                         html={draft.body_html}
                                         onMarkdownChange={(body_markdown) =>
-                                            setDraft((current) => ({ ...current, body_markdown }))
+                                            updateDraft((current) => ({ ...current, body_markdown }))
                                         }
                                         onHtmlChange={(body_html) =>
-                                            setDraft((current) => ({ ...current, body_html }))
+                                            updateDraft((current) => ({ ...current, body_html }))
                                         }
                                     />
                                 </div>
@@ -645,7 +701,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.ep_pattern}
-                                            onChange={(event) => setDraft((current) => ({ ...current, ep_pattern: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, ep_pattern: event.target.value }))}
                                             placeholder="例如：(?P<ep>\d+)"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -656,7 +712,7 @@ export default function QuickPublishTemplatesPage() {
                                             type="text"
                                             value={draft.resolution_pattern}
                                             onChange={(event) =>
-                                                setDraft((current) => ({
+                                                updateDraft((current) => ({
                                                     ...current,
                                                     resolution_pattern: event.target.value,
                                                 }))
@@ -670,7 +726,7 @@ export default function QuickPublishTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.title_pattern}
-                                            onChange={(event) => setDraft((current) => ({ ...current, title_pattern: event.target.value }))}
+                                            onChange={(event) => updateDraft((current) => ({ ...current, title_pattern: event.target.value }))}
                                             placeholder="例如：[Group] Title - <ep> [<res>]"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />

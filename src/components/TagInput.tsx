@@ -22,9 +22,67 @@ interface TagifyEvent {
     detail?: TagifyEventDetail;
 }
 
+interface TagifyHookContext {
+    tagify?: {
+        DOM: {
+            input?: {
+                textContent?: string | null;
+            };
+        };
+        state: {
+            autoCompleteData?: unknown;
+            inputSuggestion?: unknown;
+            actions?: {
+                selectOption?: boolean;
+            };
+        };
+        addTags: (tags: readonly unknown[], clearInput?: boolean) => void;
+        trim: (value: string) => string;
+    };
+}
+
+function handleSpaceConfirm(event: KeyboardEvent, context: TagifyHookContext): Promise<void> {
+    if (event.key !== ' ' && event.key !== 'Spacebar') {
+        return Promise.resolve();
+    }
+
+    if (event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) {
+        return Promise.resolve();
+    }
+
+    const tagify = context.tagify;
+    const inputText = tagify?.trim(tagify.DOM.input?.textContent ?? '') ?? '';
+    const valueToAdd = tagify?.state.autoCompleteData ?? tagify?.state.inputSuggestion ?? inputText;
+
+    if (!tagify || !valueToAdd) {
+        return Promise.resolve();
+    }
+
+    event.preventDefault();
+
+    setTimeout(() => {
+        if (tagify.state.actions?.selectOption) {
+            return;
+        }
+
+        tagify.addTags([valueToAdd], true);
+        tagify.state.autoCompleteData = undefined;
+    });
+
+    return Promise.resolve();
+}
+
 const TAGIFY_SETTINGS = {
     delimiters: ',',
     duplicates: false,
+    addTagOn: ['blur', 'tab', 'enter'],
+    autoComplete: {
+        enabled: true,
+        tabKey: true,
+    },
+    hooks: {
+        beforeKeyDown: handleSpaceConfirm,
+    },
     dropdown: {
         enabled: 0,
         maxItems: 12,

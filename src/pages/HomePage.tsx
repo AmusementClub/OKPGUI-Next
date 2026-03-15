@@ -1511,7 +1511,7 @@ export default function HomePage() {
                             onBlur={(nextTags) => autosaveTemplate(getTemplateWithFieldValue('tags', nextTags))}
                         />
                         <p className="mt-1 text-xs text-slate-500">
-                            使用 OKP 的分类标签，不是 bangumi.moe 原生 tag。按回车完成tag输入
+                            使用 OKP 的分类标签，不是 bangumi.moe 原生 tag。按 Tab 可补全当前候选，按空格或回车完成 tag 输入
                         </p>
                     </div>
                     <div className="mt-3">
