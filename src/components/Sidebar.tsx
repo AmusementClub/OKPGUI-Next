@@ -64,33 +64,34 @@ export default function Sidebar({
             }`}
         >
             {/* App Title */}
-            <div className={`border-b border-slate-700 ${isCollapsed ? 'px-2 py-4' : 'px-4 py-5'}`}>
-                <div className={`flex items-start ${isCollapsed ? 'justify-center' : 'justify-between gap-3'}`}>
-                    <div className={`min-w-0 ${isCollapsed ? 'hidden' : ''}`}>
-                        <h1 className="bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-lg font-bold text-transparent">
-                            OKPGUI Next
-                        </h1>
-                        <p className="mt-1 text-xs text-slate-500">一键发布工具</p>
+            <div className="border-b border-slate-700 px-4 py-4">
+                <div className="relative h-14 overflow-hidden">
+                    <div className="absolute inset-y-0 left-0 right-14 flex items-center overflow-hidden">
+                        <div
+                            className={`min-w-0 origin-left transition-[opacity,transform] duration-220 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                                isCollapsed
+                                    ? 'pointer-events-none -translate-x-2 opacity-0'
+                                    : 'translate-x-0 opacity-100'
+                            }`}
+                        >
+                            <h1 className="truncate whitespace-nowrap bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-lg font-bold text-transparent">
+                                OKPGUI Next
+                            </h1>
+                            <p className="mt-1 truncate whitespace-nowrap text-xs text-slate-500">一键发布工具</p>
+                        </div>
                     </div>
                     <button
                         type="button"
                         onClick={onToggleCollapse}
                         aria-label={isCollapsed ? '展开侧边栏' : '折叠侧边栏'}
                         title={isCollapsed ? '展开侧边栏' : '折叠侧边栏'}
-                        className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-slate-700/80 bg-slate-900/35 text-slate-400 transition-[color,background-color,border-color,transform] duration-200 ease-out hover:border-slate-600 hover:bg-slate-700/70 hover:text-slate-100"
+                        className={`absolute top-1/2 inline-flex h-10 w-10 -translate-y-1/2 items-center justify-center rounded-xl border border-slate-700/80 bg-slate-900/35 text-slate-400 transition-[color,background-color,border-color,transform,left,right] duration-200 ease-out hover:border-slate-600 hover:bg-slate-700/70 hover:text-slate-100 ${
+                            isCollapsed ? 'left-1/2 -translate-x-1/2' : 'right-0'
+                        }`}
                     >
                         <CollapseIcon size={18} />
                     </button>
                 </div>
-                {isCollapsed ? (
-                    <div className="mt-4 flex justify-center">
-                        <div className="flex h-10 w-10 items-center justify-center rounded-2xl border border-emerald-400/20 bg-slate-700/80 shadow-[0_14px_30px_rgba(15,23,42,0.35)]">
-                            <span className="bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-sm font-bold text-transparent">
-                                OKP
-                            </span>
-                        </div>
-                    </div>
-                ) : null}
             </div>
 
             {/* Navigation */}
@@ -98,11 +99,15 @@ export default function Sidebar({
                 <div className={`space-y-4 ${isCollapsed ? 'px-2' : 'px-3'}`}>
                     {navSections.map((section) => (
                         <div key={section.title}>
-                            {!isCollapsed ? (
-                                <div className="px-3 pb-2 text-[11px] uppercase tracking-[0.18em] text-slate-600">
-                                    {section.title}
-                                </div>
-                            ) : null}
+                            <div
+                                className={`overflow-hidden px-3 text-[11px] uppercase tracking-[0.18em] text-slate-600 transition-[max-height,margin-bottom,opacity,transform] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                                    isCollapsed
+                                        ? 'pointer-events-none mb-0 max-h-0 translate-x-1 opacity-0'
+                                        : 'mb-2 max-h-6 translate-x-0 opacity-100'
+                                }`}
+                            >
+                                <span className="block truncate whitespace-nowrap">{section.title}</span>
+                            </div>
                             <div className="space-y-1">
                                 {section.items.map(({ key, label, icon: Icon }) => {
                                     const isActive = activePage === key;
@@ -131,52 +136,34 @@ export default function Sidebar({
                                                 leaveFrom="scale-100 opacity-100"
                                                 leaveTo="scale-[0.985] opacity-0"
                                             />
-                                            <span
-                                                className={`relative z-10 flex h-full items-center transition-[padding,justify-content] duration-200 ease-out ${
-                                                    isCollapsed ? 'justify-center px-0' : 'justify-start px-4'
-                                                }`}
-                                            >
+                                            <span className="relative z-10 block h-full">
                                                 <span
-                                                    className={`flex items-center justify-center transition-[width,transform,color] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
-                                                        isCollapsed ? 'w-11' : 'w-[18px]'
-                                                    } ${
-                                                        isActive
-                                                            ? isCollapsed
-                                                                ? 'text-emerald-300'
-                                                                : 'translate-x-0.5 text-emerald-300'
-                                                            : 'text-slate-500'
-                                                    }`}
+                                                    className={`absolute top-1/2 flex h-10 w-10 items-center justify-center transition-[left,transform,color] duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                                                        isCollapsed
+                                                            ? 'left-1/2 -translate-x-1/2 -translate-y-1/2'
+                                                            : 'left-3.5 -translate-y-1/2'
+                                                    } ${isActive ? 'text-emerald-300' : 'text-slate-500'}`}
                                                 >
-                                                    <Icon size={18} />
+                                                    <span className={isActive && !isCollapsed ? 'translate-x-0.5' : ''}>
+                                                        <Icon size={18} />
+                                                    </span>
                                                 </span>
                                             </span>
                                             <Transition
                                                 show={!isCollapsed}
                                                 as="span"
-                                                className={`pointer-events-none absolute inset-y-0 left-12 right-6 z-10 flex items-center whitespace-nowrap transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
+                                                className={`pointer-events-none absolute inset-y-0 left-[3.625rem] right-6 z-10 flex items-center overflow-hidden transition-transform duration-300 ease-[cubic-bezier(0.22,1,0.36,1)] ${
                                                     isActive ? 'translate-x-0.5' : ''
                                                 }`}
-                                                enter="transition duration-180 ease-[cubic-bezier(0.22,1,0.36,1)]"
+                                                enter="transition duration-180 delay-120 ease-[cubic-bezier(0.22,1,0.36,1)]"
                                                 enterFrom="opacity-0 translate-x-1"
                                                 enterTo="opacity-100 translate-x-0"
                                                 leave="transition duration-120 ease-[cubic-bezier(0.4,0,0.2,1)]"
                                                 leaveFrom="opacity-100 translate-x-0"
                                                 leaveTo="opacity-0 translate-x-1"
                                             >
-                                                {label}
+                                                <span className="block truncate whitespace-nowrap">{label}</span>
                                             </Transition>
-                                            <Transition
-                                                show={isActive && !isCollapsed}
-                                                as="span"
-                                                aria-hidden="true"
-                                                className="absolute right-4 top-1/2 z-10 h-1.5 w-1.5 -translate-y-1/2 rounded-full bg-emerald-300"
-                                                enter="transition duration-220 ease-[cubic-bezier(0.22,1,0.36,1)]"
-                                                enterFrom="scale-50 opacity-0"
-                                                enterTo="scale-100 opacity-100"
-                                                leave="transition duration-150 ease-[cubic-bezier(0.4,0,0.2,1)]"
-                                                leaveFrom="scale-100 opacity-100"
-                                                leaveTo="scale-50 opacity-0"
-                                            />
                                         </button>
                                     );
                                 })}
@@ -192,7 +179,7 @@ export default function Sidebar({
                     isCollapsed ? 'px-2 py-3 text-center' : 'px-4 py-3'
                 }`}
             >
-                {isCollapsed ? <span title={appVersion}>Ver</span> : <p>{appVersion}</p>}
+                {isCollapsed ? null : <p>{appVersion}</p>}
             </div>
         </aside>
     );
