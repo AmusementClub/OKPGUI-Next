@@ -172,6 +172,7 @@ export default function QuickPublishPage() {
     const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
     const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
     const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
+    const [isTestingAllSiteLogins, setIsTestingAllSiteLogins] = useState(false);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
@@ -394,15 +395,22 @@ export default function QuickPublishPage() {
             }),
         [publishSites, selectedProfileData, siteDefinitions, siteLoginTests],
     );
+    const hasRunningSiteLoginTest = useMemo(
+        () => Object.values(siteLoginTests).some((test) => test.status === 'testing'),
+        [siteLoginTests],
+    );
 
     useEffect(() => {
-        setDraft((current) => {
-            let hasChanges = false;
-            const nextSites = { ...current.sites };
+        const selectableSiteKeys = new Set(siteRows.filter((row) => row.selectable).map((row) => row.site.key));
 
-            for (const row of siteRows) {
-                if (!row.selectable && nextSites[row.site.key]) {
-                    nextSites[row.site.key] = false;
+        setDraft((current) => {
+            const nextSites = { ...current.sites };
+            let hasChanges = false;
+
+            for (const siteKey of Object.keys(nextSites) as (keyof SiteSelection)[]) {
+                const shouldBeSelected = selectableSiteKeys.has(siteKey);
+                if (nextSites[siteKey] !== shouldBeSelected) {
+                    nextSites[siteKey] = shouldBeSelected;
                     hasChanges = true;
                 }
             }
@@ -759,12 +767,12 @@ export default function QuickPublishPage() {
         }
     };
 
-    const handleSiteLoginTest = async (site: SiteDefinition) => {
-        if (!selectedProfileData || !site.loginEnabled) {
+    const runSiteLoginTest = async (site: SiteDefinition, profileData: Profile) => {
+        if (!site.loginEnabled) {
             return;
         }
 
-        const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
+        const rawText = getSiteCookieText(profileData.site_cookies, site.key);
         if (!rawText.trim()) {
             setSiteLoginTests((current) => ({
                 ...current,
@@ -785,11 +793,11 @@ export default function QuickPublishPage() {
         }));
 
         try {
-            const expectedName = String(selectedProfileData[site.nameField] ?? '').trim();
+            const expectedName = String(profileData[site.nameField] ?? '').trim();
             const result = await invoke<SiteLoginTestResult>('test_site_login', {
                 site: site.key,
                 cookieText: rawText,
-                userAgent: selectedProfileData.user_agent.trim() || null,
+                userAgent: profileData.user_agent.trim() || null,
                 expectedName: expectedName || null,
             });
 
@@ -808,6 +816,34 @@ export default function QuickPublishPage() {
                     message: typeof error === 'string' ? error : '登录测试失败。',
                 },
             }));
+        }
+    };
+
+    const handleSiteLoginTest = async (site: SiteDefinition) => {
+        if (!selectedProfileData || !site.loginEnabled || isTestingAllSiteLogins) {
+            return;
+        }
+
+        await runSiteLoginTest(site, selectedProfileData);
+    };
+
+    const handleTestAllSiteLogins = async () => {
+        if (!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest) {
+            return;
+        }
+
+        const loginSites = siteDefinitions.filter((site) => site.loginEnabled);
+        if (loginSites.length === 0) {
+            return;
+        }
+
+        setIsTestingAllSiteLogins(true);
+        try {
+            for (const site of loginSites) {
+                await runSiteLoginTest(site, selectedProfileData);
+            }
+        } finally {
+            setIsTestingAllSiteLogins(false);
         }
     };
 
@@ -838,7 +874,7 @@ export default function QuickPublishPage() {
                                 void publish();
                             }}
                             disabled={isPublishing || !activeTemplate}
-                            className="inline-flex items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            className="hidden items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                             {isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
                             发布已选站点
@@ -857,7 +893,34 @@ export default function QuickPublishPage() {
                     </div>
                 ) : null}
 
-                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                <section className="order-1 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)] xl:items-start">
+                        <div>
+                            <h2 className="text-sm font-medium text-slate-200">发布模板选择</h2>
+                            <p className="mt-1 text-xs text-slate-500">先选本次发布要套用的模板，标题和正文会按这里的默认值初始化。</p>
+                            <div className="mt-4">
+                                <label className="mb-2 block text-xs text-slate-500">发布模板</label>
+                                <TemplateSelect
+                                    options={templateOptions}
+                                    value={selectedTemplateId}
+                                    onChange={(templateId) => applyTemplateSelection(templateId)}
+                                    placeholder="选择快速发布模板..."
+                                />
+                            </div>
+                        </div>
+                        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-300">
+                            <div className="text-xs text-slate-500">当前公共正文模板</div>
+                            <div className="mt-1 font-medium text-slate-100">
+                                {activeSharedContentTemplate?.name || '未关联公共正文模板'}
+                            </div>
+                            <div className="mt-2 text-xs text-slate-500">
+                                {activeSharedContentTemplate?.summary || '正文主体来自发布模板，公共尾巴可在本页临时切换。'}
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section className="order-5 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                     <h2 className="text-sm font-medium text-slate-200">状态</h2>
                     <div className="mt-4 grid gap-4 xl:grid-cols-4">
                         <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
@@ -919,29 +982,8 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <section className="grid gap-6 xl:grid-cols-2 xl:items-stretch">
+                <section className="order-3 grid gap-6 xl:grid-cols-2 xl:items-stretch">
                     <div className="space-y-6">
-                        <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                            <div>
-                                <label className="mb-2 block text-xs text-slate-500">发布模板</label>
-                                <TemplateSelect
-                                    options={templateOptions}
-                                    value={selectedTemplateId}
-                                    onChange={(templateId) => applyTemplateSelection(templateId)}
-                                    placeholder="选择快速发布模板..."
-                                />
-                            </div>
-                            <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-300">
-                                <div className="text-xs text-slate-500">当前公共正文模板</div>
-                                <div className="mt-1 font-medium text-slate-100">
-                                    {activeSharedContentTemplate?.name || '未关联公共正文模板'}
-                                </div>
-                                <div className="mt-2 text-xs text-slate-500">
-                                    {activeSharedContentTemplate?.summary || '正文主体来自发布模板，公共尾巴可在本页临时切换。'}
-                                </div>
-                            </div>
-                        </div>
-
                         <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                             <div className="flex flex-wrap items-center justify-between gap-3">
                                 <div>
@@ -1034,7 +1076,7 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <section className="space-y-6">
+                <section className="order-2 space-y-6">
                     <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                         <div className="flex items-center justify-between gap-3">
                             <div>
@@ -1160,7 +1202,7 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                <section className="order-4 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                     <h2 className="text-sm font-medium text-slate-200">站点选择</h2>
                     <div className="mt-4 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60">
                         <div className="overflow-x-auto">
@@ -1171,7 +1213,32 @@ export default function QuickPublishPage() {
                                         <th className="px-4 py-3 font-medium">站点</th>
                                         <th className="w-32 px-4 py-3 font-medium">最后发布</th>
                                         <th className="px-4 py-3 font-medium">身份状态</th>
-                                        <th className="w-28 px-4 py-3 font-medium">登录测试</th>
+                                        <th className="w-36 px-4 py-3 font-medium">
+                                            <button
+                                                type="button"
+                                                onClick={() => {
+                                                    void handleTestAllSiteLogins();
+                                                }}
+                                                disabled={!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
+                                                title={
+                                                    !selectedProfileData
+                                                        ? '请先选择身份配置'
+                                                        : hasRunningSiteLoginTest && !isTestingAllSiteLogins
+                                                          ? '请等待当前登录测试完成'
+                                                          : '测试全部支持登录检测的站点'
+                                                }
+                                                className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                            >
+                                                {isTestingAllSiteLogins ? (
+                                                    <>
+                                                        <Loader2 size={12} className="animate-spin" />
+                                                        测试中
+                                                    </>
+                                                ) : (
+                                                    '测试全部'
+                                                )}
+                                            </button>
+                                        </th>
                                         <th className="w-32 px-4 py-3 font-medium">发布状态</th>
                                     </tr>
                                 </thead>
@@ -1210,7 +1277,7 @@ export default function QuickPublishPage() {
                                                         onClick={() => {
                                                             void handleSiteLoginTest(site);
                                                         }}
-                                                        disabled={!selectedProfileData || loginState?.status === 'testing'}
+                                                        disabled={!selectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
                                                         title={loginState?.message ?? `测试 ${site.label} 登录`}
                                                         className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                                                     >
@@ -1243,6 +1310,19 @@ export default function QuickPublishPage() {
                         </div>
                     </div>
                 </section>
+                <div className="order-6">
+                    <button
+                        type="button"
+                        onClick={() => {
+                            void publish();
+                        }}
+                        disabled={isPublishing || !activeTemplate}
+                        className="inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-emerald-500/40 bg-emerald-500/15 px-6 py-4 text-base font-semibold text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        {isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+                        发布已选站点
+                    </button>
+                </div>
             </div>
 
             <ConsoleModal

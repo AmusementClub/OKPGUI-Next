@@ -26,6 +26,12 @@ import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCo
 import { renderMarkdownToHtml } from '../utils/markdown';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass, SiteLoginStatus } from '../utils/siteStatus';
+import {
+    DEFAULT_EP_PATTERN,
+    DEFAULT_RESOLUTION_PATTERN,
+    DEFAULT_TITLE_PATTERN,
+    normalizeRuleTemplate,
+} from '../utils/titleRules';
 
 interface SiteSelection {
     dmhy: boolean;
@@ -278,9 +284,9 @@ const mergePublishHistory = (
 };
 
 const defaultTemplate: Template = {
-    ep_pattern: '',
-    resolution_pattern: '',
-    title_pattern: '',
+    ep_pattern: DEFAULT_EP_PATTERN,
+    resolution_pattern: DEFAULT_RESOLUTION_PATTERN,
+    title_pattern: DEFAULT_TITLE_PATTERN,
     poster: '',
     about: '',
     tags: DEFAULT_OKP_TAGS,
@@ -303,6 +309,9 @@ function normalizeTemplate(template?: Partial<Template>): Template {
     return {
         ...defaultTemplate,
         ...template,
+        ep_pattern: normalizeRuleTemplate(template?.ep_pattern, DEFAULT_EP_PATTERN),
+        resolution_pattern: normalizeRuleTemplate(template?.resolution_pattern, DEFAULT_RESOLUTION_PATTERN),
+        title_pattern: normalizeRuleTemplate(template?.title_pattern, DEFAULT_TITLE_PATTERN),
         tags: typeof template?.tags === 'string' ? template.tags : defaultTemplate.tags,
         description: typeof template?.description === 'string' ? template.description : defaultTemplate.description,
         description_html:
@@ -413,6 +422,7 @@ export default function HomePage() {
     const [isPublishComplete, setIsPublishComplete] = useState(false);
     const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
     const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
+    const [isTestingAllSiteLogins, setIsTestingAllSiteLogins] = useState(false);
     const templateRef = useRef(template);
     const currentTemplateNameRef = useRef(currentTemplateName);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
@@ -964,12 +974,12 @@ export default function HomePage() {
         });
     };
 
-    const handleSiteLoginTest = async (site: SiteDefinition) => {
-        if (!selectedProfileData || !site.loginEnabled) {
+    const runSiteLoginTest = async (site: SiteDefinition, profileData: Profile) => {
+        if (!site.loginEnabled) {
             return;
         }
 
-        const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
+        const rawText = getSiteCookieText(profileData.site_cookies, site.key);
         if (!rawText.trim()) {
             setSiteLoginTests((current) => ({
                 ...current,
@@ -990,11 +1000,11 @@ export default function HomePage() {
         }));
 
         try {
-            const expectedName = String(selectedProfileData[site.nameField] ?? '').trim();
+            const expectedName = String(profileData[site.nameField] ?? '').trim();
             const result = await invoke<SiteLoginTestResult>('test_site_login', {
                 site: site.key,
                 cookieText: rawText,
-                userAgent: selectedProfileData.user_agent.trim() || null,
+                userAgent: profileData.user_agent.trim() || null,
                 expectedName: expectedName || null,
             });
 
@@ -1013,6 +1023,34 @@ export default function HomePage() {
                     message: getErrorMessage(error),
                 },
             }));
+        }
+    };
+
+    const handleSiteLoginTest = async (site: SiteDefinition) => {
+        if (!selectedProfileData || !site.loginEnabled || isTestingAllSiteLogins) {
+            return;
+        }
+
+        await runSiteLoginTest(site, selectedProfileData);
+    };
+
+    const handleTestAllSiteLogins = async () => {
+        if (!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest) {
+            return;
+        }
+
+        const loginSites = siteDefinitions.filter((site) => site.loginEnabled);
+        if (loginSites.length === 0) {
+            return;
+        }
+
+        setIsTestingAllSiteLogins(true);
+        try {
+            for (const site of loginSites) {
+                await runSiteLoginTest(site, selectedProfileData);
+            }
+        } finally {
+            setIsTestingAllSiteLogins(false);
         }
     };
 
@@ -1086,6 +1124,10 @@ export default function HomePage() {
                 };
             }),
         [publishSites, selectedProfileData, siteLoginTests, template.publish_history],
+    );
+    const hasRunningSiteLoginTest = useMemo(
+        () => Object.values(siteLoginTests).some((test) => test.status === 'testing'),
+        [siteLoginTests],
     );
 
     const selectedSiteKeys = useMemo(
@@ -1417,7 +1459,7 @@ export default function HomePage() {
                                 onBlur={(e) => {
                                     void handlePatternBlur('ep_pattern', e.target.value);
                                 }}
-                                placeholder="如: (?P<ep>\d+)"
+                                placeholder={`如: ${DEFAULT_EP_PATTERN}`}
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono"
                             />
                         </div>
@@ -1430,7 +1472,7 @@ export default function HomePage() {
                                 onBlur={(e) => {
                                     void handlePatternBlur('resolution_pattern', e.target.value);
                                 }}
-                                placeholder="如: (?P<res>1080p|720p)"
+                                placeholder={`如: ${DEFAULT_RESOLUTION_PATTERN}`}
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono"
                             />
                         </div>
@@ -1443,7 +1485,7 @@ export default function HomePage() {
                                 onBlur={(e) => {
                                     void handlePatternBlur('title_pattern', e.target.value);
                                 }}
-                                placeholder="如: [Group] Title - <ep> [<res>]"
+                                placeholder={`如: ${DEFAULT_TITLE_PATTERN}`}
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
                         </div>
@@ -1593,7 +1635,32 @@ export default function HomePage() {
                                             <th className="w-40 px-4 py-3 font-medium">最后发布时间</th>
                                             <th className="w-32 px-4 py-3 font-medium">最后发布版本</th>
                                             <th className="px-4 py-3 font-medium">身份状态</th>
-                                            <th className="w-36 px-4 py-3 font-medium">Cookie 测试</th>
+                                            <th className="w-36 px-4 py-3 font-medium">
+                                                <button
+                                                    type="button"
+                                                    onClick={() => {
+                                                        void handleTestAllSiteLogins();
+                                                    }}
+                                                    disabled={!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
+                                                    title={
+                                                        !selectedProfileData
+                                                            ? '请先选择身份配置'
+                                                            : hasRunningSiteLoginTest && !isTestingAllSiteLogins
+                                                              ? '请等待当前登录测试完成'
+                                                              : '测试全部支持登录检测的站点'
+                                                    }
+                                                    className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                                                >
+                                                    {isTestingAllSiteLogins ? (
+                                                        <>
+                                                            <Loader2 size={12} className="animate-spin" />
+                                                            测试中
+                                                        </>
+                                                    ) : (
+                                                        '测试全部'
+                                                    )}
+                                                </button>
+                                            </th>
                                             <th className="w-44 px-4 py-3 font-medium">发布状态</th>
                                         </tr>
                                     </thead>
@@ -1631,7 +1698,7 @@ export default function HomePage() {
                                                             onClick={() => {
                                                                 void handleSiteLoginTest(site);
                                                             }}
-                                                            disabled={!selectedProfileData || loginState?.status === 'testing'}
+                                                            disabled={!selectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
                                                             title={loginState?.message ?? `测试 ${site.label} 登录`}
                                                             className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                                                         >

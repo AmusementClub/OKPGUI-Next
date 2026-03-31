@@ -4,6 +4,7 @@ import { Copy, Layers3, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import MarkdownContentView from '../components/MarkdownContentView';
 import PublishContentEditor from '../components/PublishContentEditor';
+import { DEFAULT_EP_PATTERN, DEFAULT_RESOLUTION_PATTERN, DEFAULT_TITLE_PATTERN } from '../utils/titleRules';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -702,7 +703,7 @@ export default function QuickPublishTemplatesPage() {
                                             type="text"
                                             value={draft.ep_pattern}
                                             onChange={(event) => updateDraft((current) => ({ ...current, ep_pattern: event.target.value }))}
-                                            placeholder="例如：(?P<ep>\d+)"
+                                            placeholder={`例如：${DEFAULT_EP_PATTERN}`}
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
                                     </label>
@@ -717,7 +718,7 @@ export default function QuickPublishTemplatesPage() {
                                                     resolution_pattern: event.target.value,
                                                 }))
                                             }
-                                            placeholder="例如：(?P<res>1080p|720p)"
+                                            placeholder={`例如：${DEFAULT_RESOLUTION_PATTERN}`}
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
                                     </label>
@@ -727,7 +728,7 @@ export default function QuickPublishTemplatesPage() {
                                             type="text"
                                             value={draft.title_pattern}
                                             onChange={(event) => updateDraft((current) => ({ ...current, title_pattern: event.target.value }))}
-                                            placeholder="例如：[Group] Title - <ep> [<res>]"
+                                            placeholder={`例如：${DEFAULT_TITLE_PATTERN}`}
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
                                     </label>

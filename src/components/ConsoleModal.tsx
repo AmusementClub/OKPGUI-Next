@@ -1,6 +1,7 @@
 import { Dialog, Transition } from '@headlessui/react';
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
-import { Terminal, X } from 'lucide-react';
+import { openUrl } from '@tauri-apps/plugin-opener';
+import { ExternalLink, Terminal, X } from 'lucide-react';
 import { getPublishStatusBadgeClass, getPublishStatusLabel } from '../utils/siteStatus';
 
 export interface PublishOutput {
@@ -38,6 +39,40 @@ interface ConsoleModalProps {
     result: PublishComplete | null;
 }
 
+const HTTP_URL_PATTERN = /https?:\/\/[^\s"'<>]+/gi;
+
+function normalizeHttpUrl(candidate: string): string | null {
+    const normalized = candidate.replace(/[)\],.;!?]+$/g, '');
+    try {
+        return new URL(normalized).toString();
+    } catch {
+        return null;
+    }
+}
+
+function extractPublishUrl(lines: PublishConsoleSite['lines']): string | null {
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = lines[index];
+        if (line.isError) {
+            continue;
+        }
+
+        const matches = line.text.match(HTTP_URL_PATTERN);
+        if (!matches || matches.length === 0) {
+            continue;
+        }
+
+        for (let matchIndex = matches.length - 1; matchIndex >= 0; matchIndex -= 1) {
+            const normalized = normalizeHttpUrl(matches[matchIndex]);
+            if (normalized) {
+                return normalized;
+            }
+        }
+    }
+
+    return null;
+}
+
 export default function ConsoleModal({
     isOpen,
     onClose,
@@ -52,6 +87,13 @@ export default function ConsoleModal({
         () => sites.find((site) => site.siteCode === activeSiteCode) ?? sites[0] ?? null,
         [activeSiteCode, sites],
     );
+    const activePublishUrl = useMemo(() => {
+        if (!activeSite || activeSite.status !== 'success') {
+            return null;
+        }
+
+        return extractPublishUrl(activeSite.lines);
+    }, [activeSite]);
 
     useEffect(() => {
         if (!sites.some((site) => site.siteCode === activeSiteCode)) {
@@ -148,12 +190,34 @@ export default function ConsoleModal({
                                                     <div className="mt-1 text-slate-400">
                                                         {activeSite.message || '等待输出...'}
                                                     </div>
+                                                    {activePublishUrl ? (
+                                                        <div className="mt-2 text-[11px] text-cyan-300/90">
+                                                            发布地址: {activePublishUrl}
+                                                        </div>
+                                                    ) : null}
                                                 </div>
-                                                <span
-                                                    className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${getPublishStatusBadgeClass(activeSite.status)}`}
-                                                >
-                                                    {getPublishStatusLabel(activeSite.status)}
-                                                </span>
+                                                <div className="flex items-center gap-2">
+                                                    {activePublishUrl ? (
+                                                        <button
+                                                            type="button"
+                                                            onClick={() => {
+                                                                void openUrl(activePublishUrl).catch((error) => {
+                                                                    console.error('打开发布页面失败:', error);
+                                                                });
+                                                            }}
+                                                            title={`打开 ${activeSite.siteLabel} 发布页`}
+                                                            className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-[11px] font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20"
+                                                        >
+                                                            <ExternalLink size={13} />
+                                                            打开发布页
+                                                        </button>
+                                                    ) : null}
+                                                    <span
+                                                        className={`rounded-full border px-2.5 py-1 text-[11px] font-medium ${getPublishStatusBadgeClass(activeSite.status)}`}
+                                                    >
+                                                        {getPublishStatusLabel(activeSite.status)}
+                                                    </span>
+                                                </div>
                                             </div>
                                             {activeSite.lines.map((line, index) => (
                                                 <div

@@ -1,3 +1,10 @@
+import {
+    DEFAULT_EP_PATTERN,
+    DEFAULT_RESOLUTION_PATTERN,
+    DEFAULT_TITLE_PATTERN,
+    normalizeRuleTemplate,
+} from './titleRules';
+
 export interface SiteSelection {
     dmhy: boolean;
     nyaa: boolean;
@@ -143,9 +150,9 @@ export function createDefaultQuickPublishTemplate(): QuickPublishTemplate {
         name: '',
         summary: '',
         title: '',
-        ep_pattern: '',
-        resolution_pattern: '',
-        title_pattern: '',
+        ep_pattern: DEFAULT_EP_PATTERN,
+        resolution_pattern: DEFAULT_RESOLUTION_PATTERN,
+        title_pattern: DEFAULT_TITLE_PATTERN,
         poster: '',
         about: '',
         tags: 'Anime',
@@ -237,10 +244,9 @@ export function normalizeQuickPublishTemplate(
         name: typeof template?.name === 'string' ? template.name : '',
         summary: typeof template?.summary === 'string' ? template.summary : '',
         title: typeof template?.title === 'string' ? template.title : '',
-        ep_pattern: typeof template?.ep_pattern === 'string' ? template.ep_pattern : '',
-        resolution_pattern:
-            typeof template?.resolution_pattern === 'string' ? template.resolution_pattern : '',
-        title_pattern: typeof template?.title_pattern === 'string' ? template.title_pattern : '',
+        ep_pattern: normalizeRuleTemplate(template?.ep_pattern, DEFAULT_EP_PATTERN),
+        resolution_pattern: normalizeRuleTemplate(template?.resolution_pattern, DEFAULT_RESOLUTION_PATTERN),
+        title_pattern: normalizeRuleTemplate(template?.title_pattern, DEFAULT_TITLE_PATTERN),
         poster: typeof template?.poster === 'string' ? template.poster : '',
         about: typeof template?.about === 'string' ? template.about : '',
         tags: typeof template?.tags === 'string' ? template.tags : 'Anime',
