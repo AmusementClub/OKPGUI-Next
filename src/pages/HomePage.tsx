@@ -25,7 +25,8 @@ import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSele
 import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
-import { getPublishStatusTextClass, getSiteLoginStateBadgeClass, SiteLoginStatus } from '../utils/siteStatus';
+import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
+import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 import {
     DEFAULT_EP_PATTERN,
     DEFAULT_RESOLUTION_PATTERN,
@@ -102,28 +103,11 @@ interface Profile {
     acgnx_asia_token: string;
     acgnx_global_name: string;
     acgnx_global_token: string;
-}
-
-interface SiteLoginTestResult {
-    success: boolean;
-    message: string;
-}
-
-interface SiteLoginTestState {
-    status: SiteLoginStatus;
-    message: string;
-}
-
-interface SiteDefinition {
-    key: keyof SiteSelection;
-    label: string;
-    loginEnabled: boolean;
-    nameField: keyof Profile;
-    tokenField?: keyof Profile;
+    [key: string]: unknown;
 }
 
 interface PublishContentValidationIssue {
-    siteCode: keyof SiteSelection;
+    siteCode: string;
     siteLabel: string;
     message: string;
 }
@@ -326,29 +310,8 @@ function normalizeTemplate(template?: Partial<Template>): Template {
     };
 }
 
-const siteDefinitions: SiteDefinition[] = [
-    { key: 'dmhy', label: '動漫花園', loginEnabled: true, nameField: 'dmhy_name' },
-    { key: 'nyaa', label: 'Nyaa', loginEnabled: true, nameField: 'nyaa_name' },
-    { key: 'acgrip', label: 'ACG.RIP', loginEnabled: true, nameField: 'acgrip_name' },
-    { key: 'bangumi', label: '萌番组', loginEnabled: true, nameField: 'bangumi_name' },
-    {
-        key: 'acgnx_asia',
-        label: 'ACGNx Asia',
-        loginEnabled: false,
-        nameField: 'acgnx_asia_name',
-        tokenField: 'acgnx_asia_token',
-    },
-    {
-        key: 'acgnx_global',
-        label: 'ACGNx Global',
-        loginEnabled: false,
-        nameField: 'acgnx_global_name',
-        tokenField: 'acgnx_global_token',
-    },
-];
-
-const htmlPreferredSiteKeys = new Set<keyof SiteSelection>(['dmhy', 'bangumi', 'acgnx_asia', 'acgnx_global']);
-const markdownRequiredSiteKeys = new Set<keyof SiteSelection>(['nyaa', 'acgrip']);
+const htmlPreferredSiteKeys = new Set<string>(['dmhy', 'bangumi', 'acgnx_asia', 'acgnx_global']);
+const markdownRequiredSiteKeys = new Set<string>(['nyaa', 'acgrip']);
 
 function validatePublishContentForSites(
     template: Template,
@@ -421,8 +384,15 @@ export default function HomePage() {
     const [publishSites, setPublishSites] = useState<Record<string, PublishConsoleSite>>({});
     const [isPublishComplete, setIsPublishComplete] = useState(false);
     const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
-    const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
-    const [isTestingAllSiteLogins, setIsTestingAllSiteLogins] = useState(false);
+    const {
+        siteLoginTests,
+        isTestingAllSiteLogins,
+        hasRunningSiteLoginTest,
+        clearSiteLoginTest,
+        clearAllSiteLoginTests,
+        handleSiteLoginTest: hookHandleSiteLoginTest,
+        handleTestAllSiteLogins: hookHandleTestAllSiteLogins,
+    } = useSiteLoginTest();
     const templateRef = useRef(template);
     const currentTemplateNameRef = useRef(currentTemplateName);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
@@ -465,7 +435,7 @@ export default function HomePage() {
     useEffect(() => {
         if (!selectedProfile) {
             setSelectedProfileData(null);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             return;
         }
 
@@ -573,7 +543,7 @@ export default function HomePage() {
                 profiles: Record<string, Profile>;
             }>('get_profiles');
             setSelectedProfileData(store.profiles[profileName] ?? null);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
         } catch (e) {
             console.error('加载身份详情失败:', e);
             setSelectedProfileData(null);
@@ -670,7 +640,7 @@ export default function HomePage() {
             lastPersistedDescriptionHtmlRef.current = defaultTemplate.description_html;
             setTemplate(defaultTemplate);
             setSelectedProfile('');
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             await refreshTemplateOptions();
         } catch (e) {
             console.error('删除模板失败:', e);
@@ -962,96 +932,12 @@ export default function HomePage() {
         return '发布失败，请查看日志输出。';
     };
 
-    const clearSiteLoginTest = (siteCode: string) => {
-        setSiteLoginTests((current) => {
-            if (!(siteCode in current)) {
-                return current;
-            }
-
-            const nextState = { ...current };
-            delete nextState[siteCode];
-            return nextState;
-        });
+    const handleSiteLoginTest = (site: SiteDefinition) => {
+        void hookHandleSiteLoginTest(site, selectedProfileData);
     };
 
-    const runSiteLoginTest = async (site: SiteDefinition, profileData: Profile) => {
-        if (!site.loginEnabled) {
-            return;
-        }
-
-        const rawText = getSiteCookieText(profileData.site_cookies, site.key);
-        if (!rawText.trim()) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: 'error',
-                    message: `请先在身份页面配置 ${site.label} 的 Cookie。`,
-                },
-            }));
-            return;
-        }
-
-        setSiteLoginTests((current) => ({
-            ...current,
-            [site.key]: {
-                status: 'testing',
-                message: `正在测试 ${site.label} 登录状态...`,
-            },
-        }));
-
-        try {
-            const expectedName = String(profileData[site.nameField] ?? '').trim();
-            const result = await invoke<SiteLoginTestResult>('test_site_login', {
-                site: site.key,
-                cookieText: rawText,
-                userAgent: profileData.user_agent.trim() || null,
-                expectedName: expectedName || null,
-            });
-
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: result.success ? 'success' : 'error',
-                    message: result.message,
-                },
-            }));
-        } catch (error) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: 'error',
-                    message: getErrorMessage(error),
-                },
-            }));
-        }
-    };
-
-    const handleSiteLoginTest = async (site: SiteDefinition) => {
-        if (!selectedProfileData || !site.loginEnabled || isTestingAllSiteLogins) {
-            return;
-        }
-
-        await runSiteLoginTest(site, selectedProfileData);
-    };
-
-    const handleTestAllSiteLogins = async () => {
-        if (!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest) {
-            return;
-        }
-
-        const loginSites = siteDefinitions.filter((site) => site.loginEnabled);
-        if (loginSites.length === 0) {
-            return;
-        }
-
-        setIsTestingAllSiteLogins(true);
-        try {
-            for (const site of loginSites) {
-                await runSiteLoginTest(site, selectedProfileData);
-            }
-        } finally {
-            setIsTestingAllSiteLogins(false);
-        }
+    const handleTestAllSiteLogins = () => {
+        void hookHandleTestAllSiteLogins(siteDefinitions, selectedProfileData);
     };
 
     const siteRows = useMemo(
@@ -1125,15 +1011,11 @@ export default function HomePage() {
             }),
         [publishSites, selectedProfileData, siteLoginTests, template.publish_history],
     );
-    const hasRunningSiteLoginTest = useMemo(
-        () => Object.values(siteLoginTests).some((test) => test.status === 'testing'),
-        [siteLoginTests],
-    );
 
     const selectedSiteKeys = useMemo(
         () =>
             siteRows
-                .filter((row) => row.selectable && template.sites[row.site.key])
+                .filter((row) => row.selectable && template.sites[row.site.key as keyof SiteSelection])
                 .map((row) => row.site.key),
         [siteRows, template.sites],
     );
@@ -1175,7 +1057,7 @@ export default function HomePage() {
 
         const publishTemplateName = getTemplateName();
         const templateToPublish = withSelectedProfile(template, selectedProfile);
-        const selectedSites = siteDefinitions.filter((site) => template.sites[site.key]);
+        const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
         const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);
         if (contentValidationIssues.length > 0) {
             const issueMessageMap = new Map(
@@ -1221,7 +1103,7 @@ export default function HomePage() {
             publishedAt: new Date().toISOString(),
             publishedEpisode: publishDetails.episode,
             publishedResolution: publishDetails.resolution,
-            siteKeys: selectedSites.map((site) => site.key),
+            siteKeys: selectedSites.map((site) => site.key as keyof SiteSelection),
         };
         publishSiteSuccessRef.current = {};
 
@@ -1670,9 +1552,9 @@ export default function HomePage() {
                                                 <td className="px-4 py-3 align-middle">
                                                     <input
                                                         type="checkbox"
-                                                        checked={template.sites[site.key]}
+                                                        checked={template.sites[site.key as keyof SiteSelection]}
                                                         disabled={!selectable}
-                                                        onChange={() => toggleSite(site.key)}
+                                                        onChange={() => toggleSite(site.key as keyof SiteSelection)}
                                                         title={selectable ? `选择 ${site.label}` : selectDisabledReason}
                                                         className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-emerald-500 focus:ring-emerald-500 focus:ring-offset-0"
                                                     />
@@ -1681,10 +1563,10 @@ export default function HomePage() {
                                                     {site.label}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-xs text-slate-400">
-                                                    {formatPublishTimestamp(template.publish_history[site.key].last_published_at)}
+                                                    {formatPublishTimestamp(template.publish_history[site.key as keyof SiteSelection].last_published_at)}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-slate-300">
-                                                    {getPublishedVersionLabel(template.publish_history[site.key])}
+                                                    {getPublishedVersionLabel(template.publish_history[site.key as keyof SiteSelection])}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle">
                                                     <div className={identityClass} title={identityTitle}>

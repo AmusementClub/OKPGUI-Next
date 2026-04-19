@@ -1,4 +1,4 @@
-﻿import { Disclosure, Transition } from '@headlessui/react';
+import { Disclosure, Transition } from '@headlessui/react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -32,8 +32,8 @@ import {
     getSiteLoginMessageClass,
     getSiteLoginStateBadgeClass,
     getSiteLoginStateLabel,
-    SiteLoginStatus,
 } from '../utils/siteStatus';
+import { siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 
 interface Profile {
     cookies: string;
@@ -47,6 +47,7 @@ interface Profile {
     acgnx_asia_token: string;
     acgnx_global_name: string;
     acgnx_global_token: string;
+    [key: string]: unknown;
 }
 
 interface CookieDialogState {
@@ -76,16 +77,6 @@ interface SiteConfig {
     nameField: keyof Profile;
     tokenField?: keyof Profile;
     loginEnabled: boolean;
-}
-
-interface SiteLoginTestResult {
-    success: boolean;
-    message: string;
-}
-
-interface SiteLoginTestState {
-    status: SiteLoginStatus;
-    message: string;
 }
 
 const defaultProfile: Profile = {
@@ -186,7 +177,12 @@ export default function IdentityPage() {
     const [profile, setProfile] = useState<Profile>(defaultProfile);
     const [loginSite, setLoginSite] = useState<string | null>(null);
     const [cookieDialog, setCookieDialog] = useState<CookieDialogState | null>(null);
-    const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
+    const {
+        siteLoginTests,
+        clearSiteLoginTest,
+        clearAllSiteLoginTests,
+        handleSiteLoginTest: hookHandleSiteLoginTest,
+    } = useSiteLoginTest();
 
     const captureRequestIdRef = useRef(0);
     const captureSessionIdRef = useRef<string | null>(null);
@@ -243,7 +239,7 @@ export default function IdentityPage() {
             if (initialProfileName && store.profiles[initialProfileName]) {
                 setCurrentProfileName(initialProfileName);
                 setProfile(normalizeProfile(store.profiles[initialProfileName]));
-                setSiteLoginTests({});
+                clearAllSiteLoginTests();
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -259,7 +255,7 @@ export default function IdentityPage() {
             if (store.profiles[name]) {
                 setCurrentProfileName(name);
                 setProfile(normalizeProfile(store.profiles[name]));
-                setSiteLoginTests({});
+                clearAllSiteLoginTests();
             }
         } catch (error) {
             console.error('加载配置失败:', error);
@@ -311,23 +307,11 @@ export default function IdentityPage() {
             await invoke('delete_profile', { name: currentProfileName });
             setCurrentProfileName('');
             setProfile(defaultProfile);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             await loadProfileList();
         } catch (error) {
             console.error('删除配置失败:', error);
         }
-    };
-
-    const clearSiteLoginTest = (siteCode: string) => {
-        setSiteLoginTests((current) => {
-            if (!(siteCode in current)) {
-                return current;
-            }
-
-            const nextState = { ...current };
-            delete nextState[siteCode];
-            return nextState;
-        });
     };
 
     const closeCookieDialog = () => {
@@ -578,64 +562,17 @@ export default function IdentityPage() {
             };
 
             setProfile(nextProfile);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             await persistProfileToDisk(nextProfile);
         } catch (error) {
             console.error('导入 Cookie 文件失败:', error);
         }
     };
 
-    const handleSiteLoginTest = async (siteCode: string) => {
-        const site = cookieSites.find((item) => item.code === siteCode);
-        if (!site) {
-            return;
-        }
-
-        const rawText = getSiteCookieText(profile.site_cookies, siteCode);
-        if (!rawText.trim()) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [siteCode]: {
-                    status: 'error',
-                    message: `请先添加 ${site.label} 的 Cookie。`,
-                },
-            }));
-            return;
-        }
-
-        setSiteLoginTests((current) => ({
-            ...current,
-            [siteCode]: {
-                status: 'testing',
-                message: `正在测试 ${site.label} 登录状态...`,
-            },
-        }));
-
-        try {
-            const expectedName = String(profile[site.nameField] ?? '').trim();
-            const result = await invoke<SiteLoginTestResult>('test_site_login', {
-                site: siteCode,
-                cookieText: rawText,
-                userAgent: profile.user_agent.trim() || null,
-                expectedName: expectedName || null,
-            });
-
-            setSiteLoginTests((current) => ({
-                ...current,
-                [siteCode]: {
-                    status: result.success ? 'success' : 'error',
-                    message: result.message,
-                },
-            }));
-        } catch (error) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [siteCode]: {
-                    status: 'error',
-                    message: getErrorMessage(error),
-                },
-            }));
-        }
+    const handleSiteLoginTest = (siteCode: string) => {
+        const siteDef = siteDefinitions.find((s) => s.key === siteCode);
+        if (!siteDef) return;
+        void hookHandleSiteLoginTest(siteDef, profile);
     };
 
     return (

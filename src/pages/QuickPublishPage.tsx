@@ -22,7 +22,8 @@ import FileTree, { FileTreeNodeData } from '../components/FileTree';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
-import { getPublishStatusTextClass, getSiteLoginStateBadgeClass, SiteLoginStatus } from '../utils/siteStatus';
+import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
+import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -79,24 +80,7 @@ interface Profile {
     acgnx_asia_token: string;
     acgnx_global_name: string;
     acgnx_global_token: string;
-}
-
-interface SiteDefinition {
-    key: keyof SiteSelection;
-    label: string;
-    loginEnabled: boolean;
-    nameField: keyof Profile;
-    tokenField?: keyof Profile;
-}
-
-interface SiteLoginTestResult {
-    success: boolean;
-    message: string;
-}
-
-interface SiteLoginTestState {
-    status: SiteLoginStatus;
-    message: string;
+    [key: string]: unknown;
 }
 
 function formatTimestamp(value: string) {
@@ -171,8 +155,14 @@ export default function QuickPublishPage() {
     const [isPublishComplete, setIsPublishComplete] = useState(false);
     const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
     const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
-    const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
-    const [isTestingAllSiteLogins, setIsTestingAllSiteLogins] = useState(false);
+    const {
+        siteLoginTests,
+        isTestingAllSiteLogins,
+        hasRunningSiteLoginTest,
+        clearAllSiteLoginTests,
+        handleSiteLoginTest: hookHandleSiteLoginTest,
+        handleTestAllSiteLogins: hookHandleTestAllSiteLogins,
+    } = useSiteLoginTest();
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
@@ -184,27 +174,6 @@ export default function QuickPublishPage() {
         draft.shared_content_template_id && contentTemplates[draft.shared_content_template_id]
             ? contentTemplates[draft.shared_content_template_id]
             : null;
-
-    const siteDefinitions: SiteDefinition[] = [
-        { key: 'dmhy', label: '动漫花园', loginEnabled: true, nameField: 'dmhy_name' },
-        { key: 'nyaa', label: 'Nyaa', loginEnabled: true, nameField: 'nyaa_name' },
-        { key: 'acgrip', label: 'ACG.RIP', loginEnabled: true, nameField: 'acgrip_name' },
-        { key: 'bangumi', label: '萌番组', loginEnabled: true, nameField: 'bangumi_name' },
-        {
-            key: 'acgnx_asia',
-            label: 'ACGNx Asia',
-            loginEnabled: false,
-            nameField: 'acgnx_asia_name',
-            tokenField: 'acgnx_asia_token',
-        },
-        {
-            key: 'acgnx_global',
-            label: 'ACGNx Global',
-            loginEnabled: false,
-            nameField: 'acgnx_global_name',
-            tokenField: 'acgnx_global_token',
-        },
-    ];
 
     const publishSitesList = useMemo(
         () => Object.values(publishSites).sort((left, right) => left.siteLabel.localeCompare(right.siteLabel, 'zh-CN')),
@@ -218,7 +187,7 @@ export default function QuickPublishPage() {
     useEffect(() => {
         if (!draft.profile.trim()) {
             setSelectedProfileData(null);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             return;
         }
 
@@ -393,11 +362,7 @@ export default function QuickPublishPage() {
                     publishState,
                 };
             }),
-        [publishSites, selectedProfileData, siteDefinitions, siteLoginTests],
-    );
-    const hasRunningSiteLoginTest = useMemo(
-        () => Object.values(siteLoginTests).some((test) => test.status === 'testing'),
-        [siteLoginTests],
+        [publishSites, selectedProfileData, siteLoginTests],
     );
 
     useEffect(() => {
@@ -462,10 +427,10 @@ export default function QuickPublishPage() {
         try {
             const store = await invoke<{ profiles: Record<string, Profile> }>('get_profiles');
             setSelectedProfileData(store.profiles[profileName] ?? null);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
         } catch (error) {
             setSelectedProfileData(null);
-            setSiteLoginTests({});
+            clearAllSiteLoginTests();
             setErrorMessage(typeof error === 'string' ? error : '加载身份详情失败。');
         }
     };
@@ -767,84 +732,12 @@ export default function QuickPublishPage() {
         }
     };
 
-    const runSiteLoginTest = async (site: SiteDefinition, profileData: Profile) => {
-        if (!site.loginEnabled) {
-            return;
-        }
-
-        const rawText = getSiteCookieText(profileData.site_cookies, site.key);
-        if (!rawText.trim()) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: 'error',
-                    message: `请先在身份页面配置 ${site.label} 的 Cookie。`,
-                },
-            }));
-            return;
-        }
-
-        setSiteLoginTests((current) => ({
-            ...current,
-            [site.key]: {
-                status: 'testing',
-                message: `正在测试 ${site.label} 登录状态...`,
-            },
-        }));
-
-        try {
-            const expectedName = String(profileData[site.nameField] ?? '').trim();
-            const result = await invoke<SiteLoginTestResult>('test_site_login', {
-                site: site.key,
-                cookieText: rawText,
-                userAgent: profileData.user_agent.trim() || null,
-                expectedName: expectedName || null,
-            });
-
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: result.success ? 'success' : 'error',
-                    message: result.message,
-                },
-            }));
-        } catch (error) {
-            setSiteLoginTests((current) => ({
-                ...current,
-                [site.key]: {
-                    status: 'error',
-                    message: typeof error === 'string' ? error : '登录测试失败。',
-                },
-            }));
-        }
+    const handleSiteLoginTest = (site: SiteDefinition) => {
+        void hookHandleSiteLoginTest(site, selectedProfileData);
     };
 
-    const handleSiteLoginTest = async (site: SiteDefinition) => {
-        if (!selectedProfileData || !site.loginEnabled || isTestingAllSiteLogins) {
-            return;
-        }
-
-        await runSiteLoginTest(site, selectedProfileData);
-    };
-
-    const handleTestAllSiteLogins = async () => {
-        if (!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest) {
-            return;
-        }
-
-        const loginSites = siteDefinitions.filter((site) => site.loginEnabled);
-        if (loginSites.length === 0) {
-            return;
-        }
-
-        setIsTestingAllSiteLogins(true);
-        try {
-            for (const site of loginSites) {
-                await runSiteLoginTest(site, selectedProfileData);
-            }
-        } finally {
-            setIsTestingAllSiteLogins(false);
-        }
+    const handleTestAllSiteLogins = () => {
+        void hookHandleTestAllSiteLogins(siteDefinitions, selectedProfileData);
     };
 
     return (
@@ -1248,7 +1141,7 @@ export default function QuickPublishPage() {
                                             <td className="px-4 py-3 align-middle">
                                                 <input
                                                     type="checkbox"
-                                                    checked={draft.sites[site.key]}
+                                                    checked={draft.sites[site.key as keyof SiteSelection]}
                                                     disabled={!selectable}
                                                     onChange={(event) =>
                                                         setDraft((current) => ({
@@ -1265,7 +1158,7 @@ export default function QuickPublishPage() {
                                             </td>
                                             <td className="px-4 py-3 align-middle font-medium text-slate-100">{site.label}</td>
                                             <td className="px-4 py-3 align-middle text-xs text-slate-400">
-                                                {formatTimestamp(activeTemplate?.publish_history[site.key].last_published_at ?? '')}
+                                                {formatTimestamp(activeTemplate?.publish_history[site.key as keyof SiteSelection].last_published_at ?? '')}
                                             </td>
                                             <td className="px-4 py-3 align-middle">
                                                 <div className={identityClass} title={identityTitle}>{identityText}</div>

@@ -282,6 +282,7 @@ export function composePublishContent(bodyContent: string, sharedContent: string
 }
 
 export function createTemplateIdFromName(name: string, fallbackPrefix: string): string {
+    const randomSuffix = Math.random().toString(36).slice(2, 8);
     const normalized = name
         .trim()
         .toLowerCase()
@@ -290,10 +291,32 @@ export function createTemplateIdFromName(name: string, fallbackPrefix: string): 
         .slice(0, 60);
 
     if (normalized) {
-        return normalized;
+        return `${normalized}-${randomSuffix}`;
     }
 
-    return `${fallbackPrefix}-${Math.random().toString(36).slice(2, 10)}`;
+    return `${fallbackPrefix}-${randomSuffix}`;
+}
+
+export function formatTemplateTimestamp(value: string): string {
+    if (!value.trim()) {
+        return '未保存';
+    }
+
+    const timestamp = Date.parse(value);
+    if (Number.isNaN(timestamp)) {
+        return value;
+    }
+
+    return new Intl.DateTimeFormat('zh-CN', {
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+    })
+        .format(new Date(timestamp))
+        .replace(/\//g, '-');
 }
 
 export function createUpdatedAtTimestamp(): string {

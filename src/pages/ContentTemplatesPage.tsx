@@ -1,84 +1,24 @@
 import { invoke } from '@tauri-apps/api/core';
-import { open, save } from '@tauri-apps/plugin-dialog';
 import { Copy, FileText, Plus, Trash2 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import PublishContentEditor from '../components/PublishContentEditor';
+import { contentTemplateManagerConfig, useTemplateManager } from '../hooks/useTemplateManager';
 import {
-    ContentTemplate,
     QuickPublishConfigPayload,
     QuickPublishTemplate,
-    createDefaultContentTemplate,
-    createTemplateIdFromName,
-    createUpdatedAtTimestamp,
-    normalizeContentTemplate,
+    formatTemplateTimestamp,
     normalizeQuickPublishTemplate,
 } from '../utils/quickPublish';
 
-function formatTimestamp(value: string) {
-    if (!value.trim()) {
-        return '未保存';
-    }
-
-    const timestamp = Date.parse(value);
-    if (Number.isNaN(timestamp)) {
-        return value;
-    }
-
-    return new Intl.DateTimeFormat('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-    })
-        .format(new Date(timestamp))
-        .replace(/\//g, '-');
-}
-
-function serializeAutosaveTemplate(template: ContentTemplate) {
-    return JSON.stringify({
-        ...template,
-        updated_at: '',
-    });
-}
-
-function buildPersistableTemplate(template: ContentTemplate) {
-    const name = template.name.trim() || '未命名公共正文模板';
-
-    return normalizeContentTemplate({
-        ...template,
-        id: template.id.trim() || createTemplateIdFromName(name, 'content'),
-        name,
-        updated_at: createUpdatedAtTimestamp(),
-    });
-}
-
 export default function ContentTemplatesPage() {
-    const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
+    const manager = useTemplateManager(contentTemplateManagerConfig);
+    const {
+        draft, selectedTemplateId, sortedTemplates, statusMessage, errorMessage,
+        updateDraft, selectTemplate, createTemplate, duplicateTemplate,
+        importTemplate, exportTemplate, deleteTemplate,
+    } = manager;
+
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
-    const [selectedTemplateId, setSelectedTemplateId] = useState('');
-    const [draft, setDraft] = useState<ContentTemplate>(createDefaultContentTemplate());
-    const [statusMessage, setStatusMessage] = useState('');
-    const [errorMessage, setErrorMessage] = useState('');
-    const [hasPendingAutosave, setHasPendingAutosave] = useState(false);
-    const latestDraftRef = useRef(draft);
-    const lastPersistedSnapshotRef = useRef(serializeAutosaveTemplate(createDefaultContentTemplate()));
-
-    latestDraftRef.current = draft;
-
-    const sortedTemplates = useMemo(
-        () =>
-            Object.values(contentTemplates).sort((left, right) => {
-                const byUpdatedAt = right.updated_at.localeCompare(left.updated_at);
-                if (byUpdatedAt !== 0) {
-                    return byUpdatedAt;
-                }
-
-                return left.name.localeCompare(right.name, 'zh-CN');
-            }),
-        [contentTemplates],
-    );
 
     const referencedBy = useMemo(
         () =>
@@ -89,209 +29,19 @@ export default function ContentTemplatesPage() {
     );
 
     useEffect(() => {
-        void loadData();
+        void loadQuickPublishTemplates();
     }, []);
 
-    useEffect(() => {
-        if (!hasPendingAutosave) {
-            return undefined;
-        }
-
-        const autosaveTimer = window.setTimeout(() => {
-            void persistDraft(latestDraftRef.current);
-        }, 700);
-
-        return () => window.clearTimeout(autosaveTimer);
-    }, [draft, hasPendingAutosave]);
-
-    const loadData = async (preferredId?: string) => {
+    const loadQuickPublishTemplates = async () => {
         const config = await invoke<QuickPublishConfigPayload>('get_config');
-        const nextContentTemplates = Object.fromEntries(
-            Object.entries(config.content_templates ?? {}).map(([id, template]) => [
-                id,
-                normalizeContentTemplate({ id, ...template }),
-            ]),
+        setQuickPublishTemplates(
+            Object.fromEntries(
+                Object.entries(config.quick_publish_templates ?? {}).map(([id, template]) => [
+                    id,
+                    normalizeQuickPublishTemplate({ id, ...template }),
+                ]),
+            ),
         );
-        const nextQuickPublishTemplates = Object.fromEntries(
-            Object.entries(config.quick_publish_templates ?? {}).map(([id, template]) => [
-                id,
-                normalizeQuickPublishTemplate({ id, ...template }),
-            ]),
-        );
-
-        setContentTemplates(nextContentTemplates);
-        setQuickPublishTemplates(nextQuickPublishTemplates);
-
-        const resolvedId =
-            preferredId && nextContentTemplates[preferredId]
-                ? preferredId
-                : selectedTemplateId && nextContentTemplates[selectedTemplateId]
-                  ? selectedTemplateId
-                  : sortedObjectKeys(nextContentTemplates)[0] ?? '';
-
-        if (!resolvedId) {
-            setSelectedTemplateId('');
-            const emptyDraft = createDefaultContentTemplate();
-            setDraft(emptyDraft);
-            lastPersistedSnapshotRef.current = serializeAutosaveTemplate(emptyDraft);
-            setHasPendingAutosave(false);
-            return;
-        }
-
-        setSelectedTemplateId(resolvedId);
-        setDraft(nextContentTemplates[resolvedId]);
-        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(nextContentTemplates[resolvedId]);
-        setHasPendingAutosave(false);
-    };
-
-    const updateDraft = (updater: (current: ContentTemplate) => ContentTemplate) => {
-        setDraft((current) => updater(current));
-        setHasPendingAutosave(true);
-        setStatusMessage('');
-        setErrorMessage('');
-    };
-
-    const persistDraft = async (sourceDraft: ContentTemplate) => {
-        const sourceSnapshot = serializeAutosaveTemplate(sourceDraft);
-        const templateToSave = buildPersistableTemplate(sourceDraft);
-        const persistedSnapshot = serializeAutosaveTemplate(templateToSave);
-
-        if (persistedSnapshot === lastPersistedSnapshotRef.current) {
-            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
-                setHasPendingAutosave(false);
-            }
-            return;
-        }
-
-        try {
-            await invoke('save_content_template', { template: templateToSave });
-            lastPersistedSnapshotRef.current = persistedSnapshot;
-            setContentTemplates((current) => ({
-                ...current,
-                [templateToSave.id]: templateToSave,
-            }));
-            setSelectedTemplateId(templateToSave.id);
-            setDraft((current) =>
-                serializeAutosaveTemplate(current) === sourceSnapshot ? templateToSave : current,
-            );
-            if (serializeAutosaveTemplate(latestDraftRef.current) === sourceSnapshot) {
-                setHasPendingAutosave(false);
-            }
-            setStatusMessage(`公共正文模板“${templateToSave.name}”已自动保存。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '自动保存公共正文模板失败。');
-            setStatusMessage('');
-        }
-    };
-
-    const selectTemplate = (id: string) => {
-        setSelectedTemplateId(id);
-        const nextDraft = contentTemplates[id] ?? createDefaultContentTemplate();
-        setDraft(nextDraft);
-        lastPersistedSnapshotRef.current = serializeAutosaveTemplate(nextDraft);
-        setHasPendingAutosave(false);
-        setStatusMessage('');
-        setErrorMessage('');
-    };
-
-    const createTemplate = () => {
-        const emptyDraft = createDefaultContentTemplate();
-        setSelectedTemplateId('');
-        setDraft(emptyDraft);
-        setHasPendingAutosave(false);
-        setStatusMessage('已创建空白公共正文模板草稿。');
-        setErrorMessage('');
-    };
-
-    const duplicateTemplate = () => {
-        const duplicatedName = draft.name.trim() ? `${draft.name} 副本` : '未命名公共正文模板';
-        const duplicated = {
-            ...draft,
-            id: `${createTemplateIdFromName(duplicatedName, 'content')}-copy`,
-            name: duplicatedName,
-            updated_at: '',
-        };
-
-        setSelectedTemplateId('');
-        setDraft(duplicated);
-        setHasPendingAutosave(false);
-        setStatusMessage('已基于当前公共正文模板创建副本草稿。');
-        setErrorMessage('');
-    };
-
-    const importTemplate = async () => {
-        try {
-            const selectedFile = await open({
-                filters: [{ name: '正文模板文件', extensions: ['json'] }],
-                multiple: false,
-            });
-
-            const importPath = Array.isArray(selectedFile) ? selectedFile[0] : selectedFile;
-            if (!importPath) {
-                return;
-            }
-
-            const imported = await invoke<{ id: string; template: ContentTemplate }>(
-                'import_content_template_from_file',
-                { path: importPath },
-            );
-
-            await loadData(imported.id);
-            setStatusMessage(`已导入公共正文模板“${imported.template.name || imported.id}”。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '导入公共正文模板失败。');
-            setStatusMessage('');
-        }
-    };
-
-    const exportTemplate = async () => {
-        const id = selectedTemplateId || draft.id.trim();
-        if (!id) {
-            setErrorMessage('请先选择或保存一个公共正文模板。');
-            setStatusMessage('');
-            return;
-        }
-
-        try {
-            const name = draft.name.trim() || id;
-            const selectedPath = await save({
-                defaultPath: `${name}.json`,
-                filters: [{ name: '正文模板文件', extensions: ['json'] }],
-            });
-            if (!selectedPath) {
-                return;
-            }
-
-            await invoke('export_content_template_to_file', {
-                id,
-                path: selectedPath,
-            });
-            setStatusMessage(`已导出公共正文模板“${name}”。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '导出公共正文模板失败。');
-            setStatusMessage('');
-        }
-    };
-
-    const deleteTemplate = async () => {
-        if (!selectedTemplateId) {
-            setDraft(createDefaultContentTemplate());
-            return;
-        }
-
-        try {
-            await invoke('delete_content_template', { id: selectedTemplateId });
-            const deletedName = draft.name || selectedTemplateId;
-            await loadData();
-            setStatusMessage(`公共正文模板“${deletedName}”已删除。`);
-            setErrorMessage('');
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '删除公共正文模板失败。');
-            setStatusMessage('');
-        }
     };
 
     return (
@@ -342,7 +92,9 @@ export default function ContentTemplatesPage() {
                         </button>
                         <button
                             type="button"
-                            onClick={deleteTemplate}
+                            onClick={() => {
+                                void deleteTemplate();
+                            }}
                             className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 transition-colors hover:bg-rose-500/20"
                         >
                             <Trash2 size={16} />
@@ -396,7 +148,7 @@ export default function ContentTemplatesPage() {
                                                         {template.summary || '暂无说明'}
                                                     </p>
                                                     <p className="mt-2 text-[11px] text-slate-500">
-                                                        最近更新 {formatTimestamp(template.updated_at)}
+                                                        最近更新 {formatTemplateTimestamp(template.updated_at)}
                                                     </p>
                                                 </div>
                                             </div>
@@ -415,7 +167,7 @@ export default function ContentTemplatesPage() {
                         <div className="grid gap-6 lg:grid-cols-[minmax(0,1fr)_280px]">
                             <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                                 <h2 className="text-sm font-medium text-slate-200">基础信息</h2>
-                                <div className="mt-4 grid gap-4 md:grid-cols-2">
+                                <div className="mt-4 space-y-4">
                                     <label className="block text-sm text-slate-300">
                                         <span className="mb-2 block text-xs text-slate-500">模板名称</span>
                                         <input
@@ -426,16 +178,14 @@ export default function ContentTemplatesPage() {
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
                                     </label>
-                                    <label className="block text-sm text-slate-300">
-                                        <span className="mb-2 block text-xs text-slate-500">模板 ID</span>
-                                        <input
-                                            type="text"
-                                            value={draft.id}
-                                            onChange={(event) => updateDraft((current) => ({ ...current, id: event.target.value }))}
-                                            placeholder="留空则按名称自动生成"
-                                            className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                                        />
-                                    </label>
+                                    {selectedTemplateId ? (
+                                        <div className="block text-sm text-slate-300">
+                                            <span className="mb-2 block text-xs text-slate-500">模板 ID</span>
+                                            <div className="w-full rounded-xl border border-slate-700/50 bg-slate-800/50 px-3 py-2 text-sm text-slate-400">
+                                                {draft.id}
+                                            </div>
+                                        </div>
+                                    ) : null}
                                 </div>
 
                                 <label className="mt-4 block text-sm text-slate-300">
@@ -490,7 +240,7 @@ export default function ContentTemplatesPage() {
                                     <dl className="mt-4 space-y-3 text-sm">
                                         <div className="flex items-start justify-between gap-4">
                                             <dt className="text-slate-500">最近更新时间</dt>
-                                            <dd className="text-right text-slate-200">{formatTimestamp(draft.updated_at)}</dd>
+                                            <dd className="text-right text-slate-200">{formatTemplateTimestamp(draft.updated_at)}</dd>
                                         </div>
                                         <div className="flex items-start justify-between gap-4">
                                             <dt className="text-slate-500">Markdown 字数</dt>
@@ -522,8 +272,4 @@ export default function ContentTemplatesPage() {
             </div>
         </div>
     );
-}
-
-function sortedObjectKeys<T>(collection: Record<string, T>) {
-    return Object.keys(collection).sort((left, right) => left.localeCompare(right, 'zh-CN'));
 }
