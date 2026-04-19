@@ -1388,13 +1388,13 @@ export default function HomePage() {
                     </div>
                     <div className="mt-2">
                         <label className="text-xs text-slate-500 mb-1 block">发布标题</label>
-                        <input
-                            type="text"
+                        <textarea
+                            rows={2}
                             value={template.title}
                             onChange={(e) => updateField('title', e.target.value)}
                             onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('title', e.target.value))}
                             placeholder="最终发布标题，可手动编辑或使用上方按钮重新生成"
-                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y"
                         />
                     </div>
                 </section>
