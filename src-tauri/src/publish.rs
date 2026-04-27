@@ -1,7 +1,7 @@
 use crate::config::{load_config, Template};
 use crate::profile::{
-    get_site_cookie_text, load_profiles, normalize_site_cookie_text, resolve_site_cookie_user_agent,
-    save_profiles, set_site_cookie_text, site_cookie_has_entries, sync_profile_cookies, Profile,
+    get_site_cookie_text, normalize_site_cookie_text, resolve_site_cookie_user_agent,
+    site_cookie_has_entries, Profile,
 };
 use encoding_rs::GB18030;
 use serde::{Deserialize, Serialize};
@@ -11,7 +11,10 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Manager};
+
+pub mod publish_events;
+pub mod publish_history;
 
 const REQUIRED_OKP_TAG_FILES: &[&str] = &[
     "acgnx_asia.json",
@@ -21,12 +24,12 @@ const REQUIRED_OKP_TAG_FILES: &[&str] = &[
     "dmhy.json",
     "nyaa.json",
 ];
-const KEEP_PUBLISH_COOKIES_FOR_DEBUG: bool = true;
 
 static PUBLISH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRequest {
+    pub publish_id: String,
     pub torrent_path: String,
     pub template_name: String,
     pub profile_name: String,
@@ -35,6 +38,7 @@ pub struct PublishRequest {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishOutput {
+    pub publish_id: String,
     pub site_code: String,
     pub site_label: String,
     pub line: String,
@@ -43,6 +47,7 @@ pub struct PublishOutput {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishSiteComplete {
+    pub publish_id: String,
     pub site_code: String,
     pub site_label: String,
     pub success: bool,
@@ -51,6 +56,7 @@ pub struct PublishSiteComplete {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PublishComplete {
+    pub publish_id: String,
     pub success: bool,
     pub message: String,
 }
@@ -62,14 +68,14 @@ enum OkpLaunchMode {
 }
 
 #[derive(Debug, Clone)]
-struct ResolvedOkpExecutable {
+pub(crate) struct ResolvedOkpExecutable {
     executable_path: PathBuf,
     working_dir: PathBuf,
     launch_mode: OkpLaunchMode,
 }
 
 #[derive(Debug, Clone)]
-struct PublishArtifacts {
+pub(crate) struct PublishArtifacts {
     workspace_dir: PathBuf,
     template_path: PathBuf,
     cookies_path: PathBuf,
@@ -79,17 +85,17 @@ struct PublishArtifacts {
 }
 
 #[derive(Debug, Clone)]
-struct SitePublishConfig {
-    code: &'static str,
-    label: &'static str,
-    account_name: String,
-    token: Option<String>,
-    enabled: bool,
-    uses_cookie: bool,
+pub(crate) struct SitePublishConfig {
+    pub(crate) code: &'static str,
+    pub(crate) label: &'static str,
+    pub(crate) account_name: String,
+    pub(crate) token: Option<String>,
+    pub(crate) enabled: bool,
+    pub(crate) uses_cookie: bool,
 }
 
 #[derive(Debug, Clone)]
-struct SitePublishResult {
+pub(crate) struct SitePublishResult {
     site_code: String,
     site_label: String,
     success: bool,
@@ -97,8 +103,37 @@ struct SitePublishResult {
     updated_cookie_text: Option<String>,
 }
 
+#[derive(Debug, Serialize)]
+struct SiteTemplateToml<'a> {
+    display_name: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filename_regex: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resolution_regex: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    poster: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    about: Option<&'a str>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<&'a str>,
+    intro_template: Vec<SiteTemplateIntroToml<'a>>,
+}
+
+#[derive(Debug, Serialize)]
+struct SiteTemplateIntroToml<'a> {
+    site: &'a str,
+    name: &'a str,
+    content: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_agent: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cookie: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    proxy: Option<&'a str>,
+}
+
 impl SitePublishConfig {
-    fn build_result(
+    pub(crate) fn build_result(
         &self,
         success: bool,
         message: impl Into<String>,
@@ -114,10 +149,10 @@ impl SitePublishConfig {
     }
 }
 
-struct PublishGuard;
+pub(crate) struct PublishGuard;
 
 impl PublishGuard {
-    fn acquire() -> Result<Self, String> {
+    pub(crate) fn acquire() -> Result<Self, String> {
         if PUBLISH_IN_PROGRESS
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
@@ -135,40 +170,15 @@ impl Drop for PublishGuard {
     }
 }
 
-fn emit_publish_event<T: Serialize + Clone>(app: &AppHandle, event: &str, payload: T) {
-    let _ = app.emit(event, payload);
-}
-
 fn emit_publish_output(
     app: &AppHandle,
+    publish_id: &str,
     site_code: &str,
     site_label: &str,
     line: impl Into<String>,
     is_stderr: bool,
 ) {
-    emit_publish_event(
-        app,
-        "publish-output",
-        PublishOutput {
-            site_code: site_code.to_string(),
-            site_label: site_label.to_string(),
-            line: line.into(),
-            is_stderr,
-        },
-    );
-}
-
-fn emit_publish_site_complete(app: &AppHandle, result: &SitePublishResult) {
-    emit_publish_event(
-        app,
-        "publish-site-complete",
-        PublishSiteComplete {
-            site_code: result.site_code.clone(),
-            site_label: result.site_label.clone(),
-            success: result.success,
-            message: result.message.clone(),
-        },
-    );
+    publish_events::emit_publish_output(app, publish_id, site_code, site_label, line, is_stderr);
 }
 
 fn decode_publish_output(buffer: &[u8]) -> String {
@@ -307,12 +317,12 @@ fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpE
     })
 }
 
-fn find_okp_executable(app: &AppHandle) -> Result<ResolvedOkpExecutable, String> {
+pub(crate) fn find_okp_executable(app: &AppHandle) -> Result<ResolvedOkpExecutable, String> {
     let config = load_config(app);
     resolve_selected_okp_executable(&config.okp_executable_path)
 }
 
-fn validate_torrent_path(torrent_path: &str) -> Result<PathBuf, String> {
+pub(crate) fn validate_torrent_path(torrent_path: &str) -> Result<PathBuf, String> {
     let torrent_path = torrent_path.trim();
     if torrent_path.is_empty() {
         return Err("未选择种子文件，请先选择 .torrent 文件。".to_string());
@@ -376,9 +386,7 @@ fn create_publish_artifacts(app: &AppHandle, site_code: &str) -> Result<PublishA
 
 fn cleanup_publish_artifacts(artifacts: &PublishArtifacts, keep_log: bool) {
     let _ = std::fs::remove_file(&artifacts.template_path);
-    if !KEEP_PUBLISH_COOKIES_FOR_DEBUG {
-        let _ = std::fs::remove_file(&artifacts.cookies_path);
-    }
+    let _ = std::fs::remove_file(&artifacts.cookies_path);
     let _ = std::fs::remove_file(&artifacts.markdown_description_path);
     let _ = std::fs::remove_file(&artifacts.html_description_path);
 
@@ -386,9 +394,7 @@ fn cleanup_publish_artifacts(artifacts: &PublishArtifacts, keep_log: bool) {
         let _ = std::fs::remove_file(&artifacts.log_path);
     }
 
-    if !KEEP_PUBLISH_COOKIES_FOR_DEBUG {
-        let _ = std::fs::remove_dir(&artifacts.workspace_dir);
-    }
+    let _ = std::fs::remove_dir(&artifacts.workspace_dir);
 }
 
 fn site_label(site_code: &str) -> &'static str {
@@ -403,7 +409,7 @@ fn site_label(site_code: &str) -> &'static str {
     }
 }
 
-fn collect_site_publish_configs(template: &Template, profile: &Profile) -> Vec<SitePublishConfig> {
+pub(crate) fn collect_site_publish_configs(template: &Template, profile: &Profile) -> Vec<SitePublishConfig> {
     vec![
         SitePublishConfig {
             code: "dmhy",
@@ -478,8 +484,47 @@ fn build_site_publish_cookie_text(site: &SitePublishConfig, profile: &Profile) -
     Ok(format!("user-agent:\t{}", user_agent))
 }
 
-fn escape_toml_string(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
+fn optional_non_empty(value: &str) -> Option<&str> {
+    (!value.trim().is_empty()).then_some(value)
+}
+
+fn optional_trimmed(value: &str) -> Option<&str> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then_some(trimmed)
+}
+
+fn serialize_site_template_toml(
+    template: &Template,
+    site: &SitePublishConfig,
+    description_file_name: &str,
+    user_agent: &str,
+    proxy: Option<&str>,
+) -> Result<String, String> {
+    let tags: Vec<&str> = template
+        .tags
+        .split(',')
+        .map(|tag| tag.trim())
+        .filter(|tag| !tag.is_empty())
+        .collect();
+
+    let document = SiteTemplateToml {
+        display_name: &template.title,
+        filename_regex: optional_non_empty(&template.ep_pattern),
+        resolution_regex: optional_non_empty(&template.resolution_pattern),
+        poster: optional_non_empty(&template.poster),
+        about: optional_non_empty(&template.about),
+        tags,
+        intro_template: vec![SiteTemplateIntroToml {
+            site: site.code,
+            name: &site.account_name,
+            content: description_file_name,
+            user_agent: optional_non_empty(user_agent),
+            cookie: site.token.as_deref().and_then(optional_trimmed),
+            proxy,
+        }],
+    };
+
+    toml::to_string(&document).map_err(|error| format!("序列化 template.toml 失败: {}", error))
 }
 
 fn site_prefers_html_content(site_code: &str) -> bool {
@@ -561,80 +606,19 @@ fn generate_site_template_toml(
         .and_then(|name| name.to_str())
         .ok_or_else(|| "无法生成发布内容文件名。".to_string())?;
 
-    let mut toml_content = String::new();
-    toml_content.push_str(&format!(
-        "display_name = \"{}\"\n",
-        escape_toml_string(&template.title)
-    ));
+    let proxy = if config.proxy.proxy_type == "http" {
+        optional_trimmed(&config.proxy.proxy_host)
+    } else {
+        None
+    };
 
-    if !template.ep_pattern.trim().is_empty() {
-        toml_content.push_str(&format!("filename_regex = '''{}'''\n", template.ep_pattern));
-    }
-
-    if !template.resolution_pattern.trim().is_empty() {
-        toml_content.push_str(&format!(
-            "resolution_regex = '''{}'''\n",
-            template.resolution_pattern
-        ));
-    }
-
-    if !template.poster.trim().is_empty() {
-        toml_content.push_str(&format!(
-            "poster = \"{}\"\n",
-            escape_toml_string(&template.poster)
-        ));
-    }
-
-    if !template.about.trim().is_empty() {
-        toml_content.push_str(&format!(
-            "about = \"{}\"\n",
-            escape_toml_string(&template.about)
-        ));
-    }
-
-    let tags: Vec<&str> = template
-        .tags
-        .split(',')
-        .map(|tag| tag.trim())
-        .filter(|tag| !tag.is_empty())
-        .collect();
-    if !tags.is_empty() {
-        let tags_str: Vec<String> = tags
-            .iter()
-            .map(|tag| format!("\"{}\"", escape_toml_string(tag)))
-            .collect();
-        toml_content.push_str(&format!("tags = [{}]\n", tags_str.join(", ")));
-    }
-
-    toml_content.push('\n');
-    toml_content.push_str("[[intro_template]]\n");
-    toml_content.push_str(&format!("site = \"{}\"\n", site.code));
-    toml_content.push_str(&format!(
-        "name = \"{}\"\n",
-        escape_toml_string(&site.account_name)
-    ));
-    toml_content.push_str(&format!("content = \"{}\"\n", description_file_name));
-
-    if !user_agent.trim().is_empty() {
-        toml_content.push_str(&format!(
-            "user_agent = \"{}\"\n",
-            escape_toml_string(user_agent)
-        ));
-    }
-
-    if let Some(token) = site.token.as_deref().filter(|value| !value.trim().is_empty()) {
-        toml_content.push_str(&format!(
-            "cookie = \"{}\"\n",
-            escape_toml_string(token)
-        ));
-    }
-
-    if config.proxy.proxy_type == "http" && !config.proxy.proxy_host.trim().is_empty() {
-        toml_content.push_str(&format!(
-            "proxy = \"{}\"\n",
-            escape_toml_string(config.proxy.proxy_host.trim())
-        ));
-    }
+    let toml_content = serialize_site_template_toml(
+        template,
+        site,
+        description_file_name,
+        user_agent,
+        proxy,
+    )?;
 
     std::fs::write(&artifacts.template_path, &toml_content)
         .map_err(|e| format!("写入 template.toml 失败: {}", e))?;
@@ -645,6 +629,7 @@ fn generate_site_template_toml(
 fn spawn_output_reader<R>(
     reader: R,
     app: AppHandle,
+    publish_id: String,
     site_code: String,
     site_label: String,
     is_stderr: bool,
@@ -666,11 +651,19 @@ where
                         buffer.pop();
                     }
 
-                    emit_publish_output(&app, &site_code, &site_label, decode_publish_output(&buffer), is_stderr);
+                    emit_publish_output(
+                        &app,
+                        &publish_id,
+                        &site_code,
+                        &site_label,
+                        decode_publish_output(&buffer),
+                        is_stderr,
+                    );
                 }
                 Err(error) => {
                     emit_publish_output(
                         &app,
+                        &publish_id,
                         &site_code,
                         &site_label,
                         format!("读取 OKP 输出失败: {}", error),
@@ -711,8 +704,9 @@ fn format_command_argument(argument: &str) -> String {
     }
 }
 
-fn run_site_publish(
+pub(crate) fn run_site_publish(
     app: &AppHandle,
+    publish_id: &str,
     okp_core: &ResolvedOkpExecutable,
     torrent_path: &Path,
     template: &Template,
@@ -734,6 +728,7 @@ fn run_site_publish(
             .map_err(|e| format!("写入 cookies.txt 失败: {}", e))?;
         emit_publish_output(
             app,
+            publish_id,
             site.code,
             site.label,
             format!(
@@ -765,6 +760,7 @@ fn run_site_publish(
 
         emit_publish_output(
             app,
+            publish_id,
             site.code,
             site.label,
             format!("{} 命令行: {}", site.label, command_preview),
@@ -791,6 +787,7 @@ fn run_site_publish(
             spawn_output_reader(
                 stdout,
                 app.clone(),
+                publish_id.to_string(),
                 site.code.to_string(),
                 site.label.to_string(),
                 false,
@@ -800,6 +797,7 @@ fn run_site_publish(
             spawn_output_reader(
                 stderr,
                 app.clone(),
+                publish_id.to_string(),
                 site.code.to_string(),
                 site.label.to_string(),
                 true,
@@ -838,6 +836,7 @@ fn run_site_publish(
         Err(error) => {
             emit_publish_output(
                 app,
+                publish_id,
                 site.code,
                 site.label,
                 format!("{} 预处理失败: {}", site.label, error),
@@ -849,126 +848,9 @@ fn run_site_publish(
     }
 }
 
-fn persist_updated_site_cookies(app: &AppHandle, profile_name: &str, results: &[SitePublishResult]) {
-    if results.iter().all(|result| result.updated_cookie_text.is_none()) {
-        return;
-    }
-
-    let mut profiles = load_profiles(app);
-    let Some(profile) = profiles.profiles.get_mut(profile_name) else {
-        return;
-    };
-
-    for result in results {
-        if let Some(cookie_text) = &result.updated_cookie_text {
-            set_site_cookie_text(
-                &mut profile.site_cookies,
-                &result.site_code,
-                normalize_site_cookie_text(cookie_text, &profile.user_agent),
-            );
-        }
-    }
-
-    sync_profile_cookies(profile);
-    save_profiles(app, &profiles);
-}
-
-fn build_publish_summary(results: &[SitePublishResult]) -> (bool, String) {
-    let failed_sites = results
-        .iter()
-        .filter(|result| !result.success)
-        .map(|result| result.site_label.clone())
-        .collect::<Vec<_>>();
-
-    if failed_sites.is_empty() {
-        (true, format!("{} 个站点全部发布完成", results.len()))
-    } else {
-        (
-            false,
-            format!("以下站点发布失败: {}", failed_sites.join("、")),
-        )
-    }
-}
-
-fn run_publish(app: &AppHandle, request: &PublishRequest) -> Result<String, String> {
-    let _publish_guard = PublishGuard::acquire()?;
-
-    let okp_core = find_okp_executable(app)?;
-    let torrent_path = validate_torrent_path(&request.torrent_path)?;
-    let profiles = load_profiles(app);
-    let profile = profiles
-        .profiles
-        .get(&request.profile_name)
-        .cloned()
-        .ok_or_else(|| format!("配置不存在: {}", request.profile_name))?;
-
-    let selected_sites = collect_site_publish_configs(&request.template, &profile)
-        .into_iter()
-        .filter(|site| site.enabled)
-        .collect::<Vec<_>>();
-
-    if selected_sites.is_empty() {
-        return Err("至少选择一个发布站点后才能发布。".to_string());
-    }
-
-    let mut handles = Vec::new();
-    for site in selected_sites {
-        let app_handle = app.clone();
-        let okp_core = okp_core.clone();
-        let torrent_path = torrent_path.clone();
-        let template = request.template.clone();
-        let profile = profile.clone();
-        let site_for_join = site.clone();
-
-        let handle = std::thread::spawn(move || {
-            let result = run_site_publish(&app_handle, &okp_core, &torrent_path, &template, &profile, &site);
-            emit_publish_site_complete(&app_handle, &result);
-            result
-        });
-
-        handles.push((site_for_join, handle));
-    }
-
-    let mut results = Vec::new();
-    for (site, handle) in handles {
-        let result = match handle.join() {
-            Ok(result) => result,
-            Err(_) => site.build_result(false, format!("{} 发布线程异常退出", site.label), None),
-        };
-        results.push(result);
-    }
-
-    persist_updated_site_cookies(app, &request.profile_name, &results);
-    let (success, message) = build_publish_summary(&results);
-
-    if success {
-        Ok(message)
-    } else {
-        Err(message)
-    }
-}
-
 #[tauri::command]
 pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), String> {
-    let app_handle = app.clone();
-    let request_payload = request.clone();
-    let result = tauri::async_runtime::spawn_blocking(move || run_publish(&app_handle, &request_payload))
-        .await
-        .map_err(|error| format!("发布任务执行失败: {}", error))?;
-
-    let completion = match &result {
-        Ok(message) => PublishComplete {
-            success: true,
-            message: message.clone(),
-        },
-        Err(message) => PublishComplete {
-            success: false,
-            message: message.clone(),
-        },
-    };
-
-    emit_publish_event(&app, "publish-complete", completion);
-    result.map(|_| ())
+    crate::commands::publish_commands::publish(app, request).await
 }
 
 #[cfg(test)]
@@ -1131,6 +1013,228 @@ mod tests {
         let executable_path = root.join(file_name);
         std::fs::write(&executable_path, "test").expect("expected dummy executable to be created");
         executable_path
+    }
+
+    fn create_test_publish_artifacts(prefix: &str) -> PublishArtifacts {
+        let workspace_dir = std::env::temp_dir().join(format!(
+            "okpgui-next-{}-{}-{}",
+            prefix,
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&workspace_dir).expect("expected workspace dir to be created");
+
+        PublishArtifacts {
+            template_path: workspace_dir.join("template.toml"),
+            cookies_path: workspace_dir.join("cookies.txt"),
+            markdown_description_path: workspace_dir.join("description.md"),
+            html_description_path: workspace_dir.join("description.html"),
+            log_path: workspace_dir.join("okp.log"),
+            workspace_dir,
+        }
+    }
+
+    fn write_test_publish_artifacts(artifacts: &PublishArtifacts) {
+        std::fs::write(&artifacts.template_path, "cookie = \"token-123\"")
+            .expect("expected template file to be written");
+        std::fs::write(&artifacts.cookies_path, "session=value")
+            .expect("expected cookies file to be written");
+        std::fs::write(&artifacts.markdown_description_path, "# description")
+            .expect("expected markdown description file to be written");
+        std::fs::write(&artifacts.html_description_path, "<p>description</p>")
+            .expect("expected html description file to be written");
+        std::fs::write(&artifacts.log_path, "publish log")
+            .expect("expected log file to be written");
+    }
+
+    fn create_test_site_publish_config() -> SitePublishConfig {
+        SitePublishConfig {
+            code: "dmhy",
+            label: "动漫花园",
+            account_name: "Team".to_string(),
+            token: Some("token-123".to_string()),
+            enabled: true,
+            uses_cookie: false,
+        }
+    }
+
+    #[test]
+    fn test_template_toml_serialization_preserves_regex_values() {
+        let template = Template {
+            title: "Example Release".to_string(),
+            ep_pattern: "abc'''\nproxy = \"http://evil.example:8080\"\n#".to_string(),
+            resolution_pattern: "1080p'''\n[[intro_template]]\nsite = \"evil\"\nname = \"attacker\"\ncontent = \"pwn.md\"\n#".to_string(),
+            poster: "poster.png".to_string(),
+            about: "about text".to_string(),
+            tags: "tag-a, tag-b".to_string(),
+            ..Template::default()
+        };
+        let site = create_test_site_publish_config();
+
+        let toml_content = serialize_site_template_toml(
+            &template,
+            &site,
+            "description.md",
+            "Mozilla/5.0 Publish",
+            Some("http://proxy.local:8080"),
+        )
+        .expect("expected template.toml serialization to succeed");
+
+        let parsed: toml::Value = toml::from_str(&toml_content)
+            .expect("expected serialized template.toml to parse back successfully");
+
+        assert_eq!(
+            parsed.get("filename_regex").and_then(toml::Value::as_str),
+            Some(template.ep_pattern.as_str())
+        );
+        assert_eq!(
+            parsed.get("resolution_regex").and_then(toml::Value::as_str),
+            Some(template.resolution_pattern.as_str())
+        );
+        assert!(parsed.get("proxy").is_none());
+
+        let intro_templates = parsed
+            .get("intro_template")
+            .and_then(toml::Value::as_array)
+            .expect("expected intro_template array");
+        assert_eq!(intro_templates.len(), 1);
+
+        let intro = intro_templates[0]
+            .as_table()
+            .expect("expected intro_template entry to be a table");
+        assert_eq!(intro.get("site").and_then(toml::Value::as_str), Some("dmhy"));
+        assert_eq!(intro.get("name").and_then(toml::Value::as_str), Some("Team"));
+        assert_eq!(
+            intro.get("content").and_then(toml::Value::as_str),
+            Some("description.md")
+        );
+        assert_eq!(
+            intro.get("proxy").and_then(toml::Value::as_str),
+            Some("http://proxy.local:8080")
+        );
+    }
+
+    #[test]
+    fn test_template_toml_serialization_round_trips_expected_structure() {
+        let template = Template {
+            title: "Example Release".to_string(),
+            ep_pattern: r"(?P<ep>\d+)".to_string(),
+            resolution_pattern: r"(?P<res>1080p)".to_string(),
+            poster: "poster.png".to_string(),
+            about: "about text".to_string(),
+            tags: "tag-a, tag-b".to_string(),
+            ..Template::default()
+        };
+        let site = create_test_site_publish_config();
+
+        let toml_content = serialize_site_template_toml(
+            &template,
+            &site,
+            "description.md",
+            "Mozilla/5.0 Publish",
+            Some("http://proxy.local:8080"),
+        )
+        .expect("expected template.toml serialization to succeed");
+
+        let parsed: toml::Value = toml::from_str(&toml_content)
+            .expect("expected serialized template.toml to parse back successfully");
+
+        assert_eq!(
+            parsed.get("display_name").and_then(toml::Value::as_str),
+            Some("Example Release")
+        );
+        assert_eq!(
+            parsed.get("poster").and_then(toml::Value::as_str),
+            Some("poster.png")
+        );
+        assert_eq!(parsed.get("about").and_then(toml::Value::as_str), Some("about text"));
+
+        let tags = parsed
+            .get("tags")
+            .and_then(toml::Value::as_array)
+            .expect("expected tags array to be present");
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].as_str(), Some("tag-a"));
+        assert_eq!(tags[1].as_str(), Some("tag-b"));
+
+        let intro_templates = parsed
+            .get("intro_template")
+            .and_then(toml::Value::as_array)
+            .expect("expected intro_template array");
+        assert_eq!(intro_templates.len(), 1);
+
+        let intro = intro_templates[0]
+            .as_table()
+            .expect("expected intro_template entry to be a table");
+        assert_eq!(
+            intro.get("user_agent").and_then(toml::Value::as_str),
+            Some("Mozilla/5.0 Publish")
+        );
+        assert_eq!(intro.get("cookie").and_then(toml::Value::as_str), Some("token-123"));
+    }
+
+    #[test]
+    fn test_cleanup_publish_artifacts_removes_workspace_after_success() {
+        let artifacts = create_test_publish_artifacts("publish-cleanup-success");
+        write_test_publish_artifacts(&artifacts);
+
+        cleanup_publish_artifacts(&artifacts, false);
+
+        assert!(!artifacts.template_path.exists());
+        assert!(!artifacts.cookies_path.exists());
+        assert!(!artifacts.markdown_description_path.exists());
+        assert!(!artifacts.html_description_path.exists());
+        assert!(!artifacts.log_path.exists());
+        assert!(!artifacts.workspace_dir.exists());
+    }
+
+    #[test]
+    fn test_cleanup_publish_artifacts_removes_sensitive_files_after_failure() {
+        let artifacts = create_test_publish_artifacts("publish-cleanup-failure");
+        write_test_publish_artifacts(&artifacts);
+
+        cleanup_publish_artifacts(&artifacts, true);
+
+        assert!(!artifacts.template_path.exists());
+        assert!(!artifacts.cookies_path.exists());
+        assert!(!artifacts.markdown_description_path.exists());
+        assert!(!artifacts.html_description_path.exists());
+        assert!(artifacts.log_path.exists());
+        assert!(artifacts.workspace_dir.exists());
+
+        let _ = std::fs::remove_dir_all(&artifacts.workspace_dir);
+    }
+
+    #[test]
+    fn test_updated_cookie_text_for_persistence_requires_success() {
+        let result = SitePublishResult {
+            site_code: "dmhy".to_string(),
+            site_label: "动漫花园".to_string(),
+            success: false,
+            message: "publish failed".to_string(),
+            updated_cookie_text: Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=bad".to_string()),
+        };
+
+        assert_eq!(publish_history::updated_cookie_text_for_persistence(&result), None);
+    }
+
+    #[test]
+    fn test_updated_cookie_text_for_persistence_allows_successful_updates() {
+        let result = SitePublishResult {
+            site_code: "dmhy".to_string(),
+            site_label: "动漫花园".to_string(),
+            success: true,
+            message: "publish succeeded".to_string(),
+            updated_cookie_text: Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=good".to_string()),
+        };
+
+        assert_eq!(
+            publish_history::updated_cookie_text_for_persistence(&result),
+            Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=good")
+        );
     }
 
     #[test]

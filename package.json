@@ -7,6 +7,7 @@
     "version:sync": "node scripts/sync-version.mjs",
     "predev": "node scripts/sync-version.mjs",
     "dev": "vite",
+    "test": "vitest run --environment jsdom",
     "prebuild": "node scripts/sync-version.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
@@ -20,6 +21,7 @@
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-opener": "^2",
     "@yaireo/tagify": "^4.36.0",
+    "dompurify": "^3.4.1",
     "easymde": "^2.20.0",
     "highlight.js": "^11.11.1",
     "lucide-react": "^0.577.0",
@@ -35,9 +37,11 @@
     "@types/react-dom": "^19.2.3",
     "@vitejs/plugin-react": "^5.1.4",
     "autoprefixer": "^10.4.27",
+    "jsdom": "^27.0.1",
     "postcss": "^8.5.8",
     "tailwindcss": "^4.2.1",
     "typescript": "~5.6.2",
-    "vite": "^6.0.3"
+    "vite": "^6.0.3",
+    "vitest": "^3.2.4"
   }
 }

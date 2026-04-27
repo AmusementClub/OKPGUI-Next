@@ -1,7 +1,6 @@
 import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
-import { open } from '@tauri-apps/plugin-dialog';
 import {
     FileText,
     FolderOpen,
@@ -11,50 +10,33 @@ import {
     Send,
     Trash2,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
-import ConsoleModal, {
-    PublishComplete,
-    PublishConsoleSite,
-    PublishOutput,
-    PublishSiteComplete,
-} from '../components/ConsoleModal';
-import FileTree, { FileTreeNodeData } from '../components/FileTree';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import ConsoleModal from '../components/ConsoleModal';
+import FileTree from '../components/FileTree';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
-import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
-import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
-import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 import {
-    ContentTemplate,
-    QuickPublishConfigPayload,
-    QuickPublishRuntimeDraft,
+    createPublishConsoleSiteMap,
+    createPublishId,
+    usePublishTask,
+} from '../hooks/usePublishTask';
+import { useQuickPublishRuntimeDraft } from '../hooks/useQuickPublishRuntimeDraft';
+import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
+import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText } from '../utils/cookieUtils';
+import {
+    getPublishStatusTextClass,
+    getSiteLoginStateBadgeClass,
+} from '../utils/siteStatus';
+import {
     QuickPublishTemplate,
-    SitePublishHistory,
     SiteSelection,
     buildLegacyPublishTemplatePayload,
-    buildRuntimeDraftFromTemplate,
-    composePublishContent,
-    createDefaultQuickPublishRuntimeDraft,
-    normalizeContentTemplate,
-    normalizePublishHistory,
-    normalizeQuickPublishTemplate,
     quickPublishSiteKeys,
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
 
-interface ParsedTitleDetails {
-    title: string;
-    episode: string;
-    resolution: string;
-}
-
-interface TorrentInfo {
-    name: string;
-    total_size: number;
-    file_tree: FileTreeNodeData;
-}
-
 interface PublishAttemptContext {
+    publishId: string;
     templateId: string;
     publishedAt: string;
     publishedEpisode: string;
@@ -67,20 +49,6 @@ interface TemplatePublishHistoryUpdate {
     last_published_at: string;
     last_published_episode: string;
     last_published_resolution: string;
-}
-
-interface Profile {
-    user_agent: string;
-    site_cookies: SiteCookies;
-    dmhy_name: string;
-    nyaa_name: string;
-    acgrip_name: string;
-    bangumi_name: string;
-    acgnx_asia_name: string;
-    acgnx_asia_token: string;
-    acgnx_global_name: string;
-    acgnx_global_token: string;
-    [key: string]: unknown;
 }
 
 function formatTimestamp(value: string) {
@@ -122,39 +90,12 @@ function buildTemplateOptions(templates: Record<string, QuickPublishTemplate>): 
         .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
 }
 
-function mergePublishHistory(
-    history: SitePublishHistory,
-    updates: TemplatePublishHistoryUpdate[],
-): SitePublishHistory {
-    const nextHistory = normalizePublishHistory(history);
-
-    for (const update of updates) {
-        nextHistory[update.site_key] = {
-            last_published_at: update.last_published_at,
-            last_published_episode: update.last_published_episode,
-            last_published_resolution: update.last_published_resolution,
-        };
-    }
-
-    return nextHistory;
-}
-
 export default function QuickPublishPage() {
-    const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
-    const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
-    const [profileList, setProfileList] = useState<string[]>([]);
-    const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
-    const [selectedTemplateId, setSelectedTemplateId] = useState('');
-    const [draft, setDraft] = useState<QuickPublishRuntimeDraft>(createDefaultQuickPublishRuntimeDraft());
-    const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
     const [isDragging, setIsDragging] = useState(false);
-    const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
-    const [isPublishing, setIsPublishing] = useState(false);
     const [showConsole, setShowConsole] = useState(false);
-    const [publishSites, setPublishSites] = useState<Record<string, PublishConsoleSite>>({});
-    const [isPublishComplete, setIsPublishComplete] = useState(false);
-    const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
-    const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
+    const [statusMessage, setStatusMessage] = useState('');
+    const [errorMessage, setErrorMessage] = useState('');
+    const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
     const {
         siteLoginTests,
         isTestingAllSiteLogins,
@@ -163,110 +104,53 @@ export default function QuickPublishPage() {
         handleSiteLoginTest: hookHandleSiteLoginTest,
         handleTestAllSiteLogins: hookHandleTestAllSiteLogins,
     } = useSiteLoginTest();
-    const [okpExecutablePath, setOkpExecutablePath] = useState('');
-    const [statusMessage, setStatusMessage] = useState('');
-    const [errorMessage, setErrorMessage] = useState('');
-    const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
-    const publishSiteSuccessRef = useRef<Partial<Record<keyof SiteSelection, boolean>>>({});
+    const {
+        isPublishing,
+        publishSites,
+        isPublishComplete,
+        publishResult,
+        publishCompletion,
+        startPublishTask,
+        failActivePublish,
+        clearPublishCompletion,
+    } = usePublishTask<keyof SiteSelection>();
+    const {
+        quickPublishTemplates,
+        contentTemplates,
+        profileList,
+        selectedProfileData,
+        okpExecutablePath,
+        selectedTemplateId,
+        draft,
+        setDraft,
+        torrentInfo,
+        isGeneratingTitle,
+        activeTemplate,
+        activeSharedContentTemplate,
+        selectRuntimeTemplate,
+        parseTorrent,
+        selectTorrentFile,
+        generateTitle,
+        switchRuntimeContentTemplate,
+        resetToTemplateDefaults,
+        reconcileRuntimeSelectableSites,
+        selectOkpExecutable,
+        clearOkpExecutablePath,
+        applyTemplatePublishHistory,
+    } = useQuickPublishRuntimeDraft({
+        clearAllSiteLoginTests,
+        onError: setErrorMessage,
+    });
 
-    const activeTemplate = selectedTemplateId ? quickPublishTemplates[selectedTemplateId] ?? null : null;
-    const activeSharedContentTemplate =
-        draft.shared_content_template_id && contentTemplates[draft.shared_content_template_id]
-            ? contentTemplates[draft.shared_content_template_id]
-            : null;
+    const templateOptions = useMemo(
+        () => buildTemplateOptions(quickPublishTemplates),
+        [quickPublishTemplates],
+    );
 
     const publishSitesList = useMemo(
         () => Object.values(publishSites).sort((left, right) => left.siteLabel.localeCompare(right.siteLabel, 'zh-CN')),
         [publishSites],
     );
-
-    useEffect(() => {
-        void Promise.all([loadData(), loadProfiles()]);
-    }, []);
-
-    useEffect(() => {
-        if (!draft.profile.trim()) {
-            setSelectedProfileData(null);
-            clearAllSiteLoginTests();
-            return;
-        }
-
-        void loadSelectedProfileData(draft.profile);
-    }, [draft.profile]);
-
-    useEffect(() => {
-        let outputUnlisten: UnlistenFn | null = null;
-        let siteCompleteUnlisten: UnlistenFn | null = null;
-        let completeUnlisten: UnlistenFn | null = null;
-
-        const setupListeners = async () => {
-            outputUnlisten = await listen<PublishOutput>('publish-output', (event) => {
-                setPublishSites((current) => {
-                    const existing = current[event.payload.site_code] ?? {
-                        siteCode: event.payload.site_code,
-                        siteLabel: event.payload.site_label,
-                        lines: [],
-                        status: 'running' as const,
-                        message: '发布中...',
-                    };
-
-                    return {
-                        ...current,
-                        [event.payload.site_code]: {
-                            ...existing,
-                            status: 'running',
-                            message: '发布中...',
-                            lines: [
-                                ...existing.lines,
-                                {
-                                    text: event.payload.line,
-                                    isError: event.payload.is_stderr,
-                                },
-                            ],
-                        },
-                    };
-                });
-            });
-
-            siteCompleteUnlisten = await listen<PublishSiteComplete>('publish-site-complete', (event) => {
-                publishSiteSuccessRef.current[event.payload.site_code as keyof SiteSelection] = event.payload.success;
-
-                setPublishSites((current) => {
-                    const existing = current[event.payload.site_code] ?? {
-                        siteCode: event.payload.site_code,
-                        siteLabel: event.payload.site_label,
-                        lines: [],
-                        status: 'idle' as const,
-                        message: '',
-                    };
-
-                    return {
-                        ...current,
-                        [event.payload.site_code]: {
-                            ...existing,
-                            status: event.payload.success ? 'success' : 'error',
-                            message: event.payload.message,
-                        },
-                    };
-                });
-            });
-
-            completeUnlisten = await listen<PublishComplete>('publish-complete', (event) => {
-                setIsPublishing(false);
-                setIsPublishComplete(true);
-                setPublishResult(event.payload);
-                void finalizePublishHistory();
-            });
-        };
-
-        void setupListeners();
-
-        return () => {
-            outputUnlisten?.();
-            siteCompleteUnlisten?.();
-            completeUnlisten?.();
-        };
-    }, [quickPublishTemplates]);
 
     useEffect(() => {
         let unlisten: UnlistenFn | null = null;
@@ -299,7 +183,7 @@ export default function QuickPublishPage() {
         return () => {
             unlisten?.();
         };
-    }, [selectedTemplateId, quickPublishTemplates]);
+    }, [parseTorrent]);
 
     const siteRows = useMemo(
         () =>
@@ -366,255 +250,33 @@ export default function QuickPublishPage() {
     );
 
     useEffect(() => {
-        const selectableSiteKeys = new Set(siteRows.filter((row) => row.selectable).map((row) => row.site.key));
-
-        setDraft((current) => {
-            const nextSites = { ...current.sites };
-            let hasChanges = false;
-
-            for (const siteKey of Object.keys(nextSites) as (keyof SiteSelection)[]) {
-                const shouldBeSelected = selectableSiteKeys.has(siteKey);
-                if (nextSites[siteKey] !== shouldBeSelected) {
-                    nextSites[siteKey] = shouldBeSelected;
-                    hasChanges = true;
-                }
-            }
-
-            if (!hasChanges) {
-                return current;
-            }
-
-            return {
-                ...current,
-                sites: nextSites,
-            };
-        });
-    }, [siteRows]);
-
-    const loadProfiles = async () => {
-        const nextProfiles = await invoke<string[]>('get_profile_list');
-        setProfileList(nextProfiles);
-    };
-
-    const saveOkpExecutablePath = async (path: string) => {
-        try {
-            await invoke('save_okp_executable_path', {
-                okpExecutablePath: path,
-            });
-            setOkpExecutablePath(path);
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '保存 OKP 路径失败。');
-        }
-    };
-
-    const selectOkpExecutable = async () => {
-        try {
-            const file = await open();
-            const selectedPath = Array.isArray(file) ? file[0] : file;
-            if (selectedPath) {
-                await saveOkpExecutablePath(selectedPath);
-            }
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '选择 OKP 路径失败。');
-        }
-    };
-
-    const clearOkpExecutablePath = async () => {
-        await saveOkpExecutablePath('');
-    };
-
-    const loadSelectedProfileData = async (profileName: string) => {
-        try {
-            const store = await invoke<{ profiles: Record<string, Profile> }>('get_profiles');
-            setSelectedProfileData(store.profiles[profileName] ?? null);
-            clearAllSiteLoginTests();
-        } catch (error) {
-            setSelectedProfileData(null);
-            clearAllSiteLoginTests();
-            setErrorMessage(typeof error === 'string' ? error : '加载身份详情失败。');
-        }
-    };
-
-    const loadData = async (preferredId?: string) => {
-        const config = await invoke<QuickPublishConfigPayload>('get_config');
-        const nextQuickPublishTemplates = Object.fromEntries(
-            Object.entries(config.quick_publish_templates ?? {}).map(([id, template]) => [
-                id,
-                normalizeQuickPublishTemplate({ id, ...template }),
-            ]),
-        );
-        const nextContentTemplates = Object.fromEntries(
-            Object.entries(config.content_templates ?? {}).map(([id, template]) => [
-                id,
-                normalizeContentTemplate({ id, ...template }),
-            ]),
+        const selectableSiteKeys = new Set<keyof SiteSelection>(
+            siteRows
+                .filter((row) => row.selectable)
+                .map((row) => row.site.key as keyof SiteSelection),
         );
 
-        setQuickPublishTemplates(nextQuickPublishTemplates);
-        setContentTemplates(nextContentTemplates);
-        setTemplateOptions(buildTemplateOptions(nextQuickPublishTemplates));
-        setOkpExecutablePath(config.okp_executable_path ?? '');
+        reconcileRuntimeSelectableSites(selectableSiteKeys);
+    }, [reconcileRuntimeSelectableSites, siteRows]);
 
-        const resolvedTemplateId =
-            preferredId && nextQuickPublishTemplates[preferredId]
-                ? preferredId
-                : selectedTemplateId && nextQuickPublishTemplates[selectedTemplateId]
-                  ? selectedTemplateId
-                  : config.last_used_quick_publish_template && nextQuickPublishTemplates[config.last_used_quick_publish_template]
-                    ? config.last_used_quick_publish_template
-                    : Object.keys(nextQuickPublishTemplates).sort((left, right) => left.localeCompare(right, 'zh-CN'))[0] ?? '';
-
-        if (!resolvedTemplateId) {
-            setSelectedTemplateId('');
-            setDraft(createDefaultQuickPublishRuntimeDraft());
-            return;
-        }
-
-        applyTemplateSelection(
-            resolvedTemplateId,
-            nextQuickPublishTemplates,
-            nextContentTemplates,
-            draft.torrent_path,
-        );
-    };
-
-    const applyTemplateSelection = (
-        templateId: string,
-        templates = quickPublishTemplates,
-        contents = contentTemplates,
-        currentTorrentPath = draft.torrent_path,
-    ) => {
-        const template = templates[templateId];
-        if (!template) {
-            return;
-        }
-
-        const contentTemplate = template.shared_content_template_id
-            ? contents[template.shared_content_template_id] ?? null
-            : null;
-        const nextDraft = {
-            ...buildRuntimeDraftFromTemplate(template, contentTemplate),
-            torrent_path: currentTorrentPath,
-        };
-
-        setSelectedTemplateId(templateId);
-        setDraft(nextDraft);
+    const handleTemplateSelection = useCallback((templateId: string) => {
+        selectRuntimeTemplate(templateId);
         setStatusMessage('');
         setErrorMessage('');
+    }, [selectRuntimeTemplate]);
 
-        if (torrentInfo?.name) {
-            void generateTitle(template, nextDraft);
-        }
-    };
-
-    const parseTorrent = async (path: string) => {
-        try {
-            const info = await invoke<TorrentInfo>('parse_torrent', { path });
-            setTorrentInfo(info);
-            setDraft((current) => ({ ...current, torrent_path: path }));
-
-            if (activeTemplate) {
-                await generateTitle(activeTemplate, {
-                    ...draft,
-                    torrent_path: path,
-                });
-            }
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '解析种子失败。');
-        }
-    };
-
-    const selectTorrentFile = async () => {
-        const file = await open({
-            filters: [{ name: '种子文件', extensions: ['torrent'] }],
-        });
-
-        if (typeof file === 'string') {
-            await parseTorrent(file);
-        }
-    };
-
-    const generateTitle = async (
-        templateToUse = activeTemplate,
-        draftToUse = draft,
-        forceOverwrite = false,
+    const finalizePublishHistory = useCallback(async (
+        publishId: string,
+        siteSuccess: Partial<Record<keyof SiteSelection, boolean>>,
     ) => {
-        if (!templateToUse || !torrentInfo?.name || !templateToUse.title_pattern.trim()) {
-            return;
-        }
-
-        if (draftToUse.is_title_overridden && !forceOverwrite) {
-            return;
-        }
-
-        setIsGeneratingTitle(true);
-
-        try {
-            const details = await invoke<ParsedTitleDetails>('parse_title_details', {
-                filename: torrentInfo.name,
-                epPattern: templateToUse.ep_pattern,
-                resolutionPattern: templateToUse.resolution_pattern,
-                titlePattern: templateToUse.title_pattern,
-            });
-
-            setDraft((current) => ({
-                ...current,
-                title: details.title || current.title,
-                episode: details.episode,
-                resolution: details.resolution,
-                is_title_overridden: false,
-            }));
-        } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '生成标题失败。');
-        } finally {
-            setIsGeneratingTitle(false);
-        }
-    };
-
-    const switchRuntimeContentTemplate = (contentTemplateId: string) => {
-        const nextContentTemplate = contentTemplateId ? contentTemplates[contentTemplateId] ?? null : null;
-        const bodyMarkdown = activeTemplate?.body_markdown ?? '';
-        const bodyHtml = activeTemplate?.body_html ?? '';
-
-        setDraft((current) => ({
-            ...current,
-            shared_content_template_id: contentTemplateId || null,
-            markdown: composePublishContent(bodyMarkdown, nextContentTemplate?.markdown ?? ''),
-            html: composePublishContent(bodyHtml, nextContentTemplate?.html ?? '', '\n'),
-            is_content_overridden: false,
-        }));
-    };
-
-    const resetToTemplateDefaults = () => {
-        if (!activeTemplate) {
-            return;
-        }
-
-        const contentTemplate =
-            activeTemplate.shared_content_template_id && contentTemplates[activeTemplate.shared_content_template_id]
-                ? contentTemplates[activeTemplate.shared_content_template_id]
-                : null;
-
-        const nextDraft = {
-            ...buildRuntimeDraftFromTemplate(activeTemplate, contentTemplate),
-            torrent_path: draft.torrent_path,
-        };
-        setDraft(nextDraft);
-
-        if (torrentInfo?.name) {
-            void generateTitle(activeTemplate, nextDraft, true);
-        }
-    };
-
-    const finalizePublishHistory = async () => {
         const publishAttempt = publishAttemptRef.current;
-        if (!publishAttempt) {
+        publishAttemptRef.current = null;
+
+        if (!publishAttempt || publishAttempt.publishId !== publishId) {
             return;
         }
 
-        const successfulSiteKeys = publishAttempt.siteKeys.filter(
-            (siteKey) => publishSiteSuccessRef.current[siteKey],
-        );
+        const successfulSiteKeys = publishAttempt.siteKeys.filter((siteKey) => siteSuccess[siteKey]);
         if (successfulSiteKeys.length === 0) {
             return;
         }
@@ -631,26 +293,21 @@ export default function QuickPublishPage() {
                 id: publishAttempt.templateId,
                 updates,
             });
-
-            setQuickPublishTemplates((current) => {
-                const currentTemplate = current[publishAttempt.templateId];
-                if (!currentTemplate) {
-                    return current;
-                }
-
-                return {
-                    ...current,
-                    [publishAttempt.templateId]: {
-                        ...currentTemplate,
-                        publish_history: mergePublishHistory(currentTemplate.publish_history, updates),
-                    },
-                };
-            });
+            applyTemplatePublishHistory(publishAttempt.templateId, updates);
             setStatusMessage('已回填快速发布模板的发布历史。');
         } catch (error) {
             setErrorMessage(typeof error === 'string' ? error : '更新发布历史失败。');
         }
-    };
+    }, [applyTemplatePublishHistory]);
+
+    useEffect(() => {
+        if (!publishCompletion) {
+            return;
+        }
+
+        void finalizePublishHistory(publishCompletion.publishId, publishCompletion.siteSuccess);
+        clearPublishCompletion();
+    }, [clearPublishCompletion, finalizePublishHistory, publishCompletion]);
 
     const publish = async () => {
         if (!activeTemplate) {
@@ -685,38 +342,34 @@ export default function QuickPublishPage() {
         }
 
         const publishTemplatePayload = buildLegacyPublishTemplatePayload(draft, activeTemplate);
-        const nextPublishSites = Object.fromEntries(
-            selectedSiteKeys.map((siteKey) => [
-                siteKey,
-                {
-                    siteCode: siteKey,
-                    siteLabel: quickPublishSiteLabels[siteKey],
-                    lines: [],
-                    status: 'idle' as const,
-                    message: '等待发布...',
-                },
-            ]),
+        const publishId = createPublishId();
+        const nextPublishSites = createPublishConsoleSiteMap(
+            selectedSiteKeys.map((siteKey) => ({
+                siteCode: siteKey,
+                siteLabel: quickPublishSiteLabels[siteKey],
+                lines: [],
+                status: 'idle' as const,
+                message: '等待发布...',
+            })),
         );
 
         publishAttemptRef.current = {
+            publishId,
             templateId: activeTemplate.id,
             publishedAt: new Date().toISOString(),
             publishedEpisode: draft.episode,
             publishedResolution: draft.resolution,
             siteKeys: selectedSiteKeys,
         };
-        publishSiteSuccessRef.current = {};
         setShowConsole(true);
-        setPublishSites(nextPublishSites);
-        setPublishResult(null);
-        setIsPublishComplete(false);
-        setIsPublishing(true);
+        startPublishTask(publishId, nextPublishSites);
         setStatusMessage('');
         setErrorMessage('');
 
         try {
             await invoke('publish', {
                 request: {
+                    publish_id: publishId,
                     torrent_path: draft.torrent_path,
                     template_name: activeTemplate.name || activeTemplate.id,
                     profile_name: draft.profile,
@@ -726,9 +379,7 @@ export default function QuickPublishPage() {
         } catch (error) {
             const message = typeof error === 'string' ? error : '启动发布失败。';
             setErrorMessage(message);
-            setPublishResult({ success: false, message });
-            setIsPublishComplete(true);
-            setIsPublishing(false);
+            failActivePublish(message, { appendToFirstSite: true });
         }
     };
 
@@ -796,7 +447,7 @@ export default function QuickPublishPage() {
                                 <TemplateSelect
                                     options={templateOptions}
                                     value={selectedTemplateId}
-                                    onChange={(templateId) => applyTemplateSelection(templateId)}
+                                    onChange={handleTemplateSelection}
                                     placeholder="选择快速发布模板..."
                                 />
                             </div>
@@ -1203,6 +854,7 @@ export default function QuickPublishPage() {
                         </div>
                     </div>
                 </section>
+
                 <div className="order-6">
                     <button
                         type="button"

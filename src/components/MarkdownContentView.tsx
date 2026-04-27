@@ -1,4 +1,4 @@
-import { renderMarkdownToHtml } from '../utils/markdown';
+import { renderMarkdownToSafePreviewHtml } from '../utils/markdown';
 
 interface MarkdownContentViewProps {
     content: string;
@@ -16,7 +16,7 @@ export default function MarkdownContentView({
     return (
         <div
             className="okp-md-preview okp-md-preview-content"
-            dangerouslySetInnerHTML={{ __html: renderMarkdownToHtml(content) }}
+            dangerouslySetInnerHTML={{ __html: renderMarkdownToSafePreviewHtml(content) }}
         />
     );
 }

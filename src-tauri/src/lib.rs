@@ -1,7 +1,11 @@
-﻿mod config;
+﻿mod commands;
+mod config;
 mod cookies;
+mod domain;
+mod entity_naming;
 mod profile;
 mod publish;
+mod services;
 mod title_pattern;
 mod torrent;
 

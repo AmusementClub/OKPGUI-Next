@@ -8,6 +8,10 @@ const host = process.env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
 export default defineConfig(async () => ({
+  build: {
+    minify: process.env.TAURI_ENV_DEBUG ? false : "esbuild",
+    target: process.env.TAURI_ENV_DEBUG ? "esnext" : "es2020",
+  },
   plugins: [react(), tailwindcss()],
   define: {
     __APP_VERSION__: JSON.stringify(packageJson.version),

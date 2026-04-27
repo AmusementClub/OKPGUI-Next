@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react';
 import EasyMDE from 'easymde';
 import hljs from 'highlight.js';
-import { renderMarkdownToHtml } from '../utils/markdown';
+import { renderMarkdownToSafePreviewHtml } from '../utils/markdown';
 
 interface EasyMarkdownEditorProps {
     editorKey?: string;
@@ -56,7 +56,7 @@ export default function EasyMarkdownEditor({
                 hljs,
                 singleLineBreaks: true,
             },
-            previewRender: (markdownPlaintext) => renderMarkdownToHtml(markdownPlaintext),
+            previewRender: (markdownPlaintext) => renderMarkdownToSafePreviewHtml(markdownPlaintext),
             spellChecker: false,
             status: false,
         });

@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { UnlistenFn } from '@tauri-apps/api/event';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import {
@@ -13,20 +13,32 @@ import {
     RefreshCw,
 } from 'lucide-react';
 import FileTree, { FileTreeNodeData } from '../components/FileTree';
-import ConsoleModal, {
-    PublishComplete,
-    PublishConsoleSite,
-    PublishOutput,
-    PublishSiteComplete,
-} from '../components/ConsoleModal';
+import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
+import {
+    createPublishConsoleSiteMap,
+    createPublishId,
+    usePublishTask,
+} from '../hooks/usePublishTask';
+import { useNoticeDialog } from '../hooks/useNoticeDialog';
 import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
+import {
+    ENTITY_NAME_MAX_LENGTH,
+    parseImportConflictName,
+    sanitizeEntityNameInput,
+    sanitizeExportFileStem,
+    trimEntityName,
+} from '../utils/entityNaming';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
+import { useLatest } from '../hooks/useLatest';
+import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
+import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
 import {
     DEFAULT_EP_PATTERN,
     DEFAULT_RESOLUTION_PATTERN,
@@ -78,6 +90,7 @@ interface ImportedTemplatePayload {
 }
 
 interface PublishAttemptContext {
+    publishId: string;
     templateName: string;
     publishedAt: string;
     publishedEpisode: string;
@@ -360,6 +373,8 @@ const getTorrentPathFromUriList = (uriList: string): string | null => {
 };
 
 export default function HomePage() {
+    const { requestImportConflictStrategy, importConflictDialog } = useImportConflictDialog();
+    const { showNotice, noticeDialog } = useNoticeDialog();
     // Template state
     const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
     const [currentTemplateName, setCurrentTemplateName] = useState('');
@@ -379,11 +394,7 @@ export default function HomePage() {
     // Modal state
     const [showConsole, setShowConsole] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
-    const [isPublishing, setIsPublishing] = useState(false);
     const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
-    const [publishSites, setPublishSites] = useState<Record<string, PublishConsoleSite>>({});
-    const [isPublishComplete, setIsPublishComplete] = useState(false);
-    const [publishResult, setPublishResult] = useState<PublishComplete | null>(null);
     const {
         siteLoginTests,
         isTestingAllSiteLogins,
@@ -393,26 +404,18 @@ export default function HomePage() {
         handleSiteLoginTest: hookHandleSiteLoginTest,
         handleTestAllSiteLogins: hookHandleTestAllSiteLogins,
     } = useSiteLoginTest();
-    const templateRef = useRef(template);
-    const currentTemplateNameRef = useRef(currentTemplateName);
+    const templateRef = useLatest(template);
+    const currentTemplateNameRef = useLatest(currentTemplateName);
+    const torrentInfoRef = useLatest(torrentInfo);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
-    const publishSiteSuccessRef = useRef<Partial<Record<keyof SiteSelection, boolean>>>({});
 
     // Load templates and profiles on mount
     useEffect(() => {
         loadProfileList();
         loadLastConfig();
     }, []);
-
-    useEffect(() => {
-        templateRef.current = template;
-    }, [template]);
-
-    useEffect(() => {
-        currentTemplateNameRef.current = currentTemplateName;
-    }, [currentTemplateName]);
 
     useEffect(() => {
         const hasPendingDescriptionSave =
@@ -425,7 +428,7 @@ export default function HomePage() {
 
         const saveTimer = window.setTimeout(() => {
             void persistTemplateToDisk(withSelectedProfile(templateRef.current));
-        }, 700);
+        }, AUTOSAVE_DEBOUNCE_MS);
 
         return () => {
             window.clearTimeout(saveTimer);
@@ -441,79 +444,6 @@ export default function HomePage() {
 
         void loadSelectedProfileData(selectedProfile);
     }, [selectedProfile]);
-
-    useEffect(() => {
-        let outputUnlisten: UnlistenFn | null = null;
-        let siteCompleteUnlisten: UnlistenFn | null = null;
-        let completeUnlisten: UnlistenFn | null = null;
-
-        const setupListeners = async () => {
-            outputUnlisten = await listen<PublishOutput>('publish-output', (event) => {
-                setPublishSites((current) => {
-                    const existing = current[event.payload.site_code] ?? {
-                        siteCode: event.payload.site_code,
-                        siteLabel: event.payload.site_label,
-                        lines: [],
-                        status: 'running' as const,
-                        message: '发布中...',
-                    };
-
-                    return {
-                        ...current,
-                        [event.payload.site_code]: {
-                            ...existing,
-                            status: 'running',
-                            message: '发布中...',
-                            lines: [
-                                ...existing.lines,
-                                {
-                                    text: event.payload.line,
-                                    isError: event.payload.is_stderr,
-                                },
-                            ],
-                        },
-                    };
-                });
-            });
-
-            siteCompleteUnlisten = await listen<PublishSiteComplete>('publish-site-complete', (event) => {
-                publishSiteSuccessRef.current[event.payload.site_code as keyof SiteSelection] = event.payload.success;
-
-                setPublishSites((current) => {
-                    const existing = current[event.payload.site_code] ?? {
-                        siteCode: event.payload.site_code,
-                        siteLabel: event.payload.site_label,
-                        lines: [],
-                        status: 'idle' as const,
-                        message: '',
-                    };
-
-                    return {
-                        ...current,
-                        [event.payload.site_code]: {
-                            ...existing,
-                            status: event.payload.success ? 'success' : 'error',
-                            message: event.payload.message,
-                        },
-                    };
-                });
-            });
-
-            completeUnlisten = await listen<PublishComplete>('publish-complete', (event) => {
-                setIsPublishComplete(true);
-                setPublishResult(event.payload);
-                void finalizePublishHistory();
-            });
-        };
-
-        void setupListeners();
-
-        return () => {
-            outputUnlisten?.();
-            siteCompleteUnlisten?.();
-            completeUnlisten?.();
-        };
-    }, []);
 
     const fetchConfig = () => invoke<ConfigPayload>('get_config');
 
@@ -594,7 +524,7 @@ export default function HomePage() {
 
     const getTemplateName = (explicitName?: string) => {
         const candidates = [explicitName, currentTemplateName, newTemplateName]
-            .map((value) => value?.trim() || '')
+            .map((value) => trimEntityName(value || ''))
             .filter((value) => value.length > 0);
 
         return candidates[0] || 'default';
@@ -612,17 +542,29 @@ export default function HomePage() {
         const name = getTemplateName(explicitName);
 
         try {
-            await invoke('save_template', { name, template: templateToSave });
-            lastPersistedDescriptionRef.current = templateToSave.description;
-            lastPersistedDescriptionHtmlRef.current = templateToSave.description_html;
-            setTemplate(templateToSave);
-            setCurrentTemplateName(name);
+            const saved = await invoke<ImportedTemplatePayload>('save_template', {
+                name,
+                template: templateToSave,
+                previousName: currentTemplateName || undefined,
+            });
+            const nextTemplate = normalizeTemplate(saved.template);
+
+            lastPersistedDescriptionRef.current = nextTemplate.description;
+            lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+            setTemplate(nextTemplate);
+            setCurrentTemplateName(saved.name);
             setNewTemplateName('');
             await refreshTemplateOptions();
-            return true;
+            return { name: saved.name, template: nextTemplate };
         } catch (e) {
             console.error('保存模板失败:', e);
-            return false;
+            if (explicitName) {
+                showNotice({
+                    title: '保存模板失败',
+                    message: typeof e === 'string' ? e : '保存模板失败。',
+                });
+            }
+            return null;
         }
     };
 
@@ -662,7 +604,7 @@ export default function HomePage() {
     };
 
     const matchTitle = useCallback(async (filename?: string, templateToMatch?: Template) => {
-        const name = filename || torrentInfo?.name;
+        const name = filename || torrentInfoRef.current?.name;
         const activeTemplate = templateToMatch || templateRef.current;
 
         if (!name || !activeTemplate.title_pattern.trim()) {
@@ -683,7 +625,7 @@ export default function HomePage() {
             console.error('匹配标题失败:', e);
             return '';
         }
-    }, [torrentInfo?.name]);
+    }, [torrentInfoRef]);
 
     const parseTorrent = useCallback(async (path: string) => {
         try {
@@ -701,7 +643,7 @@ export default function HomePage() {
         } catch (e) {
             console.error('解析种子文件失败:', e);
         }
-    }, [matchTitle]);
+    }, [matchTitle, templateRef]);
 
     useEffect(() => {
         let unlisten: UnlistenFn | null = null;
@@ -776,9 +718,28 @@ export default function HomePage() {
                 return;
             }
 
-            const imported = await invoke<ImportedTemplatePayload>('import_template_from_file', {
-                path: importPath,
-            });
+            const importTemplateWithStrategy = (conflictStrategy: 'reject' | 'overwrite' | 'copy') =>
+                invoke<ImportedTemplatePayload>('import_template_from_file', {
+                    path: importPath,
+                    conflictStrategy,
+                });
+
+            let imported: ImportedTemplatePayload;
+            try {
+                imported = await importTemplateWithStrategy('reject');
+            } catch (error) {
+                const conflictName = parseImportConflictName(error);
+                if (!conflictName) {
+                    throw error;
+                }
+
+                const strategy = await requestImportConflictStrategy('模板', conflictName);
+                if (!strategy) {
+                    return;
+                }
+
+                imported = await importTemplateWithStrategy(strategy);
+            }
             const nextTemplate = normalizeTemplate(imported.template);
 
             lastPersistedDescriptionRef.current = nextTemplate.description;
@@ -790,24 +751,28 @@ export default function HomePage() {
             await refreshTemplateOptions();
         } catch (e) {
             console.error('导入模板失败:', e);
+            showNotice({
+                title: '导入模板失败',
+                message: typeof e === 'string' ? e : '导入模板失败。',
+            });
         }
     };
 
     const handleExportTemplate = async () => {
-        const candidateName = currentTemplateName.trim() || newTemplateName.trim();
+        const candidateName = trimEntityName(currentTemplateName) || trimEntityName(newTemplateName);
         if (!candidateName) {
             return;
         }
 
         try {
             const templateToExport = withSelectedProfile(templateRef.current);
-            const persisted = await persistTemplateToDisk(templateToExport, candidateName);
-            if (!persisted) {
+            const savedTemplate = await persistTemplateToDisk(templateToExport, candidateName);
+            if (!savedTemplate) {
                 return;
             }
 
             const selectedPath = await save({
-                defaultPath: `${candidateName}.json`,
+                defaultPath: `${sanitizeExportFileStem(savedTemplate.name, 'template')}.json`,
                 filters: [{ name: '模板文件', extensions: ['json'] }],
             });
 
@@ -816,7 +781,7 @@ export default function HomePage() {
             }
 
             await invoke('export_template_to_file', {
-                name: candidateName,
+                name: savedTemplate.name,
                 path: selectedPath,
             });
         } catch (e) {
@@ -850,25 +815,25 @@ export default function HomePage() {
         }
     };
 
-    const finalizePublishHistory = async () => {
+    const finalizePublishHistory = useCallback(async (
+        publishId: string,
+        siteSuccess: Partial<Record<keyof SiteSelection, boolean>>,
+    ) => {
         const publishAttempt = publishAttemptRef.current;
         publishAttemptRef.current = null;
 
-        if (!publishAttempt) {
-            publishSiteSuccessRef.current = {};
+        if (!publishAttempt || publishAttempt.publishId !== publishId) {
             return;
         }
 
         const updates = publishAttempt.siteKeys
-            .filter((siteKey) => publishSiteSuccessRef.current[siteKey])
+            .filter((siteKey) => siteSuccess[siteKey])
             .map((siteKey) => ({
                 site_key: siteKey,
                 last_published_at: publishAttempt.publishedAt,
                 last_published_episode: publishAttempt.publishedEpisode,
                 last_published_resolution: publishAttempt.publishedResolution,
             }));
-
-        publishSiteSuccessRef.current = {};
 
         if (updates.length === 0) {
             return;
@@ -888,7 +853,28 @@ export default function HomePage() {
         } catch (e) {
             console.error('保存模板发布历史失败:', e);
         }
-    };
+    }, [currentTemplateNameRef, refreshTemplateOptions]);
+
+    const {
+        isPublishing,
+        publishSites,
+        isPublishComplete,
+        publishResult,
+        publishCompletion,
+        startPublishTask,
+        showPublishResult,
+        failActivePublish,
+        clearPublishCompletion,
+    } = usePublishTask<keyof SiteSelection>();
+
+    useEffect(() => {
+        if (!publishCompletion) {
+            return;
+        }
+
+        void finalizePublishHistory(publishCompletion.publishId, publishCompletion.siteSuccess);
+        clearPublishCompletion();
+    }, [clearPublishCompletion, finalizePublishHistory, publishCompletion]);
 
     const handlePatternBlur = async (
         field: 'ep_pattern' | 'resolution_pattern' | 'title_pattern',
@@ -1021,23 +1007,16 @@ export default function HomePage() {
     );
 
     useEffect(() => {
-        const selectableSiteKeys = new Set(
-            siteRows.filter((row) => row.selectable).map((row) => row.site.key),
+        const selectableSiteKeys = new Set<keyof SiteSelection>(
+            siteRows
+                .filter((row) => row.selectable)
+                .map((row) => row.site.key as keyof SiteSelection),
         );
 
         setTemplate((current) => {
-            const nextSites = { ...current.sites };
-            let hasChanges = false;
+            const nextSites = reconcileSelectableSiteSelection(current.sites, selectableSiteKeys);
 
-            for (const siteKey of Object.keys(nextSites) as (keyof SiteSelection)[]) {
-                const shouldBeSelected = selectableSiteKeys.has(siteKey);
-                if (nextSites[siteKey] !== shouldBeSelected) {
-                    nextSites[siteKey] = shouldBeSelected;
-                    hasChanges = true;
-                }
-            }
-
-            if (!hasChanges) {
+            if (nextSites === current.sites) {
                 return current;
             }
 
@@ -1065,28 +1044,24 @@ export default function HomePage() {
             );
             const combinedMessage = contentValidationIssues.map((issue) => issue.message).join('；');
 
-            setPublishSites(
-                Object.fromEntries(
+            showPublishResult(
+                createPublishConsoleSiteMap(
                     selectedSites.map((site) => {
                         const siteMessage = issueMessageMap.get(site.key) ?? '发布已取消：发布内容校验未通过。';
-                        return [
-                            site.key,
-                            {
-                                siteCode: site.key,
-                                siteLabel: site.label,
-                                lines: [{ text: siteMessage, isError: true }],
-                                status: 'error' as const,
-                                message: siteMessage,
-                            },
-                        ];
+                        return {
+                            siteCode: site.key,
+                            siteLabel: site.label,
+                            lines: [{ text: siteMessage, isError: true }],
+                            status: 'error' as const,
+                            message: siteMessage,
+                        };
                     }),
                 ),
+                {
+                    success: false,
+                    message: combinedMessage,
+                },
             );
-            setIsPublishComplete(true);
-            setPublishResult({
-                success: false,
-                message: combinedMessage,
-            });
             setShowConsole(true);
             return;
         }
@@ -1097,38 +1072,34 @@ export default function HomePage() {
         }
 
         const publishDetails = await resolvePublishDetails(templateToPublish, torrentInfo?.name);
+        const publishId = createPublishId();
 
         publishAttemptRef.current = {
-            templateName: publishTemplateName,
+            publishId,
+            templateName: saved.name,
             publishedAt: new Date().toISOString(),
             publishedEpisode: publishDetails.episode,
             publishedResolution: publishDetails.resolution,
             siteKeys: selectedSites.map((site) => site.key as keyof SiteSelection),
         };
-        publishSiteSuccessRef.current = {};
-
-        setPublishSites(
-            Object.fromEntries(
-                selectedSites.map((site) => [
-                        site.key,
-                        {
-                            siteCode: site.key,
-                            siteLabel: site.label,
-                            lines: [],
-                            status: 'running' as const,
-                            message: '等待 OKP 输出...',
-                        },
-                    ]),
+        startPublishTask(
+            publishId,
+            createPublishConsoleSiteMap(
+                selectedSites.map((site) => ({
+                    siteCode: site.key,
+                    siteLabel: site.label,
+                    lines: [],
+                    status: 'running' as const,
+                    message: '等待 OKP 输出...',
+                })),
             ),
         );
-        setIsPublishComplete(false);
-        setPublishResult(null);
         setShowConsole(true);
-        setIsPublishing(true);
 
         try {
             await invoke('publish', {
                 request: {
+                    publish_id: publishId,
                     torrent_path: torrentPath,
                     template_name: publishTemplateName,
                     profile_name: selectedProfile,
@@ -1137,30 +1108,7 @@ export default function HomePage() {
             });
         } catch (e) {
             console.error('发布失败:', e);
-            setPublishSites((current) => {
-                if (Object.keys(current).length === 0) {
-                    return current;
-                }
-
-                const firstSiteCode = Object.keys(current)[0];
-                const firstSite = current[firstSiteCode];
-                return {
-                    ...current,
-                    [firstSiteCode]: {
-                        ...firstSite,
-                        status: 'error',
-                        message: getErrorMessage(e),
-                        lines: [...firstSite.lines, { text: getErrorMessage(e), isError: true }],
-                    },
-                };
-            });
-            setIsPublishComplete(true);
-            setPublishResult({
-                success: false,
-                message: getErrorMessage(e),
-            });
-        } finally {
-            setIsPublishing(false);
+            failActivePublish(getErrorMessage(e), { appendToFirstSite: true });
         }
     };
     // Drag and drop handlers
@@ -1247,9 +1195,10 @@ export default function HomePage() {
                         <input
                             type="text"
                             value={newTemplateName}
-                            onChange={(e) => setNewTemplateName(e.target.value)}
+                            maxLength={ENTITY_NAME_MAX_LENGTH}
+                            onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
                             onBlur={(e) => {
-                                const trimmedName = e.target.value.trim();
+                                const trimmedName = trimEntityName(e.target.value);
                                 if (trimmedName) {
                                     autosaveTemplate(withSelectedProfile(templateRef.current), trimmedName);
                                 }
@@ -1644,6 +1593,8 @@ export default function HomePage() {
                 isComplete={isPublishComplete}
                 result={publishResult}
             />
+            {importConflictDialog}
+            {noticeDialog}
         </div>
     );
 }

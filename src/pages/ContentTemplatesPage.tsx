@@ -2,7 +2,10 @@ import { invoke } from '@tauri-apps/api/core';
 import { Copy, FileText, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import PublishContentEditor from '../components/PublishContentEditor';
+import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import { contentTemplateManagerConfig, useTemplateManager } from '../hooks/useTemplateManager';
+import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
+import { getTemplateSaveStateMeta } from '../utils/templateAutosave';
 import {
     QuickPublishConfigPayload,
     QuickPublishTemplate,
@@ -11,11 +14,16 @@ import {
 } from '../utils/quickPublish';
 
 export default function ContentTemplatesPage() {
-    const manager = useTemplateManager(contentTemplateManagerConfig);
+    const { requestImportConflictStrategy, importConflictDialog } = useImportConflictDialog();
+    const manager = useTemplateManager(contentTemplateManagerConfig, {
+        resolveImportConflict: requestImportConflictStrategy,
+    });
     const {
-        draft, selectedTemplateId, sortedTemplates, statusMessage, errorMessage,
+        draft, selectedTemplateId, sortedTemplates, statusMessage, errorMessage, hasPendingAutosave,
+        saveState, conflictState,
         updateDraft, selectTemplate, createTemplate, duplicateTemplate,
         importTemplate, exportTemplate, deleteTemplate,
+        reloadConflictDraft, overwriteConflictDraft, saveConflictAsCopy,
     } = manager;
 
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
@@ -26,6 +34,11 @@ export default function ContentTemplatesPage() {
                 .filter((template) => template.shared_content_template_id === selectedTemplateId)
                 .map((template) => template.name || template.id),
         [quickPublishTemplates, selectedTemplateId],
+    );
+
+    const saveStateMeta = useMemo(
+        () => getTemplateSaveStateMeta(saveState, hasPendingAutosave),
+        [hasPendingAutosave, saveState],
     );
 
     useEffect(() => {
@@ -45,6 +58,7 @@ export default function ContentTemplatesPage() {
     };
 
     return (
+        <>
         <div className="h-full overflow-y-auto bg-slate-900 px-6 py-6 text-slate-100">
             <div className="mx-auto flex max-w-7xl flex-col gap-6">
                 <header className="flex flex-wrap items-center justify-between gap-4">
@@ -102,6 +116,51 @@ export default function ContentTemplatesPage() {
                         </button>
                     </div>
                 </header>
+
+                <div className="flex flex-wrap items-center gap-3">
+                    <span className={`inline-flex items-center rounded-full border px-3 py-1 text-xs font-medium ${saveStateMeta.className}`}>
+                        {saveStateMeta.label}
+                    </span>
+                    <span className="text-xs text-slate-500">
+                        模板编辑采用防抖自动保存；检测到版本冲突时会暂停自动写回。
+                    </span>
+                </div>
+
+                {conflictState ? (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-4 text-sm text-amber-50">
+                        <div className="font-medium text-amber-100">检测到模板保存冲突</div>
+                        <p className="mt-1 text-amber-50/90">{conflictState.message}</p>
+                        <div className="mt-3 flex flex-wrap gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void reloadConflictDraft();
+                                }}
+                                className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs font-medium text-slate-100 transition-colors hover:bg-slate-800"
+                            >
+                                重新加载远端
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void overwriteConflictDraft();
+                                }}
+                                className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/20"
+                            >
+                                覆盖保存
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void saveConflictAsCopy();
+                                }}
+                                className="rounded-lg border border-slate-700 bg-slate-900/70 px-3 py-2 text-xs font-medium text-slate-100 transition-colors hover:bg-slate-800"
+                            >
+                                另存为副本
+                            </button>
+                        </div>
+                    </div>
+                ) : null}
 
                 {statusMessage ? (
                     <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
@@ -173,7 +232,13 @@ export default function ContentTemplatesPage() {
                                         <input
                                             type="text"
                                             value={draft.name}
-                                            onChange={(event) => updateDraft((current) => ({ ...current, name: event.target.value }))}
+                                            maxLength={ENTITY_NAME_MAX_LENGTH}
+                                            onChange={(event) =>
+                                                updateDraft((current) => ({
+                                                    ...current,
+                                                    name: sanitizeEntityNameInput(event.target.value),
+                                                }))
+                                            }
                                             placeholder="例如：字幕组通用尾巴"
                                             className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                                         />
@@ -271,5 +336,7 @@ export default function ContentTemplatesPage() {
                 </div>
             </div>
         </div>
+        {importConflictDialog}
+        </>
     );
 }

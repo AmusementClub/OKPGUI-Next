@@ -4,6 +4,7 @@ import {
     DEFAULT_TITLE_PATTERN,
     normalizeRuleTemplate,
 } from './titleRules';
+import { ENTITY_ID_MAX_LENGTH } from './entityNaming';
 
 export interface SiteSelection {
     dmhy: boolean;
@@ -30,6 +31,7 @@ export interface ContentTemplate {
     html: string;
     site_notes: string;
     updated_at: string;
+    revision: number;
 }
 
 export interface QuickPublishTemplate {
@@ -50,6 +52,7 @@ export interface QuickPublishTemplate {
     shared_content_template_id: string | null;
     publish_history: SitePublishHistory;
     updated_at: string;
+    revision: number;
 }
 
 export interface QuickPublishRuntimeDraft {
@@ -141,6 +144,7 @@ export function createDefaultContentTemplate(): ContentTemplate {
         html: '',
         site_notes: '',
         updated_at: '',
+        revision: 0,
     };
 }
 
@@ -163,7 +167,14 @@ export function createDefaultQuickPublishTemplate(): QuickPublishTemplate {
         shared_content_template_id: null,
         publish_history: createDefaultPublishHistory(),
         updated_at: '',
+        revision: 0,
     };
+}
+
+function normalizeTemplateRevision(value: unknown): number {
+    return typeof value === 'number' && Number.isInteger(value) && value >= 0
+        ? value
+        : 0;
 }
 
 export function createDefaultQuickPublishRuntimeDraft(): QuickPublishRuntimeDraft {
@@ -227,6 +238,7 @@ export function normalizeContentTemplate(template?: Partial<ContentTemplate>): C
         html: typeof template?.html === 'string' ? template.html : '',
         site_notes: typeof template?.site_notes === 'string' ? template.site_notes : '',
         updated_at: typeof template?.updated_at === 'string' ? template.updated_at : '',
+        revision: normalizeTemplateRevision(template?.revision),
     };
 }
 
@@ -263,6 +275,7 @@ export function normalizeQuickPublishTemplate(
                   : null,
         publish_history: normalizePublishHistory(template?.publish_history),
         updated_at: typeof template?.updated_at === 'string' ? template.updated_at : '',
+        revision: normalizeTemplateRevision(template?.revision),
     };
 }
 
@@ -283,18 +296,27 @@ export function composePublishContent(bodyContent: string, sharedContent: string
 
 export function createTemplateIdFromName(name: string, fallbackPrefix: string): string {
     const randomSuffix = Math.random().toString(36).slice(2, 8);
+    const suffix = `-${randomSuffix}`;
+    const maxBaseLength = Math.max(1, ENTITY_ID_MAX_LENGTH - suffix.length);
     const normalized = name
         .trim()
         .toLowerCase()
         .replace(/[^a-z0-9\u4e00-\u9fa5]+/g, '-')
         .replace(/^-+|-+$/g, '')
-        .slice(0, 60);
+        .slice(0, maxBaseLength);
+
+    const fallbackBase = fallbackPrefix
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, maxBaseLength) || 'template';
 
     if (normalized) {
-        return `${normalized}-${randomSuffix}`;
+        return `${normalized}${suffix}`;
     }
 
-    return `${fallbackPrefix}-${randomSuffix}`;
+    return `${fallbackBase}${suffix}`;
 }
 
 export function formatTemplateTimestamp(value: string): string {

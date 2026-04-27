@@ -1,6 +1,20 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
+import { useLatest } from '../hooks/useLatest';
+import {
+    createCopyEntityName,
+    ImportConflictStrategy,
+    parseImportConflictName,
+    sanitizeEntityNameInput,
+    sanitizeExportFileStem,
+    trimEntityName,
+} from '../utils/entityNaming';
+import {
+    parseTemplateRevisionConflict,
+    TemplateSaveState,
+} from '../utils/templateAutosave';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -30,10 +44,28 @@ interface TemplateManagerConfig<T extends AnyTemplate> {
     entityLabel: string;
 }
 
+interface TemplateManagerOptions {
+    resolveImportConflict?: (
+        entityLabel: string,
+        targetName: string,
+    ) => Promise<ImportConflictStrategy | null>;
+}
+
+interface PersistDraftOptions {
+    expectedRevision?: number | null;
+}
+
+export interface TemplateConflictState {
+    entityId: string;
+    currentRevision: number | null;
+    message: string;
+}
+
 function serializeForComparison<T extends AnyTemplate>(template: T): string {
     return JSON.stringify({
         ...template,
         updated_at: '',
+        revision: 0,
     });
 }
 
@@ -43,7 +75,8 @@ function buildPersistableTemplate<T extends AnyTemplate>(
     fallbackPrefix: string,
     fallbackName: string,
 ): T {
-    const name = (template as AnyTemplate).name.trim() || fallbackName;
+    const name =
+        trimEntityName(sanitizeEntityNameInput((template as AnyTemplate).name)) || fallbackName;
 
     return normalize({
         ...template,
@@ -51,6 +84,25 @@ function buildPersistableTemplate<T extends AnyTemplate>(
         name,
         updated_at: createUpdatedAtTimestamp(),
     } as Partial<T>);
+}
+
+function createCopyDraft<T extends AnyTemplate>(
+    template: T,
+    fallbackName: string,
+): T {
+    const duplicated = {
+        ...template,
+        id: '',
+        name: createCopyEntityName(template.name, fallbackName),
+        updated_at: '',
+        revision: 0,
+    } as T;
+
+    if ('publish_history' in duplicated) {
+        (duplicated as QuickPublishTemplate).publish_history = createDefaultPublishHistory();
+    }
+
+    return duplicated;
 }
 
 export interface TemplateManagerState<T extends AnyTemplate> {
@@ -61,6 +113,8 @@ export interface TemplateManagerState<T extends AnyTemplate> {
     statusMessage: string;
     errorMessage: string;
     hasPendingAutosave: boolean;
+    saveState: TemplateSaveState;
+    conflictState: TemplateConflictState | null;
 
     selectTemplate: (id: string) => void;
     createTemplate: () => void;
@@ -70,10 +124,14 @@ export interface TemplateManagerState<T extends AnyTemplate> {
     importTemplate: () => Promise<void>;
     exportTemplate: () => Promise<void>;
     loadData: (preferredId?: string) => Promise<void>;
+    reloadConflictDraft: () => Promise<void>;
+    overwriteConflictDraft: () => Promise<void>;
+    saveConflictAsCopy: () => Promise<void>;
 }
 
 export function useTemplateManager<T extends AnyTemplate>(
     config: TemplateManagerConfig<T>,
+    options: TemplateManagerOptions = {},
 ): TemplateManagerState<T> {
     const [templates, setTemplates] = useState<Record<string, T>>({});
     const [selectedTemplateId, setSelectedTemplateId] = useState('');
@@ -81,10 +139,11 @@ export function useTemplateManager<T extends AnyTemplate>(
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [hasPendingAutosave, setHasPendingAutosave] = useState(false);
-    const latestDraftRef = useRef(draft);
+    const [saveState, setSaveState] = useState<TemplateSaveState>('idle');
+    const [conflictState, setConflictState] = useState<TemplateConflictState | null>(null);
+    const latestDraftRef = useLatest(draft);
+    const conflictStateRef = useLatest(conflictState);
     const lastPersistedSnapshotRef = useRef(serializeForComparison(config.createDefault()));
-
-    latestDraftRef.current = draft;
 
     const sortedTemplates = useMemo(
         () =>
@@ -110,7 +169,7 @@ export function useTemplateManager<T extends AnyTemplate>(
 
         const autosaveTimer = window.setTimeout(() => {
             void persistDraft(latestDraftRef.current);
-        }, 700);
+        }, AUTOSAVE_DEBOUNCE_MS);
 
         return () => window.clearTimeout(autosaveTimer);
     }, [draft, hasPendingAutosave]);
@@ -141,6 +200,8 @@ export function useTemplateManager<T extends AnyTemplate>(
             setDraft(emptyDraft);
             lastPersistedSnapshotRef.current = serializeForComparison(emptyDraft);
             setHasPendingAutosave(false);
+            setConflictState(null);
+            setSaveState('idle');
             return;
         }
 
@@ -148,9 +209,14 @@ export function useTemplateManager<T extends AnyTemplate>(
         setDraft(nextTemplates[resolvedId]);
         lastPersistedSnapshotRef.current = serializeForComparison(nextTemplates[resolvedId]);
         setHasPendingAutosave(false);
+        setConflictState(null);
+        setSaveState('saved');
     };
 
-    const persistDraft = async (sourceDraft: T) => {
+    const persistDraft = async (
+        sourceDraft: T,
+        options: PersistDraftOptions = {},
+    ) => {
         const sourceSnapshot = serializeForComparison(sourceDraft);
         const templateToSave = buildPersistableTemplate(
             sourceDraft,
@@ -159,33 +225,78 @@ export function useTemplateManager<T extends AnyTemplate>(
             config.fallbackName,
         );
         const persistedSnapshot = serializeForComparison(templateToSave);
+        const expectedRevision = options.expectedRevision !== undefined
+            ? options.expectedRevision
+            : sourceDraft.id.trim()
+              ? sourceDraft.revision
+              : null;
 
         if (persistedSnapshot === lastPersistedSnapshotRef.current) {
             if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
                 setHasPendingAutosave(false);
+                if (!conflictStateRef.current) {
+                    setSaveState('saved');
+                }
             }
             return;
         }
 
         try {
-            await invoke(config.saveCommand, { template: templateToSave });
-            lastPersistedSnapshotRef.current = persistedSnapshot;
-            setTemplates((current) => ({
-                ...current,
-                [templateToSave.id]: templateToSave,
-            }));
-            setSelectedTemplateId(templateToSave.id);
+            const saved = await invoke<{ id: string; template: T }>(config.saveCommand, {
+                template: templateToSave,
+                expectedRevision,
+            });
+            const savedTemplate = config.normalize({
+                ...saved.template,
+                id: saved.id,
+            } as Partial<T>);
+            const savedSnapshot = serializeForComparison(savedTemplate);
+            const previousId = (sourceDraft as AnyTemplate).id.trim();
+
+            lastPersistedSnapshotRef.current = savedSnapshot;
+            setTemplates((current) => {
+                const nextTemplates = { ...current };
+                if (previousId && previousId !== saved.id) {
+                    delete nextTemplates[previousId];
+                }
+                nextTemplates[saved.id] = savedTemplate;
+                return nextTemplates;
+            });
+            setSelectedTemplateId(saved.id);
             setDraft((current) =>
                 serializeForComparison(current) === sourceSnapshot
-                    ? templateToSave
+                    ? savedTemplate
                     : current,
             );
             if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
                 setHasPendingAutosave(false);
             }
-            setStatusMessage(`${config.entityLabel}"${templateToSave.name}"已自动保存。`);
+            setConflictState(null);
+            setSaveState('saved');
+            setStatusMessage(`${config.entityLabel}"${savedTemplate.name}"已自动保存。`);
             setErrorMessage('');
         } catch (error) {
+            const conflict = parseTemplateRevisionConflict(error);
+            if (conflict) {
+                if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
+                    setHasPendingAutosave(false);
+                }
+                setConflictState({
+                    entityId: conflict.entity_id,
+                    currentRevision: conflict.current_revision,
+                    message: conflict.message,
+                });
+                setSaveState('conflict');
+                setErrorMessage(conflict.message);
+                setStatusMessage('');
+                return;
+            }
+
+            if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
+                setHasPendingAutosave(false);
+            }
+            setConflictState(null);
+            setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `自动保存${config.entityLabel}失败。`);
             setStatusMessage('');
         }
@@ -193,7 +304,18 @@ export function useTemplateManager<T extends AnyTemplate>(
 
     const updateDraft = (updater: (current: T) => T) => {
         setDraft((current) => updater(current));
+
+        if (conflictStateRef.current) {
+            setHasPendingAutosave(false);
+            setSaveState('conflict');
+            setStatusMessage('');
+            setErrorMessage(conflictStateRef.current.message);
+            return;
+        }
+
+        setConflictState(null);
         setHasPendingAutosave(true);
+        setSaveState('saving');
         setStatusMessage('');
         setErrorMessage('');
     };
@@ -204,6 +326,8 @@ export function useTemplateManager<T extends AnyTemplate>(
         setDraft(nextDraft);
         lastPersistedSnapshotRef.current = serializeForComparison(nextDraft);
         setHasPendingAutosave(false);
+        setConflictState(null);
+        setSaveState(id ? 'saved' : 'idle');
         setStatusMessage('');
         setErrorMessage('');
     };
@@ -213,28 +337,20 @@ export function useTemplateManager<T extends AnyTemplate>(
         setSelectedTemplateId('');
         setDraft(emptyDraft);
         setHasPendingAutosave(false);
+        setConflictState(null);
+        setSaveState('idle');
         setStatusMessage(`已创建空白${config.entityLabel}草稿。`);
         setErrorMessage('');
     };
 
     const duplicateTemplate = () => {
-        const duplicatedName = draft.name.trim() ? `${draft.name} 副本` : config.fallbackName;
-
-        const duplicated = {
-            ...draft,
-            id: '',
-            name: duplicatedName,
-            updated_at: '',
-        } as T;
-
-        // Clear publish_history for QuickPublishTemplate copies
-        if ('publish_history' in duplicated) {
-            (duplicated as QuickPublishTemplate).publish_history = createDefaultPublishHistory();
-        }
+        const duplicated = createCopyDraft(draft, config.fallbackName);
 
         setSelectedTemplateId('');
         setDraft(duplicated);
         setHasPendingAutosave(false);
+        setConflictState(null);
+        setSaveState('idle');
         setStatusMessage(`已基于当前${config.entityLabel}创建副本草稿。`);
         setErrorMessage('');
     };
@@ -251,15 +367,38 @@ export function useTemplateManager<T extends AnyTemplate>(
                 return;
             }
 
-            const imported = await invoke<{ id: string; template: T }>(
-                config.importCommand,
-                { path: importPath },
-            );
+            const importTemplateWithStrategy = (conflictStrategy: 'reject' | 'overwrite' | 'copy') =>
+                invoke<{ id: string; template: T }>(config.importCommand, {
+                    path: importPath,
+                    conflictStrategy,
+                });
+
+            let imported: { id: string; template: T };
+            try {
+                imported = await importTemplateWithStrategy('reject');
+            } catch (error) {
+                const conflictName = parseImportConflictName(error);
+                if (!conflictName) {
+                    throw error;
+                }
+
+                const strategy = options.resolveImportConflict
+                    ? await options.resolveImportConflict(config.entityLabel, conflictName)
+                    : null;
+                if (!strategy) {
+                    return;
+                }
+
+                imported = await importTemplateWithStrategy(strategy);
+            }
 
             await loadData(imported.id);
+            setSaveState('saved');
             setStatusMessage(`已导入${config.entityLabel}"${imported.template.name || imported.id}"。`);
             setErrorMessage('');
+            setConflictState(null);
         } catch (error) {
+            setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `导入${config.entityLabel}失败。`);
             setStatusMessage('');
         }
@@ -276,7 +415,7 @@ export function useTemplateManager<T extends AnyTemplate>(
         try {
             const name = draft.name.trim() || id;
             const selectedPath = await save({
-                defaultPath: `${name}.json`,
+                defaultPath: `${sanitizeExportFileStem(name, id)}.json`,
                 filters: [{ name: config.fileFilterName, extensions: ['json'] }],
             });
             if (!selectedPath) {
@@ -287,9 +426,11 @@ export function useTemplateManager<T extends AnyTemplate>(
                 id,
                 path: selectedPath,
             });
+            setConflictState(null);
             setStatusMessage(`已导出${config.entityLabel}"${name}"。`);
             setErrorMessage('');
         } catch (error) {
+            setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `导出${config.entityLabel}失败。`);
             setStatusMessage('');
         }
@@ -298,6 +439,8 @@ export function useTemplateManager<T extends AnyTemplate>(
     const deleteTemplate = async () => {
         if (!selectedTemplateId) {
             setDraft(config.createDefault());
+            setSaveState('idle');
+            setConflictState(null);
             return;
         }
 
@@ -305,12 +448,60 @@ export function useTemplateManager<T extends AnyTemplate>(
             await invoke(config.deleteCommand, { id: selectedTemplateId });
             const deletedName = draft.name || selectedTemplateId;
             await loadData();
+            setSaveState('saved');
+            setConflictState(null);
             setStatusMessage(`${config.entityLabel}"${deletedName}"已删除。`);
             setErrorMessage('');
         } catch (error) {
+            setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `删除${config.entityLabel}失败。`);
             setStatusMessage('');
         }
+    };
+
+    const reloadConflictDraft = async () => {
+        const currentConflict = conflictStateRef.current;
+        if (!currentConflict) {
+            return;
+        }
+
+        try {
+            await loadData(currentConflict.entityId);
+            setConflictState(null);
+            setSaveState('saved');
+            setStatusMessage(`已重新加载远端${config.entityLabel}。`);
+            setErrorMessage('');
+        } catch (error) {
+            setSaveState('failed');
+            setErrorMessage(typeof error === 'string' ? error : `重新加载${config.entityLabel}失败。`);
+            setStatusMessage('');
+        }
+    };
+
+    const overwriteConflictDraft = async () => {
+        const currentConflict = conflictStateRef.current;
+        if (!currentConflict) {
+            return;
+        }
+
+        setConflictState(null);
+        setStatusMessage('');
+        setErrorMessage('');
+        await persistDraft(latestDraftRef.current, {
+            expectedRevision: currentConflict.currentRevision,
+        });
+    };
+
+    const saveConflictAsCopy = async () => {
+        const duplicated = createCopyDraft(latestDraftRef.current, config.fallbackName);
+
+        setSelectedTemplateId('');
+        setDraft(duplicated);
+        setHasPendingAutosave(false);
+        setConflictState(null);
+        setStatusMessage('');
+        setErrorMessage('');
+        await persistDraft(duplicated, { expectedRevision: null });
     };
 
     return {
@@ -321,6 +512,8 @@ export function useTemplateManager<T extends AnyTemplate>(
         statusMessage,
         errorMessage,
         hasPendingAutosave,
+        saveState,
+        conflictState,
         selectTemplate,
         createTemplate,
         duplicateTemplate,
@@ -329,6 +522,9 @@ export function useTemplateManager<T extends AnyTemplate>(
         importTemplate,
         exportTemplate,
         loadData,
+        reloadConflictDraft,
+        overwriteConflictDraft,
+        saveConflictAsCopy,
     };
 }
 

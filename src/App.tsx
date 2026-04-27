@@ -1,13 +1,14 @@
 import { Transition } from '@headlessui/react';
-import { ComponentType, useEffect, useRef, useState } from 'react';
+import { ComponentType, lazy, Suspense, useEffect, useRef, useState } from 'react';
 import Sidebar, { Page } from './components/Sidebar';
-import ContentTemplatesPage from './pages/ContentTemplatesPage';
-import HomePage from './pages/HomePage';
-import IdentityPage from './pages/IdentityPage';
-import MiscPage from './pages/MiscPage';
-import QuickPublishPage from './pages/QuickPublishPage';
-import QuickPublishTemplatesPage from './pages/QuickPublishTemplatesPage';
 import { getStartupPagePreference } from './utils/appPreferences';
+
+const HomePage = lazy(() => import('./pages/HomePage'));
+const QuickPublishPage = lazy(() => import('./pages/QuickPublishPage'));
+const QuickPublishTemplatesPage = lazy(() => import('./pages/QuickPublishTemplatesPage'));
+const ContentTemplatesPage = lazy(() => import('./pages/ContentTemplatesPage'));
+const IdentityPage = lazy(() => import('./pages/IdentityPage'));
+const MiscPage = lazy(() => import('./pages/MiscPage'));
 
 const pageComponents: Record<Page, ComponentType> = {
     home: HomePage,
@@ -86,7 +87,9 @@ export default function App() {
                     leaveTo="pointer-events-none opacity-0 -translate-y-1 scale-[0.996] blur-[3px]"
                     className="h-full"
                 >
-                    <ActivePage />
+                    <Suspense fallback={<div className="h-full flex items-center justify-center text-slate-400">加载中...</div>}>
+                        <ActivePage />
+                    </Suspense>
                 </Transition>
             </main>
         </div>

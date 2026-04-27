@@ -1,3 +1,4 @@
+import DOMPurify from 'dompurify';
 import MarkdownIt from 'markdown-it';
 import hljs from 'highlight.js';
 
@@ -24,6 +25,12 @@ const markdownRenderer = new MarkdownIt({
     typographer: false,
 });
 
+const previewSanitizerConfig = {
+    USE_PROFILES: { html: true },
+    SANITIZE_NAMED_PROPS: true,
+    FORBID_TAGS: ['style', 'script', 'iframe', 'object', 'embed'],
+};
+
 function applyResponsiveImageConstraints(html: string) {
     if (typeof DOMParser === 'undefined') {
         return html;
@@ -42,4 +49,12 @@ function applyResponsiveImageConstraints(html: string) {
 
 export function renderMarkdownToHtml(markdown: string) {
     return applyResponsiveImageConstraints(markdownRenderer.render(markdown));
+}
+
+export function sanitizeHtmlForPreview(html: string) {
+    return DOMPurify.sanitize(html, previewSanitizerConfig);
+}
+
+export function renderMarkdownToSafePreviewHtml(markdown: string) {
+    return applyResponsiveImageConstraints(sanitizeHtmlForPreview(markdownRenderer.render(markdown)));
 }

@@ -1,4 +1,5 @@
-﻿use reqwest::Url;
+﻿use crate::entity_naming::{normalize_required_value, ENTITY_NAME_MAX_CHARS};
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -14,6 +15,7 @@ const DEFAULT_COOKIE_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x6
 const DEFAULT_COOKIE_EXPIRES_UNIX_SECONDS: i64 = 4_070_908_800;
 const HTTP_COOKIE_DATE_FORMAT: &[time::format_description::FormatItem<'static>] =
     format_description!("[weekday repr:short], [day padding:zero] [month repr:short] [year] [hour]:[minute]:[second] GMT");
+const PROFILE_STORE_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct SiteCookieStore {
@@ -68,16 +70,38 @@ pub struct Profile {
     pub acgnx_global_token: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileStore {
+    #[serde(default = "default_profile_store_schema_version")]
+    pub schema_version: u32,
     pub last_used: Option<String>,
     pub profiles: HashMap<String, Profile>,
+}
+
+impl Default for ProfileStore {
+    fn default() -> Self {
+        Self {
+            schema_version: default_profile_store_schema_version(),
+            last_used: None,
+            profiles: HashMap::new(),
+        }
+    }
+}
+
+fn default_profile_store_schema_version() -> u32 {
+    PROFILE_STORE_SCHEMA_VERSION
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct CookieImportResult {
     pub site_cookies: SiteCookies,
     pub user_agent: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedProfilePayload {
+    pub name: String,
+    pub profile: Profile,
 }
 
 #[derive(Debug, Clone)]
@@ -556,7 +580,12 @@ pub fn sync_profile_cookies(profile: &mut Profile) {
     }
 }
 
+fn normalize_profile_name(value: &str) -> Result<String, String> {
+    normalize_required_value(value, "身份配置名称", ENTITY_NAME_MAX_CHARS)
+}
+
 fn normalize_store(store: &mut ProfileStore) {
+    store.schema_version = PROFILE_STORE_SCHEMA_VERSION;
     for profile in store.profiles.values_mut() {
         sync_profile_cookies(profile);
     }
@@ -594,12 +623,33 @@ pub fn get_profile_list(app: AppHandle) -> Vec<String> {
 }
 
 #[tauri::command]
-pub fn save_profile(app: AppHandle, name: String, mut profile: Profile) {
+pub fn save_profile(
+    app: AppHandle,
+    name: String,
+    mut profile: Profile,
+    previous_name: Option<String>,
+) -> Result<SavedProfilePayload, String> {
+    let normalized_name = normalize_profile_name(&name)?;
     sync_profile_cookies(&mut profile);
     let mut store = load_profiles(&app);
-    store.profiles.insert(name.clone(), profile);
-    store.last_used = Some(name);
+    if let Some(previous_name) = previous_name.filter(|value| !value.trim().is_empty()) {
+        if previous_name != normalized_name && store.profiles.contains_key(&normalized_name) {
+            return Err(format!("已存在同名身份配置: {}", normalized_name));
+        }
+
+        if previous_name != normalized_name {
+            store.profiles.remove(&previous_name);
+        }
+    }
+
+    store.profiles.insert(normalized_name.clone(), profile.clone());
+    store.last_used = Some(normalized_name.clone());
     save_profiles(&app, &store);
+
+    Ok(SavedProfilePayload {
+        name: normalized_name,
+        profile,
+    })
 }
 
 #[tauri::command]
@@ -657,8 +707,25 @@ mod tests {
     #[test]
     fn test_default_store() {
         let store = ProfileStore::default();
+        assert_eq!(store.schema_version, PROFILE_STORE_SCHEMA_VERSION);
         assert!(store.profiles.is_empty());
         assert!(store.last_used.is_none());
+    }
+
+    #[test]
+    fn test_normalize_profile_name_rejects_control_chars() {
+        let error = normalize_profile_name("bad\nprofile")
+            .expect_err("expected control characters to be rejected");
+
+        assert!(error.contains("控制字符"));
+    }
+
+    #[test]
+    fn test_normalize_profile_name_rejects_overlong_values() {
+        let error = normalize_profile_name(&"a".repeat(ENTITY_NAME_MAX_CHARS + 1))
+            .expect_err("expected overlong names to be rejected");
+
+        assert!(error.contains(&ENTITY_NAME_MAX_CHARS.to_string()));
     }
 
     #[test]

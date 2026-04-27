@@ -5,6 +5,7 @@ import { ExternalLink, Terminal, X } from 'lucide-react';
 import { getPublishStatusBadgeClass, getPublishStatusLabel } from '../utils/siteStatus';
 
 export interface PublishOutput {
+    publish_id: string;
     site_code: string;
     site_label: string;
     line: string;
@@ -12,6 +13,7 @@ export interface PublishOutput {
 }
 
 export interface PublishSiteComplete {
+    publish_id: string;
     site_code: string;
     site_label: string;
     success: boolean;
@@ -19,6 +21,7 @@ export interface PublishSiteComplete {
 }
 
 export interface PublishComplete {
+    publish_id: string;
     success: boolean;
     message: string;
 }

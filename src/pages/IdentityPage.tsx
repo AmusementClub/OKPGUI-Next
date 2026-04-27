@@ -17,6 +17,7 @@ import CookieCaptureDialog, {
     CookieCaptureDialogMode,
     getCapturedCookieKey,
 } from '../components/CookieCaptureDialog';
+import { useNoticeDialog } from '../hooks/useNoticeDialog';
 import {
     buildCookieTextFromCapturedCookies,
     buildMergedCookieText,
@@ -33,6 +34,11 @@ import {
     getSiteLoginStateBadgeClass,
     getSiteLoginStateLabel,
 } from '../utils/siteStatus';
+import {
+    ENTITY_NAME_MAX_LENGTH,
+    sanitizeEntityNameInput,
+    trimEntityName,
+} from '../utils/entityNaming';
 import { siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 
 interface Profile {
@@ -69,6 +75,11 @@ interface CookieCaptureResult {
 interface CookieImportResult {
     site_cookies: SiteCookies;
     user_agent: string;
+}
+
+interface SavedProfilePayload {
+    name: string;
+    profile: Profile;
 }
 
 interface SiteConfig {
@@ -171,6 +182,7 @@ function normalizeProfile(profile?: Partial<Profile>): Profile {
 }
 
 export default function IdentityPage() {
+    const { showNotice, noticeDialog } = useNoticeDialog();
     const [profileList, setProfileList] = useState<string[]>([]);
     const [currentProfileName, setCurrentProfileName] = useState('');
     const [newProfileName, setNewProfileName] = useState('');
@@ -264,20 +276,30 @@ export default function IdentityPage() {
 
     const persistProfileToDisk = async (profileToSave: Profile, explicitName?: string) => {
         const name =
-            explicitName?.trim() ||
-            currentProfileName.trim() ||
-            newProfileName.trim() ||
+            trimEntityName(explicitName ?? '') ||
+            trimEntityName(currentProfileName) ||
+            trimEntityName(newProfileName) ||
             'default';
 
         try {
-            await invoke('save_profile', { name, profile: profileToSave });
-            setProfile(profileToSave);
-            setCurrentProfileName(name);
+            const saved = await invoke<SavedProfilePayload>('save_profile', {
+                name,
+                profile: profileToSave,
+                previousName: currentProfileName || undefined,
+            });
+            setProfile(normalizeProfile(saved.profile));
+            setCurrentProfileName(saved.name);
             setNewProfileName('');
             await loadProfileList();
             return true;
         } catch (error) {
             console.error('自动保存配置失败:', error);
+            if (explicitName) {
+                showNotice({
+                    title: '保存配置失败',
+                    message: typeof error === 'string' ? error : '保存配置失败。',
+                });
+            }
             return false;
         }
     };
@@ -600,9 +622,10 @@ export default function IdentityPage() {
                             <input
                                 type="text"
                                 value={newProfileName}
-                                onChange={(event) => setNewProfileName(event.target.value)}
+                                maxLength={ENTITY_NAME_MAX_LENGTH}
+                                onChange={(event) => setNewProfileName(sanitizeEntityNameInput(event.target.value))}
                                 onBlur={(event) => {
-                                    const trimmedName = event.target.value.trim();
+                                    const trimmedName = trimEntityName(event.target.value);
                                     if (trimmedName) {
                                         autosaveProfile(profile, trimmedName);
                                     }
@@ -874,6 +897,7 @@ export default function IdentityPage() {
                 onToggleCookie={toggleCookieSelection}
                 onSubmitSelection={saveSelectedCookies}
             />
+            {noticeDialog}
         </>
     );
 }
