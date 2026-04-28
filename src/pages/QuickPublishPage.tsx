@@ -672,8 +672,8 @@ export default function QuickPublishPage() {
 
                         <label className="mt-4 block text-sm text-slate-300">
                             <span className="mb-2 block text-xs text-slate-500">最终发布标题</span>
-                            <input
-                                type="text"
+                            <textarea
+                                rows={2}
                                 value={draft.title}
                                 onChange={(event) =>
                                     setDraft((current) => ({
@@ -683,7 +683,7 @@ export default function QuickPublishPage() {
                                     }))
                                 }
                                 placeholder="最终发布标题"
-                                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 resize-y"
                             />
                         </label>
                     </div>
