@@ -8,11 +8,13 @@ import {
     RefreshCw,
     RotateCcw,
     Send,
+    Terminal,
     Trash2,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ConsoleModal from '../components/ConsoleModal';
 import FileTree from '../components/FileTree';
+import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import {
@@ -73,6 +75,20 @@ function formatTimestamp(value: string) {
         .replace(/\//g, '-');
 }
 
+function formatBytes(bytes?: number): string {
+    if (bytes === undefined || bytes === null || !Number.isFinite(bytes) || bytes <= 0) {
+        return '未知';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
 function getLatestPublishedAt(template: QuickPublishTemplate) {
     return quickPublishSiteKeys.reduce((latest, siteKey) => {
         const publishedAt = template.publish_history[siteKey].last_published_at;
@@ -93,6 +109,7 @@ function buildTemplateOptions(templates: Record<string, QuickPublishTemplate>): 
 export default function QuickPublishPage() {
     const [isDragging, setIsDragging] = useState(false);
     const [showConsole, setShowConsole] = useState(false);
+    const [showConfirm, setShowConfirm] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
@@ -309,38 +326,33 @@ export default function QuickPublishPage() {
         clearPublishCompletion();
     }, [clearPublishCompletion, finalizePublishHistory, publishCompletion]);
 
-    const publish = async () => {
+    function validateBeforePublish(): string | null {
         if (!activeTemplate) {
-            setErrorMessage('请先选择一个快速发布模板。');
-            return;
+            return '请先选择一个快速发布模板。';
         }
-
         if (!draft.torrent_path.trim()) {
-            setErrorMessage('请先选择一个种子文件。');
-            return;
+            return '请先选择一个种子文件。';
         }
-
         if (!draft.title.trim()) {
-            setErrorMessage('请先填写发布标题。');
-            return;
+            return '请先填写发布标题。';
         }
-
         if (!draft.profile.trim()) {
-            setErrorMessage('请先选择一个身份。');
-            return;
+            return '请先选择一个身份。';
         }
-
         if (!okpExecutablePath.trim()) {
-            setErrorMessage('请先在旧主页里配置 OKP 可执行文件路径。');
-            return;
+            return '请先在旧主页里配置 OKP 可执行文件路径。';
         }
-
         const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draft.sites[siteKey]);
         if (selectedSiteKeys.length === 0) {
-            setErrorMessage('请至少选择一个发布站点。');
-            return;
+            return '请至少选择一个发布站点。';
         }
+        return null;
+    }
 
+    const startPublish = async (autoOpenConsole: boolean) => {
+        if (!activeTemplate) return;
+
+        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draft.sites[siteKey]);
         const publishTemplatePayload = buildLegacyPublishTemplatePayload(draft, activeTemplate);
         const publishId = createPublishId();
         const nextPublishSites = createPublishConsoleSiteMap(
@@ -361,7 +373,9 @@ export default function QuickPublishPage() {
             publishedResolution: draft.resolution,
             siteKeys: selectedSiteKeys,
         };
-        setShowConsole(true);
+        if (autoOpenConsole) {
+            setShowConsole(true);
+        }
         startPublishTask(publishId, nextPublishSites);
         setStatusMessage('');
         setErrorMessage('');
@@ -383,6 +397,30 @@ export default function QuickPublishPage() {
         }
     };
 
+    const handlePublishClick = () => {
+        const error = validateBeforePublish();
+        if (error) {
+            setErrorMessage(error);
+            return;
+        }
+        setErrorMessage('');
+        setStatusMessage('');
+        setShowConfirm(true);
+    };
+
+    const selectedSiteSummaries = useMemo(
+        () =>
+            siteRows
+                .filter((row) => draft.sites[row.site.key as keyof SiteSelection])
+                .map((row) => ({
+                    key: row.site.key as keyof SiteSelection,
+                    label: row.site.label,
+                    identityText: row.identityText,
+                    identityToneClass: row.identityClass,
+                })),
+        [siteRows, draft.sites],
+    );
+
     const handleSiteLoginTest = (site: SiteDefinition) => {
         void hookHandleSiteLoginTest(site, selectedProfileData);
     };
@@ -394,6 +432,8 @@ export default function QuickPublishPage() {
     return (
         <div className="h-full overflow-y-auto bg-slate-900 px-6 py-6 text-slate-100">
             <div className="mx-auto flex max-w-7xl flex-col gap-6">
+
+                {/* 1. PageHeader */}
                 <header className="flex flex-wrap items-center justify-between gap-4">
                     <div>
                         <p className="text-xs uppercase tracking-[0.24em] text-cyan-400/80">快速模板发布</p>
@@ -402,30 +442,18 @@ export default function QuickPublishPage() {
                             这里是运行时装配页。发布模板提供默认值，你可以在本次发布里覆盖标题、正文、身份与站点，但这些覆盖默认不会回写模板。
                         </p>
                     </div>
-                    <div className="flex items-center gap-2">
-                        <button
-                            type="button"
-                            onClick={resetToTemplateDefaults}
-                            disabled={!activeTemplate}
-                            className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                            <RotateCcw size={16} />
-                            重置为模板默认值
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void publish();
-                            }}
-                            disabled={isPublishing || !activeTemplate}
-                            className="hidden items-center gap-2 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-4 py-2 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
-                        >
-                            {isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
-                            发布已选站点
-                        </button>
-                    </div>
+                    <button
+                        type="button"
+                        onClick={resetToTemplateDefaults}
+                        disabled={!activeTemplate}
+                        className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        <RotateCcw size={16} />
+                        重置为模板默认值
+                    </button>
                 </header>
 
+                {/* 2. Status / error banners */}
                 {statusMessage ? (
                     <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
                         {statusMessage}
@@ -437,8 +465,12 @@ export default function QuickPublishPage() {
                     </div>
                 ) : null}
 
-                <section className="order-1 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                    <div className="grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)] xl:items-start">
+                {/* 3. Template section — STEP 1 */}
+                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                        STEP 1 · TEMPLATE
+                    </div>
+                    <div className="mt-3 grid gap-6 xl:grid-cols-[minmax(0,1.15fr)_minmax(280px,0.85fr)] xl:items-start">
                         <div>
                             <h2 className="text-sm font-medium text-slate-200">发布模板选择</h2>
                             <p className="mt-1 text-xs text-slate-500">先选本次发布要套用的模板，标题和正文会按这里的默认值初始化。</p>
@@ -464,112 +496,57 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <section className="order-5 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                    <h2 className="text-sm font-medium text-slate-200">状态</h2>
-                    <div className="mt-4 grid gap-4 xl:grid-cols-4">
-                        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                            <div className="text-xs text-slate-500">标题覆盖</div>
-                            <div className="mt-2 text-sm font-medium text-slate-100">
-                                {draft.is_title_overridden ? '已覆盖' : '使用模板默认/自动生成'}
+                {/* 4. Torrent | Metadata two-col grid — STEP 2 / STEP 3 */}
+                <section className="grid gap-6 xl:grid-cols-2 xl:items-stretch">
+                    {/* Torrent — STEP 2 */}
+                    <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                        <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                            STEP 2 · TORRENT
+                        </div>
+                        <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                            <div>
+                                <h2 className="text-sm font-medium text-slate-200">发布准备</h2>
+                                <p className="mt-1 text-xs text-slate-500">支持文件选择和拖拽导入 .torrent。</p>
                             </div>
-                        </div>
-                        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                            <div className="text-xs text-slate-500">正文覆盖</div>
-                            <div className="mt-2 text-sm font-medium text-slate-100">
-                                {draft.is_content_overridden ? '已覆盖' : '使用模板默认正文'}
-                            </div>
-                        </div>
-                        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                            <div className="text-xs text-slate-500">解析集数</div>
-                            <div className="mt-2 text-sm font-medium text-slate-100">{draft.episode || '未解析'}</div>
-                        </div>
-                        <div className="rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                            <div className="text-xs text-slate-500">解析分辨率</div>
-                            <div className="mt-2 text-sm font-medium text-slate-100">{draft.resolution || '未解析'}</div>
-                        </div>
-                    </div>
-                    <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3">
-                        <div className="flex flex-wrap items-start justify-between gap-3">
-                            <div className="min-w-0 flex-1">
-                                <div className="text-xs text-slate-500">OKP 路径</div>
-                                <div className="mt-2 truncate text-sm font-medium text-slate-100" title={okpExecutablePath || '未配置'}>
-                                    {okpExecutablePath || '未配置'}
-                                </div>
-                            </div>
-                            <div className="flex gap-2">
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        void selectOkpExecutable();
-                                    }}
-                                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
-                                >
-                                    <FolderOpen size={15} />
-                                    选择 OKP
-                                </button>
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        void clearOkpExecutablePath();
-                                    }}
-                                    disabled={!okpExecutablePath}
-                                    className="inline-flex items-center justify-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
-                                >
-                                    <Trash2 size={15} />
-                                    清空
-                                </button>
-                            </div>
-                        </div>
-                        <div className="mt-3 text-xs text-slate-500">
-                            Windows 请选择 OKP.Core.exe 或 OKP.Core.dll。当前路径保存在全局配置中，与旧主页共享。
-                        </div>
-                    </div>
-                </section>
-
-                <section className="order-3 grid gap-6 xl:grid-cols-2 xl:items-stretch">
-                    <div className="space-y-6">
-                        <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                            <div className="flex flex-wrap items-center justify-between gap-3">
-                                <div>
-                                    <h2 className="text-sm font-medium text-slate-200">发布准备</h2>
-                                    <p className="mt-1 text-xs text-slate-500">支持文件选择和拖拽导入 .torrent。</p>
-                                </div>
-                                <button
-                                    type="button"
-                                    onClick={() => {
-                                        void selectTorrentFile();
-                                    }}
-                                    className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
-                                >
-                                    <FolderOpen size={16} />
-                                    选择种子
-                                </button>
-                            </div>
-
-                            <div
-                                className={`mt-4 rounded-2xl border px-4 py-4 transition-colors ${
-                                    isDragging
-                                        ? 'border-cyan-400/40 bg-cyan-500/10'
-                                        : 'border-dashed border-slate-700 bg-slate-900/60'
-                                }`}
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void selectTorrentFile();
+                                }}
+                                className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
                             >
-                                <div className="text-sm text-slate-200">{draft.torrent_path || '拖拽 .torrent 到窗口任意位置，或点击上方按钮选择文件。'}</div>
-                                <div className="mt-2 text-xs text-slate-500">
-                                    {torrentInfo ? `种子名称：${torrentInfo.name}` : '选择后会自动解析文件树。'}
-                                </div>
-                            </div>
+                                <FolderOpen size={16} />
+                                选择种子
+                            </button>
+                        </div>
 
-                            <div className="mt-4">
-                                <FileTree root={torrentInfo?.file_tree ?? null} totalSize={torrentInfo?.total_size} />
+                        <div
+                            className={`mt-4 rounded-2xl border px-4 py-4 transition-colors ${
+                                isDragging
+                                    ? 'border-cyan-400/40 bg-cyan-500/10'
+                                    : 'border-dashed border-slate-700 bg-slate-900/60'
+                            }`}
+                        >
+                            <div className="text-sm text-slate-200">{draft.torrent_path || '拖拽 .torrent 到窗口任意位置，或点击上方按钮选择文件。'}</div>
+                            <div className="mt-2 text-xs text-slate-500">
+                                {torrentInfo ? `种子名称：${torrentInfo.name}` : '选择后会自动解析文件树。'}
                             </div>
+                        </div>
+
+                        <div className="mt-4">
+                            <FileTree root={torrentInfo?.file_tree ?? null} totalSize={torrentInfo?.total_size} />
                         </div>
                     </div>
 
+                    {/* Metadata — STEP 3 */}
                     <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5 xl:flex xl:h-full xl:flex-col">
-                        <h2 className="text-sm font-medium text-slate-200">发布参数</h2>
+                        <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                            STEP 3 · PARAMS
+                        </div>
+                        <h2 className="mt-3 text-sm font-medium text-slate-200">发布参数</h2>
                         <div className="mt-4 space-y-4 xl:grid xl:flex-1 xl:grid-rows-4 xl:gap-4 xl:space-y-0">
                             <label className="block text-sm text-slate-300 xl:flex xl:h-full xl:flex-col">
-                                <span className="mb-2 block text-xs text-slate-500">身份</span>
+                                <span className="mb-2 block font-mono text-[11px] tracking-[0.08em] uppercase text-slate-500">身份</span>
                                 <select
                                     value={draft.profile}
                                     onChange={(event) => setDraft((current) => ({ ...current, profile: event.target.value }))}
@@ -585,7 +562,7 @@ export default function QuickPublishPage() {
                             </label>
 
                             <label className="block text-sm text-slate-300 xl:flex xl:h-full xl:flex-col">
-                                <span className="mb-2 block text-xs text-slate-500">Poster</span>
+                                <span className="mb-2 block font-mono text-[11px] tracking-[0.08em] uppercase text-slate-500">Poster</span>
                                 <input
                                     type="text"
                                     value={draft.poster}
@@ -596,7 +573,7 @@ export default function QuickPublishPage() {
                             </label>
 
                             <label className="block text-sm text-slate-300 xl:flex xl:h-full xl:flex-col">
-                                <span className="mb-2 block text-xs text-slate-500">About</span>
+                                <span className="mb-2 block font-mono text-[11px] tracking-[0.08em] uppercase text-slate-500">About</span>
                                 <input
                                     type="text"
                                     value={draft.about}
@@ -607,7 +584,7 @@ export default function QuickPublishPage() {
                             </label>
 
                             <label className="block text-sm text-slate-300 xl:flex xl:h-full xl:flex-col">
-                                <span className="mb-2 block text-xs text-slate-500">Tags</span>
+                                <span className="mb-2 block font-mono text-[11px] tracking-[0.08em] uppercase text-slate-500">Tags</span>
                                 <input
                                     type="text"
                                     value={draft.tags}
@@ -620,13 +597,27 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <section className="order-2 space-y-6">
-                    <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                        <div className="flex items-center justify-between gap-3">
-                            <div>
-                                <h2 className="text-sm font-medium text-slate-200">标题</h2>
-                                <p className="mt-1 text-xs text-slate-500">可按模板规则生成建议标题，也可以手动覆盖。</p>
-                            </div>
+                {/* 5. Title section — STEP 3 · TITLE */}
+                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                        STEP 3 · TITLE
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                            <h2 className="text-sm font-medium text-slate-200">标题</h2>
+                            <p className="mt-1 text-xs text-slate-500">可按模板规则生成建议标题，也可以手动覆盖。</p>
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2">
+                            {draft.episode ? (
+                                <span className="inline-flex items-center rounded-full border border-emerald-400/40 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-200">
+                                    EP {draft.episode}
+                                </span>
+                            ) : null}
+                            {draft.resolution ? (
+                                <span className="inline-flex items-center rounded-full border border-emerald-400/40 bg-emerald-500/10 px-2.5 py-0.5 text-[11px] font-medium text-emerald-200">
+                                    {draft.resolution}
+                                </span>
+                            ) : null}
                             <button
                                 type="button"
                                 onClick={() => {
@@ -639,125 +630,133 @@ export default function QuickPublishPage() {
                                 重新生成标题
                             </button>
                         </div>
+                    </div>
 
-                        <div className="mt-4 grid gap-4 md:grid-cols-3">
-                            <label className="block text-sm text-slate-300">
-                                <span className="mb-2 block text-xs text-slate-500">集数正则</span>
-                                <input
-                                    type="text"
-                                    value={activeTemplate?.ep_pattern ?? ''}
-                                    readOnly
-                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                                />
-                            </label>
-                            <label className="block text-sm text-slate-300">
-                                <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
-                                <input
-                                    type="text"
-                                    value={activeTemplate?.resolution_pattern ?? ''}
-                                    readOnly
-                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                                />
-                            </label>
-                            <label className="block text-sm text-slate-300">
-                                <span className="mb-2 block text-xs text-slate-500">标题模板</span>
-                                <input
-                                    type="text"
-                                    value={activeTemplate?.title_pattern ?? ''}
-                                    readOnly
-                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm text-slate-400"
-                                />
-                            </label>
-                        </div>
-
-                        <label className="mt-4 block text-sm text-slate-300">
-                            <span className="mb-2 block text-xs text-slate-500">最终发布标题</span>
-                            <textarea
-                                rows={2}
-                                value={draft.title}
-                                onChange={(event) =>
-                                    setDraft((current) => ({
-                                        ...current,
-                                        title: event.target.value,
-                                        is_title_overridden: true,
-                                    }))
-                                }
-                                placeholder="最终发布标题"
-                                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 resize-y"
+                    <div className="mt-4 grid gap-4 md:grid-cols-3">
+                        <label className="block text-sm text-slate-300">
+                            <span className="mb-2 block text-xs text-slate-500">集数正则</span>
+                            <input
+                                type="text"
+                                value={activeTemplate?.ep_pattern ?? ''}
+                                readOnly
+                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                            />
+                        </label>
+                        <label className="block text-sm text-slate-300">
+                            <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
+                            <input
+                                type="text"
+                                value={activeTemplate?.resolution_pattern ?? ''}
+                                readOnly
+                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                            />
+                        </label>
+                        <label className="block text-sm text-slate-300">
+                            <span className="mb-2 block text-xs text-slate-500">标题模板</span>
+                            <input
+                                type="text"
+                                value={activeTemplate?.title_pattern ?? ''}
+                                readOnly
+                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 text-sm text-slate-400"
                             />
                         </label>
                     </div>
 
-                    <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                        <div className="flex flex-wrap items-center justify-between gap-3">
-                            <div>
-                                <h2 className="text-sm font-medium text-slate-200">正文</h2>
-                                <p className="mt-1 text-xs text-slate-500">发布模板自带正文主体，这里可以临时切换公共正文模板，或直接覆盖最终正文。</p>
-                            </div>
-                            <div className="flex items-center gap-3">
-                                <select
-                                    value={draft.shared_content_template_id ?? ''}
-                                    onChange={(event) => switchRuntimeContentTemplate(event.target.value)}
-                                    className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                                >
-                                    <option value="">不使用公共正文模板</option>
-                                    {Object.values(contentTemplates)
-                                        .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
-                                        .map((template) => (
-                                            <option key={template.id} value={template.id}>
-                                                {template.name || template.id}
-                                            </option>
-                                        ))}
-                                </select>
-                            </div>
-                        </div>
+                    <label className="mt-4 block text-sm text-slate-300">
+                        <span className="mb-2 block text-xs text-slate-500">最终发布标题</span>
+                        <textarea
+                            rows={2}
+                            value={draft.title}
+                            onChange={(event) =>
+                                setDraft((current) => ({
+                                    ...current,
+                                    title: event.target.value,
+                                    is_title_overridden: true,
+                                }))
+                            }
+                            placeholder="最终发布标题"
+                            className="w-full resize-y rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                        />
+                    </label>
+                </section>
 
-                        <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-300">
-                            <div className="flex items-center gap-2 text-slate-200">
-                                <FileText size={15} />
-                                {activeSharedContentTemplate?.name || '当前未关联公共正文模板'}
-                            </div>
-                            <p className="mt-2 text-xs text-slate-500">
-                                {activeSharedContentTemplate?.site_notes || '最终正文由发布模板正文主体和公共正文模板共同组成；站点转换仍交给上游 OKP 处理。'}
-                            </p>
+                {/* 6. Body section — STEP 4 · BODY */}
+                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                        STEP 4 · BODY
+                    </div>
+                    <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+                        <div>
+                            <h2 className="text-sm font-medium text-slate-200">正文</h2>
+                            <p className="mt-1 text-xs text-slate-500">发布模板自带正文主体，这里可以临时切换公共正文模板，或直接覆盖最终正文。</p>
                         </div>
+                        <div className="flex items-center gap-3">
+                            <select
+                                value={draft.shared_content_template_id ?? ''}
+                                onChange={(event) => switchRuntimeContentTemplate(event.target.value)}
+                                className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                            >
+                                <option value="">不使用公共正文模板</option>
+                                {Object.values(contentTemplates)
+                                    .sort((left, right) => left.name.localeCompare(right.name, 'zh-CN'))
+                                    .map((template) => (
+                                        <option key={template.id} value={template.id}>
+                                            {template.name || template.id}
+                                        </option>
+                                    ))}
+                            </select>
+                        </div>
+                    </div>
 
-                        <div className="mt-4">
-                            <PublishContentEditor
-                                contentKey={draft.template_id ?? 'quick-publish-runtime'}
-                                markdown={draft.markdown}
-                                html={draft.html}
-                                onMarkdownChange={(markdown) =>
-                                    setDraft((current) => ({
-                                        ...current,
-                                        markdown,
-                                        is_content_overridden: true,
-                                    }))
-                                }
-                                onHtmlChange={(html) =>
-                                    setDraft((current) => ({
-                                        ...current,
-                                        html,
-                                        is_content_overridden: true,
-                                    }))
-                                }
-                            />
+                    <div className="mt-4 rounded-2xl border border-slate-800 bg-slate-900/60 px-4 py-3 text-sm text-slate-300">
+                        <div className="flex items-center gap-2 text-slate-200">
+                            <FileText size={15} />
+                            {activeSharedContentTemplate?.name || '当前未关联公共正文模板'}
                         </div>
+                        <p className="mt-2 text-xs text-slate-500">
+                            {activeSharedContentTemplate?.site_notes || '最终正文由发布模板正文主体和公共正文模板共同组成；站点转换仍交给上游 OKP 处理。'}
+                        </p>
+                    </div>
+
+                    <div className="mt-4">
+                        <PublishContentEditor
+                            contentKey={draft.template_id ?? 'quick-publish-runtime'}
+                            markdown={draft.markdown}
+                            html={draft.html}
+                            onMarkdownChange={(markdown) =>
+                                setDraft((current) => ({
+                                    ...current,
+                                    markdown,
+                                    is_content_overridden: true,
+                                }))
+                            }
+                            onHtmlChange={(html) =>
+                                setDraft((current) => ({
+                                    ...current,
+                                    html,
+                                    is_content_overridden: true,
+                                }))
+                            }
+                        />
                     </div>
                 </section>
 
-                <section className="order-4 rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
-                    <h2 className="text-sm font-medium text-slate-200">站点选择</h2>
+                {/* 7. Site table — STEP 5 · SITES */}
+                <section className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
+                    <div className="font-mono text-[11px] tracking-[0.18em] uppercase text-slate-500">
+                        STEP 5 · SITES
+                    </div>
+                    <h2 className="mt-3 text-sm font-medium text-slate-200">站点选择</h2>
                     <div className="mt-4 overflow-hidden rounded-2xl border border-slate-800 bg-slate-900/60">
                         <div className="overflow-x-auto">
                             <table className="min-w-full text-left text-sm text-slate-300">
-                                <thead className="bg-slate-800/80 text-xs uppercase tracking-wide text-slate-500">
+                                <thead className="bg-slate-800/80">
                                     <tr>
-                                        <th className="w-16 px-4 py-3 font-medium">选择</th>
-                                        <th className="px-4 py-3 font-medium">站点</th>
-                                        <th className="w-32 px-4 py-3 font-medium">最后发布</th>
-                                        <th className="px-4 py-3 font-medium">身份状态</th>
-                                        <th className="w-36 px-4 py-3 font-medium">
+                                        <th className="w-16 px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">选择</th>
+                                        <th className="px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">站点</th>
+                                        <th className="w-32 px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">最后发布</th>
+                                        <th className="px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">身份状态</th>
+                                        <th className="w-36 px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">
                                             <button
                                                 type="button"
                                                 onClick={() => {
@@ -783,7 +782,7 @@ export default function QuickPublishPage() {
                                                 )}
                                             </button>
                                         </th>
-                                        <th className="w-32 px-4 py-3 font-medium">发布状态</th>
+                                        <th className="w-32 px-4 py-3 font-mono text-[10.5px] font-medium uppercase tracking-[0.12em] text-slate-500">发布状态</th>
                                     </tr>
                                 </thead>
                                 <tbody>
@@ -807,7 +806,10 @@ export default function QuickPublishPage() {
                                                     className="h-4 w-4 rounded border-slate-600 bg-slate-800 text-cyan-500 focus:ring-cyan-500"
                                                 />
                                             </td>
-                                            <td className="px-4 py-3 align-middle font-medium text-slate-100">{site.label}</td>
+                                            <td className="px-4 py-3 align-middle font-medium text-slate-100">
+                                                <div>{site.label}</div>
+                                                <div className="font-mono text-[11px] text-slate-500">{site.key}</div>
+                                            </td>
                                             <td className="px-4 py-3 align-middle text-xs text-slate-400">
                                                 {formatTimestamp(activeTemplate?.publish_history[site.key as keyof SiteSelection].last_published_at ?? '')}
                                             </td>
@@ -855,14 +857,57 @@ export default function QuickPublishPage() {
                     </div>
                 </section>
 
-                <div className="order-6">
+                {/* 8. OKP path row — standalone slim card */}
+                <div className="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-950/50 px-4 py-3">
+                    <Terminal size={15} className="text-cyan-300" />
+                    <div className="min-w-0 flex-1">
+                        <div className="font-mono text-[11px] tracking-[0.06em] uppercase text-slate-500">OKP.CORE 路径</div>
+                        <div className="mt-1 truncate font-mono text-xs text-slate-100" title={okpExecutablePath || '未配置'}>
+                            {okpExecutablePath || '未配置'}
+                        </div>
+                    </div>
                     <button
                         type="button"
-                        onClick={() => {
-                            void publish();
-                        }}
+                        onClick={() => void selectOkpExecutable()}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200 hover:bg-slate-700"
+                    >
+                        <FolderOpen size={14} />
+                        选择 OKP
+                    </button>
+                    <button
+                        type="button"
+                        onClick={() => void clearOkpExecutablePath()}
+                        disabled={!okpExecutablePath}
+                        className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
+                    >
+                        <Trash2 size={14} />
+                        清空
+                    </button>
+                </div>
+
+                {/* 9. PublishBar — STEP 6 */}
+                <div className="flex items-center gap-3 rounded-2xl border border-slate-800 bg-slate-900/95 px-5 py-4 shadow-xl">
+                    <div className="min-w-0 flex-1">
+                        <div className="font-mono text-[11px] tracking-[0.16em] uppercase text-slate-500">STEP 6 · PUBLISH</div>
+                        <div className="mt-1 truncate text-sm font-semibold text-slate-100">
+                            {selectedSiteSummaries.length > 0
+                                ? `发布到 ${selectedSiteSummaries.length} 站点 · ${selectedSiteSummaries.map((s) => s.label).join(' · ')}`
+                                : '请至少选择一个发布站点'}
+                        </div>
+                        <div className="mt-0.5 text-[11px] text-slate-500">
+                            确认后会先弹出发布前检查，再启动各站点发布。
+                        </div>
+                    </div>
+                    {(draft.episode || draft.resolution) ? (
+                        <span className="inline-flex items-center rounded-full border border-cyan-400/40 bg-cyan-500/10 px-2.5 py-0.5 text-[11px] font-medium text-cyan-200">
+                            {[draft.episode && `EP ${draft.episode}`, draft.resolution].filter(Boolean).join(' / ')}
+                        </span>
+                    ) : null}
+                    <button
+                        type="button"
+                        onClick={() => handlePublishClick()}
                         disabled={isPublishing || !activeTemplate}
-                        className="inline-flex w-full items-center justify-center gap-2 rounded-2xl border border-emerald-500/40 bg-emerald-500/15 px-6 py-4 text-base font-semibold text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                        className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/40 bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                     >
                         {isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
                         发布已选站点
@@ -876,6 +921,29 @@ export default function QuickPublishPage() {
                 sites={publishSitesList}
                 isComplete={isPublishComplete}
                 result={publishResult}
+            />
+            <PublishConfirmModal
+                isOpen={showConfirm}
+                onClose={() => setShowConfirm(false)}
+                onConfirm={({ autoOpenConsole }) => {
+                    setShowConfirm(false);
+                    void startPublish(autoOpenConsole);
+                }}
+                title={draft.title}
+                templateLabel={activeTemplate ? (activeTemplate.name || activeTemplate.id) : ''}
+                templateLatestPublishedAtLabel={
+                    activeTemplate ? formatTimestamp(getLatestPublishedAt(activeTemplate)) : '未发布'
+                }
+                torrentPath={draft.torrent_path}
+                torrentTotalSizeLabel={formatBytes(torrentInfo?.total_size)}
+                episode={draft.episode}
+                resolution={draft.resolution}
+                about={draft.about}
+                tags={draft.tags}
+                poster={draft.poster}
+                profile={draft.profile}
+                okpPath={okpExecutablePath}
+                selectedSites={selectedSiteSummaries}
             />
         </div>
     );
