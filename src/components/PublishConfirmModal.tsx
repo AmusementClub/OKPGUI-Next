@@ -169,7 +169,7 @@ export default function PublishConfirmModal({
                                         <div className="h-px bg-slate-800" />
 
                                         {/* Torrent half */}
-                                        <div className="flex items-center gap-3 bg-slate-900/40 px-[18px] py-3">
+                                        <div className="flex items-start gap-3 bg-slate-900/40 px-[18px] py-3">
                                             <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border border-cyan-500/30 bg-cyan-500/10 text-cyan-200">
                                                 <FileText size={15} />
                                             </div>
@@ -178,7 +178,7 @@ export default function PublishConfirmModal({
                                                     种子
                                                 </div>
                                                 <div
-                                                    className="mt-0.5 overflow-hidden text-ellipsis whitespace-nowrap font-mono text-xs text-slate-100"
+                                                    className="mt-0.5 break-all font-mono text-xs leading-relaxed text-slate-100"
                                                     title={torrentPath}
                                                 >
                                                     {torrentName}
