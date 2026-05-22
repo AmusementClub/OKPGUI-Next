@@ -6,6 +6,7 @@ import PublishContentEditor from '../components/PublishContentEditor';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import { quickPublishTemplateManagerConfig, useTemplateManager } from '../hooks/useTemplateManager';
 import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
+import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
 import { getTemplateSaveStateMeta } from '../utils/templateAutosave';
 import { DEFAULT_EP_PATTERN, DEFAULT_RESOLUTION_PATTERN, DEFAULT_TITLE_PATTERN } from '../utils/titleRules';
 import {
@@ -39,7 +40,7 @@ function buildHtmlPreviewDocument(html: string) {
             padding: 20px;
             background: #0f172a;
             color: #cbd5e1;
-            font: 14px/1.7 ui-sans-serif, system-ui, sans-serif;
+            font: 14px/1.7 ${IFRAME_SANS_FONT_STACK};
             word-break: break-word;
         }
         a { color: #22d3ee; }
@@ -51,6 +52,7 @@ function buildHtmlPreviewDocument(html: string) {
             padding: 14px;
             border-radius: 12px;
             background: #020617;
+            font-family: ${IFRAME_MONO_FONT_STACK};
         }
         .okp-html-preview-empty {
             margin: 0;

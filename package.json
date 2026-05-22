@@ -15,6 +15,9 @@
     "tauri": "tauri"
   },
   "dependencies": {
+    "@fontsource-variable/inter": "^5.2.8",
+    "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@fontsource/noto-sans-sc": "^5.2.9",
     "@fortawesome/fontawesome-free": "^7.2.0",
     "@headlessui/react": "^2.2.9",
     "@tauri-apps/api": "^2",

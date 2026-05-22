@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import EasyMarkdownEditor from './EasyMarkdownEditor';
+import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
 import { renderMarkdownToHtml } from '../utils/markdown';
 
 interface PublishContentEditorProps {
@@ -43,7 +44,7 @@ function buildHtmlPreviewDocument(html: string) {
       padding: 20px;
       background: #0f172a;
       color: #cbd5e1;
-      font: 14px/1.7 ui-sans-serif, system-ui, sans-serif;
+      font: 14px/1.7 ${IFRAME_SANS_FONT_STACK};
       word-break: break-word;
     }
     a { color: #22d3ee; }
@@ -51,7 +52,7 @@ function buildHtmlPreviewDocument(html: string) {
     table { width: 100%; border-collapse: collapse; }
     th, td { border: 1px solid #334155; padding: 8px 10px; }
     code, pre {
-      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-family: ${IFRAME_MONO_FONT_STACK};
     }
     pre {
       overflow-x: auto;
