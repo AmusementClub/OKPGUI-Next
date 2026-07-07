@@ -5,6 +5,10 @@ import type { FileTreeNodeData } from '../components/FileTree';
 import type { SiteCookies } from '../utils/cookieUtils';
 import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
 import {
+    ParsedTitleDetails,
+    resolveOverriddenDraftPublishMetadata,
+} from '../utils/publishTitleMetadata';
+import {
     ContentTemplate,
     QuickPublishConfigPayload,
     QuickPublishRuntimeDraft,
@@ -19,12 +23,6 @@ import {
     normalizeQuickPublishTemplate,
 } from '../utils/quickPublish';
 import { useLatest } from './useLatest';
-
-interface ParsedTitleDetails {
-    title: string;
-    episode: string;
-    resolution: string;
-}
 
 export interface QuickPublishTorrentInfo {
     name: string;
@@ -241,6 +239,46 @@ export function useQuickPublishRuntimeDraft({
         [activeTemplateRef, draftRef, onError, torrentInfoRef],
     );
 
+    const resolvePublishRuntimeDraft = useCallback(async (
+        templateToUse = activeTemplateRef.current,
+        draftToUse = draftRef.current,
+    ): Promise<QuickPublishRuntimeDraft> => {
+        if (!templateToUse || !draftToUse.is_title_overridden) {
+            return draftToUse;
+        }
+
+        const nextDraft = await resolveOverriddenDraftPublishMetadata({
+            draft: draftToUse,
+            fallbackFilename: torrentInfoRef.current?.name,
+            template: templateToUse,
+            parseTitleDetails: (request) =>
+                invoke<ParsedTitleDetails>('parse_title_details', {
+                    filename: request.filename,
+                    epPattern: request.epPattern,
+                    resolutionPattern: request.resolutionPattern,
+                    titlePattern: request.titlePattern,
+                }),
+        });
+
+        setDraft((current) => {
+            if (
+                current.template_id !== draftToUse.template_id
+                || current.title !== draftToUse.title
+                || current.is_title_overridden !== draftToUse.is_title_overridden
+            ) {
+                return current;
+            }
+
+            return {
+                ...current,
+                episode: nextDraft.episode,
+                resolution: nextDraft.resolution,
+            };
+        });
+
+        return nextDraft;
+    }, [activeTemplateRef, draftRef, torrentInfoRef]);
+
     const selectRuntimeTemplate = useCallback(
         (
             templateId: string,
@@ -445,6 +483,7 @@ export function useQuickPublishRuntimeDraft({
         parseTorrent,
         selectTorrentFile,
         generateTitle,
+        resolvePublishRuntimeDraft,
         switchRuntimeContentTemplate,
         resetToTemplateDefaults,
         reconcileRuntimeSelectableSites,

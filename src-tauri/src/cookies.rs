@@ -140,11 +140,8 @@ mod tests {
         let local_browser = chrome_dir.join("chrome.exe");
         std::fs::write(&local_browser, "browser").expect("expected local browser file");
 
-        let candidates = collect_browser_executable_candidates(
-            None,
-            None,
-            Some(local_app_data.as_path()),
-        );
+        let candidates =
+            collect_browser_executable_candidates(None, None, Some(local_app_data.as_path()));
 
         assert!(candidates.contains(&local_browser));
         assert!(!candidates.contains(&browser_path));
@@ -183,11 +180,8 @@ mod tests {
     fn test_collect_browser_candidates_include_linux_path_entries() {
         let (root, browser_path) = create_temp_browser_file("google-chrome");
         let path_env = OsString::from(root.as_os_str());
-        let candidates = collect_browser_executable_candidates(
-            Some(path_env.as_os_str()),
-            None,
-            None,
-        );
+        let candidates =
+            collect_browser_executable_candidates(Some(path_env.as_os_str()), None, None);
 
         assert!(candidates.contains(&browser_path));
 

@@ -3,7 +3,7 @@ use crate::domain::cookie::{get_site_config, LoginTestResult, SiteConfig};
 use crate::profile::build_site_cookie_header;
 
 use regex::Regex;
-use reqwest::header::{COOKIE, HeaderMap, HeaderValue, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
 use reqwest::{Client, Proxy, StatusCode};
 use serde_json::Value;
 use std::sync::OnceLock;
@@ -102,8 +102,7 @@ fn acgrip_team_regex() -> &'static Regex {
 fn acgrip_personal_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r#"class="panel-title">([\s\S]*?)</div>"#)
-            .expect("valid acgrip personal regex")
+        Regex::new(r#"class="panel-title">([\s\S]*?)</div>"#).expect("valid acgrip personal regex")
     })
 }
 
@@ -116,7 +115,8 @@ fn acgrip_token_regex() -> &'static Regex {
 }
 
 fn contains_name(names: &[String], expected_name: &str) -> bool {
-    names.iter()
+    names
+        .iter()
         .any(|name| name.trim().eq_ignore_ascii_case(expected_name.trim()))
 }
 
@@ -127,12 +127,8 @@ async fn perform_site_login_test(
     expected_name: Option<&str>,
     proxy_url: Option<&str>,
 ) -> Result<LoginTestResult, String> {
-    let cookie_context = build_site_cookie_header(
-        cookie_text,
-        site.test_url,
-        site.cookie_domains,
-        user_agent,
-    )?;
+    let cookie_context =
+        build_site_cookie_header(cookie_text, site.test_url, site.cookie_domains, user_agent)?;
     if cookie_context.cookie_header.trim().is_empty() {
         return Ok(LoginTestResult {
             success: false,
@@ -188,7 +184,9 @@ async fn perform_site_login_test(
 
                 let team_names = dmhy_team_option_regex()
                     .captures_iter(team_select.as_str())
-                    .filter_map(|capture| capture.name("name").map(|value| value.as_str().to_string()))
+                    .filter_map(|capture| {
+                        capture.name("name").map(|value| value.as_str().to_string())
+                    })
                     .collect::<Vec<_>>();
 
                 if !contains_name(&team_names, expected_name) {
@@ -267,7 +265,11 @@ async fn perform_site_login_test(
                         success: false,
                         message: format!(
                             "ACG.RIP 当前账户为“{}”，与配置的发布身份“{}”不一致。",
-                            if current_name.is_empty() { "未知" } else { current_name.as_str() },
+                            if current_name.is_empty() {
+                                "未知"
+                            } else {
+                                current_name.as_str()
+                            },
                             expected_name
                         ),
                     });
@@ -299,7 +301,11 @@ async fn perform_site_login_test(
             }
 
             let teams: Value = serde_json::from_slice(&body_bytes).map_err(|e| {
-                format!("解析萌番组团队信息失败: {}，响应片段: {}", e, truncate_detail(&body))
+                format!(
+                    "解析萌番组团队信息失败: {}，响应片段: {}",
+                    e,
+                    truncate_detail(&body)
+                )
             })?;
             let team_names = teams
                 .as_array()

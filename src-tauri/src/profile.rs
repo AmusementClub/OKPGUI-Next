@@ -1,4 +1,4 @@
-﻿use crate::entity_naming::{normalize_required_value, ENTITY_NAME_MAX_CHARS};
+use crate::entity_naming::{normalize_required_value, ENTITY_NAME_MAX_CHARS};
 use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -264,7 +264,10 @@ fn unix_cookie_expiry_to_http_date(expires: &str) -> String {
         .unwrap_or(DEFAULT_COOKIE_EXPIRES_UNIX_SECONDS);
 
     OffsetDateTime::from_unix_timestamp(unix_seconds)
-        .unwrap_or_else(|_| OffsetDateTime::from_unix_timestamp(DEFAULT_COOKIE_EXPIRES_UNIX_SECONDS).expect("valid fallback timestamp"))
+        .unwrap_or_else(|_| {
+            OffsetDateTime::from_unix_timestamp(DEFAULT_COOKIE_EXPIRES_UNIX_SECONDS)
+                .expect("valid fallback timestamp")
+        })
         .format(HTTP_COOKIE_DATE_FORMAT)
         .unwrap_or_else(|_| "Thu, 01 Jan 2099 00:00:00 GMT".to_string())
 }
@@ -383,7 +386,12 @@ fn collect_cookie_records(parsed: ParsedCookieText) -> Vec<CookieRecord> {
         .filter_map(parse_custom_cookie_record)
         .collect::<Vec<_>>();
 
-    records.extend(parsed.netscape_cookies.into_iter().map(netscape_cookie_to_record));
+    records.extend(
+        parsed
+            .netscape_cookies
+            .into_iter()
+            .map(netscape_cookie_to_record),
+    );
     deduplicate_cookie_records(records)
 }
 
@@ -407,7 +415,10 @@ fn format_cookie_text(user_agent: &str, cookies: Vec<CookieRecord>) -> String {
         return String::new();
     }
 
-    let mut lines = vec![format!("user-agent:\t{}", normalized_user_agent(user_agent))];
+    let mut lines = vec![format!(
+        "user-agent:\t{}",
+        normalized_user_agent(user_agent)
+    )];
     lines.extend(cookies.into_iter().map(|cookie| {
         let secure_suffix = if cookie.secure { "; secure" } else { "" };
         format!(
@@ -527,7 +538,11 @@ pub fn build_site_cookie_header(
             continue;
         }
 
-        let cookie_path = if cookie.path.is_empty() { "/" } else { cookie.path.as_str() };
+        let cookie_path = if cookie.path.is_empty() {
+            "/"
+        } else {
+            cookie.path.as_str()
+        };
         if !request_url.path().starts_with(cookie_path) {
             continue;
         }
@@ -642,7 +657,9 @@ pub fn save_profile(
         }
     }
 
-    store.profiles.insert(normalized_name.clone(), profile.clone());
+    store
+        .profiles
+        .insert(normalized_name.clone(), profile.clone());
     store.last_used = Some(normalized_name.clone());
     save_profiles(&app, &store);
 
@@ -674,7 +691,10 @@ pub fn update_profile_cookies(app: AppHandle, name: String, cookies: String) {
 }
 
 #[tauri::command]
-pub fn import_cookie_file(cookie_path: String, fallback_user_agent: Option<String>) -> Result<CookieImportResult, String> {
+pub fn import_cookie_file(
+    cookie_path: String,
+    fallback_user_agent: Option<String>,
+) -> Result<CookieImportResult, String> {
     let raw_text = std::fs::read_to_string(&cookie_path)
         .map_err(|error| format!("读取 Cookie 文件失败: {} ({})", cookie_path, error))?;
     let fallback_user_agent = fallback_user_agent.unwrap_or_default();
@@ -763,7 +783,11 @@ mod tests {
         sync_profile_cookies(&mut profile);
 
         assert!(profile.site_cookies.bangumi.raw_text.contains("bgm_sid"));
-        assert!(profile.site_cookies.bangumi.raw_text.contains("user-agent:\tMozilla/5.0 Migrated"));
+        assert!(profile
+            .site_cookies
+            .bangumi
+            .raw_text
+            .contains("user-agent:\tMozilla/5.0 Migrated"));
         assert!(profile.cookies.contains("https://bangumi.moe"));
     }
 

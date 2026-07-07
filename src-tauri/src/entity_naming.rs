@@ -17,7 +17,11 @@ pub enum ImportConflictStrategy {
     Copy,
 }
 
-pub fn normalize_required_value(value: &str, label: &str, max_chars: usize) -> Result<String, String> {
+pub fn normalize_required_value(
+    value: &str,
+    label: &str,
+    max_chars: usize,
+) -> Result<String, String> {
     let normalized = value.trim();
     if normalized.is_empty() {
         return Err(format!("{}不能为空。", label));

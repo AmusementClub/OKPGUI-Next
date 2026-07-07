@@ -253,8 +253,13 @@ fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpE
         ));
     }
 
-    let metadata = std::fs::metadata(&configured)
-        .map_err(|e| format!("无法读取已选择的 OKP 可执行文件：{} ({})", configured.display(), e))?;
+    let metadata = std::fs::metadata(&configured).map_err(|e| {
+        format!(
+            "无法读取已选择的 OKP 可执行文件：{} ({})",
+            configured.display(),
+            e
+        )
+    })?;
 
     if !metadata.is_file() {
         return Err(format!(
@@ -289,12 +294,10 @@ fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpE
         }
     }
 
-    let working_dir = configured.parent().map(Path::to_path_buf).ok_or_else(|| {
-        format!(
-            "无法确定 OKP 可执行文件所在目录：{}",
-            configured.display()
-        )
-    })?;
+    let working_dir = configured
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| format!("无法确定 OKP 可执行文件所在目录：{}", configured.display()))?;
 
     let tags_dir = working_dir.join("config").join("tags");
     let missing_files: Vec<&str> = REQUIRED_OKP_TAG_FILES
@@ -409,7 +412,10 @@ fn site_label(site_code: &str) -> &'static str {
     }
 }
 
-pub(crate) fn collect_site_publish_configs(template: &Template, profile: &Profile) -> Vec<SitePublishConfig> {
+pub(crate) fn collect_site_publish_configs(
+    template: &Template,
+    profile: &Profile,
+) -> Vec<SitePublishConfig> {
     vec![
         SitePublishConfig {
             code: "dmhy",
@@ -462,7 +468,10 @@ pub(crate) fn collect_site_publish_configs(template: &Template, profile: &Profil
     ]
 }
 
-fn build_site_publish_cookie_text(site: &SitePublishConfig, profile: &Profile) -> Result<String, String> {
+fn build_site_publish_cookie_text(
+    site: &SitePublishConfig,
+    profile: &Profile,
+) -> Result<String, String> {
     if site.uses_cookie {
         let raw_text = get_site_cookie_text(&profile.site_cookies, site.code);
         if !site_cookie_has_entries(raw_text) {
@@ -528,7 +537,10 @@ fn serialize_site_template_toml(
 }
 
 fn site_prefers_html_content(site_code: &str) -> bool {
-    matches!(site_code, "dmhy" | "bangumi" | "acgnx_asia" | "acgnx_global")
+    matches!(
+        site_code,
+        "dmhy" | "bangumi" | "acgnx_asia" | "acgnx_global"
+    )
 }
 
 fn select_publish_content_path<'a>(
@@ -612,13 +624,8 @@ fn generate_site_template_toml(
         None
     };
 
-    let toml_content = serialize_site_template_toml(
-        template,
-        site,
-        description_file_name,
-        user_agent,
-        proxy,
-    )?;
+    let toml_content =
+        serialize_site_template_toml(template, site, description_file_name, user_agent, proxy)?;
 
     std::fs::write(&artifacts.template_path, &toml_content)
         .map_err(|e| format!("写入 template.toml 失败: {}", e))?;
@@ -819,7 +826,11 @@ pub(crate) fn run_site_publish(
 
         if status.success() {
             cleanup_publish_artifacts(&artifacts, false);
-            Ok(site.build_result(true, format!("{} 发布完成", site.label), updated_cookie_text))
+            Ok(site.build_result(
+                true,
+                format!("{} 发布完成", site.label),
+                updated_cookie_text,
+            ))
         } else {
             let failure_message = build_failure_message(status.code(), &artifacts.log_path);
             cleanup_publish_artifacts(&artifacts, true);
@@ -898,8 +909,8 @@ mod tests {
 
     #[test]
     fn test_find_okp_executable_requires_selected_path() {
-        let error =
-            resolve_selected_okp_executable("   ").expect_err("expected empty configured path to error");
+        let error = resolve_selected_okp_executable("   ")
+            .expect_err("expected empty configured path to error");
         assert!(error.contains("未选择 OKP 可执行文件"));
     }
 
@@ -1105,8 +1116,14 @@ mod tests {
         let intro = intro_templates[0]
             .as_table()
             .expect("expected intro_template entry to be a table");
-        assert_eq!(intro.get("site").and_then(toml::Value::as_str), Some("dmhy"));
-        assert_eq!(intro.get("name").and_then(toml::Value::as_str), Some("Team"));
+        assert_eq!(
+            intro.get("site").and_then(toml::Value::as_str),
+            Some("dmhy")
+        );
+        assert_eq!(
+            intro.get("name").and_then(toml::Value::as_str),
+            Some("Team")
+        );
         assert_eq!(
             intro.get("content").and_then(toml::Value::as_str),
             Some("description.md")
@@ -1150,7 +1167,10 @@ mod tests {
             parsed.get("poster").and_then(toml::Value::as_str),
             Some("poster.png")
         );
-        assert_eq!(parsed.get("about").and_then(toml::Value::as_str), Some("about text"));
+        assert_eq!(
+            parsed.get("about").and_then(toml::Value::as_str),
+            Some("about text")
+        );
 
         let tags = parsed
             .get("tags")
@@ -1173,7 +1193,10 @@ mod tests {
             intro.get("user_agent").and_then(toml::Value::as_str),
             Some("Mozilla/5.0 Publish")
         );
-        assert_eq!(intro.get("cookie").and_then(toml::Value::as_str), Some("token-123"));
+        assert_eq!(
+            intro.get("cookie").and_then(toml::Value::as_str),
+            Some("token-123")
+        );
     }
 
     #[test]
@@ -1215,10 +1238,15 @@ mod tests {
             site_label: "动漫花园".to_string(),
             success: false,
             message: "publish failed".to_string(),
-            updated_cookie_text: Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=bad".to_string()),
+            updated_cookie_text: Some(
+                "user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=bad".to_string(),
+            ),
         };
 
-        assert_eq!(publish_history::updated_cookie_text_for_persistence(&result), None);
+        assert_eq!(
+            publish_history::updated_cookie_text_for_persistence(&result),
+            None
+        );
     }
 
     #[test]
@@ -1228,7 +1256,9 @@ mod tests {
             site_label: "动漫花园".to_string(),
             success: true,
             message: "publish succeeded".to_string(),
-            updated_cookie_text: Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=good".to_string()),
+            updated_cookie_text: Some(
+                "user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=good".to_string(),
+            ),
         };
 
         assert_eq!(

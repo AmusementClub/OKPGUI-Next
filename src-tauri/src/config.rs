@@ -1,7 +1,7 @@
 use crate::entity_naming::{
     build_copy_name, import_conflict_error, next_available_copy_id, next_available_copy_name,
-    normalize_optional_name, normalize_required_value, ImportConflictStrategy,
-    ENTITY_ID_MAX_CHARS, ENTITY_NAME_MAX_CHARS,
+    normalize_optional_name, normalize_required_value, ImportConflictStrategy, ENTITY_ID_MAX_CHARS,
+    ENTITY_NAME_MAX_CHARS,
 };
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -406,7 +406,10 @@ fn validate_template_regex_field(field_label: &str, pattern: &str) -> Result<(),
     Ok(())
 }
 
-fn validate_template_regex_patterns(ep_pattern: &str, resolution_pattern: &str) -> Result<(), String> {
+fn validate_template_regex_patterns(
+    ep_pattern: &str,
+    resolution_pattern: &str,
+) -> Result<(), String> {
     validate_template_regex_field("集数正则", ep_pattern)?;
     validate_template_regex_field("分辨率正则", resolution_pattern)?;
     Ok(())
@@ -419,32 +422,46 @@ fn normalize_template_storage_name(value: &str) -> Result<String, String> {
 fn normalize_quick_publish_template_for_storage(
     template: &mut QuickPublishTemplate,
 ) -> Result<String, String> {
-    let template_id = normalize_required_value(&template.id, "快速发布模板 ID", ENTITY_ID_MAX_CHARS)?;
-    let template_name = normalize_optional_name(&template.name, &template_id, "模板名称", ENTITY_NAME_MAX_CHARS)?;
+    let template_id =
+        normalize_required_value(&template.id, "快速发布模板 ID", ENTITY_ID_MAX_CHARS)?;
+    let template_name = normalize_optional_name(
+        &template.name,
+        &template_id,
+        "模板名称",
+        ENTITY_NAME_MAX_CHARS,
+    )?;
 
     template.id = template_id.clone();
     template.name = template_name;
     template.default_profile = template.default_profile.trim().to_string();
-    template.shared_content_template_id = template
-        .shared_content_template_id
-        .take()
-        .and_then(|value| {
-            let trimmed = value.trim();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed.to_string())
-            }
-        });
+    template.shared_content_template_id =
+        template
+            .shared_content_template_id
+            .take()
+            .and_then(|value| {
+                let trimmed = value.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
+            });
     template.legacy_content_template_id = None;
 
     validate_quick_publish_template_for_storage(template)?;
     Ok(template_id)
 }
 
-fn normalize_content_template_for_storage(template: &mut ContentTemplate) -> Result<String, String> {
+fn normalize_content_template_for_storage(
+    template: &mut ContentTemplate,
+) -> Result<String, String> {
     let template_id = normalize_required_value(&template.id, "正文模板 ID", ENTITY_ID_MAX_CHARS)?;
-    let template_name = normalize_optional_name(&template.name, &template_id, "模板名称", ENTITY_NAME_MAX_CHARS)?;
+    let template_name = normalize_optional_name(
+        &template.name,
+        &template_id,
+        "模板名称",
+        ENTITY_NAME_MAX_CHARS,
+    )?;
 
     template.id = template_id.clone();
     template.name = template_name;
@@ -452,7 +469,10 @@ fn normalize_content_template_for_storage(template: &mut ContentTemplate) -> Res
     Ok(template_id)
 }
 
-fn resolve_existing_key<T>(existing: &HashMap<String, T>, candidate: Option<String>) -> Option<String> {
+fn resolve_existing_key<T>(
+    existing: &HashMap<String, T>,
+    candidate: Option<String>,
+) -> Option<String> {
     let candidate = candidate?;
     if existing.contains_key(candidate.as_str()) {
         return Some(candidate);
@@ -482,9 +502,11 @@ fn resolve_import_name_conflict<T>(
     match strategy {
         ImportConflictStrategy::Reject => Err(import_conflict_error(&desired_name)),
         ImportConflictStrategy::Overwrite => Ok(desired_name),
-        ImportConflictStrategy::Copy => {
-            Ok(next_available_copy_name(&desired_name, existing, ENTITY_NAME_MAX_CHARS))
-        }
+        ImportConflictStrategy::Copy => Ok(next_available_copy_name(
+            &desired_name,
+            existing,
+            ENTITY_NAME_MAX_CHARS,
+        )),
     }
 }
 
@@ -500,9 +522,11 @@ fn resolve_import_id_conflict<T>(
     match strategy {
         ImportConflictStrategy::Reject => Err(import_conflict_error(&desired_id)),
         ImportConflictStrategy::Overwrite => Ok(desired_id),
-        ImportConflictStrategy::Copy => {
-            Ok(next_available_copy_id(&desired_id, existing, ENTITY_ID_MAX_CHARS))
-        }
+        ImportConflictStrategy::Copy => Ok(next_available_copy_id(
+            &desired_id,
+            existing,
+            ENTITY_ID_MAX_CHARS,
+        )),
     }
 }
 
@@ -510,7 +534,9 @@ fn validate_template_for_storage(template: &Template) -> Result<(), String> {
     validate_template_regex_patterns(&template.ep_pattern, &template.resolution_pattern)
 }
 
-fn validate_quick_publish_template_for_storage(template: &QuickPublishTemplate) -> Result<(), String> {
+fn validate_quick_publish_template_for_storage(
+    template: &QuickPublishTemplate,
+) -> Result<(), String> {
     validate_template_regex_patterns(&template.ep_pattern, &template.resolution_pattern)
 }
 
@@ -537,7 +563,8 @@ pub fn load_config(app: &AppHandle) -> AppConfig {
 
 fn migrate_config(config: &mut AppConfig) {
     migrate_quick_publish_templates(config);
-    config.last_used_template = resolve_existing_key(&config.templates, config.last_used_template.take());
+    config.last_used_template =
+        resolve_existing_key(&config.templates, config.last_used_template.take());
     config.last_used_quick_publish_template = resolve_existing_key(
         &config.quick_publish_templates,
         config.last_used_quick_publish_template.take(),
@@ -626,7 +653,9 @@ pub fn save_template(
         }
     }
 
-    config.templates.insert(normalized_name.clone(), template.clone());
+    config
+        .templates
+        .insert(normalized_name.clone(), template.clone());
     config.last_used_template = Some(normalized_name.clone());
     save_config_to_disk(&app, &config);
     Ok(ImportedTemplatePayload {
@@ -802,15 +831,11 @@ pub fn export_quick_publish_template_to_file(
         .cloned()
         .ok_or_else(|| format!("未找到快速发布模板: {}", id))?;
 
-    let export_payload = ImportedQuickPublishTemplateFile {
-        id,
-        template,
-    };
+    let export_payload = ImportedQuickPublishTemplateFile { id, template };
 
     let export_path = PathBuf::from(&path);
     if let Some(parent) = export_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("无法创建导出目录: {}", error))?;
+        std::fs::create_dir_all(parent).map_err(|error| format!("无法创建导出目录: {}", error))?;
     }
 
     let file_content = serde_json::to_string_pretty(&export_payload)
@@ -874,7 +899,12 @@ pub fn import_quick_publish_template_from_file(
     )?;
 
     template.id = final_id.clone();
-    template.name = normalize_optional_name(&template.name, &normalized_id, "模板名称", ENTITY_NAME_MAX_CHARS)?;
+    template.name = normalize_optional_name(
+        &template.name,
+        &normalized_id,
+        "模板名称",
+        ENTITY_NAME_MAX_CHARS,
+    )?;
     if final_id != normalized_id {
         template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
     }
@@ -912,15 +942,11 @@ pub fn export_content_template_to_file(
         .cloned()
         .ok_or_else(|| format!("未找到正文模板: {}", id))?;
 
-    let export_payload = ImportedContentTemplateFile {
-        id,
-        template,
-    };
+    let export_payload = ImportedContentTemplateFile { id, template };
 
     let export_path = PathBuf::from(&path);
     if let Some(parent) = export_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("无法创建导出目录: {}", error))?;
+        std::fs::create_dir_all(parent).map_err(|error| format!("无法创建导出目录: {}", error))?;
     }
 
     let file_content = serde_json::to_string_pretty(&export_payload)
@@ -977,14 +1003,16 @@ pub fn import_content_template_from_file(
     let mut config = load_config(&app);
     let strategy = conflict_strategy.unwrap_or_default();
     let normalized_id = normalize_required_value(&id, "正文模板 ID", ENTITY_ID_MAX_CHARS)?;
-    let final_id = resolve_import_id_conflict(
-        normalized_id.clone(),
-        &config.content_templates,
-        strategy,
-    )?;
+    let final_id =
+        resolve_import_id_conflict(normalized_id.clone(), &config.content_templates, strategy)?;
 
     template.id = final_id.clone();
-    template.name = normalize_optional_name(&template.name, &normalized_id, "模板名称", ENTITY_NAME_MAX_CHARS)?;
+    template.name = normalize_optional_name(
+        &template.name,
+        &normalized_id,
+        "模板名称",
+        ENTITY_NAME_MAX_CHARS,
+    )?;
     if final_id != normalized_id {
         template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
     }
@@ -1049,8 +1077,7 @@ pub fn export_template_to_file(app: AppHandle, name: String, path: String) -> Re
 
     let export_path = PathBuf::from(&path);
     if let Some(parent) = export_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|error| format!("无法创建导出目录: {}", error))?;
+        std::fs::create_dir_all(parent).map_err(|error| format!("无法创建导出目录: {}", error))?;
     }
 
     let file_content = serde_json::to_string_pretty(&export_payload)
@@ -1091,7 +1118,7 @@ pub fn import_template_from_file(
 
             (resolved_name, Template::from(file.template))
         }
-        TemplateImportFileFormat::Portable(template) => ( 
+        TemplateImportFileFormat::Portable(template) => (
             import_path
                 .file_stem()
                 .and_then(|value| value.to_str())
@@ -1125,7 +1152,9 @@ pub fn import_template_from_file(
         conflict_strategy.unwrap_or_default(),
     )?;
 
-    config.templates.insert(final_name.clone(), template.clone());
+    config
+        .templates
+        .insert(final_name.clone(), template.clone());
     config.last_used_template = Some(final_name.clone());
     save_config_to_disk(&app, &config);
 
@@ -1264,7 +1293,8 @@ mod tests {
         };
 
         let serialized = serde_json::to_string(&config).expect("config should serialize");
-        let restored: AppConfig = serde_json::from_str(&serialized).expect("config should deserialize");
+        let restored: AppConfig =
+            serde_json::from_str(&serialized).expect("config should deserialize");
 
         assert_eq!(
             restored.last_used_quick_publish_template.as_deref(),
@@ -1283,7 +1313,10 @@ mod tests {
             "body markdown"
         );
         assert_eq!(restored.content_templates["content-1"].name, "Intro");
-        assert_eq!(restored.quick_publish_templates["demo-template"].revision, 4);
+        assert_eq!(
+            restored.quick_publish_templates["demo-template"].revision,
+            4
+        );
         assert_eq!(restored.content_templates["content-1"].revision, 2);
     }
 
@@ -1404,7 +1437,10 @@ mod tests {
 
     #[test]
     fn test_resolve_import_id_conflict_creates_copy_id() {
-        let existing = HashMap::from([("season-template".to_string(), QuickPublishTemplate::default())]);
+        let existing = HashMap::from([(
+            "season-template".to_string(),
+            QuickPublishTemplate::default(),
+        )]);
 
         let resolved = resolve_import_id_conflict(
             "season-template".to_string(),
@@ -1418,33 +1454,23 @@ mod tests {
 
     #[test]
     fn test_resolve_next_template_revision_advances_on_matching_revision() {
-        let next_revision = resolve_next_template_revision(
-            "发布模板",
-            "season-template",
-            Some(3),
-            Some(3),
-        )
-        .expect("expected matching revision to advance");
+        let next_revision =
+            resolve_next_template_revision("发布模板", "season-template", Some(3), Some(3))
+                .expect("expected matching revision to advance");
 
         assert_eq!(next_revision, 4);
     }
 
     #[test]
     fn test_resolve_next_template_revision_rejects_stale_revision() {
-        let error = resolve_next_template_revision(
-            "发布模板",
-            "season-template",
-            Some(4),
-            Some(3),
-        )
-        .expect_err("expected stale revision to be rejected");
+        let error = resolve_next_template_revision("发布模板", "season-template", Some(4), Some(3))
+            .expect_err("expected stale revision to be rejected");
 
         assert!(error.starts_with(TEMPLATE_REVISION_CONFLICT_PREFIX));
 
-        let payload: TemplateRevisionConflictPayload = serde_json::from_str(
-            error.trim_start_matches(TEMPLATE_REVISION_CONFLICT_PREFIX),
-        )
-        .expect("expected structured revision conflict payload");
+        let payload: TemplateRevisionConflictPayload =
+            serde_json::from_str(error.trim_start_matches(TEMPLATE_REVISION_CONFLICT_PREFIX))
+                .expect("expected structured revision conflict payload");
 
         assert_eq!(payload.entity_id, "season-template");
         assert_eq!(payload.current_revision, Some(4));
@@ -1452,14 +1478,10 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_next_template_revision_rejects_creation_without_expected_revision_on_existing_id() {
-        let error = resolve_next_template_revision(
-            "公共正文模板",
-            "shared-tail",
-            Some(2),
-            None,
-        )
-        .expect_err("expected unsafely creating over an existing id to be rejected");
+    fn test_resolve_next_template_revision_rejects_creation_without_expected_revision_on_existing_id(
+    ) {
+        let error = resolve_next_template_revision("公共正文模板", "shared-tail", Some(2), None)
+            .expect_err("expected unsafely creating over an existing id to be rejected");
 
         assert!(error.starts_with(TEMPLATE_REVISION_CONFLICT_PREFIX));
     }

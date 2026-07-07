@@ -45,6 +45,11 @@ import {
     DEFAULT_TITLE_PATTERN,
     normalizeRuleTemplate,
 } from '../utils/titleRules';
+import {
+    ParsedTitleDetails,
+    PublishTitleMetadata,
+    resolvePublishTitleMetadata,
+} from '../utils/publishTitleMetadata';
 
 interface SiteSelection {
     dmhy: boolean;
@@ -129,12 +134,6 @@ interface TorrentInfo {
     name: string;
     total_size: number;
     file_tree: FileTreeNodeData;
-}
-
-interface ParsedTitleDetails {
-    title: string;
-    episode: string;
-    resolution: string;
 }
 
 const siteKeys: (keyof SiteSelection)[] = [
@@ -791,29 +790,20 @@ export default function HomePage() {
 
     const resolvePublishDetails = async (
         templateToPublish: Template,
-        filename?: string,
-    ): Promise<Pick<ParsedTitleDetails, 'episode' | 'resolution'>> => {
-        if (!filename) {
-            return { episode: '', resolution: '' };
-        }
-
-        try {
-            const details = await invoke<ParsedTitleDetails>('parse_title_details', {
-                filename,
-                epPattern: templateToPublish.ep_pattern,
-                resolutionPattern: templateToPublish.resolution_pattern,
-                titlePattern: templateToPublish.title_pattern,
-            });
-
-            return {
-                episode: getPublishedValue(details.episode),
-                resolution: getPublishedValue(details.resolution),
-            };
-        } catch (e) {
-            console.error('提取发布信息失败:', e);
-            return { episode: '', resolution: '' };
-        }
-    };
+        fallbackFilename?: string,
+    ): Promise<PublishTitleMetadata> =>
+        resolvePublishTitleMetadata({
+            finalTitle: templateToPublish.title,
+            fallbackFilename,
+            template: templateToPublish,
+            parseTitleDetails: (request) =>
+                invoke<ParsedTitleDetails>('parse_title_details', {
+                    filename: request.filename,
+                    epPattern: request.epPattern,
+                    resolutionPattern: request.resolutionPattern,
+                    titlePattern: request.titlePattern,
+                }),
+        });
 
     const finalizePublishHistory = useCallback(async (
         publishId: string,
@@ -1071,7 +1061,11 @@ export default function HomePage() {
             return;
         }
 
-        const publishDetails = await resolvePublishDetails(templateToPublish, torrentInfo?.name);
+        const finalTitle = templateToPublish.title.trim();
+        const publishDetails = await resolvePublishDetails(
+            templateToPublish,
+            finalTitle ? undefined : torrentInfo?.name,
+        );
         const publishId = createPublishId();
 
         publishAttemptRef.current = {

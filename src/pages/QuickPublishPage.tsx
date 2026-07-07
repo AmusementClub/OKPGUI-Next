@@ -30,6 +30,7 @@ import {
     getSiteLoginStateBadgeClass,
 } from '../utils/siteStatus';
 import {
+    QuickPublishRuntimeDraft,
     QuickPublishTemplate,
     SiteSelection,
     buildLegacyPublishTemplatePayload,
@@ -112,6 +113,7 @@ export default function QuickPublishPage() {
     const [showConfirm, setShowConfirm] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+    const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
     const {
         siteLoginTests,
@@ -148,6 +150,7 @@ export default function QuickPublishPage() {
         parseTorrent,
         selectTorrentFile,
         generateTitle,
+        resolvePublishRuntimeDraft,
         switchRuntimeContentTemplate,
         resetToTemplateDefaults,
         reconcileRuntimeSelectableSites,
@@ -349,11 +352,14 @@ export default function QuickPublishPage() {
         return null;
     }
 
-    const startPublish = async (autoOpenConsole: boolean) => {
+    const startPublish = async (
+        autoOpenConsole: boolean,
+        draftToPublish: QuickPublishRuntimeDraft,
+    ) => {
         if (!activeTemplate) return;
 
-        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draft.sites[siteKey]);
-        const publishTemplatePayload = buildLegacyPublishTemplatePayload(draft, activeTemplate);
+        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draftToPublish.sites[siteKey]);
+        const publishTemplatePayload = buildLegacyPublishTemplatePayload(draftToPublish, activeTemplate);
         const publishId = createPublishId();
         const nextPublishSites = createPublishConsoleSiteMap(
             selectedSiteKeys.map((siteKey) => ({
@@ -369,8 +375,8 @@ export default function QuickPublishPage() {
             publishId,
             templateId: activeTemplate.id,
             publishedAt: new Date().toISOString(),
-            publishedEpisode: draft.episode,
-            publishedResolution: draft.resolution,
+            publishedEpisode: draftToPublish.episode,
+            publishedResolution: draftToPublish.resolution,
             siteKeys: selectedSiteKeys,
         };
         if (autoOpenConsole) {
@@ -384,9 +390,9 @@ export default function QuickPublishPage() {
             await invoke('publish', {
                 request: {
                     publish_id: publishId,
-                    torrent_path: draft.torrent_path,
+                    torrent_path: draftToPublish.torrent_path,
                     template_name: activeTemplate.name || activeTemplate.id,
-                    profile_name: draft.profile,
+                    profile_name: draftToPublish.profile,
                     template: publishTemplatePayload,
                 },
             });
@@ -397,7 +403,7 @@ export default function QuickPublishPage() {
         }
     };
 
-    const handlePublishClick = () => {
+    const handlePublishClick = async () => {
         const error = validateBeforePublish();
         if (error) {
             setErrorMessage(error);
@@ -405,20 +411,35 @@ export default function QuickPublishPage() {
         }
         setErrorMessage('');
         setStatusMessage('');
-        setShowConfirm(true);
+
+        try {
+            const nextConfirmDraft = await resolvePublishRuntimeDraft(activeTemplate, draft);
+            setConfirmDraft(nextConfirmDraft);
+            setShowConfirm(true);
+        } catch {
+            setConfirmDraft(null);
+            setShowConfirm(false);
+        }
     };
+
+    const handleCloseConfirm = () => {
+        setShowConfirm(false);
+        setConfirmDraft(null);
+    };
+
+    const publishPreviewDraft = confirmDraft ?? draft;
 
     const selectedSiteSummaries = useMemo(
         () =>
             siteRows
-                .filter((row) => draft.sites[row.site.key as keyof SiteSelection])
+                .filter((row) => publishPreviewDraft.sites[row.site.key as keyof SiteSelection])
                 .map((row) => ({
                     key: row.site.key as keyof SiteSelection,
                     label: row.site.label,
                     identityText: row.identityText,
                     identityToneClass: row.identityClass,
                 })),
-        [siteRows, draft.sites],
+        [siteRows, publishPreviewDraft.sites],
     );
 
     const handleSiteLoginTest = (site: SiteDefinition) => {
@@ -924,24 +945,26 @@ export default function QuickPublishPage() {
             />
             <PublishConfirmModal
                 isOpen={showConfirm}
-                onClose={() => setShowConfirm(false)}
+                onClose={handleCloseConfirm}
                 onConfirm={({ autoOpenConsole }) => {
+                    const draftToPublish = confirmDraft ?? draft;
                     setShowConfirm(false);
-                    void startPublish(autoOpenConsole);
+                    setConfirmDraft(null);
+                    void startPublish(autoOpenConsole, draftToPublish);
                 }}
-                title={draft.title}
+                title={publishPreviewDraft.title}
                 templateLabel={activeTemplate ? (activeTemplate.name || activeTemplate.id) : ''}
                 templateLatestPublishedAtLabel={
                     activeTemplate ? formatTimestamp(getLatestPublishedAt(activeTemplate)) : '未发布'
                 }
-                torrentPath={draft.torrent_path}
+                torrentPath={publishPreviewDraft.torrent_path}
                 torrentTotalSizeLabel={formatBytes(torrentInfo?.total_size)}
-                episode={draft.episode}
-                resolution={draft.resolution}
-                about={draft.about}
-                tags={draft.tags}
-                poster={draft.poster}
-                profile={draft.profile}
+                episode={publishPreviewDraft.episode}
+                resolution={publishPreviewDraft.resolution}
+                about={publishPreviewDraft.about}
+                tags={publishPreviewDraft.tags}
+                poster={publishPreviewDraft.poster}
+                profile={publishPreviewDraft.profile}
                 okpPath={okpExecutablePath}
                 selectedSites={selectedSiteSummaries}
             />

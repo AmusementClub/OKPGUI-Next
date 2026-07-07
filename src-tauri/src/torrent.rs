@@ -52,7 +52,11 @@ fn insert_into_tree(node: &mut FileTreeNode, path_parts: &[String], size: u64) {
     let remaining = &path_parts[1..];
 
     // Find or create the directory node
-    let dir_node = if let Some(pos) = node.children.iter().position(|c| !c.is_file && c.name == *dir_name) {
+    let dir_node = if let Some(pos) = node
+        .children
+        .iter()
+        .position(|c| !c.is_file && c.name == *dir_name)
+    {
         &mut node.children[pos]
     } else {
         node.children.push(FileTreeNode {

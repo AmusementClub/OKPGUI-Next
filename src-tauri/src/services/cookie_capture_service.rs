@@ -45,7 +45,10 @@ struct CookieCaptureHandle {
 
 impl CookieCaptureHandle {
     fn snapshot(&self) -> CookieCaptureStatus {
-        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         CookieCaptureStatus {
             cookies: state.cookies.clone(),
             user_agent: state.user_agent.clone(),
@@ -104,7 +107,11 @@ fn filter_site_cookies(cookies: Vec<Cookie>, site: &SiteConfig) -> Vec<CapturedC
     filtered
 }
 
-fn push_browser_candidate(candidates: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+fn push_browser_candidate(
+    candidates: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+    path: PathBuf,
+) {
     if seen.insert(path.clone()) && path.is_file() {
         candidates.push(path);
     }
@@ -251,8 +258,7 @@ fn create_cookie_capture_profile_dir(site: &str) -> Result<PathBuf, String> {
         timestamp
     ));
 
-    std::fs::create_dir_all(&profile_dir)
-        .map_err(|e| format!("无法创建浏览器配置目录: {}", e))?;
+    std::fs::create_dir_all(&profile_dir).map_err(|e| format!("无法创建浏览器配置目录: {}", e))?;
 
     Ok(profile_dir)
 }
@@ -510,7 +516,10 @@ impl CookieCaptureSession {
         let site = get_site_config(site_code)?;
         let browser_path = find_browser_executable()?;
 
-        println!("[cookies] === Starting cookie capture for site: {} ===", site.code);
+        println!(
+            "[cookies] === Starting cookie capture for site: {} ===",
+            site.code
+        );
         println!("[cookies] URL: {}", site.login_url);
         println!("[cookies] Browser: {}", browser_path.display());
 
@@ -518,7 +527,10 @@ impl CookieCaptureSession {
         println!("[cookies] User data dir: {}", browser.profile_dir.display());
 
         let ws_url = browser.wait_for_debug_ws_url(DEBUG_ENDPOINT_TIMEOUT)?;
-        println!("[cookies] Browser launched successfully, CDP URL: {}", ws_url);
+        println!(
+            "[cookies] Browser launched successfully, CDP URL: {}",
+            ws_url
+        );
 
         let mut client = CdpClient::connect(&ws_url)?;
         let user_agent = client.get_user_agent()?;
@@ -544,7 +556,9 @@ impl CookieCaptureSession {
         stop_flag: &AtomicBool,
         state: &Arc<Mutex<CookieCaptureRuntimeState>>,
     ) -> Result<(), String> {
-        update_runtime_state(state, |current| current.user_agent = self.user_agent.clone());
+        update_runtime_state(state, |current| {
+            current.user_agent = self.user_agent.clone()
+        });
 
         match self.snapshot_cookies() {
             Ok(cookies) => update_runtime_state(state, |current| current.cookies = cookies),
@@ -614,7 +628,10 @@ impl CookieCaptureSession {
             Err(err) => println!("[cookies] Final cookie snapshot failed: {}", err),
         }
 
-        println!("[cookies] Cookie capture worker finished for {}", self.site.code);
+        println!(
+            "[cookies] Cookie capture worker finished for {}",
+            self.site.code
+        );
         update_runtime_state(state, |current| current.completed = true);
         Ok(())
     }
@@ -624,7 +641,9 @@ fn update_runtime_state(
     state: &Arc<Mutex<CookieCaptureRuntimeState>>,
     update: impl FnOnce(&mut CookieCaptureRuntimeState),
 ) {
-    let mut current = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut current = state
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     update(&mut current);
 }
 
@@ -639,7 +658,10 @@ fn run_cookie_capture_worker(
     })();
 
     if let Err(err) = result {
-        println!("[cookies] Cookie capture worker failed for {}: {}", site_code, err);
+        println!(
+            "[cookies] Cookie capture worker failed for {}: {}",
+            site_code, err
+        );
         update_runtime_state(&state, |current| {
             current.error = Some(err);
             current.completed = true;
@@ -716,7 +738,9 @@ pub(crate) async fn start_cookie_capture(site: String) -> Result<String, String>
     Ok(session_id)
 }
 
-pub(crate) async fn finish_cookie_capture(session_id: String) -> Result<CookieCaptureResult, String> {
+pub(crate) async fn finish_cookie_capture(
+    session_id: String,
+) -> Result<CookieCaptureResult, String> {
     let status = tokio::task::spawn_blocking(move || finish_cookie_capture_sync(session_id))
         .await
         .map_err(|e| format!("Cookie capture task failed: {}", e))??;
