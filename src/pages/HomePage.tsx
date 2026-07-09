@@ -1276,7 +1276,7 @@ export default function HomePage() {
                 {/* Title Matching */}
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">标题自动生成</h2>
-                    <div className="grid gap-3 md:grid-cols-3">
+                    <div className="grid gap-3 md:grid-cols-2">
                         <div>
                             <label className="mb-1 flex items-center text-xs text-slate-500">
                                 集数匹配正则
@@ -1306,19 +1306,19 @@ export default function HomePage() {
                                 className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-mono"
                             />
                         </div>
-                        <div>
-                            <label className="text-xs text-slate-500 mb-1 block">标题模板</label>
-                            <input
-                                type="text"
-                                value={template.title_pattern}
-                                onChange={(e) => updateField('title_pattern', e.target.value)}
-                                onBlur={(e) => {
-                                    void handlePatternBlur('title_pattern', e.target.value);
-                                }}
-                                placeholder={`如: ${DEFAULT_TITLE_PATTERN}`}
-                                className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                            />
-                        </div>
+                    </div>
+                    <div className="mt-3">
+                        <label className="text-xs text-slate-500 mb-1 block">标题模板</label>
+                        <input
+                            type="text"
+                            value={template.title_pattern}
+                            onChange={(e) => updateField('title_pattern', e.target.value)}
+                            onBlur={(e) => {
+                                void handlePatternBlur('title_pattern', e.target.value);
+                            }}
+                            placeholder={`如: ${DEFAULT_TITLE_PATTERN}`}
+                            className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                        />
                     </div>
                     <div className="mt-2 flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 text-xs text-slate-500">
                         <span>自动生成仅用于填充建议标题；最终发布时始终以你手动编辑后的“发布标题”为准。</span>

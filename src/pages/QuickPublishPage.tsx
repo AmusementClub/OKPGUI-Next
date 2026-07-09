@@ -655,28 +655,30 @@ export default function QuickPublishPage() {
                         </div>
                     </div>
 
-                    <div className="mt-4 grid gap-4 md:grid-cols-3">
-                        <label className="block text-sm text-slate-300">
-                            <span className="mb-2 flex items-center text-xs text-slate-500">
-                                集数正则
-                                <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
-                            </span>
-                            <input
-                                type="text"
-                                value={activeTemplate?.ep_pattern ?? ''}
-                                readOnly
-                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                            />
-                        </label>
-                        <label className="block text-sm text-slate-300">
-                            <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
-                            <input
-                                type="text"
-                                value={activeTemplate?.resolution_pattern ?? ''}
-                                readOnly
-                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                            />
-                        </label>
+                    <div className="mt-4 space-y-4">
+                        <div className="grid gap-4 md:grid-cols-2">
+                            <label className="block text-sm text-slate-300">
+                                <span className="mb-2 flex items-center text-xs text-slate-500">
+                                    集数正则
+                                    <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                                </span>
+                                <input
+                                    type="text"
+                                    value={activeTemplate?.ep_pattern ?? ''}
+                                    readOnly
+                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                                />
+                            </label>
+                            <label className="block text-sm text-slate-300">
+                                <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
+                                <input
+                                    type="text"
+                                    value={activeTemplate?.resolution_pattern ?? ''}
+                                    readOnly
+                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                                />
+                            </label>
+                        </div>
                         <label className="block text-sm text-slate-300">
                             <span className="mb-2 block text-xs text-slate-500">标题模板</span>
                             <input
