@@ -12,6 +12,7 @@ import {
     Loader2,
     RefreshCw,
 } from 'lucide-react';
+import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree, { FileTreeNodeData } from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
@@ -43,6 +44,7 @@ import {
     DEFAULT_EP_PATTERN,
     DEFAULT_RESOLUTION_PATTERN,
     DEFAULT_TITLE_PATTERN,
+    EP_PATTERN_HELP,
     normalizeRuleTemplate,
 } from '../utils/titleRules';
 import {
@@ -1276,7 +1278,10 @@ export default function HomePage() {
                     <h2 className="text-sm font-medium text-slate-400 mb-2">标题自动生成</h2>
                     <div className="grid gap-3 md:grid-cols-3">
                         <div>
-                            <label className="text-xs text-slate-500 mb-1 block">集数匹配正则</label>
+                            <label className="mb-1 flex items-center text-xs text-slate-500">
+                                集数匹配正则
+                                <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                            </label>
                             <input
                                 type="text"
                                 value={template.ep_pattern}

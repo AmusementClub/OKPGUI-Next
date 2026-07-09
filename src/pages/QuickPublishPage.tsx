@@ -13,10 +13,12 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ConsoleModal from '../components/ConsoleModal';
+import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
 import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import { EP_PATTERN_HELP } from '../utils/titleRules';
 import {
     createPublishConsoleSiteMap,
     createPublishId,
@@ -655,7 +657,10 @@ export default function QuickPublishPage() {
 
                     <div className="mt-4 grid gap-4 md:grid-cols-3">
                         <label className="block text-sm text-slate-300">
-                            <span className="mb-2 block text-xs text-slate-500">集数正则</span>
+                            <span className="mb-2 flex items-center text-xs text-slate-500">
+                                集数正则
+                                <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                            </span>
                             <input
                                 type="text"
                                 value={activeTemplate?.ep_pattern ?? ''}

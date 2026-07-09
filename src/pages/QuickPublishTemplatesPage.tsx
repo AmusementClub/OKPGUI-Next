@@ -8,7 +8,13 @@ import { quickPublishTemplateManagerConfig, useTemplateManager } from '../hooks/
 import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
 import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
 import { getTemplateSaveStateMeta } from '../utils/templateAutosave';
-import { DEFAULT_EP_PATTERN, DEFAULT_RESOLUTION_PATTERN, DEFAULT_TITLE_PATTERN } from '../utils/titleRules';
+import FieldHelpHint from '../components/FieldHelpHint';
+import {
+    DEFAULT_EP_PATTERN,
+    DEFAULT_RESOLUTION_PATTERN,
+    DEFAULT_TITLE_PATTERN,
+    EP_PATTERN_HELP,
+} from '../utils/titleRules';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -517,7 +523,10 @@ export default function QuickPublishTemplatesPage() {
                                 <h2 className="text-sm font-medium text-slate-200">标题规则</h2>
                                 <div className="mt-4 space-y-4">
                                     <label className="block text-sm text-slate-300">
-                                        <span className="mb-2 block text-xs text-slate-500">集数正则</span>
+                                        <span className="mb-2 flex items-center text-xs text-slate-500">
+                                            集数正则
+                                            <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                                        </span>
                                         <input
                                             type="text"
                                             value={draft.ep_pattern}
