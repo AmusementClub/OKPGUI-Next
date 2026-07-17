@@ -22,9 +22,52 @@ export interface ProfileLike {
     [key: string]: unknown;
 }
 
+export interface SiteLoginCredentials {
+    apiToken: string;
+    cookieText: string;
+}
+
+export interface SiteLoginInvokeArgs extends Record<string, unknown> {
+    site: string;
+    cookieText: string;
+    userAgent: string | null;
+    expectedName: string | null;
+    apiToken: string | null;
+}
+
 interface SiteLoginTestResult {
     success: boolean;
     message: string;
+}
+
+export function getSiteLoginCredentials(
+    site: SiteDefinition,
+    profileData: ProfileLike,
+): SiteLoginCredentials {
+    const apiToken = site.tokenField
+        ? String(profileData[site.tokenField] ?? '').trim()
+        : '';
+
+    return {
+        apiToken,
+        cookieText: apiToken ? '' : getSiteCookieText(profileData.site_cookies, site.key),
+    };
+}
+
+export function buildSiteLoginInvokeArgs(
+    site: SiteDefinition,
+    profileData: ProfileLike,
+    credentials: SiteLoginCredentials,
+): SiteLoginInvokeArgs {
+    const expectedName = String(profileData[site.nameField] ?? '').trim();
+
+    return {
+        site: site.key,
+        cookieText: credentials.cookieText,
+        userAgent: profileData.user_agent.trim() || null,
+        expectedName: expectedName || null,
+        apiToken: credentials.apiToken || null,
+    };
 }
 
 export function useSiteLoginTest() {
@@ -60,13 +103,15 @@ export function useSiteLoginTest() {
             return;
         }
 
-        const rawText = getSiteCookieText(profileData.site_cookies, site.key);
-        if (!rawText.trim()) {
+        const { apiToken, cookieText } = getSiteLoginCredentials(site, profileData);
+        if (!apiToken && !cookieText.trim()) {
             setSiteLoginTests((current) => ({
                 ...current,
                 [site.key]: {
                     status: 'error',
-                    message: `请先在身份页面配置 ${site.label} 的 Cookie。`,
+                    message: site.tokenField
+                        ? `请先在身份页面配置 ${site.label} 的 API Token 或 Cookie。`
+                        : `请先在身份页面配置 ${site.label} 的 Cookie。`,
                 },
             }));
             return;
@@ -81,13 +126,10 @@ export function useSiteLoginTest() {
         }));
 
         try {
-            const expectedName = String(profileData[site.nameField] ?? '').trim();
-            const result = await invoke<SiteLoginTestResult>('test_site_login', {
-                site: site.key,
-                cookieText: rawText,
-                userAgent: profileData.user_agent.trim() || null,
-                expectedName: expectedName || null,
-            });
+            const result = await invoke<SiteLoginTestResult>(
+                'test_site_login',
+                buildSiteLoginInvokeArgs(site, profileData, { apiToken, cookieText }),
+            );
 
             setSiteLoginTests((current) => ({
                 ...current,
@@ -155,7 +197,13 @@ export function useSiteLoginTest() {
 export const siteDefinitions: SiteDefinition[] = [
     { key: 'dmhy', label: '动漫花园', loginEnabled: true, nameField: 'dmhy_name' },
     { key: 'nyaa', label: 'Nyaa', loginEnabled: true, nameField: 'nyaa_name' },
-    { key: 'acgrip', label: 'ACG.RIP', loginEnabled: true, nameField: 'acgrip_name' },
+    {
+        key: 'acgrip',
+        label: 'ACG.RIP',
+        loginEnabled: true,
+        nameField: 'acgrip_name',
+        tokenField: 'acgrip_api_token',
+    },
     { key: 'bangumi', label: '萌番组', loginEnabled: true, nameField: 'bangumi_name' },
     {
         key: 'acgnx_asia',

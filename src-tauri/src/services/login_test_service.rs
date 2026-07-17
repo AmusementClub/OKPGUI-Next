@@ -3,13 +3,15 @@ use crate::domain::cookie::{get_site_config, LoginTestResult, SiteConfig};
 use crate::profile::build_site_cookie_header;
 
 use regex::Regex;
-use reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, COOKIE, USER_AGENT};
 use reqwest::{Client, Proxy, StatusCode};
 use serde_json::Value;
 use std::sync::OnceLock;
 use tauri::AppHandle;
 
 const DEFAULT_TEST_USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36";
+const ACGRIP_API_POST_URL: &str = "https://acg.rip/api/post";
+const ACGRIP_API_TOKEN_HEADER: HeaderName = HeaderName::from_static("x-api-token");
 
 fn resolve_test_proxy(app: &AppHandle) -> Option<String> {
     let config = load_config(app);
@@ -60,6 +62,42 @@ fn build_test_client(
         .map_err(|e| format!("创建登录测试客户端失败: {}", e))
 }
 
+fn build_acgrip_api_test_client(
+    user_agent: &str,
+    api_token: &str,
+    proxy_url: Option<&str>,
+) -> Result<Client, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        USER_AGENT,
+        HeaderValue::from_str(if user_agent.trim().is_empty() {
+            DEFAULT_TEST_USER_AGENT
+        } else {
+            user_agent.trim()
+        })
+        .map_err(|e| format!("无效的 User-Agent: {}", e))?,
+    );
+    headers.insert(
+        ACGRIP_API_TOKEN_HEADER,
+        HeaderValue::from_str(api_token.trim())
+            .map_err(|_| "无效的 ACG.RIP API Token。".to_string())?,
+    );
+
+    let mut client_builder = Client::builder()
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none());
+
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        client_builder = client_builder.proxy(
+            Proxy::all(proxy_url).map_err(|e| format!("无效的代理地址 {}: {}", proxy_url, e))?,
+        );
+    }
+
+    client_builder
+        .build()
+        .map_err(|e| format!("创建 ACG.RIP API Token 测试客户端失败: {}", e))
+}
+
 fn response_body_to_string(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
@@ -73,6 +111,95 @@ fn truncate_detail(detail: &str) -> String {
     } else {
         truncated
     }
+}
+
+fn redact_secret(detail: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        detail.to_string()
+    } else {
+        detail.replace(secret, "[已隐藏]")
+    }
+}
+
+fn parse_acgrip_api_test_response(
+    status: StatusCode,
+    body_bytes: &[u8],
+    api_token: &str,
+) -> LoginTestResult {
+    if status.is_success() {
+        return LoginTestResult {
+            success: true,
+            message: "ACG.RIP API Token 测试通过。".to_string(),
+        };
+    }
+
+    let body = response_body_to_string(body_bytes);
+    let parsed = serde_json::from_slice::<Value>(body_bytes).ok();
+    let error = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let message = parsed
+        .as_ref()
+        .and_then(|value| value.get("message"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let detail = match (error, message) {
+        (Some(error), Some(message)) => format!("{}: {}", error, message),
+        (Some(error), None) => error.to_string(),
+        (None, Some(message)) => message.to_string(),
+        (None, None) => truncate_detail(&body),
+    };
+    let detail = redact_secret(&detail, api_token.trim());
+
+    LoginTestResult {
+        success: false,
+        message: if detail.is_empty() {
+            format!("ACG.RIP API Token 测试失败: HTTP {}", status.as_u16())
+        } else {
+            format!(
+                "ACG.RIP API Token 测试失败: HTTP {} {}",
+                status.as_u16(),
+                detail
+            )
+        },
+    }
+}
+
+async fn perform_acgrip_api_token_test(
+    api_token: &str,
+    user_agent: &str,
+    proxy_url: Option<&str>,
+) -> Result<LoginTestResult, String> {
+    perform_acgrip_api_token_test_at(ACGRIP_API_POST_URL, api_token, user_agent, proxy_url).await
+}
+
+async fn perform_acgrip_api_token_test_at(
+    api_url: &str,
+    api_token: &str,
+    user_agent: &str,
+    proxy_url: Option<&str>,
+) -> Result<LoginTestResult, String> {
+    let client = build_acgrip_api_test_client(user_agent, api_token, proxy_url)?;
+    let response = client
+        .post(api_url)
+        .send()
+        .await
+        .map_err(|e| format!("请求 ACG.RIP API 失败: {}", e))?;
+    let status = response.status();
+    let body_bytes = response
+        .bytes()
+        .await
+        .map_err(|e| format!("读取 ACG.RIP API 响应失败: {}", e))?;
+
+    Ok(parse_acgrip_api_test_response(
+        status,
+        &body_bytes,
+        api_token,
+    ))
 }
 
 fn dmhy_team_select_regex() -> &'static Regex {
@@ -349,9 +476,21 @@ pub(crate) async fn test_site_login(
     cookie_text: &str,
     user_agent: Option<&str>,
     expected_name: Option<&str>,
+    api_token: Option<&str>,
 ) -> Result<LoginTestResult, String> {
     let site = get_site_config(site)?;
     let proxy_url = resolve_test_proxy(app);
+    if site.code == "acgrip" {
+        if let Some(api_token) = api_token.map(str::trim).filter(|value| !value.is_empty()) {
+            return perform_acgrip_api_token_test(
+                api_token,
+                user_agent.unwrap_or_default(),
+                proxy_url.as_deref(),
+            )
+            .await;
+        }
+    }
+
     perform_site_login_test(
         site,
         cookie_text,
@@ -360,4 +499,85 @@ pub(crate) async fn test_site_login(
         proxy_url.as_deref(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_acgrip_api_success_response_accepts_token() {
+        let result = parse_acgrip_api_test_response(StatusCode::OK, br#"{}"#, "secret-token");
+
+        assert!(result.success);
+        assert!(result.message.contains("API Token"));
+    }
+
+    #[test]
+    fn test_acgrip_api_error_response_uses_error_and_message() {
+        let result = parse_acgrip_api_test_response(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"INVALID_TOKEN","message":"token is invalid"}"#,
+            "secret-token",
+        );
+
+        assert!(!result.success);
+        assert!(result.message.contains("INVALID_TOKEN: token is invalid"));
+    }
+
+    #[test]
+    fn test_acgrip_api_non_json_response_is_truncated() {
+        let body = "upstream error ".repeat(30);
+        let result = parse_acgrip_api_test_response(
+            StatusCode::BAD_GATEWAY,
+            body.as_bytes(),
+            "secret-token",
+        );
+
+        assert!(!result.success);
+        assert!(result.message.contains("HTTP 502"));
+        assert!(result.message.ends_with("..."));
+    }
+
+    #[test]
+    fn test_acgrip_api_error_response_redacts_token() {
+        let token = "secret-token";
+        let result = parse_acgrip_api_test_response(
+            StatusCode::UNAUTHORIZED,
+            br#"{"error":"INVALID_TOKEN","message":"secret-token rejected"}"#,
+            token,
+        );
+
+        assert!(!result.message.contains(token));
+        assert!(result.message.contains("[已隐藏]"));
+    }
+
+    #[test]
+    fn test_acgrip_api_client_rejects_invalid_proxy() {
+        let error = build_acgrip_api_test_client(
+            DEFAULT_TEST_USER_AGENT,
+            "secret-token",
+            Some("://invalid-proxy"),
+        )
+        .expect_err("expected invalid proxy to fail");
+
+        assert!(error.contains("无效的代理地址"));
+        assert!(!error.contains("secret-token"));
+    }
+
+    #[tokio::test]
+    async fn test_acgrip_api_transport_error_is_readable_without_exposing_token() {
+        let token = "secret-token";
+        let error = perform_acgrip_api_token_test_at(
+            "://invalid-api-url",
+            token,
+            DEFAULT_TEST_USER_AGENT,
+            None,
+        )
+        .await
+        .expect_err("expected invalid API URL to fail");
+
+        assert!(error.contains("请求 ACG.RIP API 失败"));
+        assert!(!error.contains(token));
+    }
 }

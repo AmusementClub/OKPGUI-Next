@@ -55,6 +55,7 @@ pub async fn test_site_login(
     cookie_text: String,
     user_agent: Option<String>,
     expected_name: Option<String>,
+    api_token: Option<String>,
 ) -> Result<LoginTestResult, String> {
     crate::commands::profile_commands::test_site_login(
         app,
@@ -62,6 +63,7 @@ pub async fn test_site_login(
         cookie_text,
         user_agent,
         expected_name,
+        api_token,
     )
     .await
 }

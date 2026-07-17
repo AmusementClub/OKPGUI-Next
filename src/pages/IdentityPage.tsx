@@ -48,6 +48,7 @@ interface Profile {
     dmhy_name: string;
     nyaa_name: string;
     acgrip_name: string;
+    acgrip_api_token: string;
     bangumi_name: string;
     acgnx_asia_name: string;
     acgnx_asia_token: string;
@@ -97,6 +98,7 @@ const defaultProfile: Profile = {
     dmhy_name: '',
     nyaa_name: '',
     acgrip_name: '',
+    acgrip_api_token: '',
     bangumi_name: '',
     acgnx_asia_name: '',
     acgnx_asia_token: '',
@@ -107,7 +109,13 @@ const defaultProfile: Profile = {
 const cookieSites: SiteConfig[] = [
     { code: 'dmhy', label: '动漫花园', nameField: 'dmhy_name', loginEnabled: true },
     { code: 'nyaa', label: 'Nyaa', nameField: 'nyaa_name', loginEnabled: true },
-    { code: 'acgrip', label: 'ACG.RIP', nameField: 'acgrip_name', loginEnabled: true },
+    {
+        code: 'acgrip',
+        label: 'ACG.RIP',
+        nameField: 'acgrip_name',
+        tokenField: 'acgrip_api_token',
+        loginEnabled: true,
+    },
     { code: 'bangumi', label: '萌番组', nameField: 'bangumi_name', loginEnabled: true },
 ];
 
@@ -715,14 +723,15 @@ export default function IdentityPage() {
                                         {site.tokenField && (
                                             <div>
                                                 <label className="mb-1 block text-xs text-slate-500">
-                                                    API 令牌
+                                                    {site.code === 'acgrip' ? 'API Token' : 'API 令牌'}
                                                 </label>
                                                 <input
-                                                    type="text"
+                                                    type={site.code === 'acgrip' ? 'password' : 'text'}
                                                     value={profile[site.tokenField] as string}
-                                                    onChange={(event) =>
-                                                        updateField(site.tokenField!, event.target.value)
-                                                    }
+                                                    onChange={(event) => {
+                                                        updateField(site.tokenField!, event.target.value);
+                                                        clearSiteLoginTest(site.code);
+                                                    }}
                                                     onBlur={(event) =>
                                                         autosaveProfile(
                                                             getProfileWithFieldValue(
@@ -731,9 +740,18 @@ export default function IdentityPage() {
                                                             ),
                                                         )
                                                     }
-                                                    placeholder="API 令牌"
+                                                    placeholder={
+                                                        site.code === 'acgrip'
+                                                            ? 'tpx://acg.rip/<token> 中的 token'
+                                                            : 'API 令牌'
+                                                    }
                                                     className="w-full rounded border border-slate-700 bg-slate-900 px-2.5 py-1.5 font-mono text-sm text-slate-200 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                                                 />
+                                                {site.code === 'acgrip' && (
+                                                    <p className="mt-1 text-xs text-slate-600">
+                                                        配置后优先使用 API Token；留空则使用 Cookie。
+                                                    </p>
+                                                )}
                                             </div>
                                         )}
                                     </div>
@@ -901,6 +919,4 @@ export default function IdentityPage() {
         </>
     );
 }
-
-
 

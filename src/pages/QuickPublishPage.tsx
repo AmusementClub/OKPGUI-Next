@@ -31,6 +31,11 @@ import {
     getPublishStatusTextClass,
     getSiteLoginStateBadgeClass,
 } from '../utils/siteStatus';
+import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
+import {
+    buildSortedTemplateSelectOptions,
+    getLatestPublishTimestamp,
+} from '../utils/templateSelectOptions';
 import {
     QuickPublishRuntimeDraft,
     QuickPublishTemplate,
@@ -92,21 +97,25 @@ function formatBytes(bytes?: number): string {
     return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
-function getLatestPublishedAt(template: QuickPublishTemplate) {
-    return quickPublishSiteKeys.reduce((latest, siteKey) => {
-        const publishedAt = template.publish_history[siteKey].last_published_at;
-        return publishedAt > latest ? publishedAt : latest;
-    }, '');
+function getLatestPublishedAt(template: QuickPublishTemplate): string {
+    return (
+        getLatestPublishTimestamp(
+            quickPublishSiteKeys.map((siteKey) => template.publish_history[siteKey].last_published_at),
+        )?.value ?? ''
+    );
 }
 
 function buildTemplateOptions(templates: Record<string, QuickPublishTemplate>): TemplateSelectOption[] {
-    return Object.values(templates)
-        .map((template) => ({
+    return buildSortedTemplateSelectOptions(
+        Object.values(templates).map((template) => ({
             name: template.id,
             label: template.name || template.id,
-            latestPublishedAtLabel: formatTimestamp(getLatestPublishedAt(template)),
-        }))
-        .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
+            publishTimestamps: quickPublishSiteKeys.map(
+                (siteKey) => template.publish_history[siteKey].last_published_at,
+            ),
+            formatPublishedAtLabel: formatTimestamp,
+        })),
+    );
 }
 
 export default function QuickPublishPage() {
@@ -117,6 +126,20 @@ export default function QuickPublishPage() {
     const [errorMessage, setErrorMessage] = useState('');
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
+    const lastUsedPersistQueueRef = useRef(
+        createLatestValuePersistQueue({
+            persist: async (id) => {
+                await invoke('set_last_used_quick_publish_template', { id });
+            },
+            onError: (error) => {
+                setErrorMessage(
+                    typeof error === 'string'
+                        ? error
+                        : '无法保存最近使用的快速发布模板。当前选择仍会保留。',
+                );
+            },
+        }),
+    );
     const {
         siteLoginTests,
         isTestingAllSiteLogins,
@@ -227,6 +250,22 @@ export default function QuickPublishPage() {
                 }
 
                 if (site.loginEnabled) {
+                    const tokenValue = site.tokenField
+                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
+                        : '';
+                    if (tokenValue) {
+                        return {
+                            site,
+                            selectable: true,
+                            selectDisabledReason: '',
+                            identityText: 'API Token 已配置',
+                            identityClass: 'text-emerald-300',
+                            identityTitle: `${site.label} 将优先使用 API Token`,
+                            loginState,
+                            publishState,
+                        };
+                    }
+
                     const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
                     const summary = getCookiePanelSummary(rawText);
                     const hasCookies = summary.cookieCount > 0;
@@ -282,10 +321,16 @@ export default function QuickPublishPage() {
     }, [reconcileRuntimeSelectableSites, siteRows]);
 
     const handleTemplateSelection = useCallback((templateId: string) => {
+        if (!quickPublishTemplates[templateId]) {
+            return;
+        }
+
+        // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
         setErrorMessage('');
-    }, [selectRuntimeTemplate]);
+        lastUsedPersistQueueRef.current.enqueue(templateId);
+    }, [quickPublishTemplates, selectRuntimeTemplate]);
 
     const finalizePublishHistory = useCallback(async (
         publishId: string,

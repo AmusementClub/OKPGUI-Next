@@ -52,6 +52,11 @@ import {
     PublishTitleMetadata,
     resolvePublishTitleMetadata,
 } from '../utils/publishTitleMetadata';
+import {
+    createLatestValuePersistQueue,
+    shouldApplyTemplateSelection,
+} from '../utils/lastUsedPersistQueue';
+import { buildSortedTemplateSelectOptions } from '../utils/templateSelectOptions';
 
 interface SiteSelection {
     dmhy: boolean;
@@ -118,6 +123,7 @@ interface Profile {
     dmhy_name: string;
     nyaa_name: string;
     acgrip_name: string;
+    acgrip_api_token: string;
     bangumi_name: string;
     acgnx_asia_name: string;
     acgnx_asia_token: string;
@@ -201,52 +207,20 @@ const formatPublishTimestamp = (value: string) => {
     return publishTimestampFormatter.format(new Date(parsedTimestamp)).replace(/\//g, '-');
 };
 
-const getPublishTimestampSortValue = (value: string) => {
-    if (!value.trim()) {
-        return Number.NEGATIVE_INFINITY;
-    }
-
-    const parsedTimestamp = Date.parse(value);
-    return Number.isNaN(parsedTimestamp) ? Number.NEGATIVE_INFINITY : parsedTimestamp;
-};
-
-const getLatestTemplatePublishAt = (templateValue: Template) => {
-    let latestPublishedAt = '';
-    let latestPublishedAtSortValue = Number.NEGATIVE_INFINITY;
-
-    for (const siteKey of siteKeys) {
-        const publishedAt = templateValue.publish_history[siteKey].last_published_at;
-        const sortValue = getPublishTimestampSortValue(publishedAt);
-        if (sortValue > latestPublishedAtSortValue) {
-            latestPublishedAt = publishedAt;
-            latestPublishedAtSortValue = sortValue;
-        }
-    }
-
-    return latestPublishedAt;
-};
-
 const buildTemplateOptions = (templates: Record<string, Partial<Template>>): TemplateSelectOption[] =>
-    Object.entries(templates)
-        .map(([name, templateValue]) => {
+    buildSortedTemplateSelectOptions(
+        Object.entries(templates).map(([name, templateValue]) => {
             const normalizedTemplate = normalizeTemplate(templateValue);
-            const latestPublishedAt = getLatestTemplatePublishAt(normalizedTemplate);
-
             return {
                 name,
                 label: name,
-                latestPublishedAtLabel: formatPublishTimestamp(latestPublishedAt),
-                sortValue: getPublishTimestampSortValue(latestPublishedAt),
+                publishTimestamps: siteKeys.map(
+                    (siteKey) => normalizedTemplate.publish_history[siteKey].last_published_at,
+                ),
+                formatPublishedAtLabel: formatPublishTimestamp,
             };
-        })
-        .sort((left, right) => {
-            if (left.sortValue !== right.sortValue) {
-                return left.sortValue - right.sortValue;
-            }
-
-            return left.label.localeCompare(right.label, 'zh-CN');
-        })
-        .map(({ sortValue: _sortValue, ...option }) => option);
+        }),
+    );
 
 const getPublishedValue = (value: string) => value.trim();
 
@@ -411,6 +385,22 @@ export default function HomePage() {
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
+    const lastUsedPersistQueueRef = useRef(
+        createLatestValuePersistQueue({
+            persist: async (name) => {
+                await invoke('set_last_used_template', { name });
+            },
+            onError: (error) => {
+                showNotice({
+                    title: '记住最近模板失败',
+                    message:
+                        typeof error === 'string'
+                            ? error
+                            : '无法保存最近使用的模板。当前选择仍会保留。',
+                });
+            },
+        }),
+    );
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -505,10 +495,32 @@ export default function HomePage() {
         }
     };
 
-    const loadTemplate = async (name: string) => {
+    const loadTemplate = async (name: string, selectionGeneration?: number) => {
         try {
             const config = await fetchConfig();
+            // Drop stale responses before any UI mutation (options list or template body).
+            if (
+                selectionGeneration !== undefined
+                && !shouldApplyTemplateSelection(
+                    selectionGeneration,
+                    lastUsedPersistQueueRef.current.getGeneration(),
+                )
+            ) {
+                return false;
+            }
+
             await refreshTemplateOptions(config);
+
+            if (
+                selectionGeneration !== undefined
+                && !shouldApplyTemplateSelection(
+                    selectionGeneration,
+                    lastUsedPersistQueueRef.current.getGeneration(),
+                )
+            ) {
+                return false;
+            }
+
             if (config.templates[name]) {
                 const nextTemplate = normalizeTemplate(config.templates[name]);
                 lastPersistedDescriptionRef.current = nextTemplate.description;
@@ -517,10 +529,21 @@ export default function HomePage() {
                 setNewTemplateName('');
                 setTemplate(nextTemplate);
                 setSelectedProfile(nextTemplate.profile || '');
+                return true;
             }
+            return false;
         } catch (e) {
             console.error('加载模板失败:', e);
+            return false;
         }
+    };
+
+    /** User dropdown selection only — never called from restore/import/loadLastConfig. */
+    const handleTemplateSelection = async (name: string) => {
+        // Generation advances immediately so earlier in-flight loads cannot apply after later picks.
+        // Latest-id persist is serialized by the queue (last selection wins on disk).
+        const generation = lastUsedPersistQueueRef.current.enqueue(name);
+        await loadTemplate(name, generation);
     };
 
     const getTemplateName = (explicitName?: string) => {
@@ -938,6 +961,22 @@ export default function HomePage() {
                 }
 
                 if (site.loginEnabled) {
+                    const tokenValue = site.tokenField
+                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
+                        : '';
+                    if (tokenValue) {
+                        return {
+                            site,
+                            selectable: true,
+                            selectDisabledReason: '',
+                            identityText: 'API Token 已配置',
+                            identityClass: 'text-emerald-300',
+                            identityTitle: `${site.label} 将优先使用 API Token`,
+                            loginState,
+                            publishState,
+                        };
+                    }
+
                     const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
                     const summary = getCookiePanelSummary(rawText);
                     const hasCookies = summary.cookieCount > 0;
@@ -1185,7 +1224,9 @@ export default function HomePage() {
                             <TemplateSelect
                                 options={templateOptions}
                                 value={currentTemplateName}
-                                onChange={loadTemplate}
+                                onChange={(name) => {
+                                    void handleTemplateSelection(name);
+                                }}
                             />
                         </div>
                         <input

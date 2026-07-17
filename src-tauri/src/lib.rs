@@ -19,6 +19,8 @@ pub fn run() {
             config::get_template_list,
             config::save_template,
             config::delete_template,
+            config::set_last_used_template,
+            config::set_last_used_quick_publish_template,
             config::save_proxy,
             config::get_proxy,
             config::save_okp_executable_path,

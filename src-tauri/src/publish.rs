@@ -90,6 +90,7 @@ pub(crate) struct SitePublishConfig {
     pub(crate) label: &'static str,
     pub(crate) account_name: String,
     pub(crate) token: Option<String>,
+    pub(crate) api_token: Option<String>,
     pub(crate) enabled: bool,
     pub(crate) uses_cookie: bool,
 }
@@ -128,6 +129,8 @@ struct SiteTemplateIntroToml<'a> {
     user_agent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cookie: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api_token: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     proxy: Option<&'a str>,
 }
@@ -422,6 +425,7 @@ pub(crate) fn collect_site_publish_configs(
             label: site_label("dmhy"),
             account_name: profile.dmhy_name.clone(),
             token: None,
+            api_token: None,
             enabled: template.sites.dmhy,
             uses_cookie: true,
         },
@@ -430,6 +434,7 @@ pub(crate) fn collect_site_publish_configs(
             label: site_label("nyaa"),
             account_name: profile.nyaa_name.clone(),
             token: None,
+            api_token: None,
             enabled: template.sites.nyaa,
             uses_cookie: true,
         },
@@ -438,14 +443,16 @@ pub(crate) fn collect_site_publish_configs(
             label: site_label("acgrip"),
             account_name: profile.acgrip_name.clone(),
             token: None,
+            api_token: Some(profile.acgrip_api_token.clone()),
             enabled: template.sites.acgrip,
-            uses_cookie: true,
+            uses_cookie: profile.acgrip_api_token.trim().is_empty(),
         },
         SitePublishConfig {
             code: "bangumi",
             label: site_label("bangumi"),
             account_name: profile.bangumi_name.clone(),
             token: None,
+            api_token: None,
             enabled: template.sites.bangumi,
             uses_cookie: true,
         },
@@ -454,6 +461,7 @@ pub(crate) fn collect_site_publish_configs(
             label: site_label("acgnx_asia"),
             account_name: profile.acgnx_asia_name.clone(),
             token: Some(profile.acgnx_asia_token.clone()),
+            api_token: None,
             enabled: template.sites.acgnx_asia,
             uses_cookie: false,
         },
@@ -462,6 +470,7 @@ pub(crate) fn collect_site_publish_configs(
             label: site_label("acgnx_global"),
             account_name: profile.acgnx_global_name.clone(),
             token: Some(profile.acgnx_global_token.clone()),
+            api_token: None,
             enabled: template.sites.acgnx_global,
             uses_cookie: false,
         },
@@ -529,6 +538,7 @@ fn serialize_site_template_toml(
             content: description_file_name,
             user_agent: optional_non_empty(user_agent),
             cookie: site.token.as_deref().and_then(optional_trimmed),
+            api_token: site.api_token.as_deref().and_then(optional_trimmed),
             proxy,
         }],
     };
@@ -607,7 +617,13 @@ fn generate_site_template_toml(
         return Err("标题不能为空，请先填写标题。".to_string());
     }
 
-    if !site.uses_cookie && site.token.as_deref().unwrap_or_default().trim().is_empty() {
+    let has_token = site
+        .token
+        .as_deref()
+        .and_then(optional_trimmed)
+        .or_else(|| site.api_token.as_deref().and_then(optional_trimmed))
+        .is_some();
+    if !site.uses_cookie && !has_token {
         return Err(format!("{} 的 API Token 不能为空。", site.label));
     }
 
@@ -726,37 +742,69 @@ pub(crate) fn run_site_publish(
     };
 
     let result = (|| -> Result<SitePublishResult, String> {
-        let cookie_text = build_site_publish_cookie_text(site, profile)?;
-        let site_user_agent = resolve_site_cookie_user_agent(&cookie_text, &profile.user_agent);
+        let api_token_mode = site
+            .api_token
+            .as_deref()
+            .and_then(optional_trimmed)
+            .is_some();
+        let cookie_text = if api_token_mode {
+            None
+        } else {
+            Some(build_site_publish_cookie_text(site, profile)?)
+        };
+        let site_user_agent = resolve_site_cookie_user_agent(
+            cookie_text.as_deref().unwrap_or_default(),
+            &profile.user_agent,
+        );
 
         generate_site_template_toml(app, template, site, &artifacts, &site_user_agent)?;
 
-        std::fs::write(&artifacts.cookies_path, &cookie_text)
-            .map_err(|e| format!("写入 cookies.txt 失败: {}", e))?;
         emit_publish_output(
             app,
             publish_id,
             site.code,
             site.label,
             format!(
-                "已生成 {} 的 Cookie 文件: {} ({} 字节)",
+                "{} 使用 {} 认证。",
                 site.label,
-                artifacts.cookies_path.display(),
-                cookie_text.len()
+                if site.uses_cookie {
+                    "Cookie"
+                } else {
+                    "API Token"
+                }
             ),
             false,
         );
 
-        let command_arguments = vec![
+        let mut command_arguments = vec![
             torrent_path.display().to_string(),
             "-s".to_string(),
             artifacts.template_path.display().to_string(),
             "--no_reaction".to_string(),
             "--log_file".to_string(),
             artifacts.log_path.display().to_string(),
-            "--cookies".to_string(),
-            artifacts.cookies_path.display().to_string(),
         ];
+        if let Some(cookie_text) = cookie_text.as_deref() {
+            std::fs::write(&artifacts.cookies_path, cookie_text)
+                .map_err(|e| format!("写入 cookies.txt 失败: {}", e))?;
+            emit_publish_output(
+                app,
+                publish_id,
+                site.code,
+                site.label,
+                format!(
+                    "已生成 {} 的 Cookie 文件: {} ({} 字节)",
+                    site.label,
+                    artifacts.cookies_path.display(),
+                    cookie_text.len()
+                ),
+                false,
+            );
+            command_arguments.extend([
+                "--cookies".to_string(),
+                artifacts.cookies_path.display().to_string(),
+            ]);
+        }
 
         let command_preview = okp_core
             .preview_parts(&command_arguments)
@@ -822,7 +870,10 @@ pub(crate) fn run_site_publish(
             let _ = handle.join();
         }
 
-        let updated_cookie_text = std::fs::read_to_string(&artifacts.cookies_path).ok();
+        let updated_cookie_text = site
+            .uses_cookie
+            .then(|| std::fs::read_to_string(&artifacts.cookies_path).ok())
+            .flatten();
 
         if status.success() {
             cleanup_publish_artifacts(&artifacts, false);
@@ -875,6 +926,7 @@ mod tests {
             label: "萌番组",
             account_name: "Team".to_string(),
             token: None,
+            api_token: None,
             enabled: true,
             uses_cookie: true,
         };
@@ -892,6 +944,7 @@ mod tests {
             label: "ACGNx Asia",
             account_name: "Uploader".to_string(),
             token: Some("token-123".to_string()),
+            api_token: None,
             enabled: true,
             uses_cookie: false,
         };
@@ -905,6 +958,61 @@ mod tests {
             .expect("expected token site cookie file");
 
         assert_eq!(cookie_text, "user-agent:\tMozilla/5.0 Publish");
+    }
+
+    #[test]
+    fn test_collect_acgrip_publish_config_prefers_api_token() {
+        let mut template = Template::default();
+        template.sites.acgrip = true;
+        let profile = Profile {
+            acgrip_name: "Uploader".to_string(),
+            acgrip_api_token: "  api-token-123  ".to_string(),
+            ..Profile::default()
+        };
+
+        let site = collect_site_publish_configs(&template, &profile)
+            .into_iter()
+            .find(|site| site.code == "acgrip")
+            .expect("expected ACG.RIP publish config");
+
+        assert!(site.enabled);
+        assert!(!site.uses_cookie);
+        assert_eq!(site.api_token.as_deref(), Some("  api-token-123  "));
+        assert!(site.token.is_none());
+    }
+
+    #[test]
+    fn test_collect_acgrip_publish_config_falls_back_to_cookie() {
+        let profile = Profile {
+            acgrip_api_token: "   ".to_string(),
+            ..Profile::default()
+        };
+
+        let site = collect_site_publish_configs(&Template::default(), &profile)
+            .into_iter()
+            .find(|site| site.code == "acgrip")
+            .expect("expected ACG.RIP publish config");
+
+        assert!(site.uses_cookie);
+    }
+
+    #[test]
+    fn test_acgrip_cookie_fallback_rejects_missing_cookie() {
+        let site = SitePublishConfig {
+            code: "acgrip",
+            label: "ACG.RIP",
+            account_name: "Uploader".to_string(),
+            token: None,
+            api_token: Some(String::new()),
+            enabled: true,
+            uses_cookie: true,
+        };
+
+        let error = build_site_publish_cookie_text(&site, &Profile::default())
+            .expect_err("expected missing ACG.RIP cookie error");
+
+        assert!(error.contains("ACG.RIP"));
+        assert!(error.contains("Cookie"));
     }
 
     #[test]
@@ -926,6 +1034,7 @@ mod tests {
             label: "动漫花园",
             account_name: "Team".to_string(),
             token: None,
+            api_token: None,
             enabled: true,
             uses_cookie: true,
         };
@@ -956,6 +1065,7 @@ mod tests {
             label: "ACG.RIP",
             account_name: "Team".to_string(),
             token: None,
+            api_token: None,
             enabled: true,
             uses_cookie: true,
         };
@@ -986,6 +1096,7 @@ mod tests {
             label: "动漫花园",
             account_name: "Team".to_string(),
             token: None,
+            api_token: None,
             enabled: true,
             uses_cookie: true,
         };
@@ -1067,6 +1178,7 @@ mod tests {
             label: "动漫花园",
             account_name: "Team".to_string(),
             token: Some("token-123".to_string()),
+            api_token: None,
             enabled: true,
             uses_cookie: false,
         }
@@ -1197,6 +1309,49 @@ mod tests {
             intro.get("cookie").and_then(toml::Value::as_str),
             Some("token-123")
         );
+        assert!(intro.get("api_token").is_none());
+    }
+
+    #[test]
+    fn test_acgrip_api_token_serializes_safely_without_cookie() {
+        let api_token = "api-token-123\"\nnot-a-new-key";
+        let site = SitePublishConfig {
+            code: "acgrip",
+            label: "ACG.RIP",
+            account_name: "Uploader".to_string(),
+            token: None,
+            api_token: Some(api_token.to_string()),
+            enabled: true,
+            uses_cookie: false,
+        };
+        let template = Template {
+            title: "Example Release".to_string(),
+            description: "# description".to_string(),
+            ..Template::default()
+        };
+
+        let toml_content = serialize_site_template_toml(
+            &template,
+            &site,
+            "description.md",
+            "Mozilla/5.0 Publish",
+            None,
+        )
+        .expect("expected ACG.RIP template serialization to succeed");
+        let parsed: toml::Value =
+            toml::from_str(&toml_content).expect("expected serialized ACG.RIP template to parse");
+        let intro = parsed
+            .get("intro_template")
+            .and_then(toml::Value::as_array)
+            .and_then(|entries| entries.first())
+            .and_then(toml::Value::as_table)
+            .expect("expected ACG.RIP intro template");
+
+        assert_eq!(
+            intro.get("api_token").and_then(toml::Value::as_str),
+            Some(api_token)
+        );
+        assert!(intro.get("cookie").is_none());
     }
 
     #[test]
