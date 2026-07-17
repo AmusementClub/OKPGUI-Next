@@ -340,18 +340,20 @@ mod tests {
         assert_eq!(result.resolution, "1080p");
     }
 
+    /// App default ep pattern: single episode or optional range, 1–3 digits per side.
+    const DEFAULT_EP_PATTERN: &str = r"(?P<ep>\d{1,3}(?:[-~～]\d{1,3})?)";
+    const DEFAULT_RESOLUTION_PATTERN: &str = r"(?P<res>1080p|720p)";
+
     #[test]
     fn test_parse_title_details_pairs_generic_episode_before_named_resolution() {
         let filename =
             "[Nekomoe kissaten][Azur Lane - Bisoku Zenshin! S2][01][1080p][JPSC].mp4.torrent";
-        let ep_pattern = r"(?P<ep>\d+)";
-        let resolution_pattern = r"(?P<res>1080p|720p)";
         let title_pattern = "[<ep>][<res>]";
 
         let result = parse_title_details(
             filename.to_string(),
-            ep_pattern.to_string(),
-            resolution_pattern.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
             title_pattern.to_string(),
         )
         .unwrap();
@@ -367,13 +369,91 @@ mod tests {
             "[Nekomoe kissaten][Azur Lane - Bisoku Zenshin! S2][01][1080p][JPSC].mp4.torrent";
         let result = match_title(
             filename.to_string(),
-            r"(?P<ep>\d+)".to_string(),
-            r"(?P<res>1080p|720p)".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
             "[<ep>][<res>]".to_string(),
         )
         .unwrap();
 
         assert_eq!(result, "[01][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_bracket_episode_range_pack() {
+        let filename = "[Nekomoe kissaten][Kamiina Botan, Yoeru Sugata wa Yuri no Hana][01-12][1080p|[JPSC].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01-12");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[01-12][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_dash_style_single_episode() {
+        let filename = "[喵萌奶茶屋&LoliHouse] Kimi ga Shinu made Koi wo Shitai - 01 [WebRip 1080p HEVC-10bit AAC][简繁日内封字幕].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[喵萌奶茶屋&LoliHouse] Kimi ga Shinu made Koi wo Shitai - <ep> [WebRip <res> HEVC-10bit AAC][简繁日内封字幕]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01");
+        assert_eq!(result.resolution, "1080p");
+        assert!(result.title.contains("- 01 [WebRip 1080p"));
+    }
+
+    #[test]
+    fn test_parse_title_details_dash_style_episode_range() {
+        let filename = "[喵萌奶茶屋&LoliHouse] Kimi ga Shinu made Koi wo Shitai - 01-12 [WebRip 1080p HEVC-10bit AAC][简繁日内封字幕].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[喵萌奶茶屋&LoliHouse] Kimi ga Shinu made Koi wo Shitai - <ep> [WebRip <res> HEVC-10bit AAC][简繁日内封字幕]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01-12");
+        assert_eq!(result.resolution, "1080p");
+        assert!(result.title.contains("- 01-12 [WebRip 1080p"));
+    }
+
+    #[test]
+    fn test_parse_title_details_multi_season_continuous_range() {
+        let result = parse_title_details(
+            "[Group] Title - 50-80 [WebRip 1080p HEVC-10bit AAC].torrent".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "Title - <ep> [<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "50-80");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "Title - 50-80 [1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_tilde_episode_range() {
+        let result = parse_title_details(
+            "[Group][Title][01~12][1080p].torrent".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01~12");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[01~12][1080p]");
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub async fn test_site_login(
     cookie_text: String,
     user_agent: Option<String>,
     expected_name: Option<String>,
+    api_token: Option<String>,
 ) -> Result<LoginTestResult, String> {
     crate::services::login_test_service::test_site_login(
         &app,
@@ -27,6 +28,7 @@ pub async fn test_site_login(
         &cookie_text,
         user_agent.as_deref(),
         expected_name.as_deref(),
+        api_token.as_deref(),
     )
     .await
 }

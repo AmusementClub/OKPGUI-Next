@@ -59,6 +59,8 @@ pub struct Profile {
     #[serde(default)]
     pub acgrip_name: String,
     #[serde(default)]
+    pub acgrip_api_token: String,
+    #[serde(default)]
     pub bangumi_name: String,
     #[serde(default)]
     pub acgnx_asia_name: String,
@@ -722,6 +724,22 @@ mod tests {
         assert!(profile.site_cookies.is_empty());
         assert!(profile.dmhy_name.is_empty());
         assert!(profile.nyaa_name.is_empty());
+        assert!(profile.acgrip_api_token.is_empty());
+    }
+
+    #[test]
+    fn test_profile_deserialization_defaults_missing_acgrip_api_token() {
+        let profile: Profile = serde_json::from_str(
+            r#"{
+                "acgrip_name": "Uploader",
+                "acgnx_asia_token": "legacy-token"
+            }"#,
+        )
+        .expect("expected legacy profile JSON to deserialize");
+
+        assert_eq!(profile.acgrip_name, "Uploader");
+        assert!(profile.acgrip_api_token.is_empty());
+        assert_eq!(profile.acgnx_asia_token, "legacy-token");
     }
 
     #[test]

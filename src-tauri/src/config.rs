@@ -7,6 +7,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 
 const TEMPLATE_REGEX_MAX_CHARS: usize = 4096;
@@ -549,16 +550,225 @@ fn config_path(app: &AppHandle) -> PathBuf {
     data_dir.join("okpgui_config.json")
 }
 
-pub fn load_config(app: &AppHandle) -> AppConfig {
-    let path = config_path(app);
-    if path.exists() {
-        let data = std::fs::read_to_string(&path).unwrap_or_default();
-        let mut config: AppConfig = serde_json::from_str(&data).unwrap_or_default();
-        migrate_config(&mut config);
-        config
-    } else {
-        AppConfig::default()
+fn config_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+/// Read config from disk without taking the process lock.
+/// Parse failures return Err so callers do not silently treat a corrupt file as empty.
+fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
+    if !path.exists() {
+        return Ok(AppConfig::default());
     }
+
+    let data = std::fs::read_to_string(path)
+        .map_err(|error| format!("无法读取配置文件: {}", error))?;
+    if data.trim().is_empty() {
+        return Ok(AppConfig::default());
+    }
+
+    let mut config: AppConfig = serde_json::from_str(&data).map_err(|error| {
+        format!(
+            "配置文件解析失败（已拒绝用默认配置覆盖）: {}",
+            error
+        )
+    })?;
+    migrate_config(&mut config);
+    Ok(config)
+}
+
+fn load_config_unlocked(app: &AppHandle) -> Result<AppConfig, String> {
+    read_config_file(&config_path(app))
+}
+
+/// Public reads take the same lock as writers so they never interleave with a non-atomic mid-write.
+pub fn load_config(app: &AppHandle) -> AppConfig {
+    let _guard = config_write_lock().lock().ok();
+    match load_config_unlocked(app) {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("[okpgui] {}", error);
+            AppConfig::default()
+        }
+    }
+}
+
+/// Replace `dest` with `temp` without a delete-then-rename gap.
+///
+/// - Unix: `rename` replaces an existing destination atomically.
+/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` replaces without deleting first,
+///   so a crash cannot leave the user with neither the old nor the new file.
+fn replace_file_atomically(temp: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+
+        fn to_wide(path: &std::path::Path) -> Vec<u16> {
+            path.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
+        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn MoveFileExW(
+                lp_existing_file_name: *const u16,
+                lp_new_file_name: *const u16,
+                dw_flags: u32,
+            ) -> i32;
+        }
+
+        let from_wide = to_wide(temp);
+        let to_wide_path = to_wide(dest);
+        let ok = unsafe {
+            MoveFileExW(
+                from_wide.as_ptr(),
+                to_wide_path.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        };
+        if ok == 0 {
+            return Err(format!(
+                "无法原子替换配置文件: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(temp, dest).map_err(|error| format!("无法提交配置文件: {}", error))
+    }
+}
+
+/// Atomically replace the config file via temp write + platform-safe replace.
+fn write_config_file(path: &std::path::Path, config: &AppConfig) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(config)
+        .map_err(|error| format!("无法序列化配置: {}", error))?;
+
+    let temp_path = path.with_extension("json.tmp");
+    if let Err(error) = std::fs::write(&temp_path, &data) {
+        return Err(format!("无法写入临时配置文件: {}", error));
+    }
+
+    if let Err(error) = replace_file_atomically(&temp_path, path) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(error);
+    }
+
+    Ok(())
+}
+
+/// Serialize AppConfig read-modify-write mutations so concurrent last-used writes
+/// cannot clobber template body or publish-history updates.
+fn mutate_config<F, T>(app: &AppHandle, mutator: F) -> Result<T, String>
+where
+    F: FnOnce(&mut AppConfig) -> Result<(T, bool), String>,
+{
+    let _guard = config_write_lock()
+        .lock()
+        .map_err(|_| "配置写入锁已损坏".to_string())?;
+    let mut config = load_config_unlocked(app)?;
+    let (value, changed) = mutator(&mut config)?;
+    if changed {
+        save_config_to_disk(app, &config)?;
+    }
+    Ok(value)
+}
+
+fn apply_set_last_used_template(config: &mut AppConfig, name: &str) -> Result<bool, String> {
+    let normalized = name.trim();
+    if normalized.is_empty() {
+        return Err("模板名称不能为空".to_string());
+    }
+    if !config.templates.contains_key(normalized) {
+        return Err(format!("未找到模板: {}", normalized));
+    }
+    if config.last_used_template.as_deref() == Some(normalized) {
+        return Ok(false);
+    }
+    config.last_used_template = Some(normalized.to_string());
+    Ok(true)
+}
+
+fn apply_set_last_used_quick_publish_template(
+    config: &mut AppConfig,
+    id: &str,
+) -> Result<bool, String> {
+    let normalized = id.trim();
+    if normalized.is_empty() {
+        return Err("快速发布模板 ID 不能为空".to_string());
+    }
+    if !config.quick_publish_templates.contains_key(normalized) {
+        return Err(format!("未找到快速发布模板: {}", normalized));
+    }
+    if config.last_used_quick_publish_template.as_deref() == Some(normalized) {
+        return Ok(false);
+    }
+    config.last_used_quick_publish_template = Some(normalized.to_string());
+    Ok(true)
+}
+
+/// Shared mutation for save_template (including rename continuity). Does not set last_used from save.
+fn apply_upsert_template(
+    config: &mut AppConfig,
+    normalized_name: String,
+    template: Template,
+    previous_name: Option<&str>,
+) -> Result<(), String> {
+    if let Some(previous_name) = previous_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if previous_name != normalized_name && config.templates.contains_key(&normalized_name) {
+            return Err(format!("已存在同名模板: {}", normalized_name));
+        }
+
+        if previous_name != normalized_name {
+            config.templates.remove(previous_name);
+            if config.last_used_template.as_deref() == Some(previous_name) {
+                config.last_used_template = Some(normalized_name.clone());
+            }
+        }
+    }
+
+    config.templates.insert(normalized_name, template);
+    Ok(())
+}
+
+fn apply_delete_template(config: &mut AppConfig, name: &str) {
+    config.templates.remove(name);
+    if config.last_used_template.as_deref() == Some(name) {
+        config.last_used_template = None;
+    }
+}
+
+fn apply_delete_quick_publish_template(config: &mut AppConfig, id: &str) -> Result<(), String> {
+    if config.quick_publish_templates.remove(id).is_none() {
+        return Err(format!("未找到快速发布模板: {}", id));
+    }
+    if config.last_used_quick_publish_template.as_deref() == Some(id) {
+        config.last_used_quick_publish_template = None;
+    }
+    Ok(())
+}
+
+/// Save/import must not stamp last_used; only selection setters may.
+fn apply_upsert_quick_publish_template(
+    config: &mut AppConfig,
+    template_id: String,
+    template: QuickPublishTemplate,
+) {
+    config
+        .quick_publish_templates
+        .insert(template_id, template);
 }
 
 fn migrate_config(config: &mut AppConfig) {
@@ -614,11 +824,8 @@ fn migrate_quick_publish_template(
     }
 }
 
-pub fn save_config_to_disk(app: &AppHandle, config: &AppConfig) {
-    let path = config_path(app);
-    if let Ok(data) = serde_json::to_string_pretty(config) {
-        std::fs::write(path, data).ok();
-    }
+fn save_config_to_disk(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
+    write_config_file(&config_path(app), config)
 }
 
 #[tauri::command]
@@ -642,46 +849,41 @@ pub fn save_template(
     let normalized_name = normalize_template_storage_name(&name)?;
     validate_template_for_storage(&template)?;
 
-    let mut config = load_config(&app);
-    if let Some(previous_name) = previous_name.filter(|value| !value.trim().is_empty()) {
-        if previous_name != normalized_name && config.templates.contains_key(&normalized_name) {
-            return Err(format!("已存在同名模板: {}", normalized_name));
-        }
-
-        if previous_name != normalized_name {
-            config.templates.remove(&previous_name);
-        }
-    }
-
-    config
-        .templates
-        .insert(normalized_name.clone(), template.clone());
-    config.last_used_template = Some(normalized_name.clone());
-    save_config_to_disk(&app, &config);
-    Ok(ImportedTemplatePayload {
-        name: normalized_name,
-        template,
+    mutate_config(&app, |config| {
+        apply_upsert_template(
+            config,
+            normalized_name.clone(),
+            template.clone(),
+            previous_name.as_deref(),
+        )?;
+        // Do not treat save/autosave as "last used" selection.
+        Ok((
+            ImportedTemplatePayload {
+                name: normalized_name.clone(),
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
 #[tauri::command]
-pub fn delete_template(app: AppHandle, name: String) {
-    let mut config = load_config(&app);
-    config.templates.remove(&name);
-    if config.last_used_template.as_deref() == Some(&name) {
-        config.last_used_template = None;
-    }
-    save_config_to_disk(&app, &config);
+pub fn delete_template(app: AppHandle, name: String) -> Result<(), String> {
+    mutate_config(&app, |config| {
+        apply_delete_template(config, &name);
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
-pub fn save_proxy(app: AppHandle, proxy_type: String, proxy_host: String) {
-    let mut config = load_config(&app);
-    config.proxy = ProxyConfig {
-        proxy_type,
-        proxy_host,
-    };
-    save_config_to_disk(&app, &config);
+pub fn save_proxy(app: AppHandle, proxy_type: String, proxy_host: String) -> Result<(), String> {
+    mutate_config(&app, |config| {
+        config.proxy = ProxyConfig {
+            proxy_type,
+            proxy_host,
+        };
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
@@ -690,10 +892,30 @@ pub fn get_proxy(app: AppHandle) -> ProxyConfig {
 }
 
 #[tauri::command]
-pub fn save_okp_executable_path(app: AppHandle, okp_executable_path: String) {
-    let mut config = load_config(&app);
-    config.okp_executable_path = okp_executable_path;
-    save_config_to_disk(&app, &config);
+pub fn save_okp_executable_path(
+    app: AppHandle,
+    okp_executable_path: String,
+) -> Result<(), String> {
+    mutate_config(&app, |config| {
+        config.okp_executable_path = okp_executable_path;
+        Ok(((), true))
+    })
+}
+
+#[tauri::command]
+pub fn set_last_used_template(app: AppHandle, name: String) -> Result<(), String> {
+    mutate_config(&app, |config| {
+        let changed = apply_set_last_used_template(config, &name)?;
+        Ok(((), changed))
+    })
+}
+
+#[tauri::command]
+pub fn set_last_used_quick_publish_template(app: AppHandle, id: String) -> Result<(), String> {
+    mutate_config(&app, |config| {
+        let changed = apply_set_last_used_quick_publish_template(config, &id)?;
+        Ok(((), changed))
+    })
 }
 
 #[tauri::command]
@@ -704,42 +926,35 @@ pub fn save_quick_publish_template(
 ) -> Result<ImportedQuickPublishTemplatePayload, String> {
     let template_id = normalize_quick_publish_template_for_storage(&mut template)?;
 
-    let mut config = load_config(&app);
-    let current_revision = config
-        .quick_publish_templates
-        .get(&template_id)
-        .map(|existing| existing.revision);
-    template.revision = resolve_next_template_revision(
-        "发布模板",
-        &template_id,
-        current_revision,
-        expected_revision,
-    )?;
-    config
-        .quick_publish_templates
-        .insert(template_id.clone(), template.clone());
-    config.last_used_quick_publish_template = Some(template_id.clone());
-    save_config_to_disk(&app, &config);
-
-    Ok(ImportedQuickPublishTemplatePayload {
-        id: template_id,
-        template,
+    mutate_config(&app, |config| {
+        let current_revision = config
+            .quick_publish_templates
+            .get(&template_id)
+            .map(|existing| existing.revision);
+        template.revision = resolve_next_template_revision(
+            "发布模板",
+            &template_id,
+            current_revision,
+            expected_revision,
+        )?;
+        apply_upsert_quick_publish_template(config, template_id.clone(), template.clone());
+        // Do not treat save/autosave as "last used" selection.
+        Ok((
+            ImportedQuickPublishTemplatePayload {
+                id: template_id.clone(),
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
 #[tauri::command]
 pub fn delete_quick_publish_template(app: AppHandle, id: String) -> Result<(), String> {
-    let mut config = load_config(&app);
-    if config.quick_publish_templates.remove(&id).is_none() {
-        return Err(format!("未找到快速发布模板: {}", id));
-    }
-
-    if config.last_used_quick_publish_template.as_deref() == Some(&id) {
-        config.last_used_quick_publish_template = None;
-    }
-
-    save_config_to_disk(&app, &config);
-    Ok(())
+    mutate_config(&app, |config| {
+        apply_delete_quick_publish_template(config, &id)?;
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
@@ -750,44 +965,46 @@ pub fn save_content_template(
 ) -> Result<ImportedContentTemplatePayload, String> {
     let template_id = normalize_content_template_for_storage(&mut template)?;
 
-    let mut config = load_config(&app);
-    let current_revision = config
-        .content_templates
-        .get(&template_id)
-        .map(|existing| existing.revision);
-    template.revision = resolve_next_template_revision(
-        "公共正文模板",
-        &template_id,
-        current_revision,
-        expected_revision,
-    )?;
-    config
-        .content_templates
-        .insert(template_id.clone(), template.clone());
-    save_config_to_disk(&app, &config);
-
-    Ok(ImportedContentTemplatePayload {
-        id: template_id,
-        template,
+    mutate_config(&app, |config| {
+        let current_revision = config
+            .content_templates
+            .get(&template_id)
+            .map(|existing| existing.revision);
+        template.revision = resolve_next_template_revision(
+            "公共正文模板",
+            &template_id,
+            current_revision,
+            expected_revision,
+        )?;
+        config
+            .content_templates
+            .insert(template_id.clone(), template.clone());
+        Ok((
+            ImportedContentTemplatePayload {
+                id: template_id.clone(),
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
 #[tauri::command]
 pub fn delete_content_template(app: AppHandle, id: String) -> Result<(), String> {
-    let mut config = load_config(&app);
-    if config.content_templates.remove(&id).is_none() {
-        return Err(format!("未找到正文模板: {}", id));
-    }
-
-    for template in config.quick_publish_templates.values_mut() {
-        if template.shared_content_template_id.as_deref() == Some(id.as_str()) {
-            template.shared_content_template_id = None;
-            template.revision = template.revision.saturating_add(1);
+    mutate_config(&app, |config| {
+        if config.content_templates.remove(&id).is_none() {
+            return Err(format!("未找到正文模板: {}", id));
         }
-    }
 
-    save_config_to_disk(&app, &config);
-    Ok(())
+        for template in config.quick_publish_templates.values_mut() {
+            if template.shared_content_template_id.as_deref() == Some(id.as_str()) {
+                template.shared_content_template_id = None;
+                template.revision = template.revision.saturating_add(1);
+            }
+        }
+
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
@@ -796,26 +1013,25 @@ pub fn update_quick_publish_template_publish_history(
     id: String,
     updates: Vec<TemplatePublishHistoryUpdate>,
 ) -> Result<(), String> {
-    let mut config = load_config(&app);
-    let template = config
-        .quick_publish_templates
-        .get_mut(&id)
-        .ok_or_else(|| format!("未找到快速发布模板: {}", id))?;
+    mutate_config(&app, |config| {
+        let template = config
+            .quick_publish_templates
+            .get_mut(&id)
+            .ok_or_else(|| format!("未找到快速发布模板: {}", id))?;
 
-    for update in updates {
-        let history_entry = template
-            .publish_history
-            .get_mut(&update.site_key)
-            .ok_or_else(|| format!("不支持的站点代码: {}", update.site_key))?;
-        history_entry.last_published_at = update.last_published_at;
-        history_entry.last_published_episode = update.last_published_episode;
-        history_entry.last_published_resolution = update.last_published_resolution;
-    }
+        for update in updates {
+            let history_entry = template
+                .publish_history
+                .get_mut(&update.site_key)
+                .ok_or_else(|| format!("不支持的站点代码: {}", update.site_key))?;
+            history_entry.last_published_at = update.last_published_at;
+            history_entry.last_published_episode = update.last_published_episode;
+            history_entry.last_published_resolution = update.last_published_resolution;
+        }
 
-    template.revision = template.revision.saturating_add(1);
-
-    save_config_to_disk(&app, &config);
-    Ok(())
+        template.revision = template.revision.saturating_add(1);
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
@@ -889,43 +1105,44 @@ pub fn import_quick_publish_template_from_file(
         }
     };
 
-    let mut config = load_config(&app);
     let strategy = conflict_strategy.unwrap_or_default();
     let normalized_id = normalize_required_value(&id, "快速发布模板 ID", ENTITY_ID_MAX_CHARS)?;
-    let final_id = resolve_import_id_conflict(
-        normalized_id.clone(),
-        &config.quick_publish_templates,
-        strategy,
-    )?;
 
-    template.id = final_id.clone();
-    template.name = normalize_optional_name(
-        &template.name,
-        &normalized_id,
-        "模板名称",
-        ENTITY_NAME_MAX_CHARS,
-    )?;
-    if final_id != normalized_id {
-        template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
-    }
-    let final_id = normalize_quick_publish_template_for_storage(&mut template)?;
-    let current_revision = config
-        .quick_publish_templates
-        .get(&final_id)
-        .map(|existing| existing.revision)
-        .unwrap_or(0);
-    template.revision = current_revision.saturating_add(1);
+    mutate_config(&app, |config| {
+        let final_id = resolve_import_id_conflict(
+            normalized_id.clone(),
+            &config.quick_publish_templates,
+            strategy,
+        )?;
 
-    migrate_quick_publish_template(&mut template, &config.content_templates);
-    config
-        .quick_publish_templates
-        .insert(final_id.clone(), template.clone());
-    config.last_used_quick_publish_template = Some(final_id.clone());
-    save_config_to_disk(&app, &config);
+        template.id = final_id.clone();
+        template.name = normalize_optional_name(
+            &template.name,
+            &normalized_id,
+            "模板名称",
+            ENTITY_NAME_MAX_CHARS,
+        )?;
+        if final_id != normalized_id {
+            template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
+        }
+        let final_id = normalize_quick_publish_template_for_storage(&mut template)?;
+        let current_revision = config
+            .quick_publish_templates
+            .get(&final_id)
+            .map(|existing| existing.revision)
+            .unwrap_or(0);
+        template.revision = current_revision.saturating_add(1);
 
-    Ok(ImportedQuickPublishTemplatePayload {
-        id: final_id,
-        template,
+        migrate_quick_publish_template(&mut template, &config.content_templates);
+        apply_upsert_quick_publish_template(config, final_id.clone(), template.clone());
+        // Import does not count as user dropdown selection.
+        Ok((
+            ImportedQuickPublishTemplatePayload {
+                id: final_id,
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
@@ -1000,38 +1217,44 @@ pub fn import_content_template_from_file(
         }
     };
 
-    let mut config = load_config(&app);
     let strategy = conflict_strategy.unwrap_or_default();
     let normalized_id = normalize_required_value(&id, "正文模板 ID", ENTITY_ID_MAX_CHARS)?;
-    let final_id =
-        resolve_import_id_conflict(normalized_id.clone(), &config.content_templates, strategy)?;
 
-    template.id = final_id.clone();
-    template.name = normalize_optional_name(
-        &template.name,
-        &normalized_id,
-        "模板名称",
-        ENTITY_NAME_MAX_CHARS,
-    )?;
-    if final_id != normalized_id {
-        template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
-    }
-    let final_id = normalize_content_template_for_storage(&mut template)?;
-    let current_revision = config
-        .content_templates
-        .get(&final_id)
-        .map(|existing| existing.revision)
-        .unwrap_or(0);
-    template.revision = current_revision.saturating_add(1);
+    mutate_config(&app, |config| {
+        let final_id = resolve_import_id_conflict(
+            normalized_id.clone(),
+            &config.content_templates,
+            strategy,
+        )?;
 
-    config
-        .content_templates
-        .insert(final_id.clone(), template.clone());
-    save_config_to_disk(&app, &config);
+        template.id = final_id.clone();
+        template.name = normalize_optional_name(
+            &template.name,
+            &normalized_id,
+            "模板名称",
+            ENTITY_NAME_MAX_CHARS,
+        )?;
+        if final_id != normalized_id {
+            template.name = build_copy_name(&template.name, ENTITY_NAME_MAX_CHARS);
+        }
+        let final_id = normalize_content_template_for_storage(&mut template)?;
+        let current_revision = config
+            .content_templates
+            .get(&final_id)
+            .map(|existing| existing.revision)
+            .unwrap_or(0);
+        template.revision = current_revision.saturating_add(1);
 
-    Ok(ImportedContentTemplatePayload {
-        id: final_id,
-        template,
+        config
+            .content_templates
+            .insert(final_id.clone(), template.clone());
+        Ok((
+            ImportedContentTemplatePayload {
+                id: final_id,
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
@@ -1041,24 +1264,24 @@ pub fn update_template_publish_history(
     name: String,
     updates: Vec<TemplatePublishHistoryUpdate>,
 ) -> Result<(), String> {
-    let mut config = load_config(&app);
-    let template = config
-        .templates
-        .get_mut(&name)
-        .ok_or_else(|| format!("未找到模板: {}", name))?;
+    mutate_config(&app, |config| {
+        let template = config
+            .templates
+            .get_mut(&name)
+            .ok_or_else(|| format!("未找到模板: {}", name))?;
 
-    for update in updates {
-        let history_entry = template
-            .publish_history
-            .get_mut(&update.site_key)
-            .ok_or_else(|| format!("不支持的站点代码: {}", update.site_key))?;
-        history_entry.last_published_at = update.last_published_at;
-        history_entry.last_published_episode = update.last_published_episode;
-        history_entry.last_published_resolution = update.last_published_resolution;
-    }
+        for update in updates {
+            let history_entry = template
+                .publish_history
+                .get_mut(&update.site_key)
+                .ok_or_else(|| format!("不支持的站点代码: {}", update.site_key))?;
+            history_entry.last_published_at = update.last_published_at;
+            history_entry.last_published_episode = update.last_published_episode;
+            history_entry.last_published_resolution = update.last_published_resolution;
+        }
 
-    save_config_to_disk(&app, &config);
-    Ok(())
+        Ok(((), true))
+    })
 }
 
 #[tauri::command]
@@ -1144,29 +1367,44 @@ pub fn import_template_from_file(
 
     let normalized_name = normalize_template_storage_name(&name)?;
     validate_template_for_storage(&template)?;
+    let strategy = conflict_strategy.unwrap_or_default();
 
-    let mut config = load_config(&app);
-    let final_name = resolve_import_name_conflict(
-        normalized_name,
-        &config.templates,
-        conflict_strategy.unwrap_or_default(),
-    )?;
+    mutate_config(&app, |config| {
+        let final_name =
+            resolve_import_name_conflict(normalized_name.clone(), &config.templates, strategy)?;
 
-    config
-        .templates
-        .insert(final_name.clone(), template.clone());
-    config.last_used_template = Some(final_name.clone());
-    save_config_to_disk(&app, &config);
-
-    Ok(ImportedTemplatePayload {
-        name: final_name,
-        template,
+        apply_upsert_template(config, final_name.clone(), template.clone(), None)?;
+        // Import does not count as user dropdown selection.
+        Ok((
+            ImportedTemplatePayload {
+                name: final_name,
+                template: template.clone(),
+            },
+            true,
+        ))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sample_template() -> Template {
+        Template {
+            ep_pattern: "(?P<ep>\\d+)".to_string(),
+            resolution_pattern: "(?P<res>1080p)".to_string(),
+            title_pattern: "<ep>".to_string(),
+            poster: String::new(),
+            about: String::new(),
+            tags: String::new(),
+            description: String::new(),
+            description_html: String::new(),
+            profile: String::new(),
+            title: String::new(),
+            publish_history: SitePublishHistory::default(),
+            sites: SiteSelection::default(),
+        }
+    }
 
     #[test]
     fn test_default_config() {
@@ -1179,6 +1417,292 @@ mod tests {
         assert!(config.okp_executable_path.is_empty());
         assert!(config.last_used_template.is_none());
         assert!(config.last_used_quick_publish_template.is_none());
+    }
+
+    #[test]
+    fn test_set_last_used_template_missing_same_and_switch() {
+        let mut config = AppConfig::default();
+        config
+            .templates
+            .insert("alpha".to_string(), sample_template());
+        config
+            .templates
+            .insert("beta".to_string(), sample_template());
+
+        assert!(apply_set_last_used_template(&mut config, "missing").is_err());
+
+        assert_eq!(apply_set_last_used_template(&mut config, "alpha"), Ok(true));
+        assert_eq!(config.last_used_template.as_deref(), Some("alpha"));
+        assert_eq!(apply_set_last_used_template(&mut config, "alpha"), Ok(false));
+        assert_eq!(apply_set_last_used_template(&mut config, "beta"), Ok(true));
+        assert_eq!(config.last_used_template.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn test_set_last_used_quick_publish_template_missing_same_and_switch() {
+        let mut config = AppConfig::default();
+        config.quick_publish_templates.insert(
+            "demo".to_string(),
+            QuickPublishTemplate {
+                id: "demo".to_string(),
+                name: "Demo".to_string(),
+                ..QuickPublishTemplate::default()
+            },
+        );
+
+        assert!(apply_set_last_used_quick_publish_template(&mut config, "nope").is_err());
+        assert_eq!(
+            apply_set_last_used_quick_publish_template(&mut config, "demo"),
+            Ok(true)
+        );
+        assert_eq!(
+            config.last_used_quick_publish_template.as_deref(),
+            Some("demo")
+        );
+        assert_eq!(
+            apply_set_last_used_quick_publish_template(&mut config, "demo"),
+            Ok(false)
+        );
+    }
+
+    #[test]
+    fn test_migrate_keeps_existing_last_used_without_selection() {
+        let mut config = AppConfig {
+            last_used_template: Some("legacy".to_string()),
+            last_used_quick_publish_template: Some("demo-template".to_string()),
+            templates: HashMap::from([("legacy".to_string(), sample_template())]),
+            quick_publish_templates: HashMap::from([(
+                "demo-template".to_string(),
+                QuickPublishTemplate {
+                    id: "demo-template".to_string(),
+                    name: "Demo".to_string(),
+                    ..QuickPublishTemplate::default()
+                },
+            )]),
+            ..AppConfig::default()
+        };
+
+        migrate_config(&mut config);
+
+        assert_eq!(config.last_used_template.as_deref(), Some("legacy"));
+        assert_eq!(
+            config.last_used_quick_publish_template.as_deref(),
+            Some("demo-template")
+        );
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn test_apply_upsert_template_renames_migrates_last_used_without_save_stamp() {
+        let mut config = AppConfig {
+            last_used_template: Some("old".to_string()),
+            templates: HashMap::from([("old".to_string(), sample_template())]),
+            ..AppConfig::default()
+        };
+
+        apply_upsert_template(
+            &mut config,
+            "new".to_string(),
+            sample_template(),
+            Some("old"),
+        )
+        .expect("rename upsert");
+
+        assert!(config.templates.contains_key("new"));
+        assert!(!config.templates.contains_key("old"));
+        assert_eq!(config.last_used_template.as_deref(), Some("new"));
+
+        // Saving another template must not stamp last_used.
+        apply_upsert_template(
+            &mut config,
+            "other".to_string(),
+            sample_template(),
+            None,
+        )
+        .expect("create upsert");
+        assert_eq!(config.last_used_template.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn test_apply_delete_template_and_quick_publish_clears_last_used() {
+        let mut config = AppConfig {
+            last_used_template: Some("keep".to_string()),
+            last_used_quick_publish_template: Some("qp".to_string()),
+            templates: HashMap::from([("keep".to_string(), sample_template())]),
+            quick_publish_templates: HashMap::from([(
+                "qp".to_string(),
+                QuickPublishTemplate {
+                    id: "qp".to_string(),
+                    name: "QP".to_string(),
+                    ..QuickPublishTemplate::default()
+                },
+            )]),
+            ..AppConfig::default()
+        };
+
+        apply_delete_template(&mut config, "keep");
+        assert!(config.last_used_template.is_none());
+
+        apply_delete_quick_publish_template(&mut config, "qp").expect("delete qp");
+        assert!(config.last_used_quick_publish_template.is_none());
+    }
+
+    #[test]
+    fn test_apply_upsert_quick_publish_does_not_stamp_last_used() {
+        let mut config = AppConfig {
+            last_used_quick_publish_template: Some("existing".to_string()),
+            quick_publish_templates: HashMap::from([(
+                "existing".to_string(),
+                QuickPublishTemplate {
+                    id: "existing".to_string(),
+                    name: "Existing".to_string(),
+                    ..QuickPublishTemplate::default()
+                },
+            )]),
+            ..AppConfig::default()
+        };
+
+        apply_upsert_quick_publish_template(
+            &mut config,
+            "fresh".to_string(),
+            QuickPublishTemplate {
+                id: "fresh".to_string(),
+                name: "Fresh".to_string(),
+                ..QuickPublishTemplate::default()
+            },
+        );
+
+        assert!(config.quick_publish_templates.contains_key("fresh"));
+        assert_eq!(
+            config.last_used_quick_publish_template.as_deref(),
+            Some("existing")
+        );
+    }
+
+    #[test]
+    fn test_write_config_file_is_atomic_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-config-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_config.json");
+
+        let config = AppConfig {
+            last_used_template: Some("alpha".to_string()),
+            templates: HashMap::from([("alpha".to_string(), sample_template())]),
+            ..AppConfig::default()
+        };
+
+        write_config_file(&path, &config).expect("write");
+        assert!(path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let restored = read_config_file(&path).expect("read");
+        assert_eq!(restored.last_used_template.as_deref(), Some("alpha"));
+        assert!(restored.templates.contains_key("alpha"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_config_file_replaces_existing_without_delete_gap() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-config-replace-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_config.json");
+
+        let first = AppConfig {
+            last_used_template: Some("first".to_string()),
+            templates: HashMap::from([("first".to_string(), sample_template())]),
+            ..AppConfig::default()
+        };
+        write_config_file(&path, &first).expect("initial write");
+        let before = std::fs::read_to_string(&path).expect("read first");
+        assert!(before.contains("first"));
+
+        let second = AppConfig {
+            last_used_template: Some("second".to_string()),
+            templates: HashMap::from([
+                ("first".to_string(), sample_template()),
+                ("second".to_string(), sample_template()),
+            ]),
+            ..AppConfig::default()
+        };
+        // Critical path: destination already exists (Windows MoveFileExW / Unix rename).
+        write_config_file(&path, &second).expect("replace existing");
+
+        assert!(path.exists(), "destination must still exist after replace");
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must be consumed by replace"
+        );
+
+        let restored = read_config_file(&path).expect("read replaced");
+        assert_eq!(restored.last_used_template.as_deref(), Some("second"));
+        assert!(restored.templates.contains_key("second"));
+        // Old content must no longer be the sole survivor after a successful replace.
+        let on_disk = std::fs::read_to_string(&path).expect("read disk");
+        assert!(on_disk.contains("second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_replace_file_atomically_over_existing_destination() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-replace-unit-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dest = dir.join("target.json");
+        let temp = dir.join("target.json.tmp");
+
+        std::fs::write(&dest, b"{\"old\":true}").expect("seed dest");
+        std::fs::write(&temp, b"{\"new\":true}").expect("seed temp");
+
+        replace_file_atomically(&temp, &dest).expect("atomic replace over existing");
+
+        assert!(dest.exists());
+        assert!(!temp.exists());
+        let body = std::fs::read_to_string(&dest).expect("read dest");
+        assert_eq!(body, "{\"new\":true}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_config_file_rejects_corrupt_json_without_defaulting() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-config-corrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_config.json");
+        std::fs::write(&path, "{ not valid json").expect("seed corrupt");
+
+        let error = read_config_file(&path).expect_err("corrupt must fail");
+        assert!(error.contains("解析失败"));
+
+        // File must remain intact (mutate path refuses overwrite with defaults).
+        let on_disk = std::fs::read_to_string(&path).expect("still readable");
+        assert_eq!(on_disk, "{ not valid json");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

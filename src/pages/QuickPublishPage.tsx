@@ -13,10 +13,12 @@ import {
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ConsoleModal from '../components/ConsoleModal';
+import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
 import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import { EP_PATTERN_HELP } from '../utils/titleRules';
 import {
     createPublishConsoleSiteMap,
     createPublishId,
@@ -29,6 +31,11 @@ import {
     getPublishStatusTextClass,
     getSiteLoginStateBadgeClass,
 } from '../utils/siteStatus';
+import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
+import {
+    buildSortedTemplateSelectOptions,
+    getLatestPublishTimestamp,
+} from '../utils/templateSelectOptions';
 import {
     QuickPublishRuntimeDraft,
     QuickPublishTemplate,
@@ -90,21 +97,25 @@ function formatBytes(bytes?: number): string {
     return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
-function getLatestPublishedAt(template: QuickPublishTemplate) {
-    return quickPublishSiteKeys.reduce((latest, siteKey) => {
-        const publishedAt = template.publish_history[siteKey].last_published_at;
-        return publishedAt > latest ? publishedAt : latest;
-    }, '');
+function getLatestPublishedAt(template: QuickPublishTemplate): string {
+    return (
+        getLatestPublishTimestamp(
+            quickPublishSiteKeys.map((siteKey) => template.publish_history[siteKey].last_published_at),
+        )?.value ?? ''
+    );
 }
 
 function buildTemplateOptions(templates: Record<string, QuickPublishTemplate>): TemplateSelectOption[] {
-    return Object.values(templates)
-        .map((template) => ({
+    return buildSortedTemplateSelectOptions(
+        Object.values(templates).map((template) => ({
             name: template.id,
             label: template.name || template.id,
-            latestPublishedAtLabel: formatTimestamp(getLatestPublishedAt(template)),
-        }))
-        .sort((left, right) => left.label.localeCompare(right.label, 'zh-CN'));
+            publishTimestamps: quickPublishSiteKeys.map(
+                (siteKey) => template.publish_history[siteKey].last_published_at,
+            ),
+            formatPublishedAtLabel: formatTimestamp,
+        })),
+    );
 }
 
 export default function QuickPublishPage() {
@@ -115,6 +126,20 @@ export default function QuickPublishPage() {
     const [errorMessage, setErrorMessage] = useState('');
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
+    const lastUsedPersistQueueRef = useRef(
+        createLatestValuePersistQueue({
+            persist: async (id) => {
+                await invoke('set_last_used_quick_publish_template', { id });
+            },
+            onError: (error) => {
+                setErrorMessage(
+                    typeof error === 'string'
+                        ? error
+                        : '无法保存最近使用的快速发布模板。当前选择仍会保留。',
+                );
+            },
+        }),
+    );
     const {
         siteLoginTests,
         isTestingAllSiteLogins,
@@ -225,6 +250,22 @@ export default function QuickPublishPage() {
                 }
 
                 if (site.loginEnabled) {
+                    const tokenValue = site.tokenField
+                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
+                        : '';
+                    if (tokenValue) {
+                        return {
+                            site,
+                            selectable: true,
+                            selectDisabledReason: '',
+                            identityText: 'API Token 已配置',
+                            identityClass: 'text-emerald-300',
+                            identityTitle: `${site.label} 将优先使用 API Token`,
+                            loginState,
+                            publishState,
+                        };
+                    }
+
                     const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
                     const summary = getCookiePanelSummary(rawText);
                     const hasCookies = summary.cookieCount > 0;
@@ -280,10 +321,16 @@ export default function QuickPublishPage() {
     }, [reconcileRuntimeSelectableSites, siteRows]);
 
     const handleTemplateSelection = useCallback((templateId: string) => {
+        if (!quickPublishTemplates[templateId]) {
+            return;
+        }
+
+        // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
         setErrorMessage('');
-    }, [selectRuntimeTemplate]);
+        lastUsedPersistQueueRef.current.enqueue(templateId);
+    }, [quickPublishTemplates, selectRuntimeTemplate]);
 
     const finalizePublishHistory = useCallback(async (
         publishId: string,
@@ -653,25 +700,30 @@ export default function QuickPublishPage() {
                         </div>
                     </div>
 
-                    <div className="mt-4 grid gap-4 md:grid-cols-3">
-                        <label className="block text-sm text-slate-300">
-                            <span className="mb-2 block text-xs text-slate-500">集数正则</span>
-                            <input
-                                type="text"
-                                value={activeTemplate?.ep_pattern ?? ''}
-                                readOnly
-                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                            />
-                        </label>
-                        <label className="block text-sm text-slate-300">
-                            <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
-                            <input
-                                type="text"
-                                value={activeTemplate?.resolution_pattern ?? ''}
-                                readOnly
-                                className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
-                            />
-                        </label>
+                    <div className="mt-4 space-y-4">
+                        <div className="grid gap-4 md:grid-cols-2">
+                            <label className="block text-sm text-slate-300">
+                                <span className="mb-2 flex items-center text-xs text-slate-500">
+                                    集数正则
+                                    <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                                </span>
+                                <input
+                                    type="text"
+                                    value={activeTemplate?.ep_pattern ?? ''}
+                                    readOnly
+                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                                />
+                            </label>
+                            <label className="block text-sm text-slate-300">
+                                <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
+                                <input
+                                    type="text"
+                                    value={activeTemplate?.resolution_pattern ?? ''}
+                                    readOnly
+                                    className="w-full rounded-xl border border-slate-800 bg-slate-900/70 px-3 py-2 font-mono text-sm text-slate-400"
+                                />
+                            </label>
+                        </div>
                         <label className="block text-sm text-slate-300">
                             <span className="mb-2 block text-xs text-slate-500">标题模板</span>
                             <input

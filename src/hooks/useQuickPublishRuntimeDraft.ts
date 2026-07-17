@@ -47,6 +47,7 @@ interface QuickPublishProfileData {
     dmhy_name: string;
     nyaa_name: string;
     acgrip_name: string;
+    acgrip_api_token: string;
     bangumi_name: string;
     acgnx_asia_name: string;
     acgnx_asia_token: string;

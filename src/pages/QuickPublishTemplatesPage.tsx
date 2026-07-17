@@ -8,7 +8,13 @@ import { quickPublishTemplateManagerConfig, useTemplateManager } from '../hooks/
 import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
 import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
 import { getTemplateSaveStateMeta } from '../utils/templateAutosave';
-import { DEFAULT_EP_PATTERN, DEFAULT_RESOLUTION_PATTERN, DEFAULT_TITLE_PATTERN } from '../utils/titleRules';
+import FieldHelpHint from '../components/FieldHelpHint';
+import {
+    DEFAULT_EP_PATTERN,
+    DEFAULT_RESOLUTION_PATTERN,
+    DEFAULT_TITLE_PATTERN,
+    EP_PATTERN_HELP,
+} from '../utils/titleRules';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -516,31 +522,36 @@ export default function QuickPublishTemplatesPage() {
                             <div className="rounded-3xl border border-slate-800 bg-slate-950/50 p-5">
                                 <h2 className="text-sm font-medium text-slate-200">标题规则</h2>
                                 <div className="mt-4 space-y-4">
-                                    <label className="block text-sm text-slate-300">
-                                        <span className="mb-2 block text-xs text-slate-500">集数正则</span>
-                                        <input
-                                            type="text"
-                                            value={draft.ep_pattern}
-                                            onChange={(event) => updateDraft((current) => ({ ...current, ep_pattern: event.target.value }))}
-                                            placeholder={`例如：${DEFAULT_EP_PATTERN}`}
-                                            className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                                        />
-                                    </label>
-                                    <label className="block text-sm text-slate-300">
-                                        <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
-                                        <input
-                                            type="text"
-                                            value={draft.resolution_pattern}
-                                            onChange={(event) =>
-                                                updateDraft((current) => ({
-                                                    ...current,
-                                                    resolution_pattern: event.target.value,
-                                                }))
-                                            }
-                                            placeholder={`例如：${DEFAULT_RESOLUTION_PATTERN}`}
-                                            className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
-                                        />
-                                    </label>
+                                    <div className="grid gap-4 md:grid-cols-2">
+                                        <label className="block text-sm text-slate-300">
+                                            <span className="mb-2 flex items-center text-xs text-slate-500">
+                                                集数正则
+                                                <FieldHelpHint label="集数正则说明">{EP_PATTERN_HELP}</FieldHelpHint>
+                                            </span>
+                                            <input
+                                                type="text"
+                                                value={draft.ep_pattern}
+                                                onChange={(event) => updateDraft((current) => ({ ...current, ep_pattern: event.target.value }))}
+                                                placeholder={`例如：${DEFAULT_EP_PATTERN}`}
+                                                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                                            />
+                                        </label>
+                                        <label className="block text-sm text-slate-300">
+                                            <span className="mb-2 block text-xs text-slate-500">分辨率正则</span>
+                                            <input
+                                                type="text"
+                                                value={draft.resolution_pattern}
+                                                onChange={(event) =>
+                                                    updateDraft((current) => ({
+                                                        ...current,
+                                                        resolution_pattern: event.target.value,
+                                                    }))
+                                                }
+                                                placeholder={`例如：${DEFAULT_RESOLUTION_PATTERN}`}
+                                                className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 font-mono text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
+                                            />
+                                        </label>
+                                    </div>
                                     <label className="block text-sm text-slate-300">
                                         <span className="mb-2 block text-xs text-slate-500">标题模板</span>
                                         <input

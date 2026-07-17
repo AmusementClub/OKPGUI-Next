@@ -8,6 +8,7 @@ import {
 } from '@headlessui/react';
 import { Check, ChevronDown, Search } from 'lucide-react';
 import { Fragment, useMemo, useState } from 'react';
+import { matchTemplateSelectQuery } from '../utils/templateSelectSearch';
 
 export interface TemplateSelectOption {
     name: string;
@@ -22,8 +23,6 @@ interface TemplateSelectProps {
     placeholder?: string;
 }
 
-const normalizeSearchValue = (value: string) => value.trim().toLocaleLowerCase();
-
 export default function TemplateSelect({
     options,
     value,
@@ -33,18 +32,14 @@ export default function TemplateSelect({
     const [query, setQuery] = useState('');
     const selectedOption = options.find((option) => option.name === value) ?? null;
     const isDisabled = options.length === 0;
-    const normalizedQuery = normalizeSearchValue(query);
     const filteredOptions = useMemo(() => {
-        if (!normalizedQuery) {
+        if (!query.trim()) {
             return options;
         }
 
-        return options.filter((option) => {
-            const searchFields = [option.label, option.name];
-
-            return searchFields.some((field) => normalizeSearchValue(field).includes(normalizedQuery));
-        });
-    }, [normalizedQuery, options]);
+        // Preserve caller sort order (publish-time); only filter, never re-rank.
+        return options.filter((option) => matchTemplateSelectQuery(option, query));
+    }, [options, query]);
 
     return (
         <Combobox
