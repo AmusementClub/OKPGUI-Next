@@ -2453,6 +2453,7 @@ dependencies = [
  "lava_torrent",
  "regex",
  "reqwest 0.12.28",
+ "semver",
  "serde",
  "serde_json",
  "tauri",

@@ -15,6 +15,7 @@ import {
     parseTemplateRevisionConflict,
     TemplateSaveState,
 } from '../utils/templateAutosave';
+import { renderMarkdownToHtml } from '../utils/markdown';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -86,7 +87,7 @@ function buildPersistableTemplate<T extends AnyTemplate>(
     } as Partial<T>);
 }
 
-function createCopyDraft<T extends AnyTemplate>(
+export function createCopyDraft<T extends AnyTemplate>(
     template: T,
     fallbackName: string,
 ): T {
@@ -99,7 +100,16 @@ function createCopyDraft<T extends AnyTemplate>(
     } as T;
 
     if ('publish_history' in duplicated) {
-        (duplicated as QuickPublishTemplate).publish_history = createDefaultPublishHistory();
+        const quickPublish = duplicated as QuickPublishTemplate;
+        quickPublish.publish_history = createDefaultPublishHistory();
+        // Drop inherited custom HTML, but keep the copy publish-ready from its Markdown.
+        quickPublish.body_html = renderMarkdownToHtml(quickPublish.body_markdown);
+    }
+
+    if ('markdown' in duplicated) {
+        const contentTemplate = duplicated as ContentTemplate;
+        // Drop inherited custom HTML, but keep the copy publish-ready from its Markdown.
+        contentTemplate.html = renderMarkdownToHtml(contentTemplate.markdown);
     }
 
     return duplicated;
