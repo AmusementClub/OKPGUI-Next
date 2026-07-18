@@ -4,6 +4,7 @@ use crate::profile::{
     site_cookie_has_entries, Profile,
 };
 use encoding_rs::GB18030;
+use semver::Version;
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -24,6 +25,7 @@ const REQUIRED_OKP_TAG_FILES: &[&str] = &[
     "dmhy.json",
     "nyaa.json",
 ];
+const OKP_VERSION_OUTPUT_MAX_CHARS: usize = 240;
 
 static PUBLISH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 
@@ -237,6 +239,123 @@ impl ResolvedOkpExecutable {
             OkpLaunchMode::DotnetDll => Path::new("dotnet"),
         }
     }
+}
+
+fn parse_okp_semantic_version_candidate(candidate: &str) -> Option<Version> {
+    let candidate = candidate.trim_matches(|character: char| {
+        !character.is_ascii_alphanumeric()
+            && character != '.'
+            && character != '-'
+            && character != '+'
+    });
+    let candidate = candidate
+        .strip_prefix('v')
+        .or_else(|| candidate.strip_prefix('V'))
+        .unwrap_or(candidate);
+    Version::parse(candidate).ok()
+}
+
+fn parse_okp_semantic_version(output: &str) -> Option<Version> {
+    output
+        .split_whitespace()
+        .find_map(parse_okp_semantic_version_candidate)
+}
+
+fn okp_version_supports_acgrip_api_token(version: &Version) -> bool {
+    version >= &Version::new(1, 2, 1)
+}
+
+fn summarize_okp_version_output(stdout: &str, stderr: &str) -> String {
+    let combined = [stdout.trim(), stderr.trim()]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let collapsed = combined.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut chars = collapsed.chars();
+    let summary: String = chars.by_ref().take(OKP_VERSION_OUTPUT_MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{}...", summary)
+    } else {
+        summary
+    }
+}
+
+fn query_okp_semantic_version(okp_core: &ResolvedOkpExecutable) -> Result<Version, String> {
+    let arguments = vec!["--version".to_string()];
+    let mut command = Command::new(okp_core.program());
+    command
+        .current_dir(&okp_core.working_dir)
+        .env("DOTNET_CLI_FORCE_UTF8_ENCODING", "1")
+        .env("DOTNET_SYSTEM_CONSOLE_OUTPUT_ENCODING", "utf-8")
+        .env("DOTNET_SYSTEM_CONSOLE_INPUT_ENCODING", "utf-8")
+        .stdin(Stdio::null());
+    okp_core.configure_command(&mut command, &arguments);
+
+    let output = command
+        .output()
+        .map_err(|error| format!("执行 OKP.Core --version 失败: {}", error))?;
+    let stdout = decode_publish_output(&output.stdout);
+    let stderr = decode_publish_output(&output.stderr);
+    let output_summary = summarize_okp_version_output(&stdout, &stderr);
+
+    if !output.status.success() {
+        let exit_code = output
+            .status
+            .code()
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "未知".to_string());
+        return Err(if output_summary.is_empty() {
+            format!("OKP.Core --version 失败，退出码: {}。", exit_code)
+        } else {
+            format!(
+                "OKP.Core --version 失败，退出码: {}，输出: {}",
+                exit_code, output_summary
+            )
+        });
+    }
+
+    parse_okp_semantic_version(&stdout)
+        .or_else(|| parse_okp_semantic_version(&stderr))
+        .ok_or_else(|| {
+            if output_summary.is_empty() {
+                "OKP.Core --version 未返回可识别的版本号。".to_string()
+            } else {
+                format!(
+                    "无法从 OKP.Core --version 输出中识别版本号: {}",
+                    output_summary
+                )
+            }
+        })
+}
+
+fn ensure_okp_supports_acgrip_api_token(
+    okp_core: &ResolvedOkpExecutable,
+) -> Result<String, String> {
+    let version = query_okp_semantic_version(okp_core).map_err(|error| {
+        format!(
+            "无法确认 OKP.Core 是否支持 ACG.RIP API Token：{} API Token 发布需要 OKP.Core >= 1.2.1；请升级 OKP.Core，或清空 API Token 后使用 Cookie。",
+            error
+        )
+    })?;
+
+    if !okp_version_supports_acgrip_api_token(&version) {
+        return Err(format!(
+            "当前 OKP.Core 版本为 {}，ACG.RIP API Token 发布需要 OKP.Core >= 1.2.1；请升级 OKP.Core，或清空 API Token 后使用 Cookie。",
+            version
+        ));
+    }
+
+    Ok(version.to_string())
+}
+
+fn site_requires_okp_acgrip_api_token_support(site: &SitePublishConfig) -> bool {
+    site.code == "acgrip"
+        && site
+            .api_token
+            .as_deref()
+            .and_then(optional_trimmed)
+            .is_some()
 }
 
 fn resolve_selected_okp_executable(configured_path: &str) -> Result<ResolvedOkpExecutable, String> {
@@ -747,6 +866,20 @@ pub(crate) fn run_site_publish(
             .as_deref()
             .and_then(optional_trimmed)
             .is_some();
+        if site_requires_okp_acgrip_api_token_support(site) {
+            let detected_version = ensure_okp_supports_acgrip_api_token(okp_core)?;
+            emit_publish_output(
+                app,
+                publish_id,
+                site.code,
+                site.label,
+                format!(
+                    "已确认 OKP.Core {} 支持 ACG.RIP API Token。",
+                    detected_version
+                ),
+                false,
+            );
+        }
         let cookie_text = if api_token_mode {
             None
         } else {
@@ -918,6 +1051,127 @@ pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn test_parse_okp_semantic_version_accepts_release_and_build_metadata() {
+        let plain =
+            parse_okp_semantic_version("1.2.1").expect("expected plain semantic version to parse");
+        let official = parse_okp_semantic_version("1.2.1+3f36bb1486f87606296a5ed7165cae12b3f5d255")
+            .expect("expected upstream informational version to parse");
+        let prefixed = parse_okp_semantic_version("OKP.Core v1.10.0\n")
+            .expect("expected prefixed semantic version to parse");
+
+        assert_eq!((plain.major, plain.minor, plain.patch), (1, 2, 1));
+        assert!(plain.pre.is_empty());
+        assert_eq!(
+            official.to_string(),
+            "1.2.1+3f36bb1486f87606296a5ed7165cae12b3f5d255"
+        );
+        assert_eq!((prefixed.major, prefixed.minor, prefixed.patch), (1, 10, 0));
+    }
+
+    #[test]
+    fn test_parse_okp_semantic_version_rejects_malformed_values() {
+        for output in ["", "not-a-version", "1.2", "01.2.1", "1.2.1-01"] {
+            assert!(
+                parse_okp_semantic_version(output).is_none(),
+                "expected {output:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_okp_version_gate_uses_semantic_version_precedence() {
+        for supported in ["1.2.1", "1.2.1+commit", "1.2.2-beta.1", "2.0.0"] {
+            let version =
+                parse_okp_semantic_version(supported).expect("expected supported fixture to parse");
+            assert!(
+                okp_version_supports_acgrip_api_token(&version),
+                "expected {supported} to pass"
+            );
+        }
+
+        for unsupported in ["1.2.0", "1.2.1-rc.1", "1.1.99"] {
+            let version = parse_okp_semantic_version(unsupported)
+                .expect("expected unsupported fixture to parse");
+            assert!(
+                !okp_version_supports_acgrip_api_token(&version),
+                "expected {unsupported} to fail"
+            );
+        }
+    }
+
+    #[test]
+    fn test_acgrip_api_token_version_gate_only_applies_to_non_empty_token() {
+        let mut site = SitePublishConfig {
+            code: "acgrip",
+            label: "ACG.RIP",
+            account_name: "Uploader".to_string(),
+            token: None,
+            api_token: Some(" api-token ".to_string()),
+            enabled: true,
+            uses_cookie: false,
+        };
+
+        assert!(site_requires_okp_acgrip_api_token_support(&site));
+
+        site.api_token = Some("   ".to_string());
+        site.uses_cookie = true;
+        assert!(!site_requires_okp_acgrip_api_token_support(&site));
+
+        site.code = "acgnx_asia";
+        site.api_token = Some("api-token".to_string());
+        site.uses_cookie = false;
+        assert!(!site_requires_okp_acgrip_api_token_support(&site));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_query_okp_semantic_version_runs_selected_core() {
+        let executable_path =
+            create_test_okp_version_script("1.2.1+3f36bb1486f87606296a5ed7165cae12b3f5d255", 0);
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected test OKP path to resolve");
+
+        let version = query_okp_semantic_version(&resolved)
+            .expect("expected test OKP version query to succeed");
+
+        assert_eq!((version.major, version.minor, version.patch), (1, 2, 1));
+        assert!(okp_version_supports_acgrip_api_token(&version));
+
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_okp_supports_acgrip_api_token_rejects_old_core() {
+        let executable_path = create_test_okp_version_script("1.2.0+old-build", 0);
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected test OKP path to resolve");
+
+        let error = ensure_okp_supports_acgrip_api_token(&resolved)
+            .expect_err("expected old OKP version to be rejected");
+
+        assert!(
+            error.contains("1.2.0+old-build"),
+            "unexpected error: {error}"
+        );
+        assert!(error.contains(">= 1.2.1"), "unexpected error: {error}");
+        assert!(error.contains("Cookie"), "unexpected error: {error}");
+
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
 
     #[test]
     fn test_build_site_publish_cookie_text_rejects_missing_cookie_site() {
@@ -1117,12 +1371,13 @@ mod tests {
 
     fn create_test_okp_layout(file_name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "okpgui-next-publish-test-{}-{}",
+            "okpgui-next-publish-test-{}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
-                .as_nanos()
+                .as_nanos(),
+            TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         let tags_dir = root.join("config").join("tags");
         std::fs::create_dir_all(&tags_dir).expect("expected tags dir to be created");
@@ -1134,6 +1389,26 @@ mod tests {
 
         let executable_path = root.join(file_name);
         std::fs::write(&executable_path, "test").expect("expected dummy executable to be created");
+        executable_path
+    }
+
+    #[cfg(unix)]
+    fn create_test_okp_version_script(version_output: &str, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable_path = create_test_okp_layout("OKP.Core");
+        let script = format!(
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\nprintf '%s\\n' '{}'\nexit {}\n",
+            version_output, exit_code
+        );
+        std::fs::write(&executable_path, script)
+            .expect("expected test OKP version script to be written");
+        let mut permissions = std::fs::metadata(&executable_path)
+            .expect("expected test OKP script metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&executable_path, permissions)
+            .expect("expected test OKP script to be executable");
         executable_path
     }
 
