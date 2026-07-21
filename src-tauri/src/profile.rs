@@ -758,21 +758,6 @@ pub fn delete_profile(app: AppHandle, name: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn update_profile_cookies(app: AppHandle, name: String, cookies: String) -> Result<(), String> {
-    let _guard = profile_store_lock()
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
-    let mut store = try_load_profiles(&app)?;
-    if let Some(profile) = store.profiles.get_mut(&name) {
-        profile.cookies = cookies;
-        profile.site_cookies = split_site_cookies(&profile.cookies, &profile.user_agent);
-        sync_profile_cookies(profile);
-        save_profiles(&app, &store)?;
-    }
-    Ok(())
-}
-
-#[tauri::command]
 pub fn import_cookie_file(
     cookie_path: String,
     fallback_user_agent: Option<String>,

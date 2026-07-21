@@ -835,12 +835,6 @@ pub fn get_config(app: AppHandle) -> AppConfig {
 }
 
 #[tauri::command]
-pub fn get_template_list(app: AppHandle) -> Vec<String> {
-    let config = load_config(&app);
-    config.templates.keys().cloned().collect()
-}
-
-#[tauri::command]
 pub fn save_template(
     app: AppHandle,
     name: String,
