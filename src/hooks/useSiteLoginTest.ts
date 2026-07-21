@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
 import { SiteLoginStatus } from '../utils/siteStatus';
 
@@ -73,6 +73,7 @@ export function buildSiteLoginInvokeArgs(
 export function useSiteLoginTest() {
     const [siteLoginTests, setSiteLoginTests] = useState<Record<string, SiteLoginTestState>>({});
     const [isTestingAllSiteLogins, setIsTestingAllSiteLogins] = useState(false);
+    const testGenerationRef = useRef(0);
 
     const hasRunningSiteLoginTest = useMemo(
         () => Object.values(siteLoginTests).some((test) => test.status === 'testing'),
@@ -92,6 +93,7 @@ export function useSiteLoginTest() {
     };
 
     const clearAllSiteLoginTests = () => {
+        testGenerationRef.current += 1;
         setSiteLoginTests({});
     };
 
@@ -125,11 +127,17 @@ export function useSiteLoginTest() {
             },
         }));
 
+        const testGeneration = testGenerationRef.current;
+
         try {
             const result = await invoke<SiteLoginTestResult>(
                 'test_site_login',
                 buildSiteLoginInvokeArgs(site, profileData, { apiToken, cookieText }),
             );
+
+            if (testGenerationRef.current !== testGeneration) {
+                return;
+            }
 
             setSiteLoginTests((current) => ({
                 ...current,
@@ -139,6 +147,10 @@ export function useSiteLoginTest() {
                 },
             }));
         } catch (error) {
+            if (testGenerationRef.current !== testGeneration) {
+                return;
+            }
+
             setSiteLoginTests((current) => ({
                 ...current,
                 [site.key]: {
@@ -174,8 +186,12 @@ export function useSiteLoginTest() {
         }
 
         setIsTestingAllSiteLogins(true);
+        const testGeneration = testGenerationRef.current;
         try {
             for (const site of loginSites) {
+                if (testGenerationRef.current !== testGeneration) {
+                    break;
+                }
                 await runSiteLoginTest(site, profileData);
             }
         } finally {

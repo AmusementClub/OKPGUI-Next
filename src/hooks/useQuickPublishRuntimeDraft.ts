@@ -214,6 +214,9 @@ export function useQuickPublishRuntimeDraft({
 
             setIsGeneratingTitle(true);
 
+            const capturedTemplateId = templateToUse.id;
+            const capturedTorrentPath = draftToUse.torrent_path;
+
             try {
                 const details = await invoke<ParsedTitleDetails>('parse_title_details', {
                     filename,
@@ -222,13 +225,22 @@ export function useQuickPublishRuntimeDraft({
                     titlePattern: templateToUse.title_pattern,
                 });
 
-                setDraft((current) => ({
-                    ...current,
-                    title: details.title || current.title,
-                    episode: details.episode,
-                    resolution: details.resolution,
-                    is_title_overridden: false,
-                }));
+                setDraft((current) => {
+                    if (
+                        current.torrent_path !== capturedTorrentPath
+                        || current.template_id !== capturedTemplateId
+                    ) {
+                        return current;
+                    }
+
+                    return {
+                        ...current,
+                        title: details.title || current.title,
+                        episode: details.episode,
+                        resolution: details.resolution,
+                        is_title_overridden: false,
+                    };
+                });
             } catch (error) {
                 onError?.(toErrorMessage(error, '生成标题失败。'));
             } finally {
@@ -327,18 +339,25 @@ export function useQuickPublishRuntimeDraft({
                 setDraft(nextDraft);
 
                 if (activeTemplateRef.current) {
-                    await generateTitle(activeTemplateRef.current, nextDraft, false, info.name);
+                    if (nextDraft.is_title_overridden) {
+                        await resolvePublishRuntimeDraft(activeTemplateRef.current, nextDraft);
+                    } else {
+                        await generateTitle(activeTemplateRef.current, nextDraft, false, info.name);
+                    }
                 }
             } catch (error) {
                 setTorrentInfo(null);
                 setDraft({
                     ...draftRef.current,
                     torrent_path: '',
+                    title: '',
+                    episode: '',
+                    resolution: '',
                 });
                 onError?.(toErrorMessage(error, '解析种子失败。'));
             }
         },
-        [activeTemplateRef, draftRef, generateTitle, onClearError, onError],
+        [activeTemplateRef, draftRef, generateTitle, onClearError, onError, resolvePublishRuntimeDraft],
     );
 
     const selectTorrentFile = useCallback(async () => {
