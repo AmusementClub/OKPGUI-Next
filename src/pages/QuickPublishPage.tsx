@@ -29,12 +29,13 @@ import {
 } from '../hooks/usePublishTask';
 import { useQuickPublishRuntimeDraft } from '../hooks/useQuickPublishRuntimeDraft';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
-import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText } from '../utils/cookieUtils';
+import { useSiteRows } from '../hooks/useSiteRows';
 import {
     getPublishStatusTextClass,
     getSiteLoginStateBadgeClass,
 } from '../utils/siteStatus';
 import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
+import { extractDroppedFilePath } from '../utils/drop';
 import {
     buildSortedTemplateSelectOptions,
     getLatestPublishTimestamp,
@@ -44,6 +45,7 @@ import {
     QuickPublishTemplate,
     SiteSelection,
     buildLegacyPublishTemplatePayload,
+    formatTemplateTimestamp,
     quickPublishSiteKeys,
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
@@ -62,28 +64,6 @@ interface TemplatePublishHistoryUpdate {
     last_published_at: string;
     last_published_episode: string;
     last_published_resolution: string;
-}
-
-function formatTimestamp(value: string) {
-    if (!value.trim()) {
-        return '未发布';
-    }
-
-    const timestamp = Date.parse(value);
-    if (Number.isNaN(timestamp)) {
-        return value;
-    }
-
-    return new Intl.DateTimeFormat('zh-CN', {
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        hour12: false,
-    })
-        .format(new Date(timestamp))
-        .replace(/\//g, '-');
 }
 
 function formatBytes(bytes?: number): string {
@@ -116,7 +96,7 @@ function buildTemplateOptions(templates: Record<string, QuickPublishTemplate>): 
             publishTimestamps: quickPublishSiteKeys.map(
                 (siteKey) => template.publish_history[siteKey].last_published_at,
             ),
-            formatPublishedAtLabel: formatTimestamp,
+            formatPublishedAtLabel: formatTemplateTimestamp,
         })),
     );
 }
@@ -222,9 +202,7 @@ export default function QuickPublishPage() {
                 }
 
                 setIsDragging(false);
-                const droppedTorrentPath = event.payload.paths.find((path) =>
-                    path.toLowerCase().endsWith('.torrent'),
-                );
+                const droppedTorrentPath = extractDroppedFilePath(event.payload.paths);
 
                 if (droppedTorrentPath) {
                     void parseTorrent(droppedTorrentPath);
@@ -239,85 +217,11 @@ export default function QuickPublishPage() {
         };
     }, [parseTorrent]);
 
-    const siteRows = useMemo(
-        () =>
-            siteDefinitions.map((site) => {
-                const publishState = publishSites[site.key] ?? null;
-                const loginState = siteLoginTests[site.key];
-
-                if (!selectedProfileData) {
-                    return {
-                        site,
-                        selectable: false,
-                        selectDisabledReason: '请先选择身份配置',
-                        identityText: '未选择身份',
-                        identityClass: 'text-slate-500',
-                        identityTitle: '请先选择身份配置',
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                if (site.loginEnabled) {
-                    const tokenValue = site.tokenField
-                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                        : '';
-                    if (tokenValue) {
-                        return {
-                            site,
-                            selectable: true,
-                            selectDisabledReason: '',
-                            identityText: 'API Token 已配置',
-                            identityClass: 'text-emerald-300',
-                            identityTitle: `${site.label} 将优先使用 API Token`,
-                            loginState,
-                            publishState,
-                        };
-                    }
-
-                    const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
-                    const summary = getCookiePanelSummary(rawText);
-                    const hasCookies = summary.cookieCount > 0;
-
-                    return {
-                        site,
-                        selectable: hasCookies,
-                        selectDisabledReason: hasCookies ? '' : `请先在身份页面配置 ${site.label} 的 Cookie`,
-                        identityText: hasCookies
-                            ? `${summary.remainingText} / ${summary.earliestExpiryText}`
-                            : '未配置 Cookie',
-                        identityClass: hasCookies ? getRemainingTextClass(summary.earliestExpiry) : 'text-slate-500',
-                        identityTitle: hasCookies
-                            ? `${site.label} 已配置 ${summary.cookieCount} 条 Cookie`
-                            : `尚未配置 ${site.label} Cookie`,
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                const accountName = String(selectedProfileData[site.nameField] ?? '').trim();
-                const tokenValue = site.tokenField
-                    ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                    : '';
-                const hasToken = tokenValue.length > 0;
-
-                return {
-                    site,
-                    selectable: hasToken,
-                    selectDisabledReason: hasToken ? '' : `${site.label} 缺少 API 令牌`,
-                    identityText: hasToken
-                        ? accountName.length > 0
-                            ? 'API 身份已配置'
-                            : 'API 令牌已配置'
-                        : '缺少 API 令牌',
-                    identityClass: hasToken ? 'text-emerald-300' : 'text-yellow-300',
-                    identityTitle: hasToken ? `${site.label} 已配置 API 令牌` : `${site.label} 需要 API 令牌`,
-                    loginState,
-                    publishState,
-                };
-            }),
-        [publishSites, selectedProfileData, siteLoginTests],
-    );
+    const siteRows = useSiteRows({
+        publishSites,
+        selectedProfileData,
+        siteLoginTests,
+    });
 
     useEffect(() => {
         const selectableSiteKeys = new Set<keyof SiteSelection>(
@@ -963,7 +867,7 @@ export default function QuickPublishPage() {
                                                 <div className="font-mono text-[11px] text-slate-500">{site.key}</div>
                                             </td>
                                             <td className="px-4 py-3 align-middle text-xs text-slate-400">
-                                                {formatTimestamp(activeTemplate?.publish_history[site.key as keyof SiteSelection].last_published_at ?? '')}
+                                                {formatTemplateTimestamp(activeTemplate?.publish_history[site.key as keyof SiteSelection].last_published_at ?? '')}
                                             </td>
                                             <td className="px-4 py-3 align-middle">
                                                 <div className={identityClass} title={identityTitle}>{identityText}</div>
@@ -1087,7 +991,7 @@ export default function QuickPublishPage() {
                 title={publishPreviewDraft.title}
                 templateLabel={activeTemplate ? (activeTemplate.name || activeTemplate.id) : ''}
                 templateLatestPublishedAtLabel={
-                    activeTemplate ? formatTimestamp(getLatestPublishedAt(activeTemplate)) : '未发布'
+                    activeTemplate ? formatTemplateTimestamp(getLatestPublishedAt(activeTemplate)) : '未发布'
                 }
                 torrentPath={publishPreviewDraft.torrent_path}
                 torrentTotalSizeLabel={formatBytes(torrentInfo?.total_size)}

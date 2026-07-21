@@ -22,9 +22,19 @@ export function createCopyEntityName(
     value: string,
     fallback: string,
     maxLength = ENTITY_NAME_MAX_LENGTH,
+    existingNames: readonly string[] = [],
 ): string {
     const baseName = trimEntityName(value) || trimEntityName(fallback) || 'item';
-    return buildCopyCandidate(baseName, ' 副本', maxLength);
+    const takenNames = new Set(existingNames.map(trimEntityName));
+
+    let suffixIndex = 1;
+    let candidate = buildCopyCandidate(baseName, ' 副本', maxLength);
+    while (takenNames.has(candidate)) {
+        suffixIndex += 1;
+        candidate = buildCopyCandidate(baseName, ` 副本 ${suffixIndex}`, maxLength);
+    }
+
+    return candidate;
 }
 
 export function sanitizeExportFileStem(value: string, fallback = 'export'): string {

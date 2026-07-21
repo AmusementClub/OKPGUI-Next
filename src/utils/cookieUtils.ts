@@ -124,7 +124,7 @@ export function parseCustomCookieText(cookieText: string): {
     }
 
     return {
-        userAgent: resolveCookieUserAgent(userAgent),
+        userAgent,
         cookieLines,
     };
 }
@@ -278,6 +278,13 @@ export function buildMergedCookieText(siteCookies: SiteCookies, fallbackUserAgen
 
 export function getSiteCookieText(siteCookies: SiteCookies, siteCode: string): string {
     return isCookieSiteCode(siteCode) ? siteCookies[siteCode].raw_text : '';
+}
+
+export function mergeImportedSiteCookies(existing: SiteCookies, imported: SiteCookies): SiteCookies {
+    return createSiteCookies((siteCode) => {
+        const importedText = imported[siteCode].raw_text;
+        return importedText.trim() ? { raw_text: importedText } : existing[siteCode];
+    });
 }
 
 export function updateSiteCookies(siteCookies: SiteCookies, siteCode: string, rawText: string): SiteCookies {

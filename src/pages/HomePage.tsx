@@ -27,7 +27,7 @@ import {
     usePublishTask,
 } from '../hooks/usePublishTask';
 import { useNoticeDialog } from '../hooks/useNoticeDialog';
-import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
+import { SiteCookies } from '../utils/cookieUtils';
 import {
     ENTITY_NAME_MAX_LENGTH,
     parseImportConflictName,
@@ -41,6 +41,7 @@ import { isHtmlPreferredSite, validatePublishContentForSites } from '../utils/pu
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
+import { useSiteRows } from '../hooks/useSiteRows';
 import { useLatest } from '../hooks/useLatest';
 import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
 import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
@@ -61,15 +62,16 @@ import {
     shouldApplyTemplateSelection,
 } from '../utils/lastUsedPersistQueue';
 import { buildSortedTemplateSelectOptions } from '../utils/templateSelectOptions';
-
-interface SiteSelection {
-    dmhy: boolean;
-    nyaa: boolean;
-    acgrip: boolean;
-    bangumi: boolean;
-    acgnx_asia: boolean;
-    acgnx_global: boolean;
-}
+import { extractDroppedFilePath } from '../utils/drop';
+import {
+    createDefaultPublishHistory,
+    formatTemplateTimestamp,
+    getPublishedVersionLabel,
+    normalizePublishHistory,
+    quickPublishSiteKeys,
+    SitePublishHistory,
+    SiteSelection,
+} from '../utils/quickPublish';
 
 interface Template {
     ep_pattern: string;
@@ -85,14 +87,6 @@ interface Template {
     publish_history: SitePublishHistory;
     sites: SiteSelection;
 }
-
-interface SitePublishHistoryEntry {
-    last_published_at: string;
-    last_published_episode: string;
-    last_published_resolution: string;
-}
-
-type SitePublishHistory = Record<keyof SiteSelection, SitePublishHistoryEntry>;
 
 interface ConfigPayload {
     last_used_template: string | null;
@@ -136,69 +130,6 @@ interface Profile {
     [key: string]: unknown;
 }
 
-const siteKeys: (keyof SiteSelection)[] = [
-    'dmhy',
-    'nyaa',
-    'acgrip',
-    'bangumi',
-    'acgnx_asia',
-    'acgnx_global',
-];
-
-const publishTimestampFormatter = new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-});
-
-const createDefaultPublishHistory = (): SitePublishHistory => ({
-    dmhy: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    nyaa: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgrip: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    bangumi: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgnx_asia: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgnx_global: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-});
-
-const normalizePublishHistory = (history?: Partial<SitePublishHistory>): SitePublishHistory => {
-    const defaultHistory = createDefaultPublishHistory();
-
-    return siteKeys.reduce((accumulator, siteKey) => {
-        const entry = history?.[siteKey];
-        accumulator[siteKey] = {
-            last_published_at:
-                typeof entry?.last_published_at === 'string'
-                    ? entry.last_published_at
-                    : defaultHistory[siteKey].last_published_at,
-            last_published_episode:
-                typeof entry?.last_published_episode === 'string'
-                    ? entry.last_published_episode
-                    : defaultHistory[siteKey].last_published_episode,
-            last_published_resolution:
-                typeof entry?.last_published_resolution === 'string'
-                    ? entry.last_published_resolution
-                    : defaultHistory[siteKey].last_published_resolution,
-        };
-        return accumulator;
-    }, {} as SitePublishHistory);
-};
-
-const formatPublishTimestamp = (value: string) => {
-    if (!value.trim()) {
-        return '未发布';
-    }
-
-    const parsedTimestamp = Date.parse(value);
-    if (Number.isNaN(parsedTimestamp)) {
-        return value;
-    }
-
-    return publishTimestampFormatter.format(new Date(parsedTimestamp)).replace(/\//g, '-');
-};
-
 const buildTemplateOptions = (templates: Record<string, Partial<Template>>): TemplateSelectOption[] =>
     buildSortedTemplateSelectOptions(
         Object.entries(templates).map(([name, templateValue]) => {
@@ -206,26 +137,13 @@ const buildTemplateOptions = (templates: Record<string, Partial<Template>>): Tem
             return {
                 name,
                 label: name,
-                publishTimestamps: siteKeys.map(
+                publishTimestamps: quickPublishSiteKeys.map(
                     (siteKey) => normalizedTemplate.publish_history[siteKey].last_published_at,
                 ),
-                formatPublishedAtLabel: formatPublishTimestamp,
+                formatPublishedAtLabel: formatTemplateTimestamp,
             };
         }),
     );
-
-const getPublishedValue = (value: string) => value.trim();
-
-const getPublishedVersionLabel = (entry: SitePublishHistoryEntry) => {
-    const episode = getPublishedValue(entry.last_published_episode);
-    const resolution = getPublishedValue(entry.last_published_resolution);
-
-    if (episode && resolution) {
-        return `${episode} / ${resolution}`;
-    }
-
-    return episode || resolution || '不适用';
-};
 
 const mergePublishHistory = (
     templateValue: Template,
@@ -646,9 +564,7 @@ export default function HomePage() {
                 }
 
                 setIsDragging(false);
-                const droppedTorrentPath = event.payload.paths.find((path) =>
-                    path.toLowerCase().endsWith('.torrent'),
-                );
+                const droppedTorrentPath = extractDroppedFilePath(event.payload.paths);
 
                 if (droppedTorrentPath) {
                     void parseTorrent(droppedTorrentPath);
@@ -910,93 +826,12 @@ export default function HomePage() {
         void hookHandleTestAllSiteLogins(siteDefinitions, selectedProfileData);
     };
 
-    const siteRows = useMemo(
-        () =>
-            siteDefinitions.map((site) => {
-                const publishState = publishSites[site.key] ?? null;
-                const loginState = siteLoginTests[site.key];
-
-                if (!selectedProfileData) {
-                    return {
-                        site,
-                        selectable: false,
-                        selectDisabledReason: '请先选择身份配置',
-                        identityText: '未选择身份',
-                        identityClass: 'text-slate-500',
-                        identityTitle: '请先选择身份配置',
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                if (site.loginEnabled) {
-                    const tokenValue = site.tokenField
-                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                        : '';
-                    if (tokenValue) {
-                        return {
-                            site,
-                            selectable: true,
-                            selectDisabledReason: '',
-                            identityText: 'API Token 已配置',
-                            identityClass: 'text-emerald-300',
-                            identityTitle: `${site.label} 将优先使用 API Token`,
-                            loginState,
-                            publishState,
-                        };
-                    }
-
-                    const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
-                    const summary = getCookiePanelSummary(rawText);
-                    const hasCookies = summary.cookieCount > 0;
-
-                    return {
-                        site,
-                        selectable: hasCookies,
-                        selectDisabledReason: hasCookies
-                            ? ''
-                            : `请先在身份页面配置 ${site.label} 的 Cookie`,
-                        identityText: hasCookies
-                            ? `${summary.remainingText} / ${summary.earliestExpiryText}`
-                            : '未配置 Cookie',
-                        identityClass: hasCookies
-                            ? getRemainingTextClass(summary.earliestExpiry)
-                            : 'text-slate-500',
-                        identityTitle: hasCookies
-                            ? `${site.label} 已配置 ${summary.cookieCount} 条 Cookie`
-                            : `尚未配置 ${site.label} Cookie`,
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                const accountName = String(selectedProfileData[site.nameField] ?? '').trim();
-                const tokenValue = site.tokenField
-                    ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                    : '';
-                const hasToken = tokenValue.length > 0;
-
-                return {
-                    site,
-                    selectable: hasToken,
-                    selectDisabledReason: hasToken
-                        ? ''
-                        : `${site.label} 缺少 API 令牌`,
-                    identityText: hasToken
-                        ? accountName.length > 0
-                            ? 'API 身份已配置'
-                            : 'API 令牌已配置'
-                        : '缺少 API 令牌',
-                    identityClass: hasToken ? 'text-emerald-300' : 'text-yellow-300',
-                    identityTitle: hasToken
-                        ? `${site.label} 已配置 API 令牌`
-                        : `${site.label} 需要 API 令牌`,
-                    loginState,
-                    publishState,
-                };
-            }),
-        [publishSites, selectedProfileData, siteLoginTests, template.publish_history],
-    );
+    const siteRows = useSiteRows({
+        publishSites,
+        selectedProfileData,
+        siteLoginTests,
+        publishHistory: template.publish_history,
+    });
 
     const selectedSiteKeys = useMemo(
         () =>
@@ -1509,7 +1344,7 @@ export default function HomePage() {
                                                     {site.label}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-xs text-slate-400">
-                                                    {formatPublishTimestamp(template.publish_history[site.key as keyof SiteSelection].last_published_at)}
+                                                    {formatTemplateTimestamp(template.publish_history[site.key as keyof SiteSelection].last_published_at)}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-slate-300">
                                                     {getPublishedVersionLabel(template.publish_history[site.key as keyof SiteSelection])}

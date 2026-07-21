@@ -321,7 +321,7 @@ export function createTemplateIdFromName(name: string, fallbackPrefix: string): 
 
 export function formatTemplateTimestamp(value: string): string {
     if (!value.trim()) {
-        return '未保存';
+        return '未发布';
     }
 
     const timestamp = Date.parse(value);
@@ -353,7 +353,7 @@ export function getPublishedVersionLabel(entry: SitePublishHistoryEntry): string
         return `${episode} / ${resolution}`;
     }
 
-    return episode || resolution || '未填写';
+    return episode || resolution || '不适用';
 }
 
 export function buildLegacyPublishTemplatePayload(

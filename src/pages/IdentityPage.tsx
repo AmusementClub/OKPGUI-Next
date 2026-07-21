@@ -26,6 +26,7 @@ import {
     getCookiePanelSummary,
     getRemainingTextClass,
     getSiteCookieText,
+    mergeImportedSiteCookies,
     SiteCookies,
     updateSiteCookies,
 } from '../utils/cookieUtils';
@@ -597,11 +598,14 @@ export default function IdentityPage() {
                 fallbackUserAgent: profile.user_agent.trim() || null,
             });
 
+            // Merge per-site: sites absent from the imported file keep their
+            // existing cookies instead of being wiped.
+            const mergedSiteCookies = mergeImportedSiteCookies(profile.site_cookies, result.site_cookies);
             const nextProfile: Profile = {
                 ...profile,
-                site_cookies: result.site_cookies,
+                site_cookies: mergedSiteCookies,
                 user_agent: result.user_agent,
-                cookies: buildMergedCookieText(result.site_cookies, result.user_agent),
+                cookies: buildMergedCookieText(mergedSiteCookies, result.user_agent),
             };
 
             setProfile(nextProfile);
@@ -609,6 +613,10 @@ export default function IdentityPage() {
             await persistProfileToDisk(nextProfile);
         } catch (error) {
             console.error('导入 Cookie 文件失败:', error);
+            showNotice({
+                title: '导入 Cookie 失败',
+                message: typeof error === 'string' ? error : '导入 Cookie 文件失败。',
+            });
         }
     };
 

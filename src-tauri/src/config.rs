@@ -135,17 +135,10 @@ struct ImportedTemplateFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct ImportedQuickPublishTemplateFile {
+struct ImportedEntityFile<T> {
     #[serde(default)]
     id: String,
-    template: QuickPublishTemplate,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ImportedContentTemplateFile {
-    #[serde(default)]
-    id: String,
-    template: ContentTemplate,
+    template: T,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -183,16 +176,46 @@ enum TemplateImportFileFormat {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
-enum QuickPublishTemplateImportFileFormat {
-    Wrapped(ImportedQuickPublishTemplateFile),
-    Raw(QuickPublishTemplate),
+enum EntityImportFileFormat<T> {
+    Wrapped(ImportedEntityFile<T>),
+    Raw(T),
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(untagged)]
-enum ContentTemplateImportFileFormat {
-    Wrapped(ImportedContentTemplateFile),
-    Raw(ContentTemplate),
+trait ImportEntityId {
+    fn import_entity_id(&self) -> &str;
+}
+
+impl ImportEntityId for QuickPublishTemplate {
+    fn import_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl ImportEntityId for ContentTemplate {
+    fn import_entity_id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// Unwraps a Wrapped/Raw import file and resolves the entity id, falling back
+/// to the file stem when the file does not carry one.
+fn resolve_import_id_and_template<T: ImportEntityId>(
+    import_file: EntityImportFileFormat<T>,
+    fallback_id: &str,
+) -> (String, T) {
+    let (imported_id, template) = match import_file {
+        EntityImportFileFormat::Wrapped(file) => (file.id, file.template),
+        EntityImportFileFormat::Raw(template) => {
+            (template.import_entity_id().to_string(), template)
+        }
+    };
+
+    let trimmed_id = imported_id.trim();
+    if trimmed_id.is_empty() {
+        (fallback_id.to_string(), template)
+    } else {
+        (trimmed_id.to_string(), template)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -825,6 +848,18 @@ fn migrate_quick_publish_template(
     }
 }
 
+/// Imported content templates are inserted through the same migration the
+/// load path runs, so quick-publish templates still carrying a legacy
+/// `content_template_id` re-link and back-fill their body from the import.
+fn apply_import_content_template(
+    config: &mut AppConfig,
+    template_id: String,
+    template: ContentTemplate,
+) {
+    config.content_templates.insert(template_id, template);
+    migrate_quick_publish_templates(config);
+}
+
 fn save_config_to_disk(app: &AppHandle, config: &AppConfig) -> Result<(), String> {
     write_config_file(&config_path(app), config)
 }
@@ -1042,7 +1077,7 @@ pub fn export_quick_publish_template_to_file(
         .cloned()
         .ok_or_else(|| format!("未找到快速发布模板: {}", id))?;
 
-    let export_payload = ImportedQuickPublishTemplateFile { id, template };
+    let export_payload = ImportedEntityFile { id, template };
 
     let export_path = PathBuf::from(&path);
     if let Some(parent) = export_path.parent() {
@@ -1068,7 +1103,7 @@ pub fn import_quick_publish_template_from_file(
     let file_content = std::fs::read_to_string(&import_path)
         .map_err(|error| format!("无法读取快速发布模板文件: {}", error))?;
 
-    let import_file: QuickPublishTemplateImportFileFormat = serde_json::from_str(&file_content)
+    let import_file: EntityImportFileFormat<QuickPublishTemplate> = serde_json::from_str(&file_content)
         .map_err(|error| format!("快速发布模板文件格式无效: {}", error))?;
 
     let fallback_id = import_path
@@ -1077,28 +1112,7 @@ pub fn import_quick_publish_template_from_file(
         .unwrap_or("imported-quick-publish-template")
         .to_string();
 
-    let (id, mut template) = match import_file {
-        QuickPublishTemplateImportFileFormat::Wrapped(file) => {
-            let imported_id = file.id.trim().to_string();
-            let resolved_id = if imported_id.is_empty() {
-                fallback_id.clone()
-            } else {
-                imported_id
-            };
-
-            (resolved_id, file.template)
-        }
-        QuickPublishTemplateImportFileFormat::Raw(template) => {
-            let imported_id = template.id.trim().to_string();
-            let resolved_id = if imported_id.is_empty() {
-                fallback_id.clone()
-            } else {
-                imported_id
-            };
-
-            (resolved_id, template)
-        }
-    };
+    let (id, mut template) = resolve_import_id_and_template(import_file, &fallback_id);
 
     let strategy = conflict_strategy.unwrap_or_default();
     let normalized_id = normalize_required_value(&id, "快速发布模板 ID", ENTITY_ID_MAX_CHARS)?;
@@ -1154,7 +1168,7 @@ pub fn export_content_template_to_file(
         .cloned()
         .ok_or_else(|| format!("未找到正文模板: {}", id))?;
 
-    let export_payload = ImportedContentTemplateFile { id, template };
+    let export_payload = ImportedEntityFile { id, template };
 
     let export_path = PathBuf::from(&path);
     if let Some(parent) = export_path.parent() {
@@ -1180,7 +1194,7 @@ pub fn import_content_template_from_file(
     let file_content = std::fs::read_to_string(&import_path)
         .map_err(|error| format!("无法读取正文模板文件: {}", error))?;
 
-    let import_file: ContentTemplateImportFileFormat = serde_json::from_str(&file_content)
+    let import_file: EntityImportFileFormat<ContentTemplate> = serde_json::from_str(&file_content)
         .map_err(|error| format!("正文模板文件格式无效: {}", error))?;
 
     let fallback_id = import_path
@@ -1189,28 +1203,7 @@ pub fn import_content_template_from_file(
         .unwrap_or("imported-content-template")
         .to_string();
 
-    let (id, mut template) = match import_file {
-        ContentTemplateImportFileFormat::Wrapped(file) => {
-            let imported_id = file.id.trim().to_string();
-            let resolved_id = if imported_id.is_empty() {
-                fallback_id.clone()
-            } else {
-                imported_id
-            };
-
-            (resolved_id, file.template)
-        }
-        ContentTemplateImportFileFormat::Raw(template) => {
-            let imported_id = template.id.trim().to_string();
-            let resolved_id = if imported_id.is_empty() {
-                fallback_id.clone()
-            } else {
-                imported_id
-            };
-
-            (resolved_id, template)
-        }
-    };
+    let (id, mut template) = resolve_import_id_and_template(import_file, &fallback_id);
 
     let strategy = conflict_strategy.unwrap_or_default();
     let normalized_id = normalize_required_value(&id, "正文模板 ID", ENTITY_ID_MAX_CHARS)?;
@@ -1240,9 +1233,7 @@ pub fn import_content_template_from_file(
             .unwrap_or(0);
         template.revision = current_revision.saturating_add(1);
 
-        config
-            .content_templates
-            .insert(final_id.clone(), template.clone());
+        apply_import_content_template(config, final_id.clone(), template.clone());
         Ok((
             ImportedContentTemplatePayload {
                 id: final_id,
@@ -1917,6 +1908,84 @@ mod tests {
         assert_eq!(migrated.body_html, "<p>legacy html</p>");
         assert!(migrated.shared_content_template_id.is_none());
         assert!(migrated.legacy_content_template_id.is_none());
+    }
+
+    #[test]
+    fn test_resolve_import_id_and_template_matches_wrapped_and_raw() {
+        let wrapped_quick: EntityImportFileFormat<QuickPublishTemplate> = serde_json::from_str(
+            r#"{"id":"shared-id","template":{"id":"inner-id","name":"模板"}}"#,
+        )
+        .expect("wrapped quick publish import should deserialize");
+        let raw_quick: EntityImportFileFormat<QuickPublishTemplate> =
+            serde_json::from_str(r#"{"id":"shared-id","name":"模板"}"#)
+                .expect("raw quick publish import should deserialize");
+
+        let (wrapped_id, _) = resolve_import_id_and_template(wrapped_quick, "fallback-stem");
+        let (raw_id, _) = resolve_import_id_and_template(raw_quick, "fallback-stem");
+        assert_eq!(wrapped_id, "shared-id");
+        assert_eq!(raw_id, wrapped_id);
+
+        let wrapped_content: EntityImportFileFormat<ContentTemplate> = serde_json::from_str(
+            r#"{"id":"shared-id","template":{"id":"inner-id","name":"正文"}}"#,
+        )
+        .expect("wrapped content import should deserialize");
+        let raw_content: EntityImportFileFormat<ContentTemplate> =
+            serde_json::from_str(r#"{"id":"shared-id","name":"正文"}"#)
+                .expect("raw content import should deserialize");
+
+        let (wrapped_id, _) = resolve_import_id_and_template(wrapped_content, "fallback-stem");
+        let (raw_id, _) = resolve_import_id_and_template(raw_content, "fallback-stem");
+        assert_eq!(wrapped_id, "shared-id");
+        assert_eq!(raw_id, wrapped_id);
+
+        let empty_wrapped: EntityImportFileFormat<ContentTemplate> =
+            serde_json::from_str(r#"{"template":{"id":"  ","name":"正文"}}"#)
+                .expect("wrapped import without id should deserialize");
+        let empty_raw: EntityImportFileFormat<ContentTemplate> =
+            serde_json::from_str(r#"{"id":"","name":"正文"}"#)
+                .expect("raw import without id should deserialize");
+
+        let (wrapped_id, _) = resolve_import_id_and_template(empty_wrapped, "fallback-stem");
+        let (raw_id, _) = resolve_import_id_and_template(empty_raw, "fallback-stem");
+        assert_eq!(wrapped_id, "fallback-stem");
+        assert_eq!(raw_id, wrapped_id);
+    }
+
+    #[test]
+    fn test_import_content_template_routes_through_migrate_path() {
+        // Legacy-shaped fixture: the on-disk quick-publish template still
+        // references the content template through the legacy field and has an
+        // empty body because the content template was missing at load time.
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{
+                "proxy": { "proxy_type": "none", "proxy_host": "" },
+                "quick_publish_templates": {
+                    "demo-template": {
+                        "id": "demo-template",
+                        "name": "Demo Template",
+                        "content_template_id": "content-1"
+                    }
+                },
+                "content_templates": {}
+            }"#,
+        )
+        .expect("legacy fixture should deserialize");
+
+        let imported = ContentTemplate {
+            id: "content-1".to_string(),
+            name: "Shared".to_string(),
+            markdown: "imported markdown".to_string(),
+            html: "<p>imported html</p>".to_string(),
+            ..ContentTemplate::default()
+        };
+
+        apply_import_content_template(&mut config, "content-1".to_string(), imported);
+
+        assert_eq!(config.content_templates["content-1"].name, "Shared");
+        let relinked = &config.quick_publish_templates["demo-template"];
+        assert_eq!(relinked.body_markdown, "imported markdown");
+        assert_eq!(relinked.body_html, "<p>imported html</p>");
+        assert!(relinked.legacy_content_template_id.is_none());
     }
 
     #[test]

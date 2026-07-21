@@ -5,6 +5,7 @@ import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
 import { useLatest } from '../hooks/useLatest';
 import {
     createCopyEntityName,
+    ENTITY_NAME_MAX_LENGTH,
     ImportConflictStrategy,
     parseImportConflictName,
     sanitizeEntityNameInput,
@@ -85,11 +86,12 @@ function buildPersistableTemplate<T extends AnyTemplate>(
 export function createCopyDraft<T extends AnyTemplate>(
     template: T,
     fallbackName: string,
+    existingNames: readonly string[] = [],
 ): T {
     const duplicated = {
         ...template,
         id: '',
-        name: createCopyEntityName(template.name, fallbackName),
+        name: createCopyEntityName(template.name, fallbackName, ENTITY_NAME_MAX_LENGTH, existingNames),
         updated_at: '',
         revision: 0,
     } as T;
@@ -465,7 +467,11 @@ export function useTemplateManager<T extends AnyTemplate>(
                 return;
             }
 
-            const duplicated = createCopyDraft(latestDraftRef.current, config.fallbackName);
+            const duplicated = createCopyDraft(
+                latestDraftRef.current,
+                config.fallbackName,
+                Object.values(templatesRef.current).map((template) => template.name),
+            );
 
             setSelectedTemplateId('');
             setDraft(duplicated);
@@ -618,7 +624,11 @@ export function useTemplateManager<T extends AnyTemplate>(
     };
 
     const saveConflictAsCopy = async () => {
-        const duplicated = createCopyDraft(latestDraftRef.current, config.fallbackName);
+        const duplicated = createCopyDraft(
+            latestDraftRef.current,
+            config.fallbackName,
+            Object.values(templatesRef.current).map((template) => template.name),
+        );
 
         setSelectedTemplateId('');
         setDraft(duplicated);
