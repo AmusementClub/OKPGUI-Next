@@ -63,7 +63,9 @@ interface SaveCall {
 
 let saveCalls: SaveCall[];
 let saveResolvers: Array<(value: { id: string; template: unknown }) => void>;
+let saveRejecters: Array<(reason?: unknown) => void>;
 let deleteCalls: Array<{ id: string }>;
+let invokeOrder: string[];
 
 function routeInvoke(command: string, args?: Record<string, unknown>): Promise<unknown> {
     switch (command) {
@@ -73,11 +75,14 @@ function routeInvoke(command: string, args?: Record<string, unknown>): Promise<u
             return Promise.resolve(null);
         case 'save_quick_publish_template':
             saveCalls.push(args as unknown as SaveCall);
-            return new Promise((resolve) => {
+            invokeOrder.push('save');
+            return new Promise((resolve, reject) => {
                 saveResolvers.push(resolve);
+                saveRejecters.push(reject);
             });
         case 'delete_quick_publish_template':
             deleteCalls.push(args as unknown as { id: string });
+            invokeOrder.push('delete');
             return Promise.resolve(null);
         default:
             return Promise.resolve(null);
@@ -90,7 +95,9 @@ describe('useTemplateManager stale-async guards', () => {
         manager = null;
         saveCalls = [];
         saveResolvers = [];
+        saveRejecters = [];
         deleteCalls = [];
+        invokeOrder = [];
         invokeMock.mockReset();
         invokeMock.mockImplementation(routeInvoke);
     });
@@ -252,6 +259,125 @@ describe('useTemplateManager stale-async guards', () => {
         expect(manager?.loadError).toContain('配置文件损坏');
         // Data still loads from the default config.
         expect(manager?.selectedTemplateId).toBe('a');
+
+        await rendered.unmount();
+    });
+
+    it('disarms the pending autosave before deleting so the timer cannot resurrect the template', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+        expect(manager?.selectedTemplateId).toBe('a');
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A改' })));
+        expect(manager?.hasPendingAutosave).toBe(true);
+
+        await actOn(async () => {
+            await manager!.deleteTemplate();
+        });
+
+        // The doomed template's pending edit is discarded, not saved; the debounce
+        // timer is disarmed so it cannot fire after the delete round-trip.
+        expect(invokeOrder).toEqual(['delete']);
+        expect(deleteCalls).toEqual([{ id: 'a' }]);
+        expect(manager?.hasPendingAutosave).toBe(false);
+
+        await rendered.unmount();
+    });
+
+    it('awaits an in-flight save before the delete round-trip', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A改' })));
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+        expect(saveCalls).toHaveLength(1);
+
+        let deleteSettled = false;
+        await actOn(() => {
+            void manager!.deleteTemplate().then(() => {
+                deleteSettled = true;
+            });
+        });
+
+        // The delete round-trip waits for the in-flight save to land first.
+        expect(deleteSettled).toBe(false);
+        expect(deleteCalls).toHaveLength(0);
+
+        await actOn(async () => {
+            saveResolvers[0]({ id: 'a', template: saveCalls[0].template });
+            await flushAsync();
+        });
+
+        expect(invokeOrder).toEqual(['save', 'delete']);
+        expect(deleteCalls).toEqual([{ id: 'a' }]);
+
+        await rendered.unmount();
+    });
+
+    it('targets the delete at the current selection after a mid-save switch', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+        expect(manager?.selectedTemplateId).toBe('a');
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A改' })));
+
+        // Save of A in flight; user moves to B; save resolves; delete must target B.
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+        expect(saveCalls).toHaveLength(1);
+
+        await actOn(async () => {
+            await manager!.loadData('b');
+        });
+        await actOn(() => {
+            saveResolvers[0]({ id: 'a', template: saveCalls[0].template });
+        });
+        expect(manager?.selectedTemplateId).toBe('b');
+
+        await actOn(async () => {
+            await manager!.deleteTemplate();
+        });
+        expect(deleteCalls).toEqual([{ id: 'b' }]);
+
+        await rendered.unmount();
+    });
+
+    it('keeps the dirty state armed when an autosave fails and retries on switch', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A改' })));
+
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+        expect(saveCalls).toHaveLength(1);
+
+        await actOn(() => {
+            saveRejecters[0]('磁盘写入失败');
+        });
+
+        // Failure leaves the draft dirty and armed instead of silently disarming.
+        expect(manager?.hasPendingAutosave).toBe(true);
+        expect(manager?.saveState).toBe('failed');
+        expect(manager?.errorMessage).toBe('磁盘写入失败');
+
+        // Flushing on switch retries the failed save before completing the switch.
+        let switchPromise: Promise<void> | null = null;
+        await actOn(() => {
+            switchPromise = manager!.selectTemplate('b');
+        });
+        expect(saveCalls).toHaveLength(2);
+
+        await actOn(async () => {
+            saveResolvers[1]({ id: 'a', template: saveCalls[1].template });
+            await switchPromise;
+        });
+        expect(manager?.selectedTemplateId).toBe('b');
+        expect(manager?.hasPendingAutosave).toBe(false);
 
         await rendered.unmount();
     });

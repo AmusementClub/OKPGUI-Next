@@ -321,9 +321,8 @@ export function useTemplateManager<T extends AnyTemplate>(
         } catch (error) {
             const conflict = parseTemplateRevisionConflict(error);
             if (conflict) {
-                if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
-                    setHasPendingAutosave(false);
-                }
+                // Do NOT clear hasPendingAutosave on failure: the draft is still dirty
+                // and must stay armed so flush-on-switch or the next edit retries.
                 setConflictState({
                     entityId: conflict.entity_id,
                     currentRevision: conflict.current_revision,
@@ -335,9 +334,6 @@ export function useTemplateManager<T extends AnyTemplate>(
                 return 'conflict';
             }
 
-            if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
-                setHasPendingAutosave(false);
-            }
             setConflictState(null);
             setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `自动保存${config.entityLabel}失败。`);
@@ -575,18 +571,40 @@ export function useTemplateManager<T extends AnyTemplate>(
             return;
         }
 
+        // Same switching discipline as selectTemplate: ignore re-entrant calls and
+        // flush the pending debounced autosave first, so a firing timer cannot
+        // resurrect the template while the delete round-trip is in flight.
+        if (switchingRef.current) {
+            return;
+        }
+
+        switchingRef.current = true;
+        setIsSwitching(true);
         try {
-            await invoke(config.deleteCommand, { id: selectedTemplateId });
-            const deletedName = draft.name || selectedTemplateId;
-            await loadData();
-            setSaveState('saved');
-            setConflictState(null);
-            setStatusMessage(`${config.entityLabel}"${deletedName}"已删除。`);
-            setErrorMessage('');
-        } catch (error) {
-            setSaveState('failed');
-            setErrorMessage(typeof error === 'string' ? error : `删除${config.entityLabel}失败。`);
-            setStatusMessage('');
+            // Disarm the debounce and await any in-flight persist, so neither a
+            // firing timer nor a late save can resurrect the deleted template.
+            setHasPendingAutosave(false);
+            const inFlight = persistInFlightRef.current;
+            if (inFlight) {
+                await inFlight;
+            }
+
+            try {
+                await invoke(config.deleteCommand, { id: selectedTemplateIdRef.current });
+                const deletedName = latestDraftRef.current.name || selectedTemplateIdRef.current;
+                await loadData();
+                setSaveState('saved');
+                setConflictState(null);
+                setStatusMessage(`${config.entityLabel}"${deletedName}"已删除。`);
+                setErrorMessage('');
+            } catch (error) {
+                setSaveState('failed');
+                setErrorMessage(typeof error === 'string' ? error : `删除${config.entityLabel}失败。`);
+                setStatusMessage('');
+            }
+        } finally {
+            switchingRef.current = false;
+            setIsSwitching(false);
         }
     };
 

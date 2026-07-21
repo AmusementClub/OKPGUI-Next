@@ -447,7 +447,12 @@ export default function HomePage() {
             lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
             // Only apply the saved template when the editor was not touched while the
             // save was in flight; otherwise the response would clobber fresh keystrokes.
-            if (serializeForComparison(templateRef.current) === preSaveSnapshot) {
+            // Compare with the same profile augmentation as the pre-save snapshot so a
+            // profile switch does not silently disable the guard.
+            if (
+                serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
+                === preSaveSnapshot
+            ) {
                 setTemplate(nextTemplate);
                 setNewTemplateName('');
             }
@@ -873,7 +878,9 @@ export default function HomePage() {
         let templateToPublish = withSelectedProfile(template, selectedProfile);
 
         // Back-fill rendered HTML for HTML-preferring sites before validating and
-        // persisting, so preview == persisted == published.
+        // persisting, so preview == persisted == published. The editor state is
+        // updated too, otherwise the next editor-driven persist would re-save the
+        // empty html and revert the back-fill on disk.
         if (
             templateToPublish.description.trim()
             && !templateToPublish.description_html.trim()
@@ -883,6 +890,7 @@ export default function HomePage() {
                 ...templateToPublish,
                 description_html: renderMarkdownToHtml(templateToPublish.description),
             };
+            setTemplate(templateToPublish);
         }
 
         const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);

@@ -211,7 +211,8 @@ export default function QuickPublishTemplatesPage() {
                             onClick={() => {
                                 void deleteTemplate();
                             }}
-                            className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 transition-colors hover:bg-rose-500/20"
+                            disabled={isSwitching}
+                            className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 transition-colors hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                             <Trash2 size={16} />
                             删除模板

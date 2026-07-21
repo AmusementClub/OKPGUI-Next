@@ -187,10 +187,11 @@ export default function QuickPublishPage() {
     );
 
     useEffect(() => {
+        let disposed = false;
         let unlisten: UnlistenFn | null = null;
 
         const setupDragDropListener = async () => {
-            unlisten = await getCurrentWindow().onDragDropEvent((event) => {
+            const nextUnlisten = await getCurrentWindow().onDragDropEvent((event) => {
                 if (event.payload.type === 'enter' || event.payload.type === 'over') {
                     setIsDragging(true);
                     return;
@@ -208,11 +209,19 @@ export default function QuickPublishPage() {
                     void parseTorrent(droppedTorrentPath);
                 }
             });
+
+            // If cleanup ran while registration was in flight, detach immediately.
+            if (disposed) {
+                nextUnlisten();
+                return;
+            }
+            unlisten = nextUnlisten;
         };
 
         void setupDragDropListener();
 
         return () => {
+            disposed = true;
             unlisten?.();
         };
     }, [parseTorrent]);

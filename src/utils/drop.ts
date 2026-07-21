@@ -20,7 +20,13 @@ export function normalizeDroppedFilePath(path: string): string {
         normalized = normalized.slice(1);
     }
 
-    return decodeURIComponent(normalized);
+    try {
+        return decodeURIComponent(normalized);
+    } catch {
+        // Malformed percent-escapes (e.g. a literal '%' in the filename) must not
+        // throw inside the drop handler; fall back to the undecoded path.
+        return normalized;
+    }
 }
 
 /** Picks the first dropped path with the given extension and normalizes it. */
@@ -31,17 +37,4 @@ export function extractDroppedFilePath(
     const normalizedExtension = extension.toLowerCase();
     const match = paths.find((path) => path.toLowerCase().endsWith(normalizedExtension));
     return match ? normalizeDroppedFilePath(match) : null;
-}
-
-/**
- * Fallback for drop sources that only expose `text/uri-list` data: one URI per
- * line, `#` lines are comments. Returns the first matching normalized path.
- */
-export function extractPathFromUriList(uriList: string, extension = '.torrent'): string | null {
-    const paths = uriList
-        .split(/\r?\n/)
-        .map((line) => line.trim())
-        .filter((line) => line.length > 0 && !line.startsWith('#'));
-
-    return extractDroppedFilePath(paths, extension);
 }

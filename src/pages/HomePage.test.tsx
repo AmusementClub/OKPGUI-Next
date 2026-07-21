@@ -279,7 +279,12 @@ describe('HomePage publish content pipeline', () => {
     function mountWithTemplate(
         templateOverrides: Record<string, unknown>,
         profileOverrides: Record<string, unknown>,
+        options: {
+            extraProfiles?: Record<string, Record<string, unknown>>;
+            saveTemplateResult?: (args: Record<string, unknown>) => unknown;
+        } = {},
     ) {
+        const extraProfiles = options.extraProfiles ?? {};
         invokeMock.mockImplementation((command: string, args) => {
             const typedArgs = args as Record<string, unknown> | undefined;
             switch (command) {
@@ -297,13 +302,17 @@ describe('HomePage publish content pipeline', () => {
                         },
                     });
                 case 'get_profile_list':
-                    return Promise.resolve(['p1']);
+                    return Promise.resolve(['p1', ...Object.keys(extraProfiles)]);
                 case 'get_profiles':
                     return Promise.resolve({
-                        profiles: { p1: { ...buildProfile(), ...profileOverrides } },
+                        profiles: { p1: { ...buildProfile(), ...profileOverrides }, ...extraProfiles },
                     });
                 case 'save_template':
-                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                    return Promise.resolve(
+                        options.saveTemplateResult
+                            ? options.saveTemplateResult(typedArgs ?? {})
+                            : { name: typedArgs?.name, template: typedArgs?.template },
+                    );
                 case 'parse_torrent':
                     return Promise.resolve({
                         name: 'release.mkv',
@@ -392,6 +401,76 @@ describe('HomePage publish content pipeline', () => {
         expect(publishCalls).toHaveLength(1);
         const publishRequest = (publishCalls[0] as { request: { template: { description_html: string } } }).request;
         expect(publishRequest.template.description_html).toBe('');
+
+        await rendered.unmount();
+    });
+
+    it('keeps the back-filled html on the next editor-driven save after publish', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
+
+        const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
+        const savesBefore = findInvokeArgs('save_template').length;
+
+        // A subsequent editor-driven save (site toggle autosave) must carry the
+        // back-filled html, not revert it to empty.
+        const checkbox = rendered.container.querySelector<HTMLInputElement>(
+            'input[type="checkbox"][title="选择 ACG.RIP"]',
+        );
+        expect(checkbox).not.toBeNull();
+        expect(checkbox!.disabled).toBe(false);
+        await act(async () => {
+            checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync();
+
+        const saveCalls = findInvokeArgs('save_template');
+        expect(saveCalls.length).toBeGreaterThan(savesBefore);
+        const lastSave = saveCalls[saveCalls.length - 1] as { template: { description_html: string } };
+        expect(lastSave.template.description_html).toBe(expectedHtml);
+
+        await rendered.unmount();
+    });
+
+    it('applies the saved template after a profile switch (same augmentation on both sides)', async () => {
+        mountWithTemplate(
+            {},
+            {},
+            {
+                extraProfiles: { p2: buildProfile() },
+                saveTemplateResult: (args) => ({
+                    name: args.name,
+                    template: { ...(args.template as Record<string, unknown>), about: '后端改写' },
+                }),
+            },
+        );
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        // Switch the profile: the autosave carries profile p2 while the editor
+        // template still says p1 — the guard must compare like-for-like.
+        const profileSelect = Array.from(rendered.container.querySelectorAll('select')).find(
+            (candidate) => candidate.textContent?.includes('选择身份配置'),
+        ) as HTMLSelectElement | undefined;
+        expect(profileSelect).toBeTruthy();
+
+        const valueSetter = Object.getOwnPropertyDescriptor(
+            window.HTMLSelectElement.prototype,
+            'value',
+        )!.set!;
+        await act(async () => {
+            valueSetter.call(profileSelect, 'p2');
+            profileSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await flushAsync();
+
+        // The server-normalized template is applied, not silently dropped.
+        expect(findAboutInput(rendered.container).value).toBe('后端改写');
 
         await rendered.unmount();
     });
