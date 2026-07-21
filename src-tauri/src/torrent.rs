@@ -2,6 +2,10 @@ use lava_torrent::torrent::v1::Torrent;
 use serde::Serialize;
 
 const MAX_BENCODE_DEPTH: usize = 128;
+/// Maximum number of path components (directories + file name) accepted for
+/// a single file entry. Crafted torrents with absurdly deep paths are
+/// rejected instead of being walked.
+const MAX_PATH_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct FileTreeNode {
@@ -37,44 +41,39 @@ fn build_file_tree(name: &str, files: &[(Vec<String>, u64)]) -> FileTreeNode {
     root
 }
 
-fn insert_into_tree(node: &mut FileTreeNode, path_parts: &[String], size: u64) {
-    if path_parts.is_empty() {
+fn insert_into_tree(root: &mut FileTreeNode, path_parts: &[String], size: u64) {
+    let Some((file_name, dir_parts)) = path_parts.split_last() else {
         return;
-    }
-
-    if path_parts.len() == 1 {
-        // This is a file
-        node.children.push(FileTreeNode {
-            name: path_parts[0].clone(),
-            size: Some(size),
-            children: Vec::new(),
-            is_file: true,
-        });
-        return;
-    }
-
-    // This is a directory component
-    let dir_name = &path_parts[0];
-    let remaining = &path_parts[1..];
-
-    // Find or create the directory node
-    let dir_node = if let Some(pos) = node
-        .children
-        .iter()
-        .position(|c| !c.is_file && c.name == *dir_name)
-    {
-        &mut node.children[pos]
-    } else {
-        node.children.push(FileTreeNode {
-            name: dir_name.clone(),
-            size: None,
-            children: Vec::new(),
-            is_file: false,
-        });
-        node.children.last_mut().unwrap()
     };
 
-    insert_into_tree(dir_node, remaining, size);
+    // Iterative walk: a deep path must not grow the call stack.
+    let mut node = root;
+    for dir_name in dir_parts {
+        let index = match node
+            .children
+            .iter()
+            .position(|c| !c.is_file && c.name == *dir_name)
+        {
+            Some(index) => index,
+            None => {
+                node.children.push(FileTreeNode {
+                    name: dir_name.clone(),
+                    size: None,
+                    children: Vec::new(),
+                    is_file: false,
+                });
+                node.children.len() - 1
+            }
+        };
+        node = &mut node.children[index];
+    }
+
+    node.children.push(FileTreeNode {
+        name: file_name.clone(),
+        size: Some(size),
+        children: Vec::new(),
+        is_file: true,
+    });
 }
 
 /// Reorders only the top-level bencode dictionary.
@@ -209,7 +208,7 @@ fn read_torrent_compat(path: &str) -> Result<(Torrent, Option<String>), String> 
     }
 }
 
-fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> TorrentInfo {
+fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> Result<TorrentInfo, String> {
     let name = torrent.name.clone();
 
     match &torrent.files {
@@ -224,6 +223,9 @@ fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> TorrentIn
                     .components()
                     .map(|c| c.as_os_str().to_string_lossy().to_string())
                     .collect();
+                if path_components.len() > MAX_PATH_DEPTH {
+                    return Err("路径层级过深".to_string());
+                }
                 let size = file.length as u64;
                 total_size += size;
                 file_entries.push((path_components, size));
@@ -231,12 +233,12 @@ fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> TorrentIn
 
             let file_tree = build_file_tree(&name, &file_entries);
 
-            TorrentInfo {
+            Ok(TorrentInfo {
                 name,
                 total_size,
                 file_tree,
                 compat_notice,
-            }
+            })
         }
         None => {
             // Single-file torrent
@@ -248,12 +250,12 @@ fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> TorrentIn
                 is_file: true,
             };
 
-            TorrentInfo {
+            Ok(TorrentInfo {
                 name,
                 total_size: size,
                 file_tree,
                 compat_notice,
-            }
+            })
         }
     }
 }
@@ -261,7 +263,7 @@ fn torrent_to_info(torrent: Torrent, compat_notice: Option<String>) -> TorrentIn
 #[tauri::command]
 pub fn parse_torrent(path: String) -> Result<TorrentInfo, String> {
     let (torrent, compat_notice) = read_torrent_compat(&path)?;
-    Ok(torrent_to_info(torrent, compat_notice))
+    torrent_to_info(torrent, compat_notice)
 }
 
 #[cfg(test)]
@@ -327,5 +329,61 @@ mod tests {
 
         assert_eq!(torrent.name, "x");
         assert_eq!(torrent.length, 1);
+    }
+
+    /// Writes a multi-file torrent whose single file has `components` path
+    /// components ("a/a/.../a") to a temp file and returns its path.
+    fn write_deep_path_torrent(components: usize) -> std::path::PathBuf {
+        let mut bytes = b"d4:infod5:filesld6:lengthi1e4:pathl".to_vec();
+        for _ in 0..components {
+            bytes.extend_from_slice(b"1:a");
+        }
+        bytes.extend_from_slice(b"eee4:name1:x12:piece lengthi1e6:pieces20:");
+        // 0xff keeps `pieces` a byte string: lava_torrent decodes valid-UTF-8
+        // byte strings as string elements and would reject them here.
+        bytes.extend_from_slice(&[0xff; 20]);
+        bytes.extend_from_slice(b"ee");
+
+        let path = std::env::temp_dir().join(format!(
+            "okpgui-deep-path-{}-{}.torrent",
+            std::process::id(),
+            components
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn rejects_a_path_deeper_than_the_depth_cap() {
+        let path = write_deep_path_torrent(10_000);
+        let result = parse_torrent(path.to_string_lossy().to_string());
+        let _ = std::fs::remove_file(&path);
+
+        let err = result.expect_err("a 10k-component path must be rejected");
+        assert!(
+            err.contains("路径层级过深"),
+            "unexpected error message: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn accepts_a_path_at_the_depth_cap() {
+        let path = write_deep_path_torrent(MAX_PATH_DEPTH);
+        let result = parse_torrent(path.to_string_lossy().to_string());
+        let _ = std::fs::remove_file(&path);
+
+        let info = result.expect("a depth-64 path must parse successfully");
+
+        // Walk the tree: 63 nested "a" directories, then the "a" file.
+        let mut node = &info.file_tree;
+        let mut depth = 0usize;
+        while !node.is_file {
+            assert_eq!(node.children.len(), 1);
+            node = &node.children[0];
+            depth += 1;
+        }
+        assert_eq!(depth, MAX_PATH_DEPTH);
+        assert_eq!(node.size, Some(1));
     }
 }
