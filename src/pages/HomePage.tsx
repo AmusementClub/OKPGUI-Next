@@ -37,6 +37,7 @@ import {
 } from '../utils/entityNaming';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import { serializeForComparison } from '../utils/templateSnapshot';
+import { isHtmlPreferredSite, validatePublishContentForSites } from '../utils/publishValidation';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
@@ -133,12 +134,6 @@ interface Profile {
     acgnx_global_name: string;
     acgnx_global_token: string;
     [key: string]: unknown;
-}
-
-interface PublishContentValidationIssue {
-    siteCode: string;
-    siteLabel: string;
-    message: string;
 }
 
 const siteKeys: (keyof SiteSelection)[] = [
@@ -293,38 +288,6 @@ function normalizeTemplate(template?: Partial<Template>): Template {
             ...template?.sites,
         },
     };
-}
-
-const htmlPreferredSiteKeys = new Set<string>(['dmhy', 'bangumi', 'acgnx_asia', 'acgnx_global']);
-const markdownRequiredSiteKeys = new Set<string>(['nyaa', 'acgrip']);
-
-function validatePublishContentForSites(
-    template: Template,
-    selectedSites: SiteDefinition[],
-): PublishContentValidationIssue[] {
-    const markdown = template.description.trim();
-    const html = template.description_html.trim();
-    const convertedHtml = markdown ? renderMarkdownToHtml(template.description).trim() : '';
-
-    return selectedSites.flatMap((site) => {
-        if (markdownRequiredSiteKeys.has(site.key) && !markdown) {
-            return [{
-                siteCode: site.key,
-                siteLabel: site.label,
-                message: `${site.label} 需要 Markdown 发布内容，请先填写 Markdown。`,
-            }];
-        }
-
-        if (htmlPreferredSiteKeys.has(site.key) && !html && !convertedHtml) {
-            return [{
-                siteCode: site.key,
-                siteLabel: site.label,
-                message: `${site.label} 需要 HTML 内容，或可转换为 HTML 的 Markdown 发布内容。`,
-            }];
-        }
-
-        return [];
-    });
 }
 
 export default function HomePage() {
@@ -1071,8 +1034,22 @@ export default function HomePage() {
         if (isPublishing) return;
 
         const publishTemplateName = getTemplateName();
-        const templateToPublish = withSelectedProfile(template, selectedProfile);
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
+        let templateToPublish = withSelectedProfile(template, selectedProfile);
+
+        // Back-fill rendered HTML for HTML-preferring sites before validating and
+        // persisting, so preview == persisted == published.
+        if (
+            templateToPublish.description.trim()
+            && !templateToPublish.description_html.trim()
+            && selectedSites.some((site) => isHtmlPreferredSite(site.key))
+        ) {
+            templateToPublish = {
+                ...templateToPublish,
+                description_html: renderMarkdownToHtml(templateToPublish.description),
+            };
+        }
+
         const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);
         if (contentValidationIssues.length > 0) {
             const issueMessageMap = new Map(
@@ -1141,14 +1118,13 @@ export default function HomePage() {
                 request: {
                     publish_id: publishId,
                     torrent_path: torrentPath,
-                    template_name: publishTemplateName,
                     profile_name: selectedProfile,
                     template: templateToPublish,
                 },
             });
         } catch (e) {
             console.error('发布失败:', e);
-            failActivePublish(getErrorMessage(e), { appendToFirstSite: true });
+            failActivePublish(getErrorMessage(e));
         }
     };
     // Drag and drop is handled by the Tauri window drag-drop listener above;

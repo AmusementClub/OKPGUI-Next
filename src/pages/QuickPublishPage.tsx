@@ -20,6 +20,8 @@ import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import WarningBanner from '../components/WarningBanner';
 import { EP_PATTERN_HELP } from '../utils/titleRules';
+import { renderMarkdownToHtml } from '../utils/markdown';
+import { isHtmlPreferredSite, validatePublishContentForSites } from '../utils/publishValidation';
 import {
     createPublishConsoleSiteMap,
     createPublishId,
@@ -160,6 +162,7 @@ export default function QuickPublishPage() {
         publishResult,
         publishCompletion,
         startPublishTask,
+        showPublishResult,
         failActivePublish,
         clearPublishCompletion,
     } = usePublishTask<keyof SiteSelection>();
@@ -412,7 +415,56 @@ export default function QuickPublishPage() {
         if (!activeTemplate) return;
 
         const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draftToPublish.sites[siteKey]);
+        const selectedSites = selectedSiteKeys.map((siteKey) => ({
+            key: siteKey,
+            label: quickPublishSiteLabels[siteKey],
+        }));
         const publishTemplatePayload = buildLegacyPublishTemplatePayload(draftToPublish, activeTemplate);
+
+        const contentValidationIssues = validatePublishContentForSites(
+            publishTemplatePayload,
+            selectedSites,
+        );
+        if (contentValidationIssues.length > 0) {
+            const issueMessageMap = new Map(
+                contentValidationIssues.map((issue) => [issue.siteCode, issue.message]),
+            );
+            const combinedMessage = contentValidationIssues.map((issue) => issue.message).join('；');
+
+            showPublishResult(
+                createPublishConsoleSiteMap(
+                    selectedSites.map((site) => {
+                        const siteMessage = issueMessageMap.get(site.key) ?? '发布已取消：发布内容校验未通过。';
+                        return {
+                            siteCode: site.key,
+                            siteLabel: site.label,
+                            lines: [{ text: siteMessage, isError: true }],
+                            status: 'error' as const,
+                            message: siteMessage,
+                        };
+                    }),
+                ),
+                {
+                    success: false,
+                    message: combinedMessage,
+                },
+            );
+            setShowConsole(true);
+            return;
+        }
+
+        // Back-fill rendered HTML for HTML-preferring sites so the published
+        // content matches the preview instead of sending raw Markdown.
+        if (
+            publishTemplatePayload.description.trim()
+            && !publishTemplatePayload.description_html.trim()
+            && selectedSiteKeys.some((siteKey) => isHtmlPreferredSite(siteKey))
+        ) {
+            publishTemplatePayload.description_html = renderMarkdownToHtml(
+                publishTemplatePayload.description,
+            );
+        }
+
         const publishId = createPublishId();
         const nextPublishSites = createPublishConsoleSiteMap(
             selectedSiteKeys.map((siteKey) => ({
@@ -444,7 +496,6 @@ export default function QuickPublishPage() {
                 request: {
                     publish_id: publishId,
                     torrent_path: draftToPublish.torrent_path,
-                    template_name: activeTemplate.name || activeTemplate.id,
                     profile_name: draftToPublish.profile,
                     template: publishTemplatePayload,
                 },
@@ -452,7 +503,7 @@ export default function QuickPublishPage() {
         } catch (error) {
             const message = typeof error === 'string' ? error : '启动发布失败。';
             setErrorMessage(message);
-            failActivePublish(message, { appendToFirstSite: true });
+            failActivePublish(message);
         }
     };
 

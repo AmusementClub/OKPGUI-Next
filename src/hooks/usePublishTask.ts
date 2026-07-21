@@ -151,6 +151,24 @@ export function usePublishTask<SiteKey extends string>() {
                 setIsPublishing(false);
                 setIsPublishComplete(true);
                 setPublishResult(event.payload);
+                if (!event.payload.success) {
+                    // Event-authoritative: sites absent from the per-site success map
+                    // never ran (the backend bailed early), so mark them 'error' with
+                    // the aggregate message. Sites that succeeded keep their status.
+                    setPublishSites((current) => {
+                        const nextSites = { ...current };
+                        for (const siteCode of Object.keys(nextSites)) {
+                            if (!(siteCode in siteSuccess)) {
+                                nextSites[siteCode] = {
+                                    ...nextSites[siteCode],
+                                    status: 'error',
+                                    message: event.payload.message,
+                                };
+                            }
+                        }
+                        return nextSites;
+                    });
+                }
                 setPublishCompletion({
                     publishId,
                     result: event.payload,
@@ -200,33 +218,18 @@ export function usePublishTask<SiteKey extends string>() {
     );
 
     const failActivePublish = useCallback(
-        (message: string, options?: { appendToFirstSite?: boolean }) => {
+        (message: string) => {
             const publishId = activePublishIdRef.current;
 
-            activePublishIdRef.current = '';
-            publishSiteSuccessRef.current = {};
-            setPublishSites((current) => {
-                if (!options?.appendToFirstSite || Object.keys(current).length === 0) {
-                    return current;
-                }
-
-                const firstSiteCode = Object.keys(current)[0];
-                const firstSite = current[firstSiteCode];
-
-                return {
-                    ...current,
-                    [firstSiteCode]: {
-                        ...firstSite,
-                        status: 'error',
-                        message,
-                        lines: [...firstSite.lines, { text: message, isError: true }],
-                    },
-                };
-            });
+            // Do NOT clear activePublishIdRef/publishSiteSuccessRef or relabel sites
+            // here: the backend emits publish-complete before rejecting the invoke,
+            // and clearing the refs would make the listener drop that event (losing
+            // the per-site backfill). This standalone result only covers invoke
+            // failures where no publish-complete will ever arrive (e.g. request
+            // serialization failure); when the event arrives it overrides this.
             setPublishResult(buildPublishResult(publishId, { success: false, message }));
             setIsPublishComplete(true);
             setIsPublishing(false);
-            setPublishCompletion(null);
         },
         [],
     );

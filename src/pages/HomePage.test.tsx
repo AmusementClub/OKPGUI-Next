@@ -2,10 +2,12 @@ import { act, StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { flushAsync, renderElement } from '../test-utils/react';
 import { emptySiteCookies } from '../utils/cookieUtils';
+import { renderMarkdownToHtml } from '../utils/markdown';
 import HomePage from './HomePage';
 
-const { invokeMock } = vi.hoisted(() => ({
+const { invokeMock, openMock } = vi.hoisted(() => ({
     invokeMock: vi.fn(),
+    openMock: vi.fn<() => Promise<string | null>>(() => Promise.resolve(null)),
 }));
 
 vi.mock('@tauri-apps/api/core', () => ({
@@ -23,7 +25,7 @@ vi.mock('@tauri-apps/api/window', () => ({
 }));
 
 vi.mock('@tauri-apps/plugin-dialog', () => ({
-    open: vi.fn(() => Promise.resolve(null)),
+    open: openMock,
     save: vi.fn(() => Promise.resolve(null)),
 }));
 
@@ -262,6 +264,134 @@ describe('HomePage template save guards', () => {
         });
         await flushAsync();
         expect(countSaveTemplateCalls() - savesBefore).toBe(2);
+
+        await rendered.unmount();
+    });
+});
+
+describe('HomePage publish content pipeline', () => {
+    beforeEach(() => {
+        invokeMock.mockReset();
+        openMock.mockReset();
+        openMock.mockResolvedValue('/tmp/a.torrent');
+    });
+
+    function mountWithTemplate(
+        templateOverrides: Record<string, unknown>,
+        profileOverrides: Record<string, unknown>,
+    ) {
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve({
+                        last_used_template: 'default',
+                        okp_executable_path: '/okp',
+                        templates: {
+                            default: {
+                                profile: 'p1',
+                                description: '**markdown 简介**',
+                                description_html: '',
+                                ...templateOverrides,
+                            },
+                        },
+                    });
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        profiles: { p1: { ...buildProfile(), ...profileOverrides } },
+                    });
+                case 'save_template':
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details':
+                    return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+    }
+
+    function findInvokeArgs(command: string): Record<string, unknown>[] {
+        return invokeMock.mock.calls
+            .filter(([called]) => called === command)
+            .map(([, args]) => args as Record<string, unknown>);
+    }
+
+    async function selectTorrentAndPublish(container: HTMLElement, siteLabel: string) {
+        // Toggle the site on after the profile loads (selectable rows only).
+        const checkbox = container.querySelector<HTMLInputElement>(
+            `input[type="checkbox"][title="选择 ${siteLabel}"]`,
+        );
+        expect(checkbox).not.toBeNull();
+        expect(checkbox!.disabled).toBe(false);
+        await act(async () => {
+            checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync();
+
+        const picker = container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+        expect(picker).not.toBeNull();
+        await act(async () => {
+            picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync();
+
+        const publishButton = Array.from(container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('发布已选站点'),
+        );
+        expect(publishButton).toBeTruthy();
+        expect(publishButton!.disabled).toBe(false);
+        await act(async () => {
+            publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync(20);
+    }
+
+    it('back-fills rendered HTML into the persisted and published template for HTML-preferring sites', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
+
+        const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
+        const saveCalls = findInvokeArgs('save_template');
+        const publishCalls = findInvokeArgs('publish');
+        expect(saveCalls.length).toBeGreaterThanOrEqual(1);
+        expect(publishCalls).toHaveLength(1);
+
+        const persistedTemplate = (saveCalls[saveCalls.length - 1] as { template: { description_html: string } }).template;
+        expect(persistedTemplate.description_html).toBe(expectedHtml);
+
+        const publishRequest = (publishCalls[0] as { request: { template: { description_html: string; description: string } } }).request;
+        expect(publishRequest.template.description).toBe('**markdown 简介**');
+        expect(publishRequest.template.description_html).toBe(expectedHtml);
+
+        await rendered.unmount();
+    });
+
+    it('leaves description_html empty when only markdown-required sites are selected', async () => {
+        const nyaaCookies = emptySiteCookies();
+        nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
+        mountWithTemplate({}, { site_cookies: nyaaCookies });
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        await selectTorrentAndPublish(rendered.container, 'Nyaa');
+
+        const publishCalls = findInvokeArgs('publish');
+        expect(publishCalls).toHaveLength(1);
+        const publishRequest = (publishCalls[0] as { request: { template: { description_html: string } } }).request;
+        expect(publishRequest.template.description_html).toBe('');
 
         await rendered.unmount();
     });
