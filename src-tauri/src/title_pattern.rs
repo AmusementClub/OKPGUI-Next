@@ -88,6 +88,37 @@ fn collect_named_capture_matches(
         .collect())
 }
 
+/// Fansub titles often embed a revision marker directly after the episode,
+/// e.g. `[02v2]`. The digit run inside `v2` is not an episode number, but a
+/// generic ep pattern like `\d{1,3}` still matches it, and the
+/// closest-before-resolution heuristic then prefers it over the real
+/// episode. Drop candidates whose ep capture is immediately preceded by
+/// `v`/`V`; if every candidate is filtered out, keep the original list so
+/// behavior for titles that only contain a revision marker is unchanged.
+fn filter_revision_marker_candidates(
+    filename: &str,
+    matches: Vec<NamedCaptureMatch>,
+) -> Vec<NamedCaptureMatch> {
+    // An ep capture immediately preceded by `v`/`V` is the digit run of a
+    // revision marker (`v2`), not an episode. UTF-8 safe: continuation bytes
+    // are >= 0x80 and can never equal `v`/`V`.
+    let is_revision_marker = |episode_match: &&NamedCaptureMatch| {
+        episode_match.start > 0
+            && matches!(filename.as_bytes()[episode_match.start - 1], b'v' | b'V')
+    };
+    let kept: Vec<NamedCaptureMatch> = matches
+        .iter()
+        .filter(|episode_match| !is_revision_marker(episode_match))
+        .cloned()
+        .collect();
+
+    if kept.is_empty() {
+        matches
+    } else {
+        kept
+    }
+}
+
 fn choose_episode_match<'a>(
     episode_matches: &'a [NamedCaptureMatch],
     resolution_match: Option<&NamedCaptureMatch>,
@@ -146,6 +177,7 @@ fn parse_title_details_internal(
     let ep_captures = extract_named_captures(filename, ep_pattern)?;
     let resolution_captures = extract_named_captures(filename, resolution_pattern)?;
     let episode_matches = collect_named_capture_matches(filename, ep_pattern, "ep")?;
+    let episode_matches = filter_revision_marker_candidates(filename, episode_matches);
     let resolution_matches = collect_named_capture_matches(filename, resolution_pattern, "res")?;
 
     let selected_resolution_match = resolution_matches.first();
@@ -361,6 +393,68 @@ mod tests {
         assert_eq!(result.title, "[01][1080p]");
         assert_eq!(result.episode, "01");
         assert_eq!(result.resolution, "1080p");
+    }
+
+    #[test]
+    fn test_parse_title_details_ignores_revision_marker_after_episode() {
+        let filename = "[LoliHouse] Some Title [02v2][1080p].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "02");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[02][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_ignores_uppercase_revision_marker() {
+        let filename = "[LoliHouse] Some Title [02V2][1080p].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "02");
+        assert_eq!(result.resolution, "1080p");
+    }
+
+    #[test]
+    fn test_parse_title_details_ignores_revision_marker_after_range() {
+        let filename = "[LoliHouse] Some Title [01-12v2][1080p].torrent";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01-12");
+        assert_eq!(result.resolution, "1080p");
+    }
+
+    #[test]
+    fn test_parse_title_details_falls_back_when_only_revision_marker_matches() {
+        // The only digit run is inside a revision marker: filtering would
+        // leave no candidates, so the pre-fix behavior is preserved.
+        let filename = "Some Movie v2.mkv";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "2");
     }
 
     #[test]
