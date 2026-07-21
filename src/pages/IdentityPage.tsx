@@ -40,6 +40,8 @@ import {
     trimEntityName,
 } from '../utils/entityNaming';
 import { siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
+import { useLatest } from '../hooks/useLatest';
+import { serializeForComparison } from '../utils/templateSnapshot';
 
 interface Profile {
     cookies: string;
@@ -206,6 +208,7 @@ export default function IdentityPage() {
 
     const captureRequestIdRef = useRef(0);
     const captureSessionIdRef = useRef<string | null>(null);
+    const profileRef = useLatest(profile);
     const cookiePanels = useMemo(
         () =>
             cookieSites.map((site) => {
@@ -288,6 +291,7 @@ export default function IdentityPage() {
             trimEntityName(currentProfileName) ||
             trimEntityName(newProfileName) ||
             'default';
+        const preSaveSnapshot = serializeForComparison(profileToSave);
 
         try {
             const saved = await invoke<SavedProfilePayload>('save_profile', {
@@ -295,9 +299,13 @@ export default function IdentityPage() {
                 profile: profileToSave,
                 previousName: currentProfileName || undefined,
             });
-            setProfile(normalizeProfile(saved.profile));
+            // Only apply the saved profile when the form was not touched while the
+            // save was in flight; otherwise the response would clobber fresh edits.
+            if (serializeForComparison(profileRef.current) === preSaveSnapshot) {
+                setProfile(normalizeProfile(saved.profile));
+                setNewProfileName('');
+            }
             setCurrentProfileName(saved.name);
-            setNewProfileName('');
             await loadProfileList();
             return true;
         } catch (error) {

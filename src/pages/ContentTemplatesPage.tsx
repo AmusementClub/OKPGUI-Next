@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { Copy, FileText, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import PublishContentEditor from '../components/PublishContentEditor';
+import WarningBanner from '../components/WarningBanner';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import { contentTemplateManagerConfig, useTemplateManager } from '../hooks/useTemplateManager';
 import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
@@ -20,9 +21,9 @@ export default function ContentTemplatesPage() {
     });
     const {
         draft, selectedTemplateId, sortedTemplates, statusMessage, errorMessage, hasPendingAutosave,
-        saveState, conflictState,
+        saveState, conflictState, loadError, isSwitching,
         updateDraft, selectTemplate, createTemplate, duplicateTemplate,
-        importTemplate, exportTemplate, deleteTemplate,
+        importTemplate, exportTemplate, deleteTemplate, loadData,
         reloadConflictDraft, overwriteConflictDraft, saveConflictAsCopy,
     } = manager;
 
@@ -72,16 +73,22 @@ export default function ContentTemplatesPage() {
                     <div className="flex flex-wrap items-center gap-2">
                         <button
                             type="button"
-                            onClick={createTemplate}
-                            className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
+                            onClick={() => {
+                                void createTemplate();
+                            }}
+                            disabled={isSwitching}
+                            className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                             <Plus size={16} />
                             新建公共正文模板
                         </button>
                         <button
                             type="button"
-                            onClick={duplicateTemplate}
-                            className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
+                            onClick={() => {
+                                void duplicateTemplate();
+                            }}
+                            disabled={isSwitching}
+                            className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                         >
                             <Copy size={16} />
                             复制
@@ -162,6 +169,21 @@ export default function ContentTemplatesPage() {
                     </div>
                 ) : null}
 
+                {loadError ? (
+                    <WarningBanner className="flex items-center justify-between gap-3 px-4 py-3 text-sm">
+                        <span>{loadError}</span>
+                        <button
+                            type="button"
+                            onClick={() => {
+                                void loadData();
+                            }}
+                            className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-3 py-1.5 text-xs font-medium text-amber-100 transition-colors hover:bg-amber-500/20"
+                        >
+                            重试
+                        </button>
+                    </WarningBanner>
+                ) : null}
+
                 {statusMessage ? (
                     <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
                         {statusMessage}
@@ -190,8 +212,11 @@ export default function ContentTemplatesPage() {
                                         <button
                                             key={template.id}
                                             type="button"
-                                            onClick={() => selectTemplate(template.id)}
-                                            className={`w-full rounded-2xl border px-3 py-3 text-left transition-colors ${
+                                            onClick={() => {
+                                                void selectTemplate(template.id);
+                                            }}
+                                            disabled={isSwitching}
+                                            className={`w-full rounded-2xl border px-3 py-3 text-left transition-colors disabled:cursor-not-allowed disabled:opacity-60 ${
                                                 isActive
                                                     ? 'border-cyan-400/30 bg-cyan-500/10 text-cyan-50'
                                                     : 'border-slate-800 bg-slate-900/70 text-slate-200 hover:bg-slate-800'

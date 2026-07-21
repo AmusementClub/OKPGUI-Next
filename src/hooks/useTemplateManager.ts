@@ -16,6 +16,7 @@ import {
     TemplateSaveState,
 } from '../utils/templateAutosave';
 import { renderMarkdownToHtml } from '../utils/markdown';
+import { serializeForComparison } from '../utils/templateSnapshot';
 import {
     ContentTemplate,
     QuickPublishConfigPayload,
@@ -62,13 +63,7 @@ export interface TemplateConflictState {
     message: string;
 }
 
-function serializeForComparison<T extends AnyTemplate>(template: T): string {
-    return JSON.stringify({
-        ...template,
-        updated_at: '',
-        revision: 0,
-    });
-}
+type PersistDraftResult = 'saved' | 'unchanged' | 'conflict' | 'failed';
 
 function buildPersistableTemplate<T extends AnyTemplate>(
     template: T,
@@ -125,10 +120,12 @@ export interface TemplateManagerState<T extends AnyTemplate> {
     hasPendingAutosave: boolean;
     saveState: TemplateSaveState;
     conflictState: TemplateConflictState | null;
+    loadError: string;
+    isSwitching: boolean;
 
-    selectTemplate: (id: string) => void;
-    createTemplate: () => void;
-    duplicateTemplate: () => void;
+    selectTemplate: (id: string) => Promise<void>;
+    createTemplate: () => Promise<void>;
+    duplicateTemplate: () => Promise<void>;
     updateDraft: (updater: (current: T) => T) => void;
     deleteTemplate: () => Promise<void>;
     importTemplate: () => Promise<void>;
@@ -151,9 +148,17 @@ export function useTemplateManager<T extends AnyTemplate>(
     const [hasPendingAutosave, setHasPendingAutosave] = useState(false);
     const [saveState, setSaveState] = useState<TemplateSaveState>('idle');
     const [conflictState, setConflictState] = useState<TemplateConflictState | null>(null);
+    const [loadError, setLoadError] = useState('');
+    const [isSwitching, setIsSwitching] = useState(false);
     const latestDraftRef = useLatest(draft);
     const conflictStateRef = useLatest(conflictState);
+    const templatesRef = useLatest(templates);
+    const selectedTemplateIdRef = useLatest(selectedTemplateId);
     const lastPersistedSnapshotRef = useRef(serializeForComparison(config.createDefault()));
+    // Re-entrancy guards: a switch flushes the pending autosave first, and a second
+    // switch during that in-flight flush must be ignored, not raced.
+    const switchingRef = useRef(false);
+    const persistInFlightRef = useRef<Promise<PersistDraftResult> | null>(null);
 
     const sortedTemplates = useMemo(
         () =>
@@ -185,7 +190,26 @@ export function useTemplateManager<T extends AnyTemplate>(
     }, [draft, hasPendingAutosave]);
 
     const loadData = async (preferredId?: string) => {
-        const fullConfig = await invoke<QuickPublishConfigPayload>('get_config');
+        let fullConfig: QuickPublishConfigPayload;
+        try {
+            fullConfig = await invoke<QuickPublishConfigPayload>('get_config');
+        } catch (error) {
+            setLoadError(typeof error === 'string' ? error : '加载配置失败，请重试。');
+            return;
+        }
+
+        let configLoadError: string | null = null;
+        try {
+            configLoadError = await invoke<string | null>('get_config_load_error');
+        } catch (error) {
+            console.error('读取配置加载状态失败:', error);
+        }
+        setLoadError(
+            configLoadError
+                ? '配置文件损坏，已加载默认配置，原文件未改动。请修复或删除配置文件后重启应用。'
+                : '',
+        );
+
         const rawTemplates = (fullConfig[config.configKey] ?? {}) as Record<string, Partial<T>>;
 
         const nextTemplates = Object.fromEntries(
@@ -223,10 +247,10 @@ export function useTemplateManager<T extends AnyTemplate>(
         setSaveState('saved');
     };
 
-    const persistDraft = async (
+    const persistDraftInternal = async (
         sourceDraft: T,
         options: PersistDraftOptions = {},
-    ) => {
+    ): Promise<PersistDraftResult> => {
         const sourceSnapshot = serializeForComparison(sourceDraft);
         const templateToSave = buildPersistableTemplate(
             sourceDraft,
@@ -248,8 +272,12 @@ export function useTemplateManager<T extends AnyTemplate>(
                     setSaveState('saved');
                 }
             }
-            return;
+            return 'unchanged';
         }
+
+        // Capture selection identity before the await: if the user switches templates
+        // while the save is in flight, the late response must not yank selection back.
+        const capturedSelectedId = selectedTemplateIdRef.current;
 
         try {
             const saved = await invoke<{ id: string; template: T }>(config.saveCommand, {
@@ -272,7 +300,9 @@ export function useTemplateManager<T extends AnyTemplate>(
                 nextTemplates[saved.id] = savedTemplate;
                 return nextTemplates;
             });
-            setSelectedTemplateId(saved.id);
+            if (selectedTemplateIdRef.current === capturedSelectedId) {
+                setSelectedTemplateId(saved.id);
+            }
             setDraft((current) =>
                 serializeForComparison(current) === sourceSnapshot
                     ? savedTemplate
@@ -285,6 +315,7 @@ export function useTemplateManager<T extends AnyTemplate>(
             setSaveState('saved');
             setStatusMessage(`${config.entityLabel}"${savedTemplate.name}"已自动保存。`);
             setErrorMessage('');
+            return 'saved';
         } catch (error) {
             const conflict = parseTemplateRevisionConflict(error);
             if (conflict) {
@@ -299,7 +330,7 @@ export function useTemplateManager<T extends AnyTemplate>(
                 setSaveState('conflict');
                 setErrorMessage(conflict.message);
                 setStatusMessage('');
-                return;
+                return 'conflict';
             }
 
             if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
@@ -309,7 +340,41 @@ export function useTemplateManager<T extends AnyTemplate>(
             setSaveState('failed');
             setErrorMessage(typeof error === 'string' ? error : `自动保存${config.entityLabel}失败。`);
             setStatusMessage('');
+            return 'failed';
         }
+    };
+
+    const persistDraft = (
+        sourceDraft: T,
+        options: PersistDraftOptions = {},
+    ): Promise<PersistDraftResult> => {
+        const pending = persistDraftInternal(sourceDraft, options);
+        persistInFlightRef.current = pending;
+        void pending.finally(() => {
+            if (persistInFlightRef.current === pending) {
+                persistInFlightRef.current = null;
+            }
+        });
+        return pending;
+    };
+
+    /** Flush a pending debounced autosave; resolves false when the draft could not
+     *  be persisted (conflict/failure UI is surfaced by persistDraft). */
+    const flushPendingAutosave = async (): Promise<boolean> => {
+        // Disarm the debounce so the timer cannot fire a second persist mid-switch.
+        setHasPendingAutosave(false);
+
+        const inFlight = persistInFlightRef.current;
+        if (inFlight) {
+            await inFlight;
+        }
+
+        if (serializeForComparison(latestDraftRef.current) === lastPersistedSnapshotRef.current) {
+            return true;
+        }
+
+        const result = await persistDraft(latestDraftRef.current);
+        return result === 'saved' || result === 'unchanged';
     };
 
     const updateDraft = (updater: (current: T) => T) => {
@@ -330,39 +395,89 @@ export function useTemplateManager<T extends AnyTemplate>(
         setErrorMessage('');
     };
 
-    const selectTemplate = (id: string) => {
-        setSelectedTemplateId(id);
-        const nextDraft = templates[id] ?? config.createDefault();
-        setDraft(nextDraft);
-        lastPersistedSnapshotRef.current = serializeForComparison(nextDraft);
-        setHasPendingAutosave(false);
-        setConflictState(null);
-        setSaveState(id ? 'saved' : 'idle');
-        setStatusMessage('');
-        setErrorMessage('');
+    const selectTemplate = async (id: string) => {
+        // Ignore a second switch while a flush-and-switch is already in flight.
+        if (switchingRef.current) {
+            return;
+        }
+
+        switchingRef.current = true;
+        setIsSwitching(true);
+        try {
+            const flushed = await flushPendingAutosave();
+            if (!flushed) {
+                // Keep the current draft; the conflict/failure UI is already visible.
+                return;
+            }
+
+            setSelectedTemplateId(id);
+            const nextDraft = templatesRef.current[id] ?? config.createDefault();
+            setDraft(nextDraft);
+            lastPersistedSnapshotRef.current = serializeForComparison(nextDraft);
+            setHasPendingAutosave(false);
+            setConflictState(null);
+            setSaveState(id ? 'saved' : 'idle');
+            setStatusMessage('');
+            setErrorMessage('');
+        } finally {
+            switchingRef.current = false;
+            setIsSwitching(false);
+        }
     };
 
-    const createTemplate = () => {
-        const emptyDraft = config.createDefault();
-        setSelectedTemplateId('');
-        setDraft(emptyDraft);
-        setHasPendingAutosave(false);
-        setConflictState(null);
-        setSaveState('idle');
-        setStatusMessage(`已创建空白${config.entityLabel}草稿。`);
-        setErrorMessage('');
+    const createTemplate = async () => {
+        if (switchingRef.current) {
+            return;
+        }
+
+        switchingRef.current = true;
+        setIsSwitching(true);
+        try {
+            const flushed = await flushPendingAutosave();
+            if (!flushed) {
+                return;
+            }
+
+            const emptyDraft = config.createDefault();
+            setSelectedTemplateId('');
+            setDraft(emptyDraft);
+            setHasPendingAutosave(false);
+            setConflictState(null);
+            setSaveState('idle');
+            setStatusMessage(`已创建空白${config.entityLabel}草稿。`);
+            setErrorMessage('');
+        } finally {
+            switchingRef.current = false;
+            setIsSwitching(false);
+        }
     };
 
-    const duplicateTemplate = () => {
-        const duplicated = createCopyDraft(draft, config.fallbackName);
+    const duplicateTemplate = async () => {
+        if (switchingRef.current) {
+            return;
+        }
 
-        setSelectedTemplateId('');
-        setDraft(duplicated);
-        setHasPendingAutosave(false);
-        setConflictState(null);
-        setSaveState('idle');
-        setStatusMessage(`已基于当前${config.entityLabel}创建副本草稿。`);
-        setErrorMessage('');
+        switchingRef.current = true;
+        setIsSwitching(true);
+        try {
+            const flushed = await flushPendingAutosave();
+            if (!flushed) {
+                return;
+            }
+
+            const duplicated = createCopyDraft(latestDraftRef.current, config.fallbackName);
+
+            setSelectedTemplateId('');
+            setDraft(duplicated);
+            setHasPendingAutosave(false);
+            setConflictState(null);
+            setSaveState('idle');
+            setStatusMessage(`已基于当前${config.entityLabel}创建副本草稿。`);
+            setErrorMessage('');
+        } finally {
+            switchingRef.current = false;
+            setIsSwitching(false);
+        }
     };
 
     const importTemplate = async () => {
@@ -524,6 +639,8 @@ export function useTemplateManager<T extends AnyTemplate>(
         hasPendingAutosave,
         saveState,
         conflictState,
+        loadError,
+        isSwitching,
         selectTemplate,
         createTemplate,
         duplicateTemplate,

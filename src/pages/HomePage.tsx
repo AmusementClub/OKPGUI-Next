@@ -36,6 +36,7 @@ import {
     trimEntityName,
 } from '../utils/entityNaming';
 import { renderMarkdownToHtml } from '../utils/markdown';
+import { serializeForComparison } from '../utils/templateSnapshot';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
@@ -551,6 +552,7 @@ export default function HomePage() {
         explicitName?: string,
     ) => {
         const name = getTemplateName(explicitName);
+        const preSaveSnapshot = serializeForComparison(templateToSave);
 
         try {
             const saved = await invoke<ImportedTemplatePayload>('save_template', {
@@ -562,19 +564,23 @@ export default function HomePage() {
 
             lastPersistedDescriptionRef.current = nextTemplate.description;
             lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
-            setTemplate(nextTemplate);
+            // Only apply the saved template when the editor was not touched while the
+            // save was in flight; otherwise the response would clobber fresh keystrokes.
+            if (serializeForComparison(templateRef.current) === preSaveSnapshot) {
+                setTemplate(nextTemplate);
+                setNewTemplateName('');
+            }
             setCurrentTemplateName(saved.name);
-            setNewTemplateName('');
             await refreshTemplateOptions();
             return { name: saved.name, template: nextTemplate };
         } catch (e) {
             console.error('保存模板失败:', e);
-            if (explicitName) {
-                showNotice({
-                    title: '保存模板失败',
-                    message: typeof e === 'string' ? e : '保存模板失败。',
-                });
-            }
+            // Surface autosave failures too, and leave the dirty state intact so the
+            // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
+            showNotice({
+                title: '保存模板失败',
+                message: typeof e === 'string' ? e : '保存模板失败。',
+            });
             return null;
         }
     };
