@@ -66,12 +66,20 @@ export function usePublishTask<SiteKey extends string>() {
     const publishSiteSuccessRef = useRef<Partial<Record<SiteKey, boolean>>>({});
 
     useEffect(() => {
-        let outputUnlisten: (() => void) | null = null;
-        let siteCompleteUnlisten: (() => void) | null = null;
-        let completeUnlisten: (() => void) | null = null;
+        let disposed = false;
+        const unlistens: Array<() => void> = [];
+
+        const trackUnlisten = (unlisten: () => void) => {
+            // If cleanup ran while the listen promise was in flight, detach immediately.
+            if (disposed) {
+                unlisten();
+                return;
+            }
+            unlistens.push(unlisten);
+        };
 
         const setupListeners = async () => {
-            outputUnlisten = await listen<PublishOutput>('publish-output', (event) => {
+            trackUnlisten(await listen<PublishOutput>('publish-output', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -101,9 +109,9 @@ export function usePublishTask<SiteKey extends string>() {
                         },
                     };
                 });
-            });
+            }));
 
-            siteCompleteUnlisten = await listen<PublishSiteComplete>('publish-site-complete', (event) => {
+            trackUnlisten(await listen<PublishSiteComplete>('publish-site-complete', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -128,9 +136,9 @@ export function usePublishTask<SiteKey extends string>() {
                         },
                     };
                 });
-            });
+            }));
 
-            completeUnlisten = await listen<PublishComplete>('publish-complete', (event) => {
+            trackUnlisten(await listen<PublishComplete>('publish-complete', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -148,15 +156,16 @@ export function usePublishTask<SiteKey extends string>() {
                     result: event.payload,
                     siteSuccess,
                 });
-            });
+            }));
         };
 
         void setupListeners();
 
         return () => {
-            outputUnlisten?.();
-            siteCompleteUnlisten?.();
-            completeUnlisten?.();
+            disposed = true;
+            for (const unlisten of unlistens) {
+                unlisten();
+            }
         };
     }, []);
 

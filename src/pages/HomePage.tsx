@@ -326,29 +326,13 @@ function validatePublishContentForSites(
     });
 }
 
-const getTorrentPathFromUriList = (uriList: string): string | null => {
-    const candidate = uriList
-        .split(/\r?\n/)
-        .map((entry) => entry.trim())
-        .find((entry) => entry && !entry.startsWith('#') && entry.toLowerCase().startsWith('file://'));
-
-    if (!candidate) {
-        return null;
-    }
-
-    try {
-        return decodeURIComponent(candidate.replace(/^file:\/\//i, ''));
-    } catch {
-        return candidate.replace(/^file:\/\//i, '');
-    }
-};
-
 export default function HomePage() {
     const { requestImportConflictStrategy, importConflictDialog } = useImportConflictDialog();
     const { showNotice, noticeDialog } = useNoticeDialog();
     // Template state
     const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
     const [currentTemplateName, setCurrentTemplateName] = useState('');
+    const [configLoadError, setConfigLoadError] = useState<string | null>(null);
     const [newTemplateName, setNewTemplateName] = useState('');
     const [template, setTemplate] = useState<Template>(defaultTemplate);
 
@@ -473,6 +457,12 @@ export default function HomePage() {
             const config = await refreshTemplateOptions();
             if (!config) {
                 return;
+            }
+
+            try {
+                setConfigLoadError(await invoke<string | null>('get_config_load_error'));
+            } catch (loadErrorStateError) {
+                console.error('读取配置加载状态失败:', loadErrorStateError);
             }
 
             setOkpExecutablePath(config.okp_executable_path || '');
@@ -671,10 +661,11 @@ export default function HomePage() {
     }, [matchTitle, templateRef]);
 
     useEffect(() => {
+        let disposed = false;
         let unlisten: UnlistenFn | null = null;
 
         const setupDragDropListener = async () => {
-            unlisten = await getCurrentWindow().onDragDropEvent((event) => {
+            const nextUnlisten = await getCurrentWindow().onDragDropEvent((event) => {
                 if (event.payload.type === 'enter' || event.payload.type === 'over') {
                     setIsDragging(true);
                     return;
@@ -694,11 +685,19 @@ export default function HomePage() {
                     void parseTorrent(droppedTorrentPath);
                 }
             });
+
+            // If cleanup ran while registration was in flight, detach immediately.
+            if (disposed) {
+                nextUnlisten();
+                return;
+            }
+            unlisten = nextUnlisten;
         };
 
         void setupDragDropListener();
 
         return () => {
+            disposed = true;
             unlisten?.();
         };
     }, [parseTorrent]);
@@ -1045,17 +1044,16 @@ export default function HomePage() {
                 .map((row) => row.site.key as keyof SiteSelection),
         );
 
-        setTemplate((current) => {
-            const nextSites = reconcileSelectableSiteSelection(current.sites, selectableSiteKeys);
+        const currentTemplate = templateRef.current;
+        const nextSites = reconcileSelectableSiteSelection(currentTemplate.sites, selectableSiteKeys);
 
-            if (nextSites === current.sites) {
-                return current;
-            }
+        if (nextSites === currentTemplate.sites) {
+            return;
+        }
 
-            const nextTemplate = { ...current, sites: nextSites };
-            autosaveTemplate(withSelectedProfile(nextTemplate));
-            return nextTemplate;
-        });
+        const nextTemplate = { ...currentTemplate, sites: nextSites };
+        setTemplate(nextTemplate);
+        autosaveTemplate(withSelectedProfile(nextTemplate));
     }, [siteRows]);
 
     // Publish
@@ -1147,39 +1145,8 @@ export default function HomePage() {
             failActivePublish(getErrorMessage(e), { appendToFirstSite: true });
         }
     };
-    // Drag and drop handlers
-    const handleDragOver = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(true);
-    }, []);
-
-    const handleDragLeave = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(false);
-    }, []);
-
-    const handleDrop = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(false);
-
-        const droppedFiles = Array.from(e.dataTransfer.files || []);
-        const droppedTorrent = droppedFiles.find((file) => file.name.toLowerCase().endsWith('.torrent'));
-        const droppedTorrentPath = droppedTorrent
-            ? ((droppedTorrent as File & { path?: string }).path ?? null)
-            : null;
-
-        if (droppedTorrentPath) {
-            void parseTorrent(droppedTorrentPath);
-            return;
-        }
-
-        const uriList = e.dataTransfer.getData('text/uri-list');
-        const uriPath = uriList ? getTorrentPathFromUriList(uriList) : null;
-        if (uriPath && uriPath.toLowerCase().endsWith('.torrent')) {
-            void parseTorrent(uriPath);
-        }
-    }, [parseTorrent]);
-
+    // Drag and drop is handled by the Tauri window drag-drop listener above;
+    // HTML5 drop events never fire while Tauri dragDropEnabled is on.
     const handleTorrentPickerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
         if (e.key !== 'Enter' && e.key !== ' ') {
             return;
@@ -1202,21 +1169,25 @@ export default function HomePage() {
             return;
         }
 
-        setTemplate((t) => {
-            const nextTemplate = {
-                ...t,
-                sites: { ...t.sites, [site]: !t.sites[site] },
-            };
+        const currentTemplate = templateRef.current;
+        const nextTemplate = {
+            ...currentTemplate,
+            sites: { ...currentTemplate.sites, [site]: !currentTemplate.sites[site] },
+        };
 
-            clearSiteLoginTest(site);
-            autosaveTemplate(withSelectedProfile(nextTemplate));
-            return nextTemplate;
-        });
+        setTemplate(nextTemplate);
+        clearSiteLoginTest(site);
+        autosaveTemplate(withSelectedProfile(nextTemplate));
     };
 
     return (
         <div className="flex flex-col h-full overflow-y-auto">
             <div className="p-6 space-y-5">
+                {configLoadError && (
+                    <WarningBanner>
+                        配置文件损坏，已加载默认配置，原文件未改动。请修复或删除配置文件后重启应用。
+                    </WarningBanner>
+                )}
                 {/* Template Selection */}
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">模板管理</h2>
@@ -1287,9 +1258,6 @@ export default function HomePage() {
                             void selectTorrentFile();
                         }}
                         onKeyDown={handleTorrentPickerKeyDown}
-                        onDragOver={handleDragOver}
-                        onDragLeave={handleDragLeave}
-                        onDrop={handleDrop}
                         className={`border-2 border-dashed rounded-lg p-4 text-center transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 ${
                             isDragging
                                 ? 'border-emerald-400 bg-emerald-400/10'

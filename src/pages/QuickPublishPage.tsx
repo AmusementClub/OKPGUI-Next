@@ -126,6 +126,10 @@ export default function QuickPublishPage() {
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
+    // Stable callbacks: an inline onClearError would recreate parseTorrent every render,
+    // forcing the drag-drop effect to re-register its listener each time.
+    const handleRuntimeError = useCallback((message: string) => setErrorMessage(message), []);
+    const handleClearRuntimeError = useCallback(() => setErrorMessage(''), []);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
     const lastUsedPersistQueueRef = useRef(
         createLatestValuePersistQueue({
@@ -185,8 +189,8 @@ export default function QuickPublishPage() {
         applyTemplatePublishHistory,
     } = useQuickPublishRuntimeDraft({
         clearAllSiteLoginTests,
-        onError: setErrorMessage,
-        onClearError: () => setErrorMessage(''),
+        onError: handleRuntimeError,
+        onClearError: handleClearRuntimeError,
     });
 
     const templateOptions = useMemo(
