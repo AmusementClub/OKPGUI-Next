@@ -302,7 +302,11 @@ export default function IdentityPage() {
             return true;
         } catch (error) {
             console.error('自动保存配置失败:', error);
-            if (explicitName) {
+            // Surface explicit saves and duplicate-name rejections; a silently
+            // dropped autosave would leave the user editing unsaved state.
+            const isDuplicateNameError =
+                typeof error === 'string' && error.includes('已存在同名');
+            if (explicitName || isDuplicateNameError) {
                 showNotice({
                     title: '保存配置失败',
                     message: typeof error === 'string' ? error : '保存配置失败。',
@@ -336,6 +340,7 @@ export default function IdentityPage() {
         try {
             await invoke('delete_profile', { name: currentProfileName });
             setCurrentProfileName('');
+            setNewProfileName('');
             setProfile(defaultProfile);
             clearAllSiteLoginTests();
             await loadProfileList();

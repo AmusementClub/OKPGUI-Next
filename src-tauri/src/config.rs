@@ -582,70 +582,55 @@ fn load_config_unlocked(app: &AppHandle) -> Result<AppConfig, String> {
     read_config_file(&config_path(app))
 }
 
+/// Last config load failure, surfaced to the frontend so a corrupt config file
+/// shows a warning instead of silently looking like a wiped app.
+/// Set on load failure, cleared on every successful `load_config`.
+fn config_load_error_slot() -> &'static Mutex<Option<String>> {
+    static SLOT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+    SLOT.get_or_init(|| Mutex::new(None))
+}
+
+fn set_config_load_error(error: Option<String>) {
+    let mut slot = config_load_error_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    *slot = error;
+}
+
+#[tauri::command]
+pub fn get_config_load_error() -> Option<String> {
+    config_load_error_slot()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
 /// Public reads take the same lock as writers so they never interleave with a non-atomic mid-write.
+/// A poisoned lock is recovered (empty-state mutex) instead of failing or proceeding unlocked.
 pub fn load_config(app: &AppHandle) -> AppConfig {
-    let _guard = config_write_lock().lock().ok();
+    let _guard = config_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     match load_config_unlocked(app) {
-        Ok(config) => config,
+        Ok(config) => {
+            set_config_load_error(None);
+            config
+        }
         Err(error) => {
             eprintln!("[okpgui] {}", error);
+            set_config_load_error(Some(error));
             AppConfig::default()
         }
     }
 }
 
-/// Replace `dest` with `temp` without a delete-then-rename gap.
-///
-/// - Unix: `rename` replaces an existing destination atomically.
-/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING)` replaces without deleting first,
-///   so a crash cannot leave the user with neither the old nor the new file.
-fn replace_file_atomically(temp: &std::path::Path, dest: &std::path::Path) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use std::os::windows::ffi::OsStrExt;
-
-        fn to_wide(path: &std::path::Path) -> Vec<u16> {
-            path.as_os_str()
-                .encode_wide()
-                .chain(std::iter::once(0))
-                .collect()
-        }
-
-        // https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-movefileexw
-        const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
-        const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
-
-        #[link(name = "kernel32")]
-        extern "system" {
-            fn MoveFileExW(
-                lp_existing_file_name: *const u16,
-                lp_new_file_name: *const u16,
-                dw_flags: u32,
-            ) -> i32;
-        }
-
-        let from_wide = to_wide(temp);
-        let to_wide_path = to_wide(dest);
-        let ok = unsafe {
-            MoveFileExW(
-                from_wide.as_ptr(),
-                to_wide_path.as_ptr(),
-                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-            )
-        };
-        if ok == 0 {
-            return Err(format!(
-                "无法原子替换配置文件: {}",
-                std::io::Error::last_os_error()
-            ));
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    {
-        std::fs::rename(temp, dest).map_err(|error| format!("无法提交配置文件: {}", error))
-    }
+/// Fallible read for commands that must not silently operate on defaults
+/// when the config file is corrupt (e.g. exports).
+fn try_load_config(app: &AppHandle) -> Result<AppConfig, String> {
+    let _guard = config_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    load_config_unlocked(app)
 }
 
 /// Atomically replace the config file via temp write + platform-safe replace.
@@ -653,17 +638,7 @@ fn write_config_file(path: &std::path::Path, config: &AppConfig) -> Result<(), S
     let data = serde_json::to_string_pretty(config)
         .map_err(|error| format!("无法序列化配置: {}", error))?;
 
-    let temp_path = path.with_extension("json.tmp");
-    if let Err(error) = std::fs::write(&temp_path, &data) {
-        return Err(format!("无法写入临时配置文件: {}", error));
-    }
-
-    if let Err(error) = replace_file_atomically(&temp_path, path) {
-        let _ = std::fs::remove_file(&temp_path);
-        return Err(error);
-    }
-
-    Ok(())
+    crate::atomic_file::write_text_file_atomically(path, &data)
 }
 
 /// Serialize AppConfig read-modify-write mutations so concurrent last-used writes
@@ -674,7 +649,7 @@ where
 {
     let _guard = config_write_lock()
         .lock()
-        .map_err(|_| "配置写入锁已损坏".to_string())?;
+        .unwrap_or_else(|e| e.into_inner());
     let mut config = load_config_unlocked(app)?;
     let (value, changed) = mutator(&mut config)?;
     if changed {
@@ -728,7 +703,10 @@ fn apply_upsert_template(
         .filter(|value| !value.is_empty())
     {
         if previous_name != normalized_name && config.templates.contains_key(&normalized_name) {
-            return Err(format!("已存在同名模板: {}", normalized_name));
+            return Err(format!(
+                "已存在同名模板: {}（请改名或先重新加载）",
+                normalized_name
+            ));
         }
 
         if previous_name != normalized_name {
@@ -741,6 +719,29 @@ fn apply_upsert_template(
 
     config.templates.insert(normalized_name, template);
     Ok(())
+}
+
+/// save_template-specific guard: with no previous name, saving under an existing
+/// name must fail loudly instead of silently overwriting the existing template.
+/// (Import intentionally routes through apply_upsert_template directly — its
+/// conflict strategy already decided whether overwrite is allowed.)
+fn apply_save_template(
+    config: &mut AppConfig,
+    normalized_name: String,
+    template: Template,
+    previous_name: Option<&str>,
+) -> Result<(), String> {
+    let has_previous_name = previous_name
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_previous_name && config.templates.contains_key(&normalized_name) {
+        return Err(format!(
+            "已存在同名模板: {}（请改名或先重新加载）",
+            normalized_name
+        ));
+    }
+
+    apply_upsert_template(config, normalized_name, template, previous_name)
 }
 
 fn apply_delete_template(config: &mut AppConfig, name: &str) {
@@ -850,7 +851,7 @@ pub fn save_template(
     validate_template_for_storage(&template)?;
 
     mutate_config(&app, |config| {
-        apply_upsert_template(
+        apply_save_template(
             config,
             normalized_name.clone(),
             template.clone(),
@@ -1040,7 +1041,7 @@ pub fn export_quick_publish_template_to_file(
     id: String,
     path: String,
 ) -> Result<(), String> {
-    let config = load_config(&app);
+    let config = try_load_config(&app)?;
     let template = config
         .quick_publish_templates
         .get(&id)
@@ -1152,7 +1153,7 @@ pub fn export_content_template_to_file(
     id: String,
     path: String,
 ) -> Result<(), String> {
-    let config = load_config(&app);
+    let config = try_load_config(&app)?;
     let template = config
         .content_templates
         .get(&id)
@@ -1286,7 +1287,7 @@ pub fn update_template_publish_history(
 
 #[tauri::command]
 pub fn export_template_to_file(app: AppHandle, name: String, path: String) -> Result<(), String> {
-    let config = load_config(&app);
+    let config = try_load_config(&app)?;
     let template = config
         .templates
         .get(&name)
@@ -1657,29 +1658,76 @@ mod tests {
     }
 
     #[test]
-    fn test_replace_file_atomically_over_existing_destination() {
-        let dir = std::env::temp_dir().join(format!(
-            "okpgui-replace-unit-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("time")
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
-        let dest = dir.join("target.json");
-        let temp = dir.join("target.json.tmp");
+    fn test_apply_save_template_rejects_existing_name_without_previous_name() {
+        let mut config = AppConfig {
+            templates: HashMap::from([("alpha".to_string(), sample_template())]),
+            ..AppConfig::default()
+        };
+        let original = config.templates["alpha"].clone();
 
-        std::fs::write(&dest, b"{\"old\":true}").expect("seed dest");
-        std::fs::write(&temp, b"{\"new\":true}").expect("seed temp");
+        let error = apply_save_template(&mut config, "alpha".to_string(), sample_template(), None)
+            .expect_err("expected duplicate-name save without previous name to be rejected");
+        assert!(error.contains("已存在同名模板"));
+        assert!(error.contains("请改名或先重新加载"));
 
-        replace_file_atomically(&temp, &dest).expect("atomic replace over existing");
+        let error = apply_save_template(
+            &mut config,
+            "alpha".to_string(),
+            sample_template(),
+            Some("  "),
+        )
+        .expect_err("expected blank previous name to be treated as none");
+        assert!(error.contains("已存在同名模板"));
 
-        assert!(dest.exists());
-        assert!(!temp.exists());
-        let body = std::fs::read_to_string(&dest).expect("read dest");
-        assert_eq!(body, "{\"new\":true}");
+        // Existing template must remain untouched.
+        assert_eq!(config.templates["alpha"].title_pattern, original.title_pattern);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // Same-name update WITH previous name (normal autosave) still works.
+        apply_save_template(
+            &mut config,
+            "alpha".to_string(),
+            sample_template(),
+            Some("alpha"),
+        )
+        .expect("same-name save with previous name");
+
+        // New name without previous name still works.
+        apply_save_template(&mut config, "beta".to_string(), sample_template(), None)
+            .expect("new-name save");
+        assert!(config.templates.contains_key("beta"));
+    }
+
+    #[test]
+    fn test_config_write_lock_recovers_from_poisoning() {
+        let lock = config_write_lock();
+
+        // Poison the process-global lock via a panic while holding it.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().expect("initial lock");
+            panic!("intentional poison for test");
+        }));
+
+        // Both lock sites (load_config + mutate_config) use unwrap_or_else(into_inner):
+        // they must keep working instead of hard-failing or proceeding unlocked.
+        {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        }
+        let second = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+        }));
+        assert!(second.is_ok(), "poisoned lock must remain acquirable");
+    }
+
+    #[test]
+    fn test_config_load_error_slot_set_and_cleared() {
+        set_config_load_error(Some("配置文件解析失败".to_string()));
+        assert_eq!(
+            get_config_load_error().as_deref(),
+            Some("配置文件解析失败")
+        );
+
+        set_config_load_error(None);
+        assert_eq!(get_config_load_error(), None);
     }
 
     #[test]

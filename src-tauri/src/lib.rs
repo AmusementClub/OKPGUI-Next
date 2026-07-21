@@ -1,4 +1,5 @@
-﻿mod commands;
+﻿mod atomic_file;
+mod commands;
 mod config;
 mod cookies;
 mod domain;
@@ -16,6 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             config::get_config,
+            config::get_config_load_error,
             config::get_template_list,
             config::save_template,
             config::delete_template,
