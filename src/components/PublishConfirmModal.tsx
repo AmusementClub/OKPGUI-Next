@@ -21,6 +21,8 @@ interface PublishConfirmModalProps {
     torrentTotalSizeLabel: string;
     episode: string;
     resolution: string;
+    onEpisodeChange: (value: string) => void;
+    onResolutionChange: (value: string) => void;
     about: string;
     tags: string;
     poster: string;
@@ -42,17 +44,58 @@ function dotBgFromTone(toneClass: string): string {
     }
 }
 
-function Pill({ tone, children }: { tone: 'success' | 'outline'; children: React.ReactNode }) {
-    const cls =
-        tone === 'success'
-            ? 'border-emerald-400/40 bg-emerald-500/10 text-emerald-200'
-            : 'border-slate-600 bg-transparent text-slate-300';
+function Pill({ children }: { children: React.ReactNode }) {
     return (
         <span
-            className={`inline-flex items-center rounded-full border px-2.5 py-0.5 text-[11px] font-medium whitespace-nowrap ${tone === 'outline' ? 'font-mono' : ''} ${cls}`}
+            className="inline-flex items-center whitespace-nowrap rounded-full border border-slate-600 bg-transparent px-2.5 py-0.5 font-mono text-[11px] font-medium text-slate-300"
         >
             {children}
         </span>
+    );
+}
+
+export function LocalPublishRecordFields({
+    episode,
+    resolution,
+    onEpisodeChange,
+    onResolutionChange,
+}: Pick<
+    PublishConfirmModalProps,
+    'episode' | 'resolution' | 'onEpisodeChange' | 'onResolutionChange'
+>) {
+    return (
+        <section className="flex flex-col gap-2 rounded-lg border border-slate-800/80 bg-slate-900/40 px-3.5 py-2.5">
+            <div className="font-mono text-[11px] tracking-[0.14em] uppercase text-slate-500">
+                本地发布记录
+            </div>
+            <p className="text-[11px] leading-relaxed text-slate-500">
+                仅用于本地发布历史，不会修改最终标题或站点发布内容。
+            </p>
+            <div className="grid gap-2 sm:grid-cols-2">
+                <label className="block min-w-0 text-xs text-slate-400">
+                    <span className="mb-1 block text-slate-500">集数</span>
+                    <input
+                        type="text"
+                        value={episode}
+                        onChange={(event) => onEpisodeChange(event.target.value)}
+                        placeholder="可选"
+                        aria-label="本地发布记录集数"
+                        className="w-full rounded-lg border border-slate-700/80 bg-slate-900/70 px-2.5 py-1.5 font-mono text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-500"
+                    />
+                </label>
+                <label className="block min-w-0 text-xs text-slate-400">
+                    <span className="mb-1 block text-slate-500">分辨率</span>
+                    <input
+                        type="text"
+                        value={resolution}
+                        onChange={(event) => onResolutionChange(event.target.value)}
+                        placeholder="可选"
+                        aria-label="本地发布记录分辨率"
+                        className="w-full rounded-lg border border-slate-700/80 bg-slate-900/70 px-2.5 py-1.5 font-mono text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-500"
+                    />
+                </label>
+            </div>
+        </section>
     );
 }
 
@@ -67,6 +110,8 @@ export default function PublishConfirmModal({
     torrentTotalSizeLabel,
     episode,
     resolution,
+    onEpisodeChange,
+    onResolutionChange,
     about,
     tags,
     poster,
@@ -184,11 +229,16 @@ export default function PublishConfirmModal({
                                                     {torrentName}
                                                 </div>
                                             </div>
-                                            <Pill tone="outline">{torrentTotalSizeLabel}</Pill>
-                                            <Pill tone="success">EP {episode}</Pill>
-                                            <Pill tone="success">{resolution}</Pill>
+                                            <Pill>{torrentTotalSizeLabel}</Pill>
                                         </div>
                                     </div>
+
+                                    <LocalPublishRecordFields
+                                        episode={episode}
+                                        resolution={resolution}
+                                        onEpisodeChange={onEpisodeChange}
+                                        onResolutionChange={onResolutionChange}
+                                    />
 
                                     {/* Metadata card */}
                                     <div className="flex flex-col gap-2 rounded-lg border border-slate-800 bg-slate-900/60 px-3.5 py-2.5">

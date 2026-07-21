@@ -474,6 +474,13 @@ export default function QuickPublishPage() {
         setConfirmDraft(null);
     };
 
+    const updateConfirmDraftMetadata = useCallback(
+        (field: 'episode' | 'resolution', value: string) => {
+            setConfirmDraft((current) => current ? { ...current, [field]: value } : current);
+        },
+        [],
+    );
+
     const publishPreviewDraft = confirmDraft ?? draft;
 
     const selectedSiteSummaries = useMemo(
@@ -1013,6 +1020,8 @@ export default function QuickPublishPage() {
                 torrentTotalSizeLabel={formatBytes(torrentInfo?.total_size)}
                 episode={publishPreviewDraft.episode}
                 resolution={publishPreviewDraft.resolution}
+                onEpisodeChange={(value) => updateConfirmDraftMetadata('episode', value)}
+                onResolutionChange={(value) => updateConfirmDraftMetadata('resolution', value)}
                 about={publishPreviewDraft.about}
                 tags={publishPreviewDraft.tags}
                 poster={publishPreviewDraft.poster}
