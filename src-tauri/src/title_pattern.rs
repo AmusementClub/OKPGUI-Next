@@ -92,19 +92,25 @@ fn collect_named_capture_matches(
 /// e.g. `[02v2]`. The digit run inside `v2` is not an episode number, but a
 /// generic ep pattern like `\d{1,3}` still matches it, and the
 /// closest-before-resolution heuristic then prefers it over the real
-/// episode. Drop candidates whose ep capture is immediately preceded by
-/// `v`/`V`; if every candidate is filtered out, keep the original list so
-/// behavior for titles that only contain a revision marker is unchanged.
+/// episode. Drop an ep capture only when it is a fansub revision suffix of the
+/// form `…[digit]v[digits]…` / `…[digit]V[digits]…` (ASCII digit immediately
+/// before the `v`/`V`). Standalone `v2` (space/punctuation before `v`) and
+/// word-internal forms like `MV03` are kept. If every candidate is filtered
+/// out, keep the original list so behavior for titles that only contain a
+/// revision marker is unchanged.
 fn filter_revision_marker_candidates(
     filename: &str,
     matches: Vec<NamedCaptureMatch>,
 ) -> Vec<NamedCaptureMatch> {
-    // An ep capture immediately preceded by `v`/`V` is the digit run of a
-    // revision marker (`v2`), not an episode. UTF-8 safe: continuation bytes
-    // are >= 0x80 and can never equal `v`/`V`.
+    // Drop only when: filename[start-1] is v/V AND start >= 2 AND
+    // filename[start-2] is an ASCII digit (`02v2` → drop `2`; ` v2` / `MV03`
+    // → keep). UTF-8 safe: continuation bytes are >= 0x80 and can never equal
+    // `v`/`V` or be ASCII digits.
     let is_revision_marker = |episode_match: &&NamedCaptureMatch| {
-        episode_match.start > 0
-            && matches!(filename.as_bytes()[episode_match.start - 1], b'v' | b'V')
+        let start = episode_match.start;
+        start >= 2
+            && matches!(filename.as_bytes()[start - 1], b'v' | b'V')
+            && filename.as_bytes()[start - 2].is_ascii_digit()
     };
     let kept: Vec<NamedCaptureMatch> = matches
         .iter()
@@ -455,6 +461,40 @@ mod tests {
         .unwrap();
 
         assert_eq!(result.episode, "2");
+    }
+
+    #[test]
+    fn test_parse_title_details_keeps_standalone_v_revision_before_resolution() {
+        // Space before `v` is not a fansub revision suffix; keep `2` so
+        // closest-before-res prefers it over the `108` fragment of `1080p`.
+        let filename = "Some Movie v2 [1080p].mkv";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "2");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[2][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_keeps_episode_inside_word_before_v() {
+        // `V` in `MV03` is part of a word, not a revision marker; keep `03`.
+        let filename = "Title 2024 MV03 [1080p]";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "03");
+        assert_eq!(result.resolution, "1080p");
     }
 
     #[test]

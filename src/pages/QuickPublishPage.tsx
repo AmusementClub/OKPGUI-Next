@@ -18,6 +18,7 @@ import FileTree from '../components/FileTree';
 import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import WarningBanner from '../components/WarningBanner';
 import { EP_PATTERN_HELP } from '../utils/titleRules';
 import {
     createPublishConsoleSiteMap,
@@ -185,6 +186,7 @@ export default function QuickPublishPage() {
     } = useQuickPublishRuntimeDraft({
         clearAllSiteLoginTests,
         onError: setErrorMessage,
+        onClearError: () => setErrorMessage(''),
     });
 
     const templateOptions = useMemo(
@@ -474,6 +476,18 @@ export default function QuickPublishPage() {
         setConfirmDraft(null);
     };
 
+    const handleReturnToEdit = () => {
+        if (confirmDraft) {
+            setDraft((current) => ({
+                ...current,
+                episode: confirmDraft.episode,
+                resolution: confirmDraft.resolution,
+            }));
+        }
+        setShowConfirm(false);
+        setConfirmDraft(null);
+    };
+
     const updateConfirmDraftMetadata = useCallback(
         (field: 'episode' | 'resolution', value: string) => {
             setConfirmDraft((current) => current ? { ...current, [field]: value } : current);
@@ -611,6 +625,9 @@ export default function QuickPublishPage() {
                         <div className="mt-4">
                             <FileTree root={torrentInfo?.file_tree ?? null} totalSize={torrentInfo?.total_size} />
                         </div>
+                        {torrentInfo?.compat_notice ? (
+                            <WarningBanner className="mt-4">{torrentInfo.compat_notice}</WarningBanner>
+                        ) : null}
                     </div>
 
                     {/* Metadata — STEP 3 */}
@@ -1005,6 +1022,7 @@ export default function QuickPublishPage() {
             <PublishConfirmModal
                 isOpen={showConfirm}
                 onClose={handleCloseConfirm}
+                onReturnToEdit={handleReturnToEdit}
                 onConfirm={({ autoOpenConsole }) => {
                     const draftToPublish = confirmDraft ?? draft;
                     setShowConfirm(false);

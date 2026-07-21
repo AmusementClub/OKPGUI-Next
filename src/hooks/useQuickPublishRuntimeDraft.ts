@@ -1,7 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { FileTreeNodeData } from '../components/FileTree';
+import type { TorrentInfo } from '../types/torrent';
 import type { SiteCookies } from '../utils/cookieUtils';
 import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
 import {
@@ -24,12 +24,7 @@ import {
 } from '../utils/quickPublish';
 import { useLatest } from './useLatest';
 
-export interface QuickPublishTorrentInfo {
-    name: string;
-    total_size: number;
-    file_tree: FileTreeNodeData;
-    compat_notice?: string | null;
-}
+export type QuickPublishTorrentInfo = TorrentInfo;
 
 interface RuntimeTemplateSelectionOptions {
     templates?: Record<string, QuickPublishTemplate>;
@@ -40,6 +35,7 @@ interface RuntimeTemplateSelectionOptions {
 interface UseQuickPublishRuntimeDraftOptions {
     clearAllSiteLoginTests?: () => void;
     onError?: (message: string) => void;
+    onClearError?: () => void;
 }
 
 interface QuickPublishProfileData {
@@ -88,6 +84,7 @@ function toErrorMessage(error: unknown, fallback: string): string {
 export function useQuickPublishRuntimeDraft({
     clearAllSiteLoginTests,
     onError,
+    onClearError,
 }: UseQuickPublishRuntimeDraftOptions) {
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
     const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
@@ -96,7 +93,7 @@ export function useQuickPublishRuntimeDraft({
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
     const [selectedTemplateId, setSelectedTemplateId] = useState('');
     const [draft, setDraft] = useState<QuickPublishRuntimeDraft>(createDefaultQuickPublishRuntimeDraft());
-    const [torrentInfo, setTorrentInfo] = useState<QuickPublishTorrentInfo | null>(null);
+    const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
     const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
     const clearAllSiteLoginTestsRef = useLatest(clearAllSiteLoginTests);
     const quickPublishTemplatesRef = useLatest(quickPublishTemplates);
@@ -319,13 +316,9 @@ export function useQuickPublishRuntimeDraft({
     const parseTorrent = useCallback(
         async (path: string) => {
             try {
-                const info = await invoke<QuickPublishTorrentInfo>('parse_torrent', { path });
+                const info = await invoke<TorrentInfo>('parse_torrent', { path });
                 setTorrentInfo(info);
-
-                if (info.compat_notice) {
-                    // Readable but non-standard torrent: warn explicitly.
-                    onError?.(info.compat_notice);
-                }
+                onClearError?.();
 
                 const nextDraft = {
                     ...draftRef.current,
@@ -337,10 +330,15 @@ export function useQuickPublishRuntimeDraft({
                     await generateTitle(activeTemplateRef.current, nextDraft, false, info.name);
                 }
             } catch (error) {
+                setTorrentInfo(null);
+                setDraft({
+                    ...draftRef.current,
+                    torrent_path: '',
+                });
                 onError?.(toErrorMessage(error, '解析种子失败。'));
             }
         },
-        [activeTemplateRef, draftRef, generateTitle, onError],
+        [activeTemplateRef, draftRef, generateTitle, onClearError, onError],
     );
 
     const selectTorrentFile = useCallback(async () => {

@@ -13,11 +13,13 @@ import {
     RefreshCw,
 } from 'lucide-react';
 import FieldHelpHint from '../components/FieldHelpHint';
-import FileTree, { FileTreeNodeData } from '../components/FileTree';
+import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import WarningBanner from '../components/WarningBanner';
+import type { TorrentInfo } from '../types/torrent';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import {
     createPublishConsoleSiteMap,
@@ -136,13 +138,6 @@ interface PublishContentValidationIssue {
     siteCode: string;
     siteLabel: string;
     message: string;
-}
-
-interface TorrentInfo {
-    name: string;
-    total_size: number;
-    file_tree: FileTreeNodeData;
-    compat_notice?: string | null;
 }
 
 const siteKeys: (keyof SiteSelection)[] = [
@@ -366,6 +361,7 @@ export default function HomePage() {
     // Torrent state
     const [torrentPath, setTorrentPath] = useState('');
     const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
+    const [torrentError, setTorrentError] = useState('');
 
     // Modal state
     const [showConsole, setShowConsole] = useState(false);
@@ -657,6 +653,7 @@ export default function HomePage() {
             const info = await invoke<TorrentInfo>('parse_torrent', { path });
             setTorrentPath(path);
             setTorrentInfo(info);
+            setTorrentError('');
             // Only prefill an empty title; never overwrite a user-edited final title.
             const activeTemplate = templateRef.current;
             if (!activeTemplate.title.trim() && activeTemplate.title_pattern.trim()) {
@@ -667,6 +664,9 @@ export default function HomePage() {
             }
         } catch (e) {
             console.error('解析种子文件失败:', e);
+            setTorrentInfo(null);
+            setTorrentPath('');
+            setTorrentError(typeof e === 'string' ? e : '解析种子文件失败。');
         }
     }, [matchTitle, templateRef]);
 
@@ -1313,11 +1313,12 @@ export default function HomePage() {
                             <FileTree root={torrentInfo.file_tree} totalSize={torrentInfo.total_size} />
                         </div>
                     )}
-                    {torrentInfo?.compat_notice && (
-                        <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                            {torrentInfo.compat_notice}
-                        </div>
-                    )}
+                    {torrentInfo?.compat_notice ? (
+                        <WarningBanner className="mt-2">{torrentInfo.compat_notice}</WarningBanner>
+                    ) : null}
+                    {torrentError ? (
+                        <p className="mt-2 text-xs text-rose-400">{torrentError}</p>
+                    ) : null}
                 </section>
 
                 {/* Title Matching */}

@@ -353,7 +353,7 @@ export function getPublishedVersionLabel(entry: SitePublishHistoryEntry): string
         return `${episode} / ${resolution}`;
     }
 
-    return episode || resolution || '未发布';
+    return episode || resolution || '未填写';
 }
 
 export function buildLegacyPublishTemplatePayload(

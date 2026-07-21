@@ -201,7 +201,7 @@ fn read_torrent_compat(path: &str) -> Result<(Torrent, Option<String>), String> 
             Ok((
                 torrent,
                 Some(
-                    "该种子文件不符合 BEP 3 规范（顶层字典键未按字节排序），已自动修正后读取。建议重新生成规范的种子文件。"
+                    "该种子文件不符合 BEP 3（顶层字典键未按字节排序）。界面已用内存修正后的副本读取；磁盘上的原文件未改动，发布时仍上传原文件。建议重新生成规范种子。"
                         .to_string(),
                 ),
             ))
