@@ -28,6 +28,7 @@ export interface QuickPublishTorrentInfo {
     name: string;
     total_size: number;
     file_tree: FileTreeNodeData;
+    compat_notice?: string | null;
 }
 
 interface RuntimeTemplateSelectionOptions {
@@ -320,6 +321,11 @@ export function useQuickPublishRuntimeDraft({
             try {
                 const info = await invoke<QuickPublishTorrentInfo>('parse_torrent', { path });
                 setTorrentInfo(info);
+
+                if (info.compat_notice) {
+                    // Readable but non-standard torrent: warn explicitly.
+                    onError?.(info.compat_notice);
+                }
 
                 const nextDraft = {
                     ...draftRef.current,

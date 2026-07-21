@@ -142,6 +142,7 @@ interface TorrentInfo {
     name: string;
     total_size: number;
     file_tree: FileTreeNodeData;
+    compat_notice?: string | null;
 }
 
 const siteKeys: (keyof SiteSelection)[] = [
@@ -1310,6 +1311,11 @@ export default function HomePage() {
                     {torrentInfo && (
                         <div className="mt-2">
                             <FileTree root={torrentInfo.file_tree} totalSize={torrentInfo.total_size} />
+                        </div>
+                    )}
+                    {torrentInfo?.compat_notice && (
+                        <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                            {torrentInfo.compat_notice}
                         </div>
                     )}
                 </section>
