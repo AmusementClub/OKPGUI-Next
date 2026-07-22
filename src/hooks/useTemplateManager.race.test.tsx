@@ -135,6 +135,140 @@ describe('useTemplateManager stale-async guards', () => {
         await rendered.unmount();
     });
 
+    it('serializes and coalesces edits while a save is in flight before switching', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A-1' })));
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].expectedRevision).toBe(0);
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A-2' })));
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A-3' })));
+        await actOn(() => {
+            vi.advanceTimersByTime(AUTOSAVE_DEBOUNCE_MS + 1);
+        });
+
+        // B and C are coalesced behind unresolved save A; no overlapping request starts.
+        expect(saveCalls).toHaveLength(1);
+        expect(manager?.draft.name).toBe('A-3');
+
+        let switchSettled = false;
+        await actOn(() => {
+            void manager!.selectTemplate('b').then(() => {
+                switchSettled = true;
+            });
+        });
+        expect(switchSettled).toBe(false);
+
+        await actOn(async () => {
+            saveResolvers[0]({
+                id: 'a',
+                template: {
+                    ...saveCalls[0].template,
+                    revision: 1,
+                    updated_at: '2026-07-22T06:00:00.000Z',
+                },
+            });
+            await flushAsync();
+        });
+
+        // The latest queued content receives A's backend metadata and is the only
+        // follow-up request. The switch still waits for that request to settle.
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].template.name).toBe('A-3');
+        expect(saveCalls[1].template.revision).toBe(1);
+        expect(saveCalls[1].expectedRevision).toBe(1);
+        expect(manager?.draft.name).toBe('A-3');
+        expect(manager?.draft.revision).toBe(1);
+        expect(manager?.draft.updated_at).toBe('2026-07-22T06:00:00.000Z');
+        expect(switchSettled).toBe(false);
+        expect(manager?.conflictState).toBeNull();
+
+        await actOn(async () => {
+            saveResolvers[1]({
+                id: 'a',
+                template: {
+                    ...saveCalls[1].template,
+                    revision: 2,
+                    updated_at: '2026-07-22T06:00:01.000Z',
+                },
+            });
+            await flushAsync();
+        });
+
+        expect(switchSettled).toBe(true);
+        expect(manager?.selectedTemplateId).toBe('b');
+        expect(manager?.conflictState).toBeNull();
+
+        await rendered.unmount();
+    });
+
+    it('flushes an edit made after switching starts before applying the target', async () => {
+        const rendered = await renderElement(<Probe />);
+        await flushAsync();
+
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A-1' })));
+
+        let switchSettled = false;
+        await actOn(() => {
+            void manager!.selectTemplate('b').then(() => {
+                switchSettled = true;
+            });
+        });
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].expectedRevision).toBe(0);
+
+        // The editor remains live while the switch flush is awaiting save A.
+        await actOn(() => manager?.updateDraft((current) => ({ ...current, name: 'A-2' })));
+        expect(manager?.draft.name).toBe('A-2');
+        expect(saveCalls).toHaveLength(1);
+
+        await actOn(async () => {
+            saveResolvers[0]({
+                id: 'a',
+                template: {
+                    ...saveCalls[0].template,
+                    revision: 1,
+                    updated_at: '2026-07-22T06:01:00.000Z',
+                },
+            });
+            await flushAsync();
+        });
+
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].template.name).toBe('A-2');
+        expect(saveCalls[1].template.revision).toBe(1);
+        expect(saveCalls[1].expectedRevision).toBe(1);
+        expect(switchSettled).toBe(false);
+        expect(manager?.selectedTemplateId).toBe('a');
+
+        await actOn(async () => {
+            saveResolvers[1]({
+                id: 'a',
+                template: {
+                    ...saveCalls[1].template,
+                    revision: 2,
+                    updated_at: '2026-07-22T06:01:01.000Z',
+                },
+            });
+            await flushAsync();
+        });
+
+        expect(switchSettled).toBe(true);
+        expect(manager?.selectedTemplateId).toBe('b');
+        expect(manager?.draft.name).toBe('模板B');
+        expect(manager?.conflictState).toBeNull();
+
+        await rendered.unmount();
+    });
+
     it('ignores a rapid second switch during an in-flight flush', async () => {
         const rendered = await renderElement(<Probe />);
         await flushAsync();

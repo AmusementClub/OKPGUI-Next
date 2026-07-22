@@ -57,10 +57,7 @@ import {
     PublishTitleMetadata,
     resolvePublishTitleMetadata,
 } from '../utils/publishTitleMetadata';
-import {
-    createLatestValuePersistQueue,
-    shouldApplyTemplateSelection,
-} from '../utils/lastUsedPersistQueue';
+import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
 import { buildSortedTemplateSelectOptions } from '../utils/templateSelectOptions';
 import { extractDroppedFilePath } from '../utils/drop';
 import {
@@ -223,6 +220,7 @@ export default function HomePage() {
     const [selectedProfile, setSelectedProfile] = useState('');
     const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
+    const [loadedProfileName, setLoadedProfileName] = useState('');
 
     // Torrent state
     const [torrentPath, setTorrentPath] = useState('');
@@ -245,6 +243,7 @@ export default function HomePage() {
     const templateRef = useLatest(template);
     const currentTemplateNameRef = useLatest(currentTemplateName);
     const torrentInfoRef = useLatest(torrentInfo);
+    const selectedProfileRef = useLatest(selectedProfile);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
@@ -264,6 +263,15 @@ export default function HomePage() {
             },
         }),
     );
+    const descriptionSaveTimerRef = useRef<number | null>(null);
+    const templateSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const templateSaveFailureGenerationRef = useRef(0);
+    const templateSelectionQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const templateSelectionGenerationRef = useRef(0);
+    const parseGenerationRef = useRef(0);
+    const titleGenerationRef = useRef(0);
+    const manualTitleEditGenerationRef = useRef(0);
+    const profileLoadGenerationRef = useRef(0);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -280,23 +288,31 @@ export default function HomePage() {
             return;
         }
 
-        const saveTimer = window.setTimeout(() => {
+        descriptionSaveTimerRef.current = window.setTimeout(() => {
+            descriptionSaveTimerRef.current = null;
             void persistTemplateToDisk(withSelectedProfile(templateRef.current));
         }, AUTOSAVE_DEBOUNCE_MS);
 
         return () => {
-            window.clearTimeout(saveTimer);
+            if (descriptionSaveTimerRef.current !== null) {
+                window.clearTimeout(descriptionSaveTimerRef.current);
+                descriptionSaveTimerRef.current = null;
+            }
         };
     }, [template.description, template.description_html]);
 
     useEffect(() => {
-        if (!selectedProfile) {
-            setSelectedProfileData(null);
-            clearAllSiteLoginTests();
+        const generation = ++profileLoadGenerationRef.current;
+        const profileName = selectedProfile;
+        setSelectedProfileData(null);
+        setLoadedProfileName('');
+        clearAllSiteLoginTests();
+
+        if (!profileName) {
             return;
         }
 
-        void loadSelectedProfileData(selectedProfile);
+        void loadSelectedProfileData(profileName, generation);
     }, [selectedProfile]);
 
     const fetchConfig = () => invoke<ConfigPayload>('get_config');
@@ -321,16 +337,29 @@ export default function HomePage() {
         }
     };
 
-    const loadSelectedProfileData = async (profileName: string) => {
+    const loadSelectedProfileData = async (profileName: string, generation: number) => {
         try {
             const store = await invoke<{
                 profiles: Record<string, Profile>;
             }>('get_profiles');
+            if (
+                profileLoadGenerationRef.current !== generation
+                || selectedProfileRef.current !== profileName
+            ) {
+                return;
+            }
             setSelectedProfileData(store.profiles[profileName] ?? null);
+            setLoadedProfileName(profileName);
             clearAllSiteLoginTests();
         } catch (e) {
             console.error('加载身份详情失败:', e);
-            setSelectedProfileData(null);
+            if (
+                profileLoadGenerationRef.current === generation
+                && selectedProfileRef.current === profileName
+            ) {
+                setSelectedProfileData(null);
+                setLoadedProfileName(profileName);
+            }
         }
     };
 
@@ -364,16 +393,28 @@ export default function HomePage() {
         }
     };
 
-    const loadTemplate = async (name: string, selectionGeneration?: number) => {
+    const loadTemplate = async (
+        name: string,
+        selectionGeneration?: number,
+        beforeApply?: () => Promise<boolean>,
+    ) => {
         try {
             const config = await fetchConfig();
             // Drop stale responses before any UI mutation (options list or template body).
             if (
                 selectionGeneration !== undefined
-                && !shouldApplyTemplateSelection(
-                    selectionGeneration,
-                    lastUsedPersistQueueRef.current.getGeneration(),
-                )
+                && selectionGeneration !== templateSelectionGenerationRef.current
+            ) {
+                return false;
+            }
+
+            if (beforeApply && !(await beforeApply())) {
+                return false;
+            }
+
+            if (
+                selectionGeneration !== undefined
+                && selectionGeneration !== templateSelectionGenerationRef.current
             ) {
                 return false;
             }
@@ -382,10 +423,7 @@ export default function HomePage() {
 
             if (
                 selectionGeneration !== undefined
-                && !shouldApplyTemplateSelection(
-                    selectionGeneration,
-                    lastUsedPersistQueueRef.current.getGeneration(),
-                )
+                && selectionGeneration !== templateSelectionGenerationRef.current
             ) {
                 return false;
             }
@@ -397,6 +435,8 @@ export default function HomePage() {
                 setCurrentTemplateName(name);
                 setNewTemplateName('');
                 setTemplate(nextTemplate);
+                titleGenerationRef.current += 1;
+                setIsGeneratingTitle(false);
                 setSelectedProfile(nextTemplate.profile || '');
                 return true;
             }
@@ -408,11 +448,52 @@ export default function HomePage() {
     };
 
     /** User dropdown selection only — never called from restore/import/loadLastConfig. */
-    const handleTemplateSelection = async (name: string) => {
-        // Generation advances immediately so earlier in-flight loads cannot apply after later picks.
-        // Latest-id persist is serialized by the queue (last selection wins on disk).
-        const generation = lastUsedPersistQueueRef.current.enqueue(name);
-        await loadTemplate(name, generation);
+    const handleTemplateSelection = (name: string) => {
+        const selectionGeneration = ++templateSelectionGenerationRef.current;
+        const runSelection = async () => {
+            const failureGeneration = templateSaveFailureGenerationRef.current;
+            const drainDescriptionSaves = async () => {
+                while (selectionGeneration === templateSelectionGenerationRef.current) {
+                    const pendingQueue = templateSaveQueueRef.current;
+                    await pendingQueue;
+                    if (templateSaveFailureGenerationRef.current !== failureGeneration) {
+                        return false;
+                    }
+                    if (pendingQueue !== templateSaveQueueRef.current) {
+                        continue;
+                    }
+
+                    if (descriptionSaveTimerRef.current !== null) {
+                        window.clearTimeout(descriptionSaveTimerRef.current);
+                        descriptionSaveTimerRef.current = null;
+                    }
+                    const currentTemplate = templateRef.current;
+                    const hasDirtyDescription =
+                        currentTemplate.description !== lastPersistedDescriptionRef.current
+                        || currentTemplate.description_html !== lastPersistedDescriptionHtmlRef.current;
+                    if (!hasDirtyDescription) {
+                        return true;
+                    }
+
+                    const saved = await persistTemplateToDisk(withSelectedProfile(currentTemplate));
+                    if (!saved) {
+                        return false;
+                    }
+                }
+                return false;
+            };
+
+            if (!(await drainDescriptionSaves())) {
+                return;
+            }
+            const loaded = await loadTemplate(name, selectionGeneration, drainDescriptionSaves);
+            if (loaded) {
+                lastUsedPersistQueueRef.current.enqueue(name);
+            }
+        };
+
+        const selection = templateSelectionQueueRef.current.then(runSelection, runSelection);
+        templateSelectionQueueRef.current = selection.then(() => undefined, () => undefined);
     };
 
     const getTemplateName = (explicitName?: string) => {
@@ -428,7 +509,7 @@ export default function HomePage() {
         profile: profileName,
     });
 
-    const persistTemplateToDisk = async (
+    const persistTemplateToDisk = (
         templateToSave: Template = withSelectedProfile(templateRef.current),
         explicitName?: string,
         expectedEditorSnapshot?: string,
@@ -437,44 +518,51 @@ export default function HomePage() {
         const capturedTemplateName = currentTemplateNameRef.current;
         const preSaveSnapshot = expectedEditorSnapshot ?? serializeForComparison(templateToSave);
 
-        try {
-            const saved = await invoke<ImportedTemplatePayload>('save_template', {
-                name,
-                template: templateToSave,
-                previousName: capturedTemplateName || undefined,
-            });
-            const nextTemplate = normalizeTemplate(saved.template);
-
-            if (currentTemplateNameRef.current === capturedTemplateName) {
-                lastPersistedDescriptionRef.current = nextTemplate.description;
-                lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
-                // Only apply the saved template when the editor was not touched while the
-                // save was in flight; otherwise the response would clobber fresh keystrokes.
-                // Compare with the same profile augmentation as the pre-save snapshot so a
-                // profile switch does not silently disable the guard.
-                if (
-                    serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
-                    === preSaveSnapshot
-                ) {
-                    setTemplate(nextTemplate);
-                    setNewTemplateName('');
-                }
-                setCurrentTemplateName(saved.name);
-            }
-            await refreshTemplateOptions();
-            return { name: saved.name, template: nextTemplate };
-        } catch (e) {
-            console.error('保存模板失败:', e);
-            if (currentTemplateNameRef.current === capturedTemplateName) {
-                // Surface autosave failures too, and leave the dirty state intact so the
-                // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
-                showNotice({
-                    title: '保存模板失败',
-                    message: typeof e === 'string' ? e : '保存模板失败。',
+        const save = async () => {
+            try {
+                const saved = await invoke<ImportedTemplatePayload>('save_template', {
+                    name,
+                    template: templateToSave,
+                    previousName: capturedTemplateName || undefined,
                 });
+                const nextTemplate = normalizeTemplate(saved.template);
+
+                if (currentTemplateNameRef.current === capturedTemplateName) {
+                    lastPersistedDescriptionRef.current = nextTemplate.description;
+                    lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+                    // Only apply the saved template when the editor was not touched while the
+                    // save was in flight; otherwise the response would clobber fresh keystrokes.
+                    // Compare with the same profile augmentation as the pre-save snapshot so a
+                    // profile switch does not silently disable the guard.
+                    if (
+                        serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
+                        === preSaveSnapshot
+                    ) {
+                        setTemplate(nextTemplate);
+                        setNewTemplateName('');
+                    }
+                    setCurrentTemplateName(saved.name);
+                }
+                await refreshTemplateOptions();
+                return { name: saved.name, template: nextTemplate };
+            } catch (e) {
+                templateSaveFailureGenerationRef.current += 1;
+                console.error('保存模板失败:', e);
+                if (currentTemplateNameRef.current === capturedTemplateName) {
+                    // Surface autosave failures too, and leave the dirty state intact so the
+                    // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
+                    showNotice({
+                        title: '保存模板失败',
+                        message: typeof e === 'string' ? e : '保存模板失败。',
+                    });
+                }
+                return null;
             }
-            return null;
-        }
+        };
+
+        const queuedSave = templateSaveQueueRef.current.then(save, save);
+        templateSaveQueueRef.current = queuedSave.then(() => undefined, () => undefined);
+        return queuedSave;
     };
 
     const autosaveTemplate = (templateToSave: Template = withSelectedProfile(templateRef.current), explicitName?: string) => {
@@ -537,20 +625,37 @@ export default function HomePage() {
     }, [torrentInfoRef]);
 
     const parseTorrent = useCallback(async (path: string) => {
+        const generation = ++parseGenerationRef.current;
+        titleGenerationRef.current += 1;
+        setIsGeneratingTitle(false);
+        setTorrentPath('');
+        setTorrentInfo(null);
+        setTorrentError('');
         try {
             const info = await invoke<TorrentInfo>('parse_torrent', { path });
+            if (generation !== parseGenerationRef.current) {
+                return;
+            }
             setTorrentPath(path);
             setTorrentInfo(info);
             setTorrentError('');
             // Only prefill an empty title; never overwrite a user-edited final title.
             const activeTemplate = templateRef.current;
             if (!activeTemplate.title.trim() && activeTemplate.title_pattern.trim()) {
+                const manualTitleEditGeneration = manualTitleEditGenerationRef.current;
                 const title = await matchTitle(info.name, activeTemplate);
-                if (title) {
+                if (
+                    generation === parseGenerationRef.current
+                    && manualTitleEditGeneration === manualTitleEditGenerationRef.current
+                    && title
+                ) {
                     setTemplate((current) => (current.title.trim() ? current : { ...current, title }));
                 }
             }
         } catch (e) {
+            if (generation !== parseGenerationRef.current) {
+                return;
+            }
             console.error('解析种子文件失败:', e);
             setTorrentInfo(null);
             setTorrentPath('');
@@ -801,19 +906,37 @@ export default function HomePage() {
             return;
         }
 
+        const requestId = ++titleGenerationRef.current;
+        const capturedTemplateName = currentTemplateNameRef.current;
+        const capturedTorrentName = torrentInfoRef.current?.name ?? '';
+        const capturedTemplate = templateRef.current;
+        const startingTitle = capturedTemplate.title;
+        const startingManualEditGeneration = manualTitleEditGenerationRef.current;
         setIsGeneratingTitle(true);
 
         try {
-            const generatedTitle = await matchTitle();
+            const generatedTitle = await matchTitle(capturedTorrentName, capturedTemplate);
             if (!generatedTitle.trim()) {
                 return;
             }
 
-            const nextTemplate = getTemplateWithFieldValue('title', generatedTitle);
+            if (
+                requestId !== titleGenerationRef.current
+                || capturedTemplateName !== currentTemplateNameRef.current
+                || capturedTorrentName !== (torrentInfoRef.current?.name ?? '')
+                || startingTitle !== templateRef.current.title
+                || startingManualEditGeneration !== manualTitleEditGenerationRef.current
+            ) {
+                return;
+            }
+
+            const nextTemplate = withSelectedProfile({ ...templateRef.current, title: generatedTitle });
             setTemplate(nextTemplate);
             await persistTemplateToDisk(nextTemplate);
         } finally {
-            setIsGeneratingTitle(false);
+            if (requestId === titleGenerationRef.current) {
+                setIsGeneratingTitle(false);
+            }
         }
     };
 
@@ -830,16 +953,19 @@ export default function HomePage() {
     };
 
     const handleSiteLoginTest = (site: SiteDefinition) => {
-        void hookHandleSiteLoginTest(site, selectedProfileData);
+        void hookHandleSiteLoginTest(site, readySelectedProfileData);
     };
 
     const handleTestAllSiteLogins = () => {
-        void hookHandleTestAllSiteLogins(siteDefinitions, selectedProfileData);
+        void hookHandleTestAllSiteLogins(siteDefinitions, readySelectedProfileData);
     };
+
+    const readySelectedProfileData =
+        loadedProfileName === selectedProfile ? selectedProfileData : null;
 
     const siteRows = useSiteRows({
         publishSites,
-        selectedProfileData,
+        selectedProfileData: readySelectedProfileData,
         siteLoginTests,
         publishHistory: template.publish_history,
     });
@@ -1189,7 +1315,10 @@ export default function HomePage() {
                         <textarea
                             rows={2}
                             value={template.title}
-                            onChange={(e) => updateField('title', e.target.value)}
+                            onChange={(e) => {
+                                manualTitleEditGenerationRef.current += 1;
+                                updateField('title', e.target.value);
+                            }}
                             onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('title', e.target.value))}
                             placeholder="最终发布标题，可手动编辑或使用上方按钮重新生成"
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y"
@@ -1321,9 +1450,9 @@ export default function HomePage() {
                                                     onClick={() => {
                                                         void handleTestAllSiteLogins();
                                                     }}
-                                                    disabled={!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
+                                                    disabled={!readySelectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
                                                     title={
-                                                        !selectedProfileData
+                                                        !readySelectedProfileData
                                                             ? '请先选择身份配置'
                                                             : hasRunningSiteLoginTest && !isTestingAllSiteLogins
                                                               ? '请等待当前登录测试完成'
@@ -1378,7 +1507,7 @@ export default function HomePage() {
                                                             onClick={() => {
                                                                 void handleSiteLoginTest(site);
                                                             }}
-                                                            disabled={!selectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
+                                                            disabled={!readySelectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
                                                             title={loginState?.message ?? `测试 ${site.label} 登录`}
                                                             className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                                                         >
@@ -1423,7 +1552,8 @@ export default function HomePage() {
                             !selectedProfile ||
                             !okpExecutablePath ||
                             isPublishing ||
-                            selectedSiteKeys.length === 0
+                            selectedSiteKeys.length === 0 ||
+                            !readySelectedProfileData
                         }
                         className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-600 hover:to-cyan-600 disabled:from-slate-600 disabled:to-slate-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-all shadow-lg shadow-emerald-500/20"
                     >

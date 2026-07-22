@@ -66,6 +66,12 @@ export interface TemplateConflictState {
 
 type PersistDraftResult = 'saved' | 'unchanged' | 'conflict' | 'failed';
 
+interface QueuedPersistDraft<T extends AnyTemplate> {
+    sourceDraft: T;
+    options: PersistDraftOptions;
+    selectedTemplateId: string;
+}
+
 function buildPersistableTemplate<T extends AnyTemplate>(
     template: T,
     normalize: (t: Partial<T>) => T,
@@ -161,6 +167,7 @@ export function useTemplateManager<T extends AnyTemplate>(
     // switch during that in-flight flush must be ignored, not raced.
     const switchingRef = useRef(false);
     const persistInFlightRef = useRef<Promise<PersistDraftResult> | null>(null);
+    const queuedPersistRef = useRef<QueuedPersistDraft<T> | null>(null);
 
     const sortedTemplates = useMemo(
         () =>
@@ -292,6 +299,29 @@ export function useTemplateManager<T extends AnyTemplate>(
             } as Partial<T>);
             const savedSnapshot = serializeForComparison(savedTemplate);
             const previousId = (sourceDraft as AnyTemplate).id.trim();
+            const isStillSelected = () => {
+                const currentSelectedId = selectedTemplateIdRef.current;
+                return currentSelectedId === capturedSelectedId || currentSelectedId === previousId;
+            };
+            const mergeSavedMetadata = (current: T): T =>
+                config.normalize({
+                    ...current,
+                    id: saved.id,
+                    revision: savedTemplate.revision,
+                    updated_at: savedTemplate.updated_at,
+                } as Partial<T>);
+
+            const queued = queuedPersistRef.current;
+            if (
+                queued
+                && (queued.selectedTemplateId === capturedSelectedId
+                    || queued.sourceDraft.id.trim() === previousId)
+            ) {
+                queuedPersistRef.current = {
+                    ...queued,
+                    sourceDraft: mergeSavedMetadata(queued.sourceDraft),
+                };
+            }
 
             lastPersistedSnapshotRef.current = savedSnapshot;
             setTemplates((current) => {
@@ -302,14 +332,22 @@ export function useTemplateManager<T extends AnyTemplate>(
                 nextTemplates[saved.id] = savedTemplate;
                 return nextTemplates;
             });
-            if (selectedTemplateIdRef.current === capturedSelectedId) {
+            if (isStillSelected()) {
                 setSelectedTemplateId(saved.id);
+                latestDraftRef.current =
+                    serializeForComparison(latestDraftRef.current) === sourceSnapshot
+                        ? savedTemplate
+                        : mergeSavedMetadata(latestDraftRef.current);
             }
-            setDraft((current) =>
-                serializeForComparison(current) === sourceSnapshot
+            setDraft((current) => {
+                if (!isStillSelected()) {
+                    return current;
+                }
+
+                return serializeForComparison(current) === sourceSnapshot
                     ? savedTemplate
-                    : current,
-            );
+                    : mergeSavedMetadata(current);
+            });
             if (serializeForComparison(latestDraftRef.current) === sourceSnapshot) {
                 setHasPendingAutosave(false);
             }
@@ -346,14 +384,42 @@ export function useTemplateManager<T extends AnyTemplate>(
         sourceDraft: T,
         options: PersistDraftOptions = {},
     ): Promise<PersistDraftResult> => {
-        const pending = persistDraftInternal(sourceDraft, options);
-        persistInFlightRef.current = pending;
-        void pending.finally(() => {
-            if (persistInFlightRef.current === pending) {
+        const request: QueuedPersistDraft<T> = {
+            sourceDraft,
+            options,
+            selectedTemplateId: selectedTemplateIdRef.current,
+        };
+        const inFlight = persistInFlightRef.current;
+        if (inFlight) {
+            queuedPersistRef.current = request;
+            return inFlight;
+        }
+
+        const drain = (async () => {
+            let nextRequest: QueuedPersistDraft<T> | null = request;
+            let result: PersistDraftResult = 'unchanged';
+
+            while (nextRequest) {
+                result = await persistDraftInternal(nextRequest.sourceDraft, nextRequest.options);
+                if (result === 'failed' || result === 'conflict') {
+                    queuedPersistRef.current = null;
+                    return result;
+                }
+
+                nextRequest = queuedPersistRef.current;
+                queuedPersistRef.current = null;
+            }
+
+            return result;
+        })();
+
+        persistInFlightRef.current = drain;
+        void drain.finally(() => {
+            if (persistInFlightRef.current === drain) {
                 persistInFlightRef.current = null;
             }
         });
-        return pending;
+        return drain;
     };
 
     /** Flush a pending debounced autosave; resolves false when the draft could not
@@ -362,17 +428,24 @@ export function useTemplateManager<T extends AnyTemplate>(
         // Disarm the debounce so the timer cannot fire a second persist mid-switch.
         setHasPendingAutosave(false);
 
-        const inFlight = persistInFlightRef.current;
-        if (inFlight) {
-            await inFlight;
-        }
+        while (true) {
+            const inFlight = persistInFlightRef.current;
+            if (inFlight) {
+                const result = await inFlight;
+                if (result === 'failed' || result === 'conflict') {
+                    return false;
+                }
+            }
 
-        if (serializeForComparison(latestDraftRef.current) === lastPersistedSnapshotRef.current) {
-            return true;
-        }
+            if (serializeForComparison(latestDraftRef.current) === lastPersistedSnapshotRef.current) {
+                return true;
+            }
 
-        const result = await persistDraft(latestDraftRef.current);
-        return result === 'saved' || result === 'unchanged';
+            const result = await persistDraft(latestDraftRef.current);
+            if (result === 'failed' || result === 'conflict') {
+                return false;
+            }
+        }
     };
 
     const updateDraft = (updater: (current: T) => T) => {

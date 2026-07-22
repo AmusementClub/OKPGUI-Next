@@ -76,37 +76,34 @@ fn collect_named_capture_matches(
 /// e.g. `[02v2]`. The digit run inside `v2` is not an episode number, but a
 /// generic ep pattern like `\d{1,3}` still matches it, and the
 /// closest-before-resolution heuristic then prefers it over the real
-/// episode. Drop an ep capture only when it is a fansub revision suffix of the
-/// form `…[digit]v[digits]…` / `…[digit]V[digits]…` (ASCII digit immediately
-/// before the `v`/`V`). Standalone `v2` (space/punctuation before `v`) and
-/// word-internal forms like `MV03` are kept. If every candidate is filtered
-/// out, keep the original list so behavior for titles that only contain a
-/// revision marker is unchanged.
+/// episode. Drop an ep capture when its digits immediately follow `v`/`V` and
+/// that marker either follows an episode digit (`02v2`) or starts its own token
+/// (` v2`, `[V3]`). Word-internal forms like `MV03` remain eligible episodes.
 fn filter_revision_marker_candidates(
     filename: &str,
     matches: Vec<NamedCaptureMatch>,
 ) -> Vec<NamedCaptureMatch> {
-    // Drop only when: filename[start-1] is v/V AND start >= 2 AND
-    // filename[start-2] is an ASCII digit (`02v2` → drop `2`; ` v2` / `MV03`
-    // → keep). UTF-8 safe: continuation bytes are >= 0x80 and can never equal
-    // `v`/`V` or be ASCII digits.
     let is_revision_marker = |episode_match: &&NamedCaptureMatch| {
         let start = episode_match.start;
-        start >= 2
-            && matches!(filename.as_bytes()[start - 1], b'v' | b'V')
-            && filename.as_bytes()[start - 2].is_ascii_digit()
+        let Some(marker_start) = start.checked_sub(1) else {
+            return false;
+        };
+        if !matches!(filename.as_bytes()[marker_start], b'v' | b'V') {
+            return false;
+        }
+
+        match filename[..marker_start].chars().next_back() {
+            None => true,
+            Some(previous) => {
+                previous.is_ascii_digit() || (!previous.is_alphanumeric() && previous != '_')
+            }
+        }
     };
-    let kept: Vec<NamedCaptureMatch> = matches
+    matches
         .iter()
         .filter(|episode_match| !is_revision_marker(episode_match))
         .cloned()
-        .collect();
-
-    if kept.is_empty() {
-        matches
-    } else {
-        kept
-    }
+        .collect()
 }
 
 fn choose_episode_match<'a>(
@@ -172,13 +169,16 @@ fn parse_title_details_internal(
     let requires_resolution = title_pattern.contains("<res>");
     let ep_captures = extract_named_captures(filename, ep_pattern)?;
     let resolution_captures = extract_named_captures(filename, resolution_pattern)?;
-    let episode_matches = collect_named_capture_matches(filename, ep_pattern, "ep")?;
-    let episode_matches = filter_revision_marker_candidates(filename, episode_matches);
+    let raw_episode_matches = collect_named_capture_matches(filename, ep_pattern, "ep")?;
+    let had_raw_episode_matches = !raw_episode_matches.is_empty();
+    let episode_matches = filter_revision_marker_candidates(filename, raw_episode_matches);
     let resolution_matches = collect_named_capture_matches(filename, resolution_pattern, "res")?;
 
     // Prefer the LAST resolution match: release filenames conventionally put
     // the authoritative resolution token last (e.g. `[Group] 720p ... [1080p]`).
-    let selected_resolution_match = resolution_matches.iter().max_by_key(|matched| matched.start);
+    let selected_resolution_match = resolution_matches
+        .iter()
+        .max_by_key(|matched| matched.start);
 
     // Exclude episode candidates whose byte range intersects ANY resolution
     // match: a generic ep pattern like `\d{1,3}` matches the `108` fragment
@@ -194,7 +194,8 @@ fn parse_title_details_internal(
         })
         .cloned()
         .collect();
-    let selected_episode_match = choose_episode_match(&episode_candidates, selected_resolution_match);
+    let selected_episode_match =
+        choose_episode_match(&episode_candidates, selected_resolution_match);
 
     let episode = selected_episode_match
         .map(|matched| matched.value.clone())
@@ -202,7 +203,7 @@ fn parse_title_details_internal(
             // Only fall back to the raw first capture when no `ep` group ever
             // participated in a match; otherwise an excluded overlapping
             // fragment like `108` inside `1080p` would resurface here.
-            if episode_matches.is_empty() {
+            if !had_raw_episode_matches {
                 ep_captures.get("ep").cloned()
             } else {
                 None
@@ -427,9 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_title_details_falls_back_when_only_revision_marker_matches() {
-        // The only digit run is inside a revision marker: filtering would
-        // leave no candidates, so the pre-fix behavior is preserved.
+    fn test_parse_title_details_ignores_lone_revision_marker() {
         let filename = "Some Movie v2.mkv";
         let result = parse_title_details(
             filename.to_string(),
@@ -439,14 +438,28 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.episode, "2");
+        assert_eq!(result.episode, "");
     }
 
     #[test]
-    fn test_parse_title_details_keeps_standalone_v_revision_before_resolution() {
-        // Space before `v` is not a fansub revision suffix; keep `2` so
-        // closest-before-res prefers it over the `108` fragment of `1080p`.
+    fn test_parse_title_details_ignores_standalone_revision_before_resolution() {
         let filename = "Some Movie v2 [1080p].mkv";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "");
+    }
+
+    #[test]
+    fn test_parse_title_details_keeps_episode_before_standalone_revision() {
+        let filename = "Season 2 v12 [1080p].mkv";
         let result = parse_title_details(
             filename.to_string(),
             DEFAULT_EP_PATTERN.to_string(),

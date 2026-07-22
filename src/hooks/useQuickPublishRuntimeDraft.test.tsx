@@ -320,4 +320,352 @@ describe('useQuickPublishRuntimeDraft stale-async guards', () => {
 
         harness.unmount();
     });
+
+    it('keeps the fast second torrent when the slow first torrent succeeds later', async () => {
+        const pending = new Map<string, ReturnType<typeof deferred<TorrentInfo>>>();
+
+        installInvokeMock({
+            parseTorrent: (path) => {
+                const slot = deferred<TorrentInfo>();
+                pending.set(path, slot);
+                return slot.promise;
+            },
+            parseTitleDetails: (args) => Promise.resolve({
+                title: String(args.filename),
+                episode: '',
+                resolution: '',
+            }),
+        });
+
+        const harness = await mountAndLoad();
+        let first!: Promise<void>;
+        let second!: Promise<void>;
+
+        act(() => {
+            first = harness.result.parseTorrent('/downloads/a.torrent');
+            second = harness.result.parseTorrent('/downloads/b.torrent');
+        });
+
+        await act(async () => {
+            pending.get('/downloads/b.torrent')!.resolve(torrentInfo('b.mkv'));
+            await second;
+        });
+        expect(harness.result.draft.torrent_path).toBe('/downloads/b.torrent');
+        expect(harness.result.draft.title).toBe('b.mkv');
+
+        await act(async () => {
+            pending.get('/downloads/a.torrent')!.resolve(torrentInfo('a.mkv'));
+            await first;
+        });
+        expect(harness.result.torrentInfo?.name).toBe('b.mkv');
+        expect(harness.result.draft.torrent_path).toBe('/downloads/b.torrent');
+        expect(harness.result.draft.title).toBe('b.mkv');
+
+        harness.unmount();
+    });
+
+    it('ignores a slow first torrent rejection after the second torrent succeeds', async () => {
+        const onError = vi.fn();
+        const pending = new Map<string, ReturnType<typeof deferred<TorrentInfo>>>();
+
+        installInvokeMock({
+            parseTorrent: (path) => {
+                const slot = deferred<TorrentInfo>();
+                pending.set(path, slot);
+                return slot.promise;
+            },
+            parseTitleDetails: (args) => Promise.resolve({
+                title: String(args.filename),
+                episode: '',
+                resolution: '',
+            }),
+        });
+
+        const harness = await mountAndLoad({ onError });
+        let first!: Promise<void>;
+        let second!: Promise<void>;
+
+        act(() => {
+            first = harness.result.parseTorrent('/downloads/a.torrent');
+            second = harness.result.parseTorrent('/downloads/b.torrent');
+        });
+
+        await act(async () => {
+            pending.get('/downloads/b.torrent')!.resolve(torrentInfo('b.mkv'));
+            await second;
+        });
+        await act(async () => {
+            pending.get('/downloads/a.torrent')!.reject('A 解析失败');
+            await first;
+        });
+
+        expect(onError).not.toHaveBeenCalled();
+        expect(harness.result.torrentInfo?.name).toBe('b.mkv');
+        expect(harness.result.draft.torrent_path).toBe('/downloads/b.torrent');
+        expect(harness.result.draft.title).toBe('b.mkv');
+
+        harness.unmount();
+    });
+
+    it('keeps the second torrent rejection authoritative when the first torrent succeeds', async () => {
+        const onError = vi.fn();
+        const pending = new Map<string, ReturnType<typeof deferred<TorrentInfo>>>();
+
+        installInvokeMock({
+            parseTorrent: (path) => {
+                const slot = deferred<TorrentInfo>();
+                pending.set(path, slot);
+                return slot.promise;
+            },
+        });
+
+        const harness = await mountAndLoad({ onError });
+        let first!: Promise<void>;
+        let second!: Promise<void>;
+
+        act(() => {
+            first = harness.result.parseTorrent('/downloads/a.torrent');
+            second = harness.result.parseTorrent('/downloads/b.torrent');
+        });
+
+        await act(async () => {
+            pending.get('/downloads/a.torrent')!.resolve(torrentInfo('a.mkv'));
+            await first;
+        });
+        await act(async () => {
+            pending.get('/downloads/b.torrent')!.reject('B 解析失败');
+            await second;
+        });
+
+        expect(onError).toHaveBeenCalledTimes(1);
+        expect(onError).toHaveBeenCalledWith('B 解析失败');
+        expect(harness.result.torrentInfo).toBeNull();
+        expect(harness.result.draft.torrent_path).toBe('');
+        expect(harness.result.draft.title).toBe('');
+
+        harness.unmount();
+    });
+
+    it('does not restore a torrent after the runtime draft is cleared while parsing', async () => {
+        const onClearError = vi.fn();
+        const pending = deferred<TorrentInfo>();
+
+        installInvokeMock({
+            parseTorrent: () => pending.promise,
+        });
+
+        const harness = await mountAndLoad({ onClearError });
+        let parse!: Promise<void>;
+
+        act(() => {
+            parse = harness.result.parseTorrent('/downloads/a.torrent');
+            harness.result.clearRuntimeDraft();
+        });
+
+        await act(async () => {
+            pending.resolve(torrentInfo('a.mkv'));
+            await parse;
+        });
+
+        expect(onClearError).not.toHaveBeenCalled();
+        expect(harness.result.selectedTemplateId).toBe('');
+        expect(harness.result.torrentInfo).toBeNull();
+        expect(harness.result.draft.torrent_path).toBe('');
+        expect(harness.result.draft.title).toBe('');
+
+        harness.unmount();
+    });
+
+    it('does not overwrite a manual edit made after forced title generation starts', async () => {
+        const pending = deferred<ParsedTitleDetails>();
+
+        installInvokeMock({
+            parseTitleDetails: () => pending.promise,
+        });
+
+        const harness = await mountAndLoad();
+
+        act(() => {
+            harness.result.setDraft({
+                ...harness.result.draft,
+                torrent_path: '/downloads/a.torrent',
+                title: '开始标题',
+                is_title_overridden: true,
+            });
+        });
+        const startingDraft = harness.result.draft;
+        let generation!: Promise<void>;
+
+        act(() => {
+            generation = harness.result.generateTitle(
+                harness.result.activeTemplate,
+                startingDraft,
+                true,
+                'a.mkv',
+            );
+        });
+        expect(harness.result.isGeneratingTitle).toBe(true);
+
+        act(() => {
+            harness.result.setDraft({
+                ...harness.result.draft,
+                title: '用户后来输入的标题',
+                is_title_overridden: true,
+            });
+        });
+
+        await act(async () => {
+            pending.resolve({ title: '自动生成标题', episode: '01', resolution: '1080p' });
+            await generation;
+        });
+
+        expect(harness.result.draft.title).toBe('用户后来输入的标题');
+        expect(harness.result.draft.is_title_overridden).toBe(true);
+        expect(harness.result.isGeneratingTitle).toBe(false);
+
+        harness.unmount();
+    });
+
+    it('does not apply forced generation after a manual title ABA edit', async () => {
+        const pending = deferred<ParsedTitleDetails>();
+
+        installInvokeMock({
+            parseTitleDetails: () => pending.promise,
+        });
+
+        const harness = await mountAndLoad();
+        const startingDraft = {
+            ...harness.result.draft,
+            torrent_path: '/downloads/a.torrent',
+            title: '标题 A',
+            is_title_overridden: true,
+        };
+        act(() => {
+            harness.result.setDraft(startingDraft);
+        });
+
+        let generation!: Promise<void>;
+        act(() => {
+            generation = harness.result.generateTitle(
+                harness.result.activeTemplate,
+                startingDraft,
+                true,
+                'a.mkv',
+            );
+        });
+
+        act(() => {
+            harness.result.setDraft({
+                ...startingDraft,
+                title: '标题 B',
+            });
+            harness.result.setDraft(startingDraft);
+        });
+
+        await act(async () => {
+            pending.resolve({ title: '自动生成标题', episode: '09', resolution: '1080p' });
+            await generation;
+        });
+
+        expect(harness.result.draft.title).toBe('标题 A');
+        expect(harness.result.draft.is_title_overridden).toBe(true);
+        expect(harness.result.draft.episode).toBe('');
+        expect(harness.result.draft.resolution).toBe('');
+        expect(harness.result.isGeneratingTitle).toBe(false);
+
+        harness.unmount();
+    });
+
+    it('does not report a title failure after the user edits the captured title', async () => {
+        const onError = vi.fn();
+        const pending = deferred<ParsedTitleDetails>();
+
+        installInvokeMock({
+            parseTitleDetails: () => pending.promise,
+        });
+
+        const harness = await mountAndLoad({ onError });
+        const startingDraft = {
+            ...harness.result.draft,
+            torrent_path: '/downloads/a.torrent',
+            title: '开始标题',
+            is_title_overridden: true,
+        };
+        act(() => {
+            harness.result.setDraft(startingDraft);
+        });
+
+        let generation!: Promise<void>;
+        act(() => {
+            generation = harness.result.generateTitle(
+                harness.result.activeTemplate,
+                startingDraft,
+                true,
+                'a.mkv',
+            );
+        });
+        act(() => {
+            harness.result.setDraft({
+                ...harness.result.draft,
+                title: '用户后来输入的标题',
+            });
+        });
+
+        await act(async () => {
+            pending.reject('旧标题请求失败');
+            await generation;
+        });
+
+        expect(onError).not.toHaveBeenCalled();
+        expect(harness.result.draft.title).toBe('用户后来输入的标题');
+        expect(harness.result.isGeneratingTitle).toBe(false);
+
+        harness.unmount();
+    });
+
+    it('keeps the current title request loading when a stale request rejects', async () => {
+        const onError = vi.fn();
+        const pending: ReturnType<typeof deferred<ParsedTitleDetails>>[] = [];
+
+        installInvokeMock({
+            parseTitleDetails: () => {
+                const slot = deferred<ParsedTitleDetails>();
+                pending.push(slot);
+                return slot.promise;
+            },
+        });
+
+        const harness = await mountAndLoad({ onError });
+        const draft = {
+            ...harness.result.draft,
+            torrent_path: '/downloads/a.torrent',
+        };
+        act(() => {
+            harness.result.setDraft(draft);
+        });
+
+        let first!: Promise<void>;
+        let second!: Promise<void>;
+        act(() => {
+            first = harness.result.generateTitle(harness.result.activeTemplate, draft, true, 'a.mkv');
+            second = harness.result.generateTitle(harness.result.activeTemplate, draft, true, 'b.mkv');
+        });
+        expect(pending).toHaveLength(2);
+
+        await act(async () => {
+            pending[0].reject('旧请求失败');
+            await first;
+        });
+        expect(onError).not.toHaveBeenCalled();
+        expect(harness.result.isGeneratingTitle).toBe(true);
+
+        await act(async () => {
+            pending[1].resolve({ title: 'B 标题', episode: '02', resolution: '720p' });
+            await second;
+        });
+        expect(harness.result.draft.title).toBe('B 标题');
+        expect(harness.result.isGeneratingTitle).toBe(false);
+
+        harness.unmount();
+    });
 });
