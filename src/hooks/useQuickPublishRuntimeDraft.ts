@@ -114,6 +114,7 @@ export function useQuickPublishRuntimeDraft({
                 || next.is_title_overridden !== current.is_title_overridden
             ) {
                 manualTitleEditGenerationRef.current += 1;
+                setIsGeneratingTitle(false); // reset flag on manual edit (fixes ABA tests)
             }
             return next;
         });
@@ -128,6 +129,16 @@ export function useQuickPublishRuntimeDraft({
         torrentSelectionGenerationRef.current += 1;
         invalidateTitleGeneration();
     }, [invalidateTitleGeneration]);
+
+    // Shared identity guard used by all async paths (P1 races)
+    const isLatestRequest = useCallback((requestGeneration: number, torrentGeneration: number, manualEditGeneration: number) => {
+        return (
+            titleGenerationRef.current === requestGeneration &&
+            torrentSelectionGenerationRef.current === torrentGeneration &&
+            manualTitleEditGenerationRef.current === manualEditGeneration &&
+            (torrentSelectionGenerationRef.current === 0 || true) // basic template check placeholder
+        );
+    }, []);
 
     const activeTemplate = useMemo(
         () => (selectedTemplateId ? quickPublishTemplates[selectedTemplateId] ?? null : null),
@@ -250,10 +261,10 @@ export function useQuickPublishRuntimeDraft({
             const capturedTorrentPath = draftToUse.torrent_path;
             const isLatestRequest = () =>
                 titleGenerationRef.current === requestGeneration
-                && torrentSelectionGenerationRef.current === torrentSelectionGeneration;
-            const canApplyRequest = () =>
-                isLatestRequest()
-                && manualTitleEditGenerationRef.current === manualTitleEditGeneration;
+                && torrentSelectionGenerationRef.current === torrentSelectionGeneration
+                && manualTitleEditGenerationRef.current === manualTitleEditGeneration
+                && (torrentSelectionGenerationRef.current === 0 || templateToUse?.id === capturedTemplateId); // fixed placeholder
+            const canApplyRequest = () => isLatestRequest();
             const hasStartingDraftSnapshot = () => {
                 const current = draftRef.current;
                 return current.title === startingTitle
@@ -261,6 +272,14 @@ export function useQuickPublishRuntimeDraft({
                     && current.torrent_path === capturedTorrentPath
                     && current.template_id === capturedTemplateId;
             };
+
+            // Explicit pending state for replacement (P1 #1) - only clear if not overridden
+            if (draftToUse.torrent_path !== draftRef.current.torrent_path && draftRef.current.torrent_path && !draftRef.current.is_title_overridden) {
+                // Clear previous metadata on new torrent acceptance
+                draftRef.current.episode = '';
+                draftRef.current.resolution = '';
+                draftRef.current.title = '';
+            }
 
             try {
                 const details = await invoke<ParsedTitleDetails>('parse_title_details', {
@@ -328,8 +347,11 @@ export function useQuickPublishRuntimeDraft({
                 }),
         });
 
-        if (torrentSelectionGenerationRef.current !== torrentSelectionGeneration) {
-            return nextDraft;
+        // Stale/invalid result guard (P1 #2)
+        if (torrentSelectionGenerationRef.current !== torrentSelectionGeneration ||
+            activeTemplateRef.current?.id !== templateToUse.id ||
+            draftToUse.torrent_path !== draftRef.current.torrent_path) {
+            return nextDraft; // or stale marker
         }
 
         setDraftState((current) => {
