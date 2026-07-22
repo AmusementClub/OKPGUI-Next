@@ -233,7 +233,7 @@ export default function ContentTemplatesPage() {
                                                         {template.summary || '暂无说明'}
                                                     </p>
                                                     <p className="mt-2 text-[11px] text-slate-500">
-                                                        最近更新 {formatTemplateTimestamp(template.updated_at)}
+                                                        最近更新 {formatTemplateTimestamp(template.updated_at, '未保存')}
                                                     </p>
                                                 </div>
                                             </div>
@@ -331,7 +331,7 @@ export default function ContentTemplatesPage() {
                                     <dl className="mt-4 space-y-3 text-sm">
                                         <div className="flex items-start justify-between gap-4">
                                             <dt className="text-slate-500">最近更新时间</dt>
-                                            <dd className="text-right text-slate-200">{formatTemplateTimestamp(draft.updated_at)}</dd>
+                                            <dd className="text-right text-slate-200">{formatTemplateTimestamp(draft.updated_at, '未保存')}</dd>
                                         </div>
                                         <div className="flex items-start justify-between gap-4">
                                             <dt className="text-slate-500">Markdown 字数</dt>

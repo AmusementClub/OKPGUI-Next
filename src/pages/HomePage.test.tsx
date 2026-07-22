@@ -1,7 +1,8 @@
 import { act, StrictMode } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { flushAsync, renderElement } from '../test-utils/react';
+import { deferred, flushAsync, renderElement } from '../test-utils/react';
 import { emptySiteCookies } from '../utils/cookieUtils';
+import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import HomePage from './HomePage';
 
@@ -39,6 +40,28 @@ vi.mock('../components/PublishContentEditor', () => ({
 
 vi.mock('../components/TagInput', () => ({
     default: () => null,
+}));
+
+vi.mock('../components/TemplateSelect', () => ({
+    default: ({
+        options,
+        value,
+        onChange,
+    }: {
+        options: Array<{ name: string; label: string }>;
+        value: string;
+        onChange: (value: string) => void;
+    }) => (
+        <select
+            aria-label="选择模板"
+            value={value}
+            onChange={(event) => onChange(event.target.value)}
+        >
+            {options.map((option) => (
+                <option key={option.name} value={option.name}>{option.label}</option>
+            ))}
+        </select>
+    ),
 }));
 
 function buildProfile() {
@@ -233,6 +256,149 @@ describe('HomePage template save guards', () => {
         await rendered.unmount();
     });
 
+    it('keeps template B identity and body when template A save resolves late', async () => {
+        const firstSave = deferred<{ name: string; template: Record<string, unknown> }>();
+        const saveCalls: Record<string, unknown>[] = [];
+        const config = {
+            last_used_template: 'alpha',
+            okp_executable_path: '/okp',
+            templates: {
+                alpha: { profile: 'p1', about: '模板 A' },
+                beta: { profile: 'p1', about: '模板 B' },
+            },
+        };
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'get_config') {
+                return Promise.resolve(config);
+            }
+            if (command === 'save_template') {
+                const saveArgs = args ?? {};
+                saveCalls.push(saveArgs);
+                if (saveCalls.length === 1) {
+                    return firstSave.promise;
+                }
+                return Promise.resolve({ name: saveArgs.name, template: saveArgs.template });
+            }
+            return routeInvoke(command, args);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        await act(async () => {
+            findAcgripCheckbox(rendered.container).dispatchEvent(
+                new MouseEvent('click', { bubbles: true }),
+            );
+        });
+        await flushAsync();
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].name).toBe('alpha');
+
+        const templateSelect = rendered.container.querySelector<HTMLSelectElement>(
+            'select[aria-label="选择模板"]',
+        );
+        expect(templateSelect).not.toBeNull();
+        await act(async () => {
+            templateSelect!.value = 'beta';
+            templateSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await flushAsync();
+        expect(templateSelect!.value).toBe('beta');
+        expect(findAboutInput(rendered.container).value).toBe('模板 B');
+
+        await act(async () => {
+            firstSave.resolve({
+                name: 'alpha',
+                template: saveCalls[0].template as Record<string, unknown>,
+            });
+        });
+        await flushAsync();
+        expect(templateSelect!.value).toBe('beta');
+        expect(findAboutInput(rendered.container).value).toBe('模板 B');
+
+        await act(async () => {
+            findAcgripCheckbox(rendered.container).dispatchEvent(
+                new MouseEvent('click', { bubbles: true }),
+            );
+        });
+        await flushAsync();
+
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].name).toBe('beta');
+        expect(saveCalls[1].previousName).toBe('beta');
+        expect((saveCalls[1].template as { about: string }).about).toBe('模板 B');
+
+        await rendered.unmount();
+    });
+
+    it('suppresses stale alpha rejection after switch to beta with no failure notice', async () => {
+        const firstSave = deferred<{ name: string; template: Record<string, unknown> }>();
+        const saveCalls: Record<string, unknown>[] = [];
+        const config = {
+            last_used_template: 'alpha',
+            okp_executable_path: '/okp',
+            templates: {
+                alpha: { profile: 'p1', about: '模板 A' },
+                beta: { profile: 'p1', about: '模板 B' },
+            },
+        };
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'get_config') {
+                return Promise.resolve(config);
+            }
+            if (command === 'save_template') {
+                const saveArgs = args ?? {};
+                saveCalls.push(saveArgs);
+                if (saveCalls.length === 1) {
+                    return firstSave.promise;
+                }
+                return Promise.resolve({ name: saveArgs.name, template: saveArgs.template });
+            }
+            return routeInvoke(command, args);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        await flushAsync();
+
+        const checkbox = findAcgripCheckbox(rendered.container);
+        await act(async () => {
+            checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync();
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].name).toBe('alpha');
+
+        const templateSelect = rendered.container.querySelector<HTMLSelectElement>(
+            'select[aria-label="选择模板"]',
+        );
+        expect(templateSelect).not.toBeNull();
+        await act(async () => {
+            templateSelect!.value = 'beta';
+            templateSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await flushAsync();
+        expect(templateSelect!.value).toBe('beta');
+        expect(findAboutInput(rendered.container).value).toBe('模板 B');
+
+        await act(async () => {
+            firstSave.reject('stale alpha rejection');
+        });
+        await flushAsync();
+        expect(document.body.textContent).not.toContain('保存模板失败');
+
+        await act(async () => {
+            checkbox.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync();
+
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].name).toBe('beta');
+        expect(saveCalls[1].previousName).toBe('beta');
+        expect((saveCalls[1].template as { about: string }).about).toBe('模板 B');
+
+        await rendered.unmount();
+    });
+
     it('shows a notice and preserves dirty state when an autosave fails', async () => {
         invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
             if (command === 'save_template') {
@@ -364,27 +530,37 @@ describe('HomePage publish content pipeline', () => {
     }
 
     it('back-fills rendered HTML into the persisted and published template for HTML-preferring sites', async () => {
+        vi.useFakeTimers();
         mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
 
         const rendered = await renderElement(<HomePage />);
-        await flushAsync();
+        try {
+            await flushAsync();
 
-        await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
+            await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
 
-        const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
-        const saveCalls = findInvokeArgs('save_template');
-        const publishCalls = findInvokeArgs('publish');
-        expect(saveCalls.length).toBeGreaterThanOrEqual(1);
-        expect(publishCalls).toHaveLength(1);
+            const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
+            const saveCalls = findInvokeArgs('save_template');
+            const publishCalls = findInvokeArgs('publish');
+            expect(saveCalls.length).toBeGreaterThanOrEqual(1);
+            expect(publishCalls).toHaveLength(1);
 
-        const persistedTemplate = (saveCalls[saveCalls.length - 1] as { template: { description_html: string } }).template;
-        expect(persistedTemplate.description_html).toBe(expectedHtml);
+            const persistedTemplate = (saveCalls[saveCalls.length - 1] as { template: { description_html: string } }).template;
+            expect(persistedTemplate.description_html).toBe(expectedHtml);
 
-        const publishRequest = (publishCalls[0] as { request: { template: { description_html: string; description: string } } }).request;
-        expect(publishRequest.template.description).toBe('**markdown 简介**');
-        expect(publishRequest.template.description_html).toBe(expectedHtml);
+            const publishRequest = (publishCalls[0] as { request: { template: { description_html: string; description: string } } }).request;
+            expect(publishRequest.template.description).toBe('**markdown 简介**');
+            expect(publishRequest.template.description_html).toBe(expectedHtml);
 
-        await rendered.unmount();
+            const savesAfterPublish = saveCalls.length;
+            await act(async () => {
+                await vi.advanceTimersByTimeAsync(AUTOSAVE_DEBOUNCE_MS + 1);
+            });
+            expect(findInvokeArgs('save_template')).toHaveLength(savesAfterPublish);
+        } finally {
+            await rendered.unmount();
+            vi.useRealTimers();
+        }
     });
 
     it('leaves description_html empty when only markdown-required sites are selected', async () => {

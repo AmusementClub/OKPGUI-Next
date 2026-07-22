@@ -10,6 +10,7 @@ describe('shared publish formatters (K4 canonical strings)', () => {
     it('labels a missing publish timestamp as 未发布', () => {
         expect(formatTemplateTimestamp('')).toBe('未发布');
         expect(formatTemplateTimestamp('   ')).toBe('未发布');
+        expect(formatTemplateTimestamp('', '未保存')).toBe('未保存');
     });
 
     it('labels a missing published version as 不适用', () => {
@@ -20,6 +21,16 @@ describe('shared publish formatters (K4 canonical strings)', () => {
                 last_published_resolution: '',
             }),
         ).toBe('不适用');
+        expect(
+            getPublishedVersionLabel(
+                {
+                    last_published_at: '',
+                    last_published_episode: '',
+                    last_published_resolution: '',
+                },
+                '未发布',
+            ),
+        ).toBe('未发布');
     });
 
     it('combines episode and resolution when both are present', () => {

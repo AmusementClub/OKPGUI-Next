@@ -319,9 +319,9 @@ export function createTemplateIdFromName(name: string, fallbackPrefix: string): 
     return `${fallbackBase}${suffix}`;
 }
 
-export function formatTemplateTimestamp(value: string): string {
+export function formatTemplateTimestamp(value: string, fallback = '未发布'): string {
     if (!value.trim()) {
-        return '未发布';
+        return fallback;
     }
 
     const timestamp = Date.parse(value);
@@ -345,7 +345,10 @@ export function createUpdatedAtTimestamp(): string {
     return new Date().toISOString();
 }
 
-export function getPublishedVersionLabel(entry: SitePublishHistoryEntry): string {
+export function getPublishedVersionLabel(
+    entry: SitePublishHistoryEntry,
+    fallback = '不适用',
+): string {
     const episode = entry.last_published_episode.trim();
     const resolution = entry.last_published_resolution.trim();
 
@@ -353,7 +356,7 @@ export function getPublishedVersionLabel(entry: SitePublishHistoryEntry): string
         return `${episode} / ${resolution}`;
     }
 
-    return episode || resolution || '不适用';
+    return episode || resolution || fallback;
 }
 
 export function buildLegacyPublishTemplatePayload(

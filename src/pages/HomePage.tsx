@@ -431,42 +431,48 @@ export default function HomePage() {
     const persistTemplateToDisk = async (
         templateToSave: Template = withSelectedProfile(templateRef.current),
         explicitName?: string,
+        expectedEditorSnapshot?: string,
     ) => {
         const name = getTemplateName(explicitName);
-        const preSaveSnapshot = serializeForComparison(templateToSave);
+        const capturedTemplateName = currentTemplateNameRef.current;
+        const preSaveSnapshot = expectedEditorSnapshot ?? serializeForComparison(templateToSave);
 
         try {
             const saved = await invoke<ImportedTemplatePayload>('save_template', {
                 name,
                 template: templateToSave,
-                previousName: currentTemplateName || undefined,
+                previousName: capturedTemplateName || undefined,
             });
             const nextTemplate = normalizeTemplate(saved.template);
 
-            lastPersistedDescriptionRef.current = nextTemplate.description;
-            lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
-            // Only apply the saved template when the editor was not touched while the
-            // save was in flight; otherwise the response would clobber fresh keystrokes.
-            // Compare with the same profile augmentation as the pre-save snapshot so a
-            // profile switch does not silently disable the guard.
-            if (
-                serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
-                === preSaveSnapshot
-            ) {
-                setTemplate(nextTemplate);
-                setNewTemplateName('');
+            if (currentTemplateNameRef.current === capturedTemplateName) {
+                lastPersistedDescriptionRef.current = nextTemplate.description;
+                lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+                // Only apply the saved template when the editor was not touched while the
+                // save was in flight; otherwise the response would clobber fresh keystrokes.
+                // Compare with the same profile augmentation as the pre-save snapshot so a
+                // profile switch does not silently disable the guard.
+                if (
+                    serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
+                    === preSaveSnapshot
+                ) {
+                    setTemplate(nextTemplate);
+                    setNewTemplateName('');
+                }
+                setCurrentTemplateName(saved.name);
             }
-            setCurrentTemplateName(saved.name);
             await refreshTemplateOptions();
             return { name: saved.name, template: nextTemplate };
         } catch (e) {
             console.error('保存模板失败:', e);
-            // Surface autosave failures too, and leave the dirty state intact so the
-            // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
-            showNotice({
-                title: '保存模板失败',
-                message: typeof e === 'string' ? e : '保存模板失败。',
-            });
+            if (currentTemplateNameRef.current === capturedTemplateName) {
+                // Surface autosave failures too, and leave the dirty state intact so the
+                // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
+                showNotice({
+                    title: '保存模板失败',
+                    message: typeof e === 'string' ? e : '保存模板失败。',
+                });
+            }
             return null;
         }
     };
@@ -876,11 +882,11 @@ export default function HomePage() {
         const publishTemplateName = getTemplateName();
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
         let templateToPublish = withSelectedProfile(template, selectedProfile);
+        const preBackfillSnapshot = serializeForComparison(templateToPublish);
 
         // Back-fill rendered HTML for HTML-preferring sites before validating and
-        // persisting, so preview == persisted == published. The editor state is
-        // updated too, otherwise the next editor-driven persist would re-save the
-        // empty html and revert the back-fill on disk.
+        // persisting, so preview == persisted == published. The persisted response
+        // updates the editor after the refs are current, avoiding a redundant autosave.
         if (
             templateToPublish.description.trim()
             && !templateToPublish.description_html.trim()
@@ -890,7 +896,6 @@ export default function HomePage() {
                 ...templateToPublish,
                 description_html: renderMarkdownToHtml(templateToPublish.description),
             };
-            setTemplate(templateToPublish);
         }
 
         const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);
@@ -922,7 +927,11 @@ export default function HomePage() {
             return;
         }
 
-        const saved = await persistTemplateToDisk(templateToPublish, publishTemplateName);
+        const saved = await persistTemplateToDisk(
+            templateToPublish,
+            publishTemplateName,
+            preBackfillSnapshot,
+        );
         if (!saved) {
             return;
         }

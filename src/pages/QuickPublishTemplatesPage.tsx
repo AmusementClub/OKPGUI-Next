@@ -328,7 +328,7 @@ export default function QuickPublishTemplatesPage() {
                                                         {template.summary || '暂无说明'}
                                                     </p>
                                                     <p className="mt-2 text-[11px] text-slate-500">
-                                                        最近更新 {formatTemplateTimestamp(template.updated_at)}
+                                                        最近更新 {formatTemplateTimestamp(template.updated_at, '未保存')}
                                                     </p>
                                                 </div>
                                             </div>
@@ -629,10 +629,10 @@ export default function QuickPublishTemplatesPage() {
                                                 {quickPublishSiteLabels[siteKey]}
                                             </div>
                                             <div className="mt-2 text-xs text-slate-500">
-                                                最近发布时间 {formatTemplateTimestamp(history.last_published_at)}
+                                                最近发布时间 {formatTemplateTimestamp(history.last_published_at, '未保存')}
                                             </div>
                                             <div className="mt-1 text-sm text-slate-300">
-                                                最近发布版本 {getPublishedVersionLabel(history)}
+                                                最近发布版本 {getPublishedVersionLabel(history, '未发布')}
                                             </div>
                                         </div>
                                     );

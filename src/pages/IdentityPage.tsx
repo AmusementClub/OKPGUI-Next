@@ -210,6 +210,7 @@ export default function IdentityPage() {
     const captureRequestIdRef = useRef(0);
     const captureSessionIdRef = useRef<string | null>(null);
     const profileRef = useLatest(profile);
+    const currentProfileNameRef = useLatest(currentProfileName);
     const cookiePanels = useMemo(
         () =>
             cookieSites.map((site) => {
@@ -292,21 +293,24 @@ export default function IdentityPage() {
             trimEntityName(currentProfileName) ||
             trimEntityName(newProfileName) ||
             'default';
+        const capturedProfileName = currentProfileNameRef.current;
         const preSaveSnapshot = serializeForComparison(profileToSave);
 
         try {
             const saved = await invoke<SavedProfilePayload>('save_profile', {
                 name,
                 profile: profileToSave,
-                previousName: currentProfileName || undefined,
+                previousName: capturedProfileName || undefined,
             });
-            // Only apply the saved profile when the form was not touched while the
-            // save was in flight; otherwise the response would clobber fresh edits.
-            if (serializeForComparison(profileRef.current) === preSaveSnapshot) {
-                setProfile(normalizeProfile(saved.profile));
-                setNewProfileName('');
+            if (currentProfileNameRef.current === capturedProfileName) {
+                // Only apply the saved profile when the form was not touched while the
+                // save was in flight; otherwise the response would clobber fresh edits.
+                if (serializeForComparison(profileRef.current) === preSaveSnapshot) {
+                    setProfile(normalizeProfile(saved.profile));
+                    setNewProfileName('');
+                }
+                setCurrentProfileName(saved.name);
             }
-            setCurrentProfileName(saved.name);
             await loadProfileList();
             return true;
         } catch (error) {
@@ -315,7 +319,10 @@ export default function IdentityPage() {
             // dropped autosave would leave the user editing unsaved state.
             const isDuplicateNameError =
                 typeof error === 'string' && error.includes('已存在同名');
-            if (explicitName || isDuplicateNameError) {
+            if (
+                currentProfileNameRef.current === capturedProfileName
+                && (explicitName || isDuplicateNameError)
+            ) {
                 showNotice({
                     title: '保存配置失败',
                     message: typeof error === 'string' ? error : '保存配置失败。',
@@ -940,4 +947,3 @@ export default function IdentityPage() {
         </>
     );
 }
-

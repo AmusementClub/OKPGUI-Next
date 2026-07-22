@@ -8,6 +8,7 @@ vi.mock('@tauri-apps/api/core', () => ({
 
 import { invoke } from '@tauri-apps/api/core';
 import IdentityPage from './IdentityPage';
+import { deferred } from '../test-utils/react';
 import { emptySiteCookies } from '../utils/cookieUtils';
 
 const invokeMock = vi.mocked(invoke);
@@ -233,5 +234,145 @@ describe('IdentityPage stale-save guard', () => {
         });
 
         expect(uaInput.value).toBe('UA-1');
+    });
+
+    it('keeps profile beta identity and body when profile alpha save resolves late', async () => {
+        const firstSave = deferred<{ name: string; profile: Record<string, unknown> }>();
+        const saveCalls: Record<string, unknown>[] = [];
+        const alpha = { ...makeProfile(), user_agent: 'UA-alpha' };
+        const beta = { ...makeProfile(), user_agent: 'UA-beta' };
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_profile_list':
+                    return Promise.resolve(['alpha', 'beta']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        last_used: 'alpha',
+                        profiles: { alpha, beta },
+                    });
+                case 'save_profile': {
+                    const saveArgs = typedArgs ?? {};
+                    saveCalls.push(saveArgs);
+                    if (saveCalls.length === 1) {
+                        return firstSave.promise;
+                    }
+                    return Promise.resolve({ name: saveArgs.name, profile: saveArgs.profile });
+                }
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        await act(async () => {
+            root.render(<IdentityPage />);
+        });
+
+        const uaInput = findInput('留空则使用默认UA');
+        await typeInto(uaInput, 'UA-alpha-edited');
+        await act(async () => {
+            uaInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await Promise.resolve();
+        });
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].name).toBe('alpha');
+
+        const profileSelect = container.querySelector('select') as HTMLSelectElement;
+        await act(async () => {
+            profileSelect.value = 'beta';
+            profileSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            await Promise.resolve();
+        });
+        expect(profileSelect.value).toBe('beta');
+        expect(uaInput.value).toBe('UA-beta');
+
+        await act(async () => {
+            firstSave.resolve({
+                name: 'alpha',
+                profile: saveCalls[0].profile as Record<string, unknown>,
+            });
+            await Promise.resolve();
+        });
+        expect(profileSelect.value).toBe('beta');
+        expect(uaInput.value).toBe('UA-beta');
+
+        await typeInto(uaInput, 'UA-beta-edited');
+        await act(async () => {
+            uaInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await Promise.resolve();
+        });
+
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].name).toBe('beta');
+        expect(saveCalls[1].previousName).toBe('beta');
+        expect((saveCalls[1].profile as { user_agent: string }).user_agent).toBe('UA-beta-edited');
+    });
+
+    it('suppresses stale alpha rejection after switch to beta with no failure notice', async () => {
+        const firstSave = deferred<{ name: string; profile: Record<string, unknown> }>();
+        const saveCalls: Record<string, unknown>[] = [];
+        const alpha = { ...makeProfile(), user_agent: 'UA-alpha' };
+        const beta = { ...makeProfile(), user_agent: 'UA-beta' };
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_profile_list':
+                    return Promise.resolve(['alpha', 'beta']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        last_used: 'alpha',
+                        profiles: { alpha, beta },
+                    });
+                case 'save_profile': {
+                    const saveArgs = typedArgs ?? {};
+                    saveCalls.push(saveArgs);
+                    if (saveCalls.length === 1) {
+                        return firstSave.promise;
+                    }
+                    return Promise.resolve({ name: saveArgs.name, profile: saveArgs.profile });
+                }
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        await act(async () => {
+            root.render(<IdentityPage />);
+        });
+
+        const uaInput = findInput('留空则使用默认UA');
+        await typeInto(uaInput, 'UA-alpha-edited');
+        await act(async () => {
+            uaInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await Promise.resolve();
+        });
+        expect(saveCalls).toHaveLength(1);
+        expect(saveCalls[0].name).toBe('alpha');
+
+        const profileSelect = container.querySelector('select') as HTMLSelectElement;
+        await act(async () => {
+            profileSelect.value = 'beta';
+            profileSelect.dispatchEvent(new Event('change', { bubbles: true }));
+            await Promise.resolve();
+        });
+        expect(profileSelect.value).toBe('beta');
+        expect(uaInput.value).toBe('UA-beta');
+
+        await act(async () => {
+            firstSave.reject('已存在同名身份配置: alpha');
+            await Promise.resolve();
+        });
+        expect(document.body.textContent).not.toContain('保存配置失败');
+
+        await typeInto(uaInput, 'UA-beta-edited');
+        await act(async () => {
+            uaInput.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await Promise.resolve();
+        });
+
+        expect(saveCalls).toHaveLength(2);
+        expect(saveCalls[1].name).toBe('beta');
+        expect(saveCalls[1].previousName).toBe('beta');
+        expect((saveCalls[1].profile as { user_agent: string }).user_agent).toBe('UA-beta-edited');
     });
 });
