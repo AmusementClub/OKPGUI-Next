@@ -130,16 +130,6 @@ export function useQuickPublishRuntimeDraft({
         invalidateTitleGeneration();
     }, [invalidateTitleGeneration]);
 
-    // Shared identity guard used by all async paths (P1 races)
-    const isLatestRequest = useCallback((requestGeneration: number, torrentGeneration: number, manualEditGeneration: number) => {
-        return (
-            titleGenerationRef.current === requestGeneration &&
-            torrentSelectionGenerationRef.current === torrentGeneration &&
-            manualTitleEditGenerationRef.current === manualEditGeneration &&
-            (torrentSelectionGenerationRef.current === 0 || true) // basic template check placeholder
-        );
-    }, []);
-
     const activeTemplate = useMemo(
         () => (selectedTemplateId ? quickPublishTemplates[selectedTemplateId] ?? null : null),
         [quickPublishTemplates, selectedTemplateId],
