@@ -18,22 +18,6 @@ pub struct ParsedTitleDetails {
     pub resolution: String,
 }
 
-fn extract_named_value(filename: &str, pattern: &str, group_name: &str) -> Result<String, String> {
-    if pattern.trim().is_empty() {
-        return Ok(String::new());
-    }
-
-    let re = Regex::new(pattern).map_err(|e| format!("正则表达式错误: {}", e))?;
-    let caps = re
-        .captures(filename)
-        .ok_or_else(|| "未匹配到内容".to_string())?;
-
-    Ok(caps
-        .name(group_name)
-        .map(|matched| matched.as_str().to_string())
-        .unwrap_or_default())
-}
-
 fn captures_to_map(re: &Regex, caps: &regex::Captures<'_>) -> HashMap<String, String> {
     let mut values = HashMap::new();
     for name in re.capture_names().flatten() {
@@ -92,50 +76,59 @@ fn collect_named_capture_matches(
 /// e.g. `[02v2]`. The digit run inside `v2` is not an episode number, but a
 /// generic ep pattern like `\d{1,3}` still matches it, and the
 /// closest-before-resolution heuristic then prefers it over the real
-/// episode. Drop candidates whose ep capture is immediately preceded by
-/// `v`/`V`; if every candidate is filtered out, keep the original list so
-/// behavior for titles that only contain a revision marker is unchanged.
+/// episode. Drop an ep capture when its digits immediately follow `v`/`V` and
+/// that marker either follows an episode digit (`02v2`) or starts its own token
+/// (` v2`, `[V3]`). Word-internal forms like `MV03` remain eligible episodes.
 fn filter_revision_marker_candidates(
     filename: &str,
     matches: Vec<NamedCaptureMatch>,
 ) -> Vec<NamedCaptureMatch> {
-    // An ep capture immediately preceded by `v`/`V` is the digit run of a
-    // revision marker (`v2`), not an episode. UTF-8 safe: continuation bytes
-    // are >= 0x80 and can never equal `v`/`V`.
     let is_revision_marker = |episode_match: &&NamedCaptureMatch| {
-        episode_match.start > 0
-            && matches!(filename.as_bytes()[episode_match.start - 1], b'v' | b'V')
+        let start = episode_match.start;
+        let Some(marker_start) = start.checked_sub(1) else {
+            return false;
+        };
+        if !matches!(filename.as_bytes()[marker_start], b'v' | b'V') {
+            return false;
+        }
+
+        match filename[..marker_start].chars().next_back() {
+            None => true,
+            Some(previous) => {
+                previous.is_ascii_digit() || (!previous.is_alphanumeric() && previous != '_')
+            }
+        }
     };
-    let kept: Vec<NamedCaptureMatch> = matches
+    matches
         .iter()
         .filter(|episode_match| !is_revision_marker(episode_match))
         .cloned()
-        .collect();
-
-    if kept.is_empty() {
-        matches
-    } else {
-        kept
-    }
+        .collect()
 }
 
 fn choose_episode_match<'a>(
     episode_matches: &'a [NamedCaptureMatch],
     resolution_match: Option<&NamedCaptureMatch>,
 ) -> Option<&'a NamedCaptureMatch> {
-    if episode_matches.len() <= 1 {
-        return episode_matches.first();
-    }
-
     let Some(resolution_match) = resolution_match else {
         return episode_matches.first();
     };
 
+    // Prefer the candidate closest before the resolution; when nothing is
+    // before it (resolution-first filenames), fall back to the closest
+    // candidate after it.
     episode_matches
         .iter()
         .filter(|episode_match| episode_match.end <= resolution_match.start)
         .min_by_key(|episode_match| resolution_match.start.saturating_sub(episode_match.end))
-        .or_else(|| episode_matches.first())
+        .or_else(|| {
+            episode_matches
+                .iter()
+                .filter(|episode_match| episode_match.start >= resolution_match.end)
+                .min_by_key(|episode_match| {
+                    episode_match.start.saturating_sub(resolution_match.end)
+                })
+        })
 }
 
 fn build_title(
@@ -176,16 +169,46 @@ fn parse_title_details_internal(
     let requires_resolution = title_pattern.contains("<res>");
     let ep_captures = extract_named_captures(filename, ep_pattern)?;
     let resolution_captures = extract_named_captures(filename, resolution_pattern)?;
-    let episode_matches = collect_named_capture_matches(filename, ep_pattern, "ep")?;
-    let episode_matches = filter_revision_marker_candidates(filename, episode_matches);
+    let raw_episode_matches = collect_named_capture_matches(filename, ep_pattern, "ep")?;
+    let had_raw_episode_matches = !raw_episode_matches.is_empty();
+    let episode_matches = filter_revision_marker_candidates(filename, raw_episode_matches);
     let resolution_matches = collect_named_capture_matches(filename, resolution_pattern, "res")?;
 
-    let selected_resolution_match = resolution_matches.first();
-    let selected_episode_match = choose_episode_match(&episode_matches, selected_resolution_match);
+    // Prefer the LAST resolution match: release filenames conventionally put
+    // the authoritative resolution token last (e.g. `[Group] 720p ... [1080p]`).
+    let selected_resolution_match = resolution_matches
+        .iter()
+        .max_by_key(|matched| matched.start);
+
+    // Exclude episode candidates whose byte range intersects ANY resolution
+    // match: a generic ep pattern like `\d{1,3}` matches the `108` fragment
+    // inside `1080p`, which is never an episode number regardless of which
+    // resolution token gets selected.
+    let episode_candidates: Vec<NamedCaptureMatch> = episode_matches
+        .iter()
+        .filter(|episode_match| {
+            resolution_matches.iter().all(|resolution_match| {
+                episode_match.end <= resolution_match.start
+                    || episode_match.start >= resolution_match.end
+            })
+        })
+        .cloned()
+        .collect();
+    let selected_episode_match =
+        choose_episode_match(&episode_candidates, selected_resolution_match);
 
     let episode = selected_episode_match
         .map(|matched| matched.value.clone())
-        .or_else(|| ep_captures.get("ep").cloned())
+        .or_else(|| {
+            // Only fall back to the raw first capture when no `ep` group ever
+            // participated in a match; otherwise an excluded overlapping
+            // fragment like `108` inside `1080p` would resurface here.
+            if !had_raw_episode_matches {
+                ep_captures.get("ep").cloned()
+            } else {
+                None
+            }
+        })
         .unwrap_or_default();
     let resolution = selected_resolution_match
         .map(|matched| matched.value.clone())
@@ -203,6 +226,10 @@ fn parse_title_details_internal(
     }
     if !episode.is_empty() {
         replacements.insert("ep".to_string(), episode.clone());
+    } else {
+        // An excluded overlapping fragment (e.g. `108` inside `1080p`) must
+        // not leak into `<ep>` substitution via the raw first capture.
+        replacements.remove("ep");
     }
     if !resolution.is_empty() {
         replacements.insert("res".to_string(), resolution.clone());
@@ -232,98 +259,57 @@ pub fn parse_title_details(
     parse_title_details_internal(&filename, &ep_pattern, &resolution_pattern, &title_pattern)
 }
 
-#[tauri::command]
-pub fn match_title(
-    filename: String,
-    ep_pattern: String,
-    resolution_pattern: String,
-    title_pattern: String,
-) -> Result<String, String> {
-    Ok(
-        parse_title_details_internal(&filename, &ep_pattern, &resolution_pattern, &title_pattern)?
-            .title,
-    )
-}
-
-#[tauri::command]
-pub fn extract_episode_value(filename: String, ep_pattern: String) -> Result<String, String> {
-    extract_named_value(&filename, &ep_pattern, "ep")
-}
-
-#[tauri::command]
-pub fn extract_resolution_value(
-    filename: String,
-    resolution_pattern: String,
-) -> Result<String, String> {
-    extract_named_value(&filename, &resolution_pattern, "res")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn test_match_title_basic() {
+    fn test_parse_title_details_basic_group_first() {
         let filename = "[Group] Title - 01 [1080p].mkv";
         let ep_pattern =
             r"\[(?P<group>.+?)\]\s*(?P<title>.+?)\s*-\s*(?P<ep>\d+)\s*\[(?P<res>\d+p)\]";
         let resolution_pattern = r"\[(?P<res>\d+p)\]";
         let title_pattern = "[<group>] <title> - <ep> [<res>]";
 
-        let result = match_title(
+        let result = parse_title_details(
             filename.to_string(),
             ep_pattern.to_string(),
             resolution_pattern.to_string(),
             title_pattern.to_string(),
-        );
+        )
+        .unwrap();
 
-        assert!(result.is_ok());
-        let title = result.unwrap();
-        assert_eq!(title, "[Group] Title - 01 [1080p]");
+        assert_eq!(result.title, "[Group] Title - 01 [1080p]");
+        assert_eq!(result.episode, "01");
+        assert_eq!(result.resolution, "1080p");
     }
 
     #[test]
-    fn test_match_title_no_match() {
-        let result = match_title(
+    fn test_parse_title_details_no_match_yields_empty_title() {
+        let result = parse_title_details(
             "no_match_file.mkv".to_string(),
             r"(?P<ep>\d{2})".to_string(),
             r"(?P<res>\d{3,4}p)".to_string(),
             "Episode <ep>".to_string(),
-        );
+        )
+        .unwrap();
 
-        assert_eq!(result.unwrap(), "");
+        assert_eq!(result.title, "");
+        assert_eq!(result.episode, "");
+        assert_eq!(result.resolution, "");
     }
 
     #[test]
-    fn test_match_title_empty_pattern() {
-        let result = match_title(
+    fn test_parse_title_details_empty_pattern() {
+        let result = parse_title_details(
             "file.mkv".to_string(),
             String::new(),
             String::new(),
             "title".to_string(),
-        );
-        assert_eq!(result.unwrap(), "");
-    }
+        )
+        .unwrap();
 
-    #[test]
-    fn test_extract_episode_value() {
-        let result = extract_episode_value(
-            "[Group] Title - 12 [1080p].mkv".to_string(),
-            r"\[(?P<group>.+?)\]\s*(?P<title>.+?)\s*-\s*(?P<ep>\d+)\s*\[(?P<res>\d+p)\]"
-                .to_string(),
-        );
-
-        assert_eq!(result.unwrap(), "12");
-    }
-
-    #[test]
-    fn test_extract_resolution_value() {
-        let result = extract_resolution_value(
-            "[Group] Title - 12 [1080p].mkv".to_string(),
-            r"\[(?P<res>\d+p)\]".to_string(),
-        );
-
-        assert_eq!(result.unwrap(), "1080p");
+        assert_eq!(result.title, "");
     }
 
     #[test]
@@ -442,9 +428,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_title_details_falls_back_when_only_revision_marker_matches() {
-        // The only digit run is inside a revision marker: filtering would
-        // leave no candidates, so the pre-fix behavior is preserved.
+    fn test_parse_title_details_ignores_lone_revision_marker() {
         let filename = "Some Movie v2.mkv";
         let result = parse_title_details(
             filename.to_string(),
@@ -454,14 +438,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result.episode, "2");
+        assert_eq!(result.episode, "");
     }
 
     #[test]
-    fn test_match_title_pairs_generic_episode_before_named_resolution() {
-        let filename =
-            "[Nekomoe kissaten][Azur Lane - Bisoku Zenshin! S2][01][1080p][JPSC].mp4.torrent";
-        let result = match_title(
+    fn test_parse_title_details_ignores_standalone_revision_before_resolution() {
+        let filename = "Some Movie v2 [1080p].mkv";
+        let result = parse_title_details(
             filename.to_string(),
             DEFAULT_EP_PATTERN.to_string(),
             DEFAULT_RESOLUTION_PATTERN.to_string(),
@@ -469,7 +452,165 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(result, "[01][1080p]");
+        assert_eq!(result.episode, "");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "");
+    }
+
+    #[test]
+    fn test_parse_title_details_keeps_episode_before_standalone_revision() {
+        let filename = "Season 2 v12 [1080p].mkv";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "2");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[2][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_keeps_episode_inside_word_before_v() {
+        // `V` in `MV03` is part of a word, not a revision marker; keep `03`.
+        let filename = "Title 2024 MV03 [1080p]";
+        let result = parse_title_details(
+            filename.to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "03");
+        assert_eq!(result.resolution, "1080p");
+    }
+
+    #[test]
+    fn test_parse_title_details_episode_after_resolution() {
+        let result = parse_title_details(
+            "Movie 1080p 05.mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "05");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[05][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_dual_resolution_prefers_last() {
+        let result = parse_title_details(
+            "[Group] 720p Pilot - 01 [1080p].mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[01][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_episode_candidate_inside_resolution_yields_empty() {
+        // The only digit run is inside the resolution token: excluding the
+        // overlap leaves no episode, which is better than reporting `108`.
+        let result = parse_title_details(
+            "Movie 1080p.mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "");
+    }
+
+    #[test]
+    fn test_parse_title_details_resolution_first_episode_after() {
+        let result = parse_title_details(
+            "[1080p] Movie - 05.mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "05");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[05][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_dotted_scene_style() {
+        let result = parse_title_details(
+            "Show.Name.S01E05.1080p.WEB-DL.mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "05");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[05][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_dual_resolution_last_wins_even_if_lower() {
+        // Pin the last-match heuristic: with two resolution tokens the
+        // trailing one is selected, whichever it is.
+        let result = parse_title_details(
+            "[Group] Title - 01 [1080p][720p].mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01");
+        assert_eq!(result.resolution, "720p");
+        assert_eq!(result.title, "[01][720p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_resolution_last_episode_range() {
+        let result = parse_title_details(
+            "[Group] Title [1080p] [01-12].mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "01-12");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[01-12][1080p]");
+    }
+
+    #[test]
+    fn test_parse_title_details_revision_marker_with_episode_after_resolution() {
+        let result = parse_title_details(
+            "Title 1080p 03v2.mkv".to_string(),
+            DEFAULT_EP_PATTERN.to_string(),
+            DEFAULT_RESOLUTION_PATTERN.to_string(),
+            "[<ep>][<res>]".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(result.episode, "03");
+        assert_eq!(result.resolution, "1080p");
+        assert_eq!(result.title, "[03][1080p]");
     }
 
     #[test]

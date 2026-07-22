@@ -13,6 +13,8 @@ export interface PublishConfirmSiteSummary {
 interface PublishConfirmModalProps {
     isOpen: boolean;
     onClose: () => void;
+    /** Commit episode/resolution edits back to the runtime draft and close. */
+    onReturnToEdit: () => void;
     onConfirm: (options: { autoOpenConsole: boolean }) => void;
     title: string;
     templateLabel: string;
@@ -63,6 +65,23 @@ export function LocalPublishRecordFields({
     PublishConfirmModalProps,
     'episode' | 'resolution' | 'onEpisodeChange' | 'onResolutionChange'
 >) {
+    const fields = [
+        {
+            key: 'episode',
+            label: '集数',
+            value: episode,
+            onChange: onEpisodeChange,
+            ariaLabel: '本地发布记录集数',
+        },
+        {
+            key: 'resolution',
+            label: '分辨率',
+            value: resolution,
+            onChange: onResolutionChange,
+            ariaLabel: '本地发布记录分辨率',
+        },
+    ] as const;
+
     return (
         <section className="flex flex-col gap-2 rounded-lg border border-slate-800/80 bg-slate-900/40 px-3.5 py-2.5">
             <div className="font-mono text-[11px] tracking-[0.14em] uppercase text-slate-500">
@@ -72,28 +91,19 @@ export function LocalPublishRecordFields({
                 仅用于本地发布历史，不会修改最终标题或站点发布内容。
             </p>
             <div className="grid gap-2 sm:grid-cols-2">
-                <label className="block min-w-0 text-xs text-slate-400">
-                    <span className="mb-1 block text-slate-500">集数</span>
-                    <input
-                        type="text"
-                        value={episode}
-                        onChange={(event) => onEpisodeChange(event.target.value)}
-                        placeholder="可选"
-                        aria-label="本地发布记录集数"
-                        className="w-full rounded-lg border border-slate-700/80 bg-slate-900/70 px-2.5 py-1.5 font-mono text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-500"
-                    />
-                </label>
-                <label className="block min-w-0 text-xs text-slate-400">
-                    <span className="mb-1 block text-slate-500">分辨率</span>
-                    <input
-                        type="text"
-                        value={resolution}
-                        onChange={(event) => onResolutionChange(event.target.value)}
-                        placeholder="可选"
-                        aria-label="本地发布记录分辨率"
-                        className="w-full rounded-lg border border-slate-700/80 bg-slate-900/70 px-2.5 py-1.5 font-mono text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-500"
-                    />
-                </label>
+                {fields.map((field) => (
+                    <label key={field.key} className="block min-w-0 text-xs text-slate-400">
+                        <span className="mb-1 block text-slate-500">{field.label}</span>
+                        <input
+                            type="text"
+                            value={field.value}
+                            onChange={(event) => field.onChange(event.target.value)}
+                            placeholder="可选"
+                            aria-label={field.ariaLabel}
+                            className="w-full rounded-lg border border-slate-700/80 bg-slate-900/70 px-2.5 py-1.5 font-mono text-xs text-slate-300 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-slate-500"
+                        />
+                    </label>
+                ))}
             </div>
         </section>
     );
@@ -102,6 +112,7 @@ export function LocalPublishRecordFields({
 export default function PublishConfirmModal({
     isOpen,
     onClose,
+    onReturnToEdit,
     onConfirm,
     title,
     templateLabel,
@@ -350,7 +361,7 @@ export default function PublishConfirmModal({
                                     </button>
                                     <button
                                         type="button"
-                                        onClick={onClose}
+                                        onClick={onReturnToEdit}
                                         className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3.5 py-2 text-xs font-medium text-slate-200 transition-colors hover:bg-slate-700"
                                     >
                                         <ChevronLeft size={13} />

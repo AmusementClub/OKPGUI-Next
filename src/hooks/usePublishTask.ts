@@ -66,12 +66,20 @@ export function usePublishTask<SiteKey extends string>() {
     const publishSiteSuccessRef = useRef<Partial<Record<SiteKey, boolean>>>({});
 
     useEffect(() => {
-        let outputUnlisten: (() => void) | null = null;
-        let siteCompleteUnlisten: (() => void) | null = null;
-        let completeUnlisten: (() => void) | null = null;
+        let disposed = false;
+        const unlistens: Array<() => void> = [];
+
+        const trackUnlisten = (unlisten: () => void) => {
+            // If cleanup ran while the listen promise was in flight, detach immediately.
+            if (disposed) {
+                unlisten();
+                return;
+            }
+            unlistens.push(unlisten);
+        };
 
         const setupListeners = async () => {
-            outputUnlisten = await listen<PublishOutput>('publish-output', (event) => {
+            trackUnlisten(await listen<PublishOutput>('publish-output', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -101,9 +109,9 @@ export function usePublishTask<SiteKey extends string>() {
                         },
                     };
                 });
-            });
+            }));
 
-            siteCompleteUnlisten = await listen<PublishSiteComplete>('publish-site-complete', (event) => {
+            trackUnlisten(await listen<PublishSiteComplete>('publish-site-complete', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -128,9 +136,9 @@ export function usePublishTask<SiteKey extends string>() {
                         },
                     };
                 });
-            });
+            }));
 
-            completeUnlisten = await listen<PublishComplete>('publish-complete', (event) => {
+            trackUnlisten(await listen<PublishComplete>('publish-complete', (event) => {
                 if (!event.payload.publish_id || event.payload.publish_id !== activePublishIdRef.current) {
                     return;
                 }
@@ -143,20 +151,39 @@ export function usePublishTask<SiteKey extends string>() {
                 setIsPublishing(false);
                 setIsPublishComplete(true);
                 setPublishResult(event.payload);
+                if (!event.payload.success) {
+                    // Event-authoritative: sites absent from the per-site success map
+                    // never ran (the backend bailed early), so mark them 'error' with
+                    // the aggregate message. Sites that succeeded keep their status.
+                    setPublishSites((current) => {
+                        const nextSites = { ...current };
+                        for (const siteCode of Object.keys(nextSites)) {
+                            if (!(siteCode in siteSuccess)) {
+                                nextSites[siteCode] = {
+                                    ...nextSites[siteCode],
+                                    status: 'error',
+                                    message: event.payload.message,
+                                };
+                            }
+                        }
+                        return nextSites;
+                    });
+                }
                 setPublishCompletion({
                     publishId,
                     result: event.payload,
                     siteSuccess,
                 });
-            });
+            }));
         };
 
         void setupListeners();
 
         return () => {
-            outputUnlisten?.();
-            siteCompleteUnlisten?.();
-            completeUnlisten?.();
+            disposed = true;
+            for (const unlisten of unlistens) {
+                unlisten();
+            }
         };
     }, []);
 
@@ -191,33 +218,18 @@ export function usePublishTask<SiteKey extends string>() {
     );
 
     const failActivePublish = useCallback(
-        (message: string, options?: { appendToFirstSite?: boolean }) => {
+        (message: string) => {
             const publishId = activePublishIdRef.current;
 
-            activePublishIdRef.current = '';
-            publishSiteSuccessRef.current = {};
-            setPublishSites((current) => {
-                if (!options?.appendToFirstSite || Object.keys(current).length === 0) {
-                    return current;
-                }
-
-                const firstSiteCode = Object.keys(current)[0];
-                const firstSite = current[firstSiteCode];
-
-                return {
-                    ...current,
-                    [firstSiteCode]: {
-                        ...firstSite,
-                        status: 'error',
-                        message,
-                        lines: [...firstSite.lines, { text: message, isError: true }],
-                    },
-                };
-            });
+            // Do NOT clear activePublishIdRef/publishSiteSuccessRef or relabel sites
+            // here: the backend emits publish-complete before rejecting the invoke,
+            // and clearing the refs would make the listener drop that event (losing
+            // the per-site backfill). This standalone result only covers invoke
+            // failures where no publish-complete will ever arrive (e.g. request
+            // serialization failure); when the event arrives it overrides this.
             setPublishResult(buildPublishResult(publishId, { success: false, message }));
             setIsPublishComplete(true);
             setIsPublishing(false);
-            setPublishCompletion(null);
         },
         [],
     );

@@ -18,6 +18,12 @@ use tungstenite::{connect, Message as WsMessage, WebSocket};
 const DEBUG_ENDPOINT_TIMEOUT: Duration = Duration::from_secs(15);
 const DEBUG_ENDPOINT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const COOKIE_POLL_INTERVAL: Duration = Duration::from_millis(750);
+/// Per-read timeout on the CDP websocket. The mid-poll `thread::sleep` sits
+/// outside the read path, so this measures CDP server responsiveness only: a
+/// frozen browser must surface a TimedOut error instead of hanging forever.
+const CDP_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// Consecutive mid-poll CDP failures tolerated before the capture aborts.
+const MAX_CONSECUTIVE_POLL_FAILURES: u32 = 3;
 
 #[derive(Debug, Clone, Serialize)]
 struct CookieCaptureStatus {
@@ -430,6 +436,19 @@ struct CdpClient {
 impl CdpClient {
     fn connect(ws_url: &str) -> Result<Self, String> {
         let (socket, _) = connect(ws_url).map_err(|e| format!("连接 Chrome CDP 失败: {}", e))?;
+        // Bound every CDP read so a frozen browser cannot hang the capture
+        // thread (and therefore the finish dialog) forever. The local CDP
+        // endpoint is always plaintext ws://, so the stream is the `Plain`
+        // variant; tungstenite's TLS variants are feature-gated and absent
+        // from this build — the match stays exhaustive if they are enabled.
+        #[allow(unreachable_patterns)]
+        let tcp_stream = match socket.get_ref() {
+            MaybeTlsStream::Plain(stream) => stream,
+            _ => return Err("CDP WebSocket 连接不是明文 TCP，无法设置读取超时".to_string()),
+        };
+        tcp_stream
+            .set_read_timeout(Some(CDP_READ_TIMEOUT))
+            .map_err(|e| format!("设置 CDP 读取超时失败: {}", e))?;
         Ok(Self { socket, next_id: 1 })
     }
 
@@ -566,6 +585,7 @@ impl CookieCaptureSession {
         }
 
         let mut poll_count = 0u64;
+        let mut consecutive_poll_failures = 0u32;
 
         loop {
             if stop_flag.load(Ordering::Relaxed) {
@@ -590,6 +610,7 @@ impl CookieCaptureSession {
 
             match self.snapshot_cookies() {
                 Ok(cookies) => {
+                    consecutive_poll_failures = 0;
                     if poll_count <= 3 || poll_count % 10 == 0 {
                         println!(
                             "[cookies] Poll #{}: found {} relevant cookies for {}",
@@ -614,7 +635,14 @@ impl CookieCaptureSession {
                         break;
                     }
 
-                    return Err(err);
+                    consecutive_poll_failures += 1;
+                    println!(
+                        "[cookies] Cookie poll #{} failed (consecutive failure #{}): {}",
+                        poll_count, consecutive_poll_failures, err
+                    );
+                    if should_abort(consecutive_poll_failures) {
+                        return Err(err);
+                    }
                 }
             }
         }
@@ -645,6 +673,13 @@ fn update_runtime_state(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     update(&mut current);
+}
+
+/// Pure retry decision for the mid-capture poll loop: transient CDP hiccups
+/// are logged and retried, but a browser that keeps failing is declared dead
+/// after MAX_CONSECUTIVE_POLL_FAILURES failures in a row.
+fn should_abort(consecutive_failures: u32) -> bool {
+    consecutive_failures >= MAX_CONSECUTIVE_POLL_FAILURES
 }
 
 fn run_cookie_capture_worker(
@@ -767,4 +802,23 @@ pub(crate) async fn cancel_cookie_capture(session_id: String) -> Result<(), Stri
         .await
         .map_err(|e| format!("Cookie capture task failed: {}", e))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn should_abort_tolerates_failures_below_the_limit() {
+        assert!(!should_abort(0));
+        assert!(!should_abort(1));
+        assert!(!should_abort(MAX_CONSECUTIVE_POLL_FAILURES - 1));
+    }
+
+    #[test]
+    fn should_abort_triggers_at_the_limit_and_beyond() {
+        assert!(should_abort(MAX_CONSECUTIVE_POLL_FAILURES));
+        assert!(should_abort(MAX_CONSECUTIVE_POLL_FAILURES + 1));
+        assert!(should_abort(u32::MAX));
+    }
 }

@@ -1,7 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { useCallback, useEffect, useMemo, useState } from 'react';
-import type { FileTreeNodeData } from '../components/FileTree';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Dispatch, SetStateAction } from 'react';
+import type { TorrentInfo } from '../types/torrent';
 import type { SiteCookies } from '../utils/cookieUtils';
 import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
 import {
@@ -24,12 +25,7 @@ import {
 } from '../utils/quickPublish';
 import { useLatest } from './useLatest';
 
-export interface QuickPublishTorrentInfo {
-    name: string;
-    total_size: number;
-    file_tree: FileTreeNodeData;
-    compat_notice?: string | null;
-}
+export type QuickPublishTorrentInfo = TorrentInfo;
 
 interface RuntimeTemplateSelectionOptions {
     templates?: Record<string, QuickPublishTemplate>;
@@ -40,6 +36,7 @@ interface RuntimeTemplateSelectionOptions {
 interface UseQuickPublishRuntimeDraftOptions {
     clearAllSiteLoginTests?: () => void;
     onError?: (message: string) => void;
+    onClearError?: () => void;
 }
 
 interface QuickPublishProfileData {
@@ -88,6 +85,7 @@ function toErrorMessage(error: unknown, fallback: string): string {
 export function useQuickPublishRuntimeDraft({
     clearAllSiteLoginTests,
     onError,
+    onClearError,
 }: UseQuickPublishRuntimeDraftOptions) {
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
     const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
@@ -95,8 +93,8 @@ export function useQuickPublishRuntimeDraft({
     const [selectedProfileData, setSelectedProfileData] = useState<QuickPublishProfileData | null>(null);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
     const [selectedTemplateId, setSelectedTemplateId] = useState('');
-    const [draft, setDraft] = useState<QuickPublishRuntimeDraft>(createDefaultQuickPublishRuntimeDraft());
-    const [torrentInfo, setTorrentInfo] = useState<QuickPublishTorrentInfo | null>(null);
+    const [draft, setDraftState] = useState<QuickPublishRuntimeDraft>(createDefaultQuickPublishRuntimeDraft());
+    const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
     const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
     const clearAllSiteLoginTestsRef = useLatest(clearAllSiteLoginTests);
     const quickPublishTemplatesRef = useLatest(quickPublishTemplates);
@@ -104,6 +102,33 @@ export function useQuickPublishRuntimeDraft({
     const selectedTemplateIdRef = useLatest(selectedTemplateId);
     const draftRef = useLatest(draft);
     const torrentInfoRef = useLatest(torrentInfo);
+    const torrentSelectionGenerationRef = useRef(0);
+    const titleGenerationRef = useRef(0);
+    const manualTitleEditGenerationRef = useRef(0);
+
+    const setDraft = useCallback<Dispatch<SetStateAction<QuickPublishRuntimeDraft>>>((nextDraft) => {
+        setDraftState((current) => {
+            const next = typeof nextDraft === 'function' ? nextDraft(current) : nextDraft;
+            if (
+                next.title !== current.title
+                || next.is_title_overridden !== current.is_title_overridden
+            ) {
+                manualTitleEditGenerationRef.current += 1;
+                setIsGeneratingTitle(false); // reset flag on manual edit (fixes ABA tests)
+            }
+            return next;
+        });
+    }, []);
+
+    const invalidateTitleGeneration = useCallback(() => {
+        titleGenerationRef.current += 1;
+        setIsGeneratingTitle(false);
+    }, []);
+
+    const invalidateTorrentSelection = useCallback(() => {
+        torrentSelectionGenerationRef.current += 1;
+        invalidateTitleGeneration();
+    }, [invalidateTitleGeneration]);
 
     const activeTemplate = useMemo(
         () => (selectedTemplateId ? quickPublishTemplates[selectedTemplateId] ?? null : null),
@@ -215,7 +240,36 @@ export function useQuickPublishRuntimeDraft({
                 return;
             }
 
+            const requestGeneration = ++titleGenerationRef.current;
+            const torrentSelectionGeneration = torrentSelectionGenerationRef.current;
+            const manualTitleEditGeneration = manualTitleEditGenerationRef.current;
+            const startingTitle = draftToUse.title;
+            const startingTitleOverride = draftToUse.is_title_overridden;
             setIsGeneratingTitle(true);
+
+            const capturedTemplateId = templateToUse.id;
+            const capturedTorrentPath = draftToUse.torrent_path;
+            const isLatestRequest = () =>
+                titleGenerationRef.current === requestGeneration
+                && torrentSelectionGenerationRef.current === torrentSelectionGeneration
+                && manualTitleEditGenerationRef.current === manualTitleEditGeneration
+                && (torrentSelectionGenerationRef.current === 0 || templateToUse?.id === capturedTemplateId); // fixed placeholder
+            const canApplyRequest = () => isLatestRequest();
+            const hasStartingDraftSnapshot = () => {
+                const current = draftRef.current;
+                return current.title === startingTitle
+                    && current.is_title_overridden === startingTitleOverride
+                    && current.torrent_path === capturedTorrentPath
+                    && current.template_id === capturedTemplateId;
+            };
+
+            // Explicit pending state for replacement (P1 #1) - only clear if not overridden
+            if (draftToUse.torrent_path !== draftRef.current.torrent_path && draftRef.current.torrent_path && !draftRef.current.is_title_overridden) {
+                // Clear previous metadata on new torrent acceptance
+                draftRef.current.episode = '';
+                draftRef.current.resolution = '';
+                draftRef.current.title = '';
+            }
 
             try {
                 const details = await invoke<ParsedTitleDetails>('parse_title_details', {
@@ -225,17 +279,37 @@ export function useQuickPublishRuntimeDraft({
                     titlePattern: templateToUse.title_pattern,
                 });
 
-                setDraft((current) => ({
-                    ...current,
-                    title: details.title || current.title,
-                    episode: details.episode,
-                    resolution: details.resolution,
-                    is_title_overridden: false,
-                }));
+                if (!canApplyRequest()) {
+                    return;
+                }
+
+                setDraftState((current) => {
+                    if (
+                        !canApplyRequest()
+                        || current.title !== startingTitle
+                        || current.is_title_overridden !== startingTitleOverride
+                        || current.torrent_path !== capturedTorrentPath
+                        || current.template_id !== capturedTemplateId
+                    ) {
+                        return current;
+                    }
+
+                    return {
+                        ...current,
+                        title: details.title || current.title,
+                        episode: details.episode,
+                        resolution: details.resolution,
+                        is_title_overridden: false,
+                    };
+                });
             } catch (error) {
-                onError?.(toErrorMessage(error, '生成标题失败。'));
+                if (canApplyRequest() && hasStartingDraftSnapshot()) {
+                    onError?.(toErrorMessage(error, '生成标题失败。'));
+                }
             } finally {
-                setIsGeneratingTitle(false);
+                if (isLatestRequest()) {
+                    setIsGeneratingTitle(false);
+                }
             }
         },
         [activeTemplateRef, draftRef, onError, torrentInfoRef],
@@ -244,6 +318,7 @@ export function useQuickPublishRuntimeDraft({
     const resolvePublishRuntimeDraft = useCallback(async (
         templateToUse = activeTemplateRef.current,
         draftToUse = draftRef.current,
+        torrentSelectionGeneration = torrentSelectionGenerationRef.current,
     ): Promise<QuickPublishRuntimeDraft> => {
         if (!templateToUse || !draftToUse.is_title_overridden) {
             return draftToUse;
@@ -262,9 +337,18 @@ export function useQuickPublishRuntimeDraft({
                 }),
         });
 
-        setDraft((current) => {
+        // Stale/invalid result guard (P1 #2)
+        if (torrentSelectionGenerationRef.current !== torrentSelectionGeneration ||
+            activeTemplateRef.current?.id !== templateToUse.id ||
+            draftToUse.torrent_path !== draftRef.current.torrent_path) {
+            return nextDraft; // or stale marker
+        }
+
+        setDraftState((current) => {
             if (
-                current.template_id !== draftToUse.template_id
+                torrentSelectionGenerationRef.current !== torrentSelectionGeneration
+                || current.torrent_path !== draftToUse.torrent_path
+                || current.template_id !== draftToUse.template_id
                 || current.title !== draftToUse.title
                 || current.is_title_overridden !== draftToUse.is_title_overridden
             ) {
@@ -293,6 +377,8 @@ export function useQuickPublishRuntimeDraft({
                 return;
             }
 
+            invalidateTitleGeneration();
+
             const contentTemplate = template.shared_content_template_id
                 ? contents[template.shared_content_template_id] ?? null
                 : null;
@@ -302,45 +388,68 @@ export function useQuickPublishRuntimeDraft({
             };
 
             setSelectedTemplateId(templateId);
-            setDraft(nextDraft);
+            setDraftState(nextDraft);
 
             if (torrentInfoRef.current?.name) {
                 void generateTitle(template, nextDraft);
             }
         },
-        [contentTemplatesRef, draftRef, generateTitle, quickPublishTemplatesRef, torrentInfoRef],
+        [contentTemplatesRef, draftRef, generateTitle, invalidateTitleGeneration, quickPublishTemplatesRef, torrentInfoRef],
     );
 
     const clearRuntimeDraft = useCallback(() => {
+        invalidateTorrentSelection();
         setSelectedTemplateId('');
-        setDraft(createDefaultQuickPublishRuntimeDraft());
-    }, []);
+        setDraftState(createDefaultQuickPublishRuntimeDraft());
+    }, [invalidateTorrentSelection]);
 
     const parseTorrent = useCallback(
         async (path: string) => {
-            try {
-                const info = await invoke<QuickPublishTorrentInfo>('parse_torrent', { path });
-                setTorrentInfo(info);
+            const requestGeneration = ++torrentSelectionGenerationRef.current;
+            invalidateTitleGeneration();
+            const isCurrentRequest = () => torrentSelectionGenerationRef.current === requestGeneration;
 
-                if (info.compat_notice) {
-                    // Readable but non-standard torrent: warn explicitly.
-                    onError?.(info.compat_notice);
+            try {
+                const info = await invoke<TorrentInfo>('parse_torrent', { path });
+
+                if (!isCurrentRequest()) {
+                    return;
                 }
+
+                setTorrentInfo(info);
+                onClearError?.();
 
                 const nextDraft = {
                     ...draftRef.current,
                     torrent_path: path,
                 };
-                setDraft(nextDraft);
+                setDraftState(nextDraft);
 
                 if (activeTemplateRef.current) {
-                    await generateTitle(activeTemplateRef.current, nextDraft, false, info.name);
+                    if (nextDraft.is_title_overridden) {
+                        await resolvePublishRuntimeDraft(activeTemplateRef.current, nextDraft, requestGeneration);
+                    } else {
+                        await generateTitle(activeTemplateRef.current, nextDraft, false, info.name);
+                    }
                 }
             } catch (error) {
+                if (!isCurrentRequest()) {
+                    return;
+                }
+
+                invalidateTitleGeneration();
+                setTorrentInfo(null);
+                setDraftState({
+                    ...draftRef.current,
+                    torrent_path: '',
+                    title: '',
+                    episode: '',
+                    resolution: '',
+                });
                 onError?.(toErrorMessage(error, '解析种子失败。'));
             }
         },
-        [activeTemplateRef, draftRef, generateTitle, onError],
+        [activeTemplateRef, draftRef, generateTitle, invalidateTitleGeneration, onClearError, onError, resolvePublishRuntimeDraft],
     );
 
     const selectTorrentFile = useCallback(async () => {
@@ -366,7 +475,7 @@ export function useQuickPublishRuntimeDraft({
             const bodyMarkdown = template.body_markdown ?? '';
             const bodyHtml = template.body_html ?? '';
 
-            setDraft((current) => ({
+            setDraftState((current) => ({
                 ...current,
                 shared_content_template_id: contentTemplateId || null,
                 markdown: composePublishContent(bodyMarkdown, nextContentTemplate?.markdown ?? ''),
@@ -383,6 +492,8 @@ export function useQuickPublishRuntimeDraft({
             return;
         }
 
+        invalidateTorrentSelection();
+
         const contentTemplate =
             template.shared_content_template_id && contentTemplatesRef.current[template.shared_content_template_id]
                 ? contentTemplatesRef.current[template.shared_content_template_id]
@@ -392,16 +503,16 @@ export function useQuickPublishRuntimeDraft({
             ...buildRuntimeDraftFromTemplate(template, contentTemplate),
             torrent_path: draftRef.current.torrent_path,
         };
-        setDraft(nextDraft);
+        setDraftState(nextDraft);
 
         if (torrentInfoRef.current?.name) {
             void generateTitle(template, nextDraft, true, torrentInfoRef.current.name);
         }
-    }, [activeTemplateRef, contentTemplatesRef, draftRef, generateTitle, torrentInfoRef]);
+    }, [activeTemplateRef, contentTemplatesRef, draftRef, generateTitle, invalidateTorrentSelection, torrentInfoRef]);
 
     const reconcileRuntimeSelectableSites = useCallback(
         (selectableSiteKeys: Iterable<keyof SiteSelection>) => {
-            setDraft((current) => {
+            setDraftState((current) => {
                 const nextSites = reconcileSelectableSiteSelection(current.sites, selectableSiteKeys);
 
                 if (nextSites === current.sites) {

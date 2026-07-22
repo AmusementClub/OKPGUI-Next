@@ -33,7 +33,6 @@ static PUBLISH_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
 pub struct PublishRequest {
     pub publish_id: String,
     pub torrent_path: String,
-    pub template_name: String,
     pub profile_name: String,
     pub template: Template,
 }

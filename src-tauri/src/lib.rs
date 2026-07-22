@@ -1,4 +1,5 @@
-﻿mod commands;
+﻿mod atomic_file;
+mod commands;
 mod config;
 mod cookies;
 mod domain;
@@ -16,7 +17,7 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![
             config::get_config,
-            config::get_template_list,
+            config::get_config_load_error,
             config::save_template,
             config::delete_template,
             config::set_last_used_template,
@@ -40,13 +41,9 @@ pub fn run() {
             profile::get_profile_list,
             profile::save_profile,
             profile::delete_profile,
-            profile::update_profile_cookies,
             profile::import_cookie_file,
             torrent::parse_torrent,
             title_pattern::parse_title_details,
-            title_pattern::match_title,
-            title_pattern::extract_episode_value,
-            title_pattern::extract_resolution_value,
             cookies::start_cookie_capture,
             cookies::finish_cookie_capture,
             cookies::cancel_cookie_capture,

@@ -1,8 +1,8 @@
 use tauri::AppHandle;
 
 use crate::profile::{
-    load_profiles, normalize_site_cookie_text, save_profiles, set_site_cookie_text,
-    sync_profile_cookies,
+    normalize_site_cookie_text, profile_store_lock, save_profiles, set_site_cookie_text,
+    sync_profile_cookies, try_load_profiles,
 };
 use crate::publish::SitePublishResult;
 
@@ -18,7 +18,19 @@ pub(crate) fn persist_updated_site_cookies(
         return;
     }
 
-    let mut profiles = load_profiles(app);
+    // Serialize against IdentityPage autosave: load-mutate-save must be atomic
+    // or a concurrent save_profile can lose these cookie updates (or vice versa).
+    let _guard = profile_store_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut profiles = match try_load_profiles(app) {
+        Ok(profiles) => profiles,
+        Err(error) => {
+            // Never clobber a corrupt profile store with defaults.
+            eprintln!("[okpgui] 跳过发布后的 Cookie 持久化: {}", error);
+            return;
+        }
+    };
     let Some(profile) = profiles.profiles.get_mut(profile_name) else {
         return;
     };
@@ -34,7 +46,9 @@ pub(crate) fn persist_updated_site_cookies(
     }
 
     sync_profile_cookies(profile);
-    save_profiles(app, &profiles);
+    if let Err(error) = save_profiles(app, &profiles) {
+        eprintln!("[okpgui] 发布后的 Cookie 持久化失败: {}", error);
+    }
 }
 
 pub(crate) fn updated_cookie_text_for_persistence(result: &SitePublishResult) -> Option<&str> {

@@ -13,11 +13,13 @@ import {
     RefreshCw,
 } from 'lucide-react';
 import FieldHelpHint from '../components/FieldHelpHint';
-import FileTree, { FileTreeNodeData } from '../components/FileTree';
+import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
+import WarningBanner from '../components/WarningBanner';
+import type { TorrentInfo } from '../types/torrent';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import {
     createPublishConsoleSiteMap,
@@ -25,7 +27,7 @@ import {
     usePublishTask,
 } from '../hooks/usePublishTask';
 import { useNoticeDialog } from '../hooks/useNoticeDialog';
-import { getCookiePanelSummary, getRemainingTextClass, getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
+import { SiteCookies } from '../utils/cookieUtils';
 import {
     ENTITY_NAME_MAX_LENGTH,
     parseImportConflictName,
@@ -34,9 +36,12 @@ import {
     trimEntityName,
 } from '../utils/entityNaming';
 import { renderMarkdownToHtml } from '../utils/markdown';
+import { serializeForComparison } from '../utils/templateSnapshot';
+import { isHtmlPreferredSite, validatePublishContentForSites } from '../utils/publishValidation';
 import { DEFAULT_OKP_TAGS } from '../utils/okpTags';
 import { getPublishStatusTextClass, getSiteLoginStateBadgeClass } from '../utils/siteStatus';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
+import { useSiteRows } from '../hooks/useSiteRows';
 import { useLatest } from '../hooks/useLatest';
 import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
 import { reconcileSelectableSiteSelection } from '../utils/siteSelection';
@@ -52,20 +57,18 @@ import {
     PublishTitleMetadata,
     resolvePublishTitleMetadata,
 } from '../utils/publishTitleMetadata';
-import {
-    createLatestValuePersistQueue,
-    shouldApplyTemplateSelection,
-} from '../utils/lastUsedPersistQueue';
+import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
 import { buildSortedTemplateSelectOptions } from '../utils/templateSelectOptions';
-
-interface SiteSelection {
-    dmhy: boolean;
-    nyaa: boolean;
-    acgrip: boolean;
-    bangumi: boolean;
-    acgnx_asia: boolean;
-    acgnx_global: boolean;
-}
+import { extractDroppedFilePath } from '../utils/drop';
+import {
+    createDefaultPublishHistory,
+    formatTemplateTimestamp,
+    getPublishedVersionLabel,
+    normalizePublishHistory,
+    quickPublishSiteKeys,
+    SitePublishHistory,
+    SiteSelection,
+} from '../utils/quickPublish';
 
 interface Template {
     ep_pattern: string;
@@ -81,14 +84,6 @@ interface Template {
     publish_history: SitePublishHistory;
     sites: SiteSelection;
 }
-
-interface SitePublishHistoryEntry {
-    last_published_at: string;
-    last_published_episode: string;
-    last_published_resolution: string;
-}
-
-type SitePublishHistory = Record<keyof SiteSelection, SitePublishHistoryEntry>;
 
 interface ConfigPayload {
     last_used_template: string | null;
@@ -132,82 +127,6 @@ interface Profile {
     [key: string]: unknown;
 }
 
-interface PublishContentValidationIssue {
-    siteCode: string;
-    siteLabel: string;
-    message: string;
-}
-
-interface TorrentInfo {
-    name: string;
-    total_size: number;
-    file_tree: FileTreeNodeData;
-    compat_notice?: string | null;
-}
-
-const siteKeys: (keyof SiteSelection)[] = [
-    'dmhy',
-    'nyaa',
-    'acgrip',
-    'bangumi',
-    'acgnx_asia',
-    'acgnx_global',
-];
-
-const publishTimestampFormatter = new Intl.DateTimeFormat('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-    hour: '2-digit',
-    minute: '2-digit',
-    hour12: false,
-});
-
-const createDefaultPublishHistory = (): SitePublishHistory => ({
-    dmhy: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    nyaa: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgrip: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    bangumi: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgnx_asia: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-    acgnx_global: { last_published_at: '', last_published_episode: '', last_published_resolution: '' },
-});
-
-const normalizePublishHistory = (history?: Partial<SitePublishHistory>): SitePublishHistory => {
-    const defaultHistory = createDefaultPublishHistory();
-
-    return siteKeys.reduce((accumulator, siteKey) => {
-        const entry = history?.[siteKey];
-        accumulator[siteKey] = {
-            last_published_at:
-                typeof entry?.last_published_at === 'string'
-                    ? entry.last_published_at
-                    : defaultHistory[siteKey].last_published_at,
-            last_published_episode:
-                typeof entry?.last_published_episode === 'string'
-                    ? entry.last_published_episode
-                    : defaultHistory[siteKey].last_published_episode,
-            last_published_resolution:
-                typeof entry?.last_published_resolution === 'string'
-                    ? entry.last_published_resolution
-                    : defaultHistory[siteKey].last_published_resolution,
-        };
-        return accumulator;
-    }, {} as SitePublishHistory);
-};
-
-const formatPublishTimestamp = (value: string) => {
-    if (!value.trim()) {
-        return '未发布';
-    }
-
-    const parsedTimestamp = Date.parse(value);
-    if (Number.isNaN(parsedTimestamp)) {
-        return value;
-    }
-
-    return publishTimestampFormatter.format(new Date(parsedTimestamp)).replace(/\//g, '-');
-};
-
 const buildTemplateOptions = (templates: Record<string, Partial<Template>>): TemplateSelectOption[] =>
     buildSortedTemplateSelectOptions(
         Object.entries(templates).map(([name, templateValue]) => {
@@ -215,26 +134,13 @@ const buildTemplateOptions = (templates: Record<string, Partial<Template>>): Tem
             return {
                 name,
                 label: name,
-                publishTimestamps: siteKeys.map(
+                publishTimestamps: quickPublishSiteKeys.map(
                     (siteKey) => normalizedTemplate.publish_history[siteKey].last_published_at,
                 ),
-                formatPublishedAtLabel: formatPublishTimestamp,
+                formatPublishedAtLabel: formatTemplateTimestamp,
             };
         }),
     );
-
-const getPublishedValue = (value: string) => value.trim();
-
-const getPublishedVersionLabel = (entry: SitePublishHistoryEntry) => {
-    const episode = getPublishedValue(entry.last_published_episode);
-    const resolution = getPublishedValue(entry.last_published_resolution);
-
-    if (episode && resolution) {
-        return `${episode} / ${resolution}`;
-    }
-
-    return episode || resolution || '不适用';
-};
 
 const mergePublishHistory = (
     templateValue: Template,
@@ -299,61 +205,13 @@ function normalizeTemplate(template?: Partial<Template>): Template {
     };
 }
 
-const htmlPreferredSiteKeys = new Set<string>(['dmhy', 'bangumi', 'acgnx_asia', 'acgnx_global']);
-const markdownRequiredSiteKeys = new Set<string>(['nyaa', 'acgrip']);
-
-function validatePublishContentForSites(
-    template: Template,
-    selectedSites: SiteDefinition[],
-): PublishContentValidationIssue[] {
-    const markdown = template.description.trim();
-    const html = template.description_html.trim();
-    const convertedHtml = markdown ? renderMarkdownToHtml(template.description).trim() : '';
-
-    return selectedSites.flatMap((site) => {
-        if (markdownRequiredSiteKeys.has(site.key) && !markdown) {
-            return [{
-                siteCode: site.key,
-                siteLabel: site.label,
-                message: `${site.label} 需要 Markdown 发布内容，请先填写 Markdown。`,
-            }];
-        }
-
-        if (htmlPreferredSiteKeys.has(site.key) && !html && !convertedHtml) {
-            return [{
-                siteCode: site.key,
-                siteLabel: site.label,
-                message: `${site.label} 需要 HTML 内容，或可转换为 HTML 的 Markdown 发布内容。`,
-            }];
-        }
-
-        return [];
-    });
-}
-
-const getTorrentPathFromUriList = (uriList: string): string | null => {
-    const candidate = uriList
-        .split(/\r?\n/)
-        .map((entry) => entry.trim())
-        .find((entry) => entry && !entry.startsWith('#') && entry.toLowerCase().startsWith('file://'));
-
-    if (!candidate) {
-        return null;
-    }
-
-    try {
-        return decodeURIComponent(candidate.replace(/^file:\/\//i, ''));
-    } catch {
-        return candidate.replace(/^file:\/\//i, '');
-    }
-};
-
 export default function HomePage() {
     const { requestImportConflictStrategy, importConflictDialog } = useImportConflictDialog();
     const { showNotice, noticeDialog } = useNoticeDialog();
     // Template state
     const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
     const [currentTemplateName, setCurrentTemplateName] = useState('');
+    const [configLoadError, setConfigLoadError] = useState<string | null>(null);
     const [newTemplateName, setNewTemplateName] = useState('');
     const [template, setTemplate] = useState<Template>(defaultTemplate);
 
@@ -362,10 +220,12 @@ export default function HomePage() {
     const [selectedProfile, setSelectedProfile] = useState('');
     const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
+    const [loadedProfileName, setLoadedProfileName] = useState('');
 
     // Torrent state
     const [torrentPath, setTorrentPath] = useState('');
     const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
+    const [torrentError, setTorrentError] = useState('');
 
     // Modal state
     const [showConsole, setShowConsole] = useState(false);
@@ -383,6 +243,7 @@ export default function HomePage() {
     const templateRef = useLatest(template);
     const currentTemplateNameRef = useLatest(currentTemplateName);
     const torrentInfoRef = useLatest(torrentInfo);
+    const selectedProfileRef = useLatest(selectedProfile);
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
@@ -402,6 +263,15 @@ export default function HomePage() {
             },
         }),
     );
+    const descriptionSaveTimerRef = useRef<number | null>(null);
+    const templateSaveQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const templateSaveFailureGenerationRef = useRef(0);
+    const templateSelectionQueueRef = useRef<Promise<void>>(Promise.resolve());
+    const templateSelectionGenerationRef = useRef(0);
+    const parseGenerationRef = useRef(0);
+    const titleGenerationRef = useRef(0);
+    const manualTitleEditGenerationRef = useRef(0);
+    const profileLoadGenerationRef = useRef(0);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -418,23 +288,31 @@ export default function HomePage() {
             return;
         }
 
-        const saveTimer = window.setTimeout(() => {
+        descriptionSaveTimerRef.current = window.setTimeout(() => {
+            descriptionSaveTimerRef.current = null;
             void persistTemplateToDisk(withSelectedProfile(templateRef.current));
         }, AUTOSAVE_DEBOUNCE_MS);
 
         return () => {
-            window.clearTimeout(saveTimer);
+            if (descriptionSaveTimerRef.current !== null) {
+                window.clearTimeout(descriptionSaveTimerRef.current);
+                descriptionSaveTimerRef.current = null;
+            }
         };
     }, [template.description, template.description_html]);
 
     useEffect(() => {
-        if (!selectedProfile) {
-            setSelectedProfileData(null);
-            clearAllSiteLoginTests();
+        const generation = ++profileLoadGenerationRef.current;
+        const profileName = selectedProfile;
+        setSelectedProfileData(null);
+        setLoadedProfileName('');
+        clearAllSiteLoginTests();
+
+        if (!profileName) {
             return;
         }
 
-        void loadSelectedProfileData(selectedProfile);
+        void loadSelectedProfileData(profileName, generation);
     }, [selectedProfile]);
 
     const fetchConfig = () => invoke<ConfigPayload>('get_config');
@@ -459,16 +337,29 @@ export default function HomePage() {
         }
     };
 
-    const loadSelectedProfileData = async (profileName: string) => {
+    const loadSelectedProfileData = async (profileName: string, generation: number) => {
         try {
             const store = await invoke<{
                 profiles: Record<string, Profile>;
             }>('get_profiles');
+            if (
+                profileLoadGenerationRef.current !== generation
+                || selectedProfileRef.current !== profileName
+            ) {
+                return;
+            }
             setSelectedProfileData(store.profiles[profileName] ?? null);
+            setLoadedProfileName(profileName);
             clearAllSiteLoginTests();
         } catch (e) {
             console.error('加载身份详情失败:', e);
-            setSelectedProfileData(null);
+            if (
+                profileLoadGenerationRef.current === generation
+                && selectedProfileRef.current === profileName
+            ) {
+                setSelectedProfileData(null);
+                setLoadedProfileName(profileName);
+            }
         }
     };
 
@@ -477,6 +368,12 @@ export default function HomePage() {
             const config = await refreshTemplateOptions();
             if (!config) {
                 return;
+            }
+
+            try {
+                setConfigLoadError(await invoke<string | null>('get_config_load_error'));
+            } catch (loadErrorStateError) {
+                console.error('读取配置加载状态失败:', loadErrorStateError);
             }
 
             setOkpExecutablePath(config.okp_executable_path || '');
@@ -496,16 +393,28 @@ export default function HomePage() {
         }
     };
 
-    const loadTemplate = async (name: string, selectionGeneration?: number) => {
+    const loadTemplate = async (
+        name: string,
+        selectionGeneration?: number,
+        beforeApply?: () => Promise<boolean>,
+    ) => {
         try {
             const config = await fetchConfig();
             // Drop stale responses before any UI mutation (options list or template body).
             if (
                 selectionGeneration !== undefined
-                && !shouldApplyTemplateSelection(
-                    selectionGeneration,
-                    lastUsedPersistQueueRef.current.getGeneration(),
-                )
+                && selectionGeneration !== templateSelectionGenerationRef.current
+            ) {
+                return false;
+            }
+
+            if (beforeApply && !(await beforeApply())) {
+                return false;
+            }
+
+            if (
+                selectionGeneration !== undefined
+                && selectionGeneration !== templateSelectionGenerationRef.current
             ) {
                 return false;
             }
@@ -514,10 +423,7 @@ export default function HomePage() {
 
             if (
                 selectionGeneration !== undefined
-                && !shouldApplyTemplateSelection(
-                    selectionGeneration,
-                    lastUsedPersistQueueRef.current.getGeneration(),
-                )
+                && selectionGeneration !== templateSelectionGenerationRef.current
             ) {
                 return false;
             }
@@ -529,6 +435,8 @@ export default function HomePage() {
                 setCurrentTemplateName(name);
                 setNewTemplateName('');
                 setTemplate(nextTemplate);
+                titleGenerationRef.current += 1;
+                setIsGeneratingTitle(false);
                 setSelectedProfile(nextTemplate.profile || '');
                 return true;
             }
@@ -540,11 +448,52 @@ export default function HomePage() {
     };
 
     /** User dropdown selection only — never called from restore/import/loadLastConfig. */
-    const handleTemplateSelection = async (name: string) => {
-        // Generation advances immediately so earlier in-flight loads cannot apply after later picks.
-        // Latest-id persist is serialized by the queue (last selection wins on disk).
-        const generation = lastUsedPersistQueueRef.current.enqueue(name);
-        await loadTemplate(name, generation);
+    const handleTemplateSelection = (name: string) => {
+        const selectionGeneration = ++templateSelectionGenerationRef.current;
+        const runSelection = async () => {
+            const failureGeneration = templateSaveFailureGenerationRef.current;
+            const drainDescriptionSaves = async () => {
+                while (selectionGeneration === templateSelectionGenerationRef.current) {
+                    const pendingQueue = templateSaveQueueRef.current;
+                    await pendingQueue;
+                    if (templateSaveFailureGenerationRef.current !== failureGeneration) {
+                        return false;
+                    }
+                    if (pendingQueue !== templateSaveQueueRef.current) {
+                        continue;
+                    }
+
+                    if (descriptionSaveTimerRef.current !== null) {
+                        window.clearTimeout(descriptionSaveTimerRef.current);
+                        descriptionSaveTimerRef.current = null;
+                    }
+                    const currentTemplate = templateRef.current;
+                    const hasDirtyDescription =
+                        currentTemplate.description !== lastPersistedDescriptionRef.current
+                        || currentTemplate.description_html !== lastPersistedDescriptionHtmlRef.current;
+                    if (!hasDirtyDescription) {
+                        return true;
+                    }
+
+                    const saved = await persistTemplateToDisk(withSelectedProfile(currentTemplate));
+                    if (!saved) {
+                        return false;
+                    }
+                }
+                return false;
+            };
+
+            if (!(await drainDescriptionSaves())) {
+                return;
+            }
+            const loaded = await loadTemplate(name, selectionGeneration, drainDescriptionSaves);
+            if (loaded) {
+                lastUsedPersistQueueRef.current.enqueue(name);
+            }
+        };
+
+        const selection = templateSelectionQueueRef.current.then(runSelection, runSelection);
+        templateSelectionQueueRef.current = selection.then(() => undefined, () => undefined);
     };
 
     const getTemplateName = (explicitName?: string) => {
@@ -560,37 +509,60 @@ export default function HomePage() {
         profile: profileName,
     });
 
-    const persistTemplateToDisk = async (
+    const persistTemplateToDisk = (
         templateToSave: Template = withSelectedProfile(templateRef.current),
         explicitName?: string,
+        expectedEditorSnapshot?: string,
     ) => {
         const name = getTemplateName(explicitName);
+        const capturedTemplateName = currentTemplateNameRef.current;
+        const preSaveSnapshot = expectedEditorSnapshot ?? serializeForComparison(templateToSave);
 
-        try {
-            const saved = await invoke<ImportedTemplatePayload>('save_template', {
-                name,
-                template: templateToSave,
-                previousName: currentTemplateName || undefined,
-            });
-            const nextTemplate = normalizeTemplate(saved.template);
-
-            lastPersistedDescriptionRef.current = nextTemplate.description;
-            lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
-            setTemplate(nextTemplate);
-            setCurrentTemplateName(saved.name);
-            setNewTemplateName('');
-            await refreshTemplateOptions();
-            return { name: saved.name, template: nextTemplate };
-        } catch (e) {
-            console.error('保存模板失败:', e);
-            if (explicitName) {
-                showNotice({
-                    title: '保存模板失败',
-                    message: typeof e === 'string' ? e : '保存模板失败。',
+        const save = async () => {
+            try {
+                const saved = await invoke<ImportedTemplatePayload>('save_template', {
+                    name,
+                    template: templateToSave,
+                    previousName: capturedTemplateName || undefined,
                 });
+                const nextTemplate = normalizeTemplate(saved.template);
+
+                if (currentTemplateNameRef.current === capturedTemplateName) {
+                    lastPersistedDescriptionRef.current = nextTemplate.description;
+                    lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+                    // Only apply the saved template when the editor was not touched while the
+                    // save was in flight; otherwise the response would clobber fresh keystrokes.
+                    // Compare with the same profile augmentation as the pre-save snapshot so a
+                    // profile switch does not silently disable the guard.
+                    if (
+                        serializeForComparison(withSelectedProfile(templateRef.current, templateToSave.profile))
+                        === preSaveSnapshot
+                    ) {
+                        setTemplate(nextTemplate);
+                        setNewTemplateName('');
+                    }
+                    setCurrentTemplateName(saved.name);
+                }
+                await refreshTemplateOptions();
+                return { name: saved.name, template: nextTemplate };
+            } catch (e) {
+                templateSaveFailureGenerationRef.current += 1;
+                console.error('保存模板失败:', e);
+                if (currentTemplateNameRef.current === capturedTemplateName) {
+                    // Surface autosave failures too, and leave the dirty state intact so the
+                    // debounce effect re-arms (lastPersisted* refs stay at their pre-save values).
+                    showNotice({
+                        title: '保存模板失败',
+                        message: typeof e === 'string' ? e : '保存模板失败。',
+                    });
+                }
+                return null;
             }
-            return null;
-        }
+        };
+
+        const queuedSave = templateSaveQueueRef.current.then(save, save);
+        templateSaveQueueRef.current = queuedSave.then(() => undefined, () => undefined);
+        return queuedSave;
     };
 
     const autosaveTemplate = (templateToSave: Template = withSelectedProfile(templateRef.current), explicitName?: string) => {
@@ -653,28 +625,50 @@ export default function HomePage() {
     }, [torrentInfoRef]);
 
     const parseTorrent = useCallback(async (path: string) => {
+        const generation = ++parseGenerationRef.current;
+        titleGenerationRef.current += 1;
+        setIsGeneratingTitle(false);
+        setTorrentPath('');
+        setTorrentInfo(null);
+        setTorrentError('');
         try {
             const info = await invoke<TorrentInfo>('parse_torrent', { path });
+            if (generation !== parseGenerationRef.current) {
+                return;
+            }
             setTorrentPath(path);
             setTorrentInfo(info);
+            setTorrentError('');
             // Only prefill an empty title; never overwrite a user-edited final title.
             const activeTemplate = templateRef.current;
             if (!activeTemplate.title.trim() && activeTemplate.title_pattern.trim()) {
+                const manualTitleEditGeneration = manualTitleEditGenerationRef.current;
                 const title = await matchTitle(info.name, activeTemplate);
-                if (title) {
+                if (
+                    generation === parseGenerationRef.current
+                    && manualTitleEditGeneration === manualTitleEditGenerationRef.current
+                    && title
+                ) {
                     setTemplate((current) => (current.title.trim() ? current : { ...current, title }));
                 }
             }
         } catch (e) {
+            if (generation !== parseGenerationRef.current) {
+                return;
+            }
             console.error('解析种子文件失败:', e);
+            setTorrentInfo(null);
+            setTorrentPath('');
+            setTorrentError(typeof e === 'string' ? e : '解析种子文件失败。');
         }
     }, [matchTitle, templateRef]);
 
     useEffect(() => {
+        let disposed = false;
         let unlisten: UnlistenFn | null = null;
 
         const setupDragDropListener = async () => {
-            unlisten = await getCurrentWindow().onDragDropEvent((event) => {
+            const nextUnlisten = await getCurrentWindow().onDragDropEvent((event) => {
                 if (event.payload.type === 'enter' || event.payload.type === 'over') {
                     setIsDragging(true);
                     return;
@@ -686,19 +680,25 @@ export default function HomePage() {
                 }
 
                 setIsDragging(false);
-                const droppedTorrentPath = event.payload.paths.find((path) =>
-                    path.toLowerCase().endsWith('.torrent'),
-                );
+                const droppedTorrentPath = extractDroppedFilePath(event.payload.paths);
 
                 if (droppedTorrentPath) {
                     void parseTorrent(droppedTorrentPath);
                 }
             });
+
+            // If cleanup ran while registration was in flight, detach immediately.
+            if (disposed) {
+                nextUnlisten();
+                return;
+            }
+            unlisten = nextUnlisten;
         };
 
         void setupDragDropListener();
 
         return () => {
+            disposed = true;
             unlisten?.();
         };
     }, [parseTorrent]);
@@ -906,19 +906,37 @@ export default function HomePage() {
             return;
         }
 
+        const requestId = ++titleGenerationRef.current;
+        const capturedTemplateName = currentTemplateNameRef.current;
+        const capturedTorrentName = torrentInfoRef.current?.name ?? '';
+        const capturedTemplate = templateRef.current;
+        const startingTitle = capturedTemplate.title;
+        const startingManualEditGeneration = manualTitleEditGenerationRef.current;
         setIsGeneratingTitle(true);
 
         try {
-            const generatedTitle = await matchTitle();
+            const generatedTitle = await matchTitle(capturedTorrentName, capturedTemplate);
             if (!generatedTitle.trim()) {
                 return;
             }
 
-            const nextTemplate = getTemplateWithFieldValue('title', generatedTitle);
+            if (
+                requestId !== titleGenerationRef.current
+                || capturedTemplateName !== currentTemplateNameRef.current
+                || capturedTorrentName !== (torrentInfoRef.current?.name ?? '')
+                || startingTitle !== templateRef.current.title
+                || startingManualEditGeneration !== manualTitleEditGenerationRef.current
+            ) {
+                return;
+            }
+
+            const nextTemplate = withSelectedProfile({ ...templateRef.current, title: generatedTitle });
             setTemplate(nextTemplate);
             await persistTemplateToDisk(nextTemplate);
         } finally {
-            setIsGeneratingTitle(false);
+            if (requestId === titleGenerationRef.current) {
+                setIsGeneratingTitle(false);
+            }
         }
     };
 
@@ -935,100 +953,22 @@ export default function HomePage() {
     };
 
     const handleSiteLoginTest = (site: SiteDefinition) => {
-        void hookHandleSiteLoginTest(site, selectedProfileData);
+        void hookHandleSiteLoginTest(site, readySelectedProfileData);
     };
 
     const handleTestAllSiteLogins = () => {
-        void hookHandleTestAllSiteLogins(siteDefinitions, selectedProfileData);
+        void hookHandleTestAllSiteLogins(siteDefinitions, readySelectedProfileData);
     };
 
-    const siteRows = useMemo(
-        () =>
-            siteDefinitions.map((site) => {
-                const publishState = publishSites[site.key] ?? null;
-                const loginState = siteLoginTests[site.key];
+    const readySelectedProfileData =
+        loadedProfileName === selectedProfile ? selectedProfileData : null;
 
-                if (!selectedProfileData) {
-                    return {
-                        site,
-                        selectable: false,
-                        selectDisabledReason: '请先选择身份配置',
-                        identityText: '未选择身份',
-                        identityClass: 'text-slate-500',
-                        identityTitle: '请先选择身份配置',
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                if (site.loginEnabled) {
-                    const tokenValue = site.tokenField
-                        ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                        : '';
-                    if (tokenValue) {
-                        return {
-                            site,
-                            selectable: true,
-                            selectDisabledReason: '',
-                            identityText: 'API Token 已配置',
-                            identityClass: 'text-emerald-300',
-                            identityTitle: `${site.label} 将优先使用 API Token`,
-                            loginState,
-                            publishState,
-                        };
-                    }
-
-                    const rawText = getSiteCookieText(selectedProfileData.site_cookies, site.key);
-                    const summary = getCookiePanelSummary(rawText);
-                    const hasCookies = summary.cookieCount > 0;
-
-                    return {
-                        site,
-                        selectable: hasCookies,
-                        selectDisabledReason: hasCookies
-                            ? ''
-                            : `请先在身份页面配置 ${site.label} 的 Cookie`,
-                        identityText: hasCookies
-                            ? `${summary.remainingText} / ${summary.earliestExpiryText}`
-                            : '未配置 Cookie',
-                        identityClass: hasCookies
-                            ? getRemainingTextClass(summary.earliestExpiry)
-                            : 'text-slate-500',
-                        identityTitle: hasCookies
-                            ? `${site.label} 已配置 ${summary.cookieCount} 条 Cookie`
-                            : `尚未配置 ${site.label} Cookie`,
-                        loginState,
-                        publishState,
-                    };
-                }
-
-                const accountName = String(selectedProfileData[site.nameField] ?? '').trim();
-                const tokenValue = site.tokenField
-                    ? String(selectedProfileData[site.tokenField] ?? '').trim()
-                    : '';
-                const hasToken = tokenValue.length > 0;
-
-                return {
-                    site,
-                    selectable: hasToken,
-                    selectDisabledReason: hasToken
-                        ? ''
-                        : `${site.label} 缺少 API 令牌`,
-                    identityText: hasToken
-                        ? accountName.length > 0
-                            ? 'API 身份已配置'
-                            : 'API 令牌已配置'
-                        : '缺少 API 令牌',
-                    identityClass: hasToken ? 'text-emerald-300' : 'text-yellow-300',
-                    identityTitle: hasToken
-                        ? `${site.label} 已配置 API 令牌`
-                        : `${site.label} 需要 API 令牌`,
-                    loginState,
-                    publishState,
-                };
-            }),
-        [publishSites, selectedProfileData, siteLoginTests, template.publish_history],
-    );
+    const siteRows = useSiteRows({
+        publishSites,
+        selectedProfileData: readySelectedProfileData,
+        siteLoginTests,
+        publishHistory: template.publish_history,
+    });
 
     const selectedSiteKeys = useMemo(
         () =>
@@ -1045,17 +985,16 @@ export default function HomePage() {
                 .map((row) => row.site.key as keyof SiteSelection),
         );
 
-        setTemplate((current) => {
-            const nextSites = reconcileSelectableSiteSelection(current.sites, selectableSiteKeys);
+        const currentTemplate = templateRef.current;
+        const nextSites = reconcileSelectableSiteSelection(currentTemplate.sites, selectableSiteKeys);
 
-            if (nextSites === current.sites) {
-                return current;
-            }
+        if (nextSites === currentTemplate.sites) {
+            return;
+        }
 
-            const nextTemplate = { ...current, sites: nextSites };
-            autosaveTemplate(withSelectedProfile(nextTemplate));
-            return nextTemplate;
-        });
+        const nextTemplate = { ...currentTemplate, sites: nextSites };
+        setTemplate(nextTemplate);
+        autosaveTemplate(withSelectedProfile(nextTemplate));
     }, [siteRows]);
 
     // Publish
@@ -1067,8 +1006,24 @@ export default function HomePage() {
         if (isPublishing) return;
 
         const publishTemplateName = getTemplateName();
-        const templateToPublish = withSelectedProfile(template, selectedProfile);
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
+        let templateToPublish = withSelectedProfile(template, selectedProfile);
+        const preBackfillSnapshot = serializeForComparison(templateToPublish);
+
+        // Back-fill rendered HTML for HTML-preferring sites before validating and
+        // persisting, so preview == persisted == published. The persisted response
+        // updates the editor after the refs are current, avoiding a redundant autosave.
+        if (
+            templateToPublish.description.trim()
+            && !templateToPublish.description_html.trim()
+            && selectedSites.some((site) => isHtmlPreferredSite(site.key))
+        ) {
+            templateToPublish = {
+                ...templateToPublish,
+                description_html: renderMarkdownToHtml(templateToPublish.description),
+            };
+        }
+
         const contentValidationIssues = validatePublishContentForSites(templateToPublish, selectedSites);
         if (contentValidationIssues.length > 0) {
             const issueMessageMap = new Map(
@@ -1098,7 +1053,11 @@ export default function HomePage() {
             return;
         }
 
-        const saved = await persistTemplateToDisk(templateToPublish, publishTemplateName);
+        const saved = await persistTemplateToDisk(
+            templateToPublish,
+            publishTemplateName,
+            preBackfillSnapshot,
+        );
         if (!saved) {
             return;
         }
@@ -1137,49 +1096,17 @@ export default function HomePage() {
                 request: {
                     publish_id: publishId,
                     torrent_path: torrentPath,
-                    template_name: publishTemplateName,
                     profile_name: selectedProfile,
                     template: templateToPublish,
                 },
             });
         } catch (e) {
             console.error('发布失败:', e);
-            failActivePublish(getErrorMessage(e), { appendToFirstSite: true });
+            failActivePublish(getErrorMessage(e));
         }
     };
-    // Drag and drop handlers
-    const handleDragOver = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(true);
-    }, []);
-
-    const handleDragLeave = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(false);
-    }, []);
-
-    const handleDrop = useCallback((e: React.DragEvent) => {
-        e.preventDefault();
-        setIsDragging(false);
-
-        const droppedFiles = Array.from(e.dataTransfer.files || []);
-        const droppedTorrent = droppedFiles.find((file) => file.name.toLowerCase().endsWith('.torrent'));
-        const droppedTorrentPath = droppedTorrent
-            ? ((droppedTorrent as File & { path?: string }).path ?? null)
-            : null;
-
-        if (droppedTorrentPath) {
-            void parseTorrent(droppedTorrentPath);
-            return;
-        }
-
-        const uriList = e.dataTransfer.getData('text/uri-list');
-        const uriPath = uriList ? getTorrentPathFromUriList(uriList) : null;
-        if (uriPath && uriPath.toLowerCase().endsWith('.torrent')) {
-            void parseTorrent(uriPath);
-        }
-    }, [parseTorrent]);
-
+    // Drag and drop is handled by the Tauri window drag-drop listener above;
+    // HTML5 drop events never fire while Tauri dragDropEnabled is on.
     const handleTorrentPickerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
         if (e.key !== 'Enter' && e.key !== ' ') {
             return;
@@ -1202,21 +1129,25 @@ export default function HomePage() {
             return;
         }
 
-        setTemplate((t) => {
-            const nextTemplate = {
-                ...t,
-                sites: { ...t.sites, [site]: !t.sites[site] },
-            };
+        const currentTemplate = templateRef.current;
+        const nextTemplate = {
+            ...currentTemplate,
+            sites: { ...currentTemplate.sites, [site]: !currentTemplate.sites[site] },
+        };
 
-            clearSiteLoginTest(site);
-            autosaveTemplate(withSelectedProfile(nextTemplate));
-            return nextTemplate;
-        });
+        setTemplate(nextTemplate);
+        clearSiteLoginTest(site);
+        autosaveTemplate(withSelectedProfile(nextTemplate));
     };
 
     return (
         <div className="flex flex-col h-full overflow-y-auto">
             <div className="p-6 space-y-5">
+                {configLoadError && (
+                    <WarningBanner>
+                        配置文件损坏，已加载默认配置，原文件未改动。请修复或删除配置文件后重启应用。
+                    </WarningBanner>
+                )}
                 {/* Template Selection */}
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">模板管理</h2>
@@ -1287,9 +1218,6 @@ export default function HomePage() {
                             void selectTorrentFile();
                         }}
                         onKeyDown={handleTorrentPickerKeyDown}
-                        onDragOver={handleDragOver}
-                        onDragLeave={handleDragLeave}
-                        onDrop={handleDrop}
                         className={`border-2 border-dashed rounded-lg p-4 text-center transition-colors cursor-pointer focus:outline-none focus:ring-2 focus:ring-emerald-500 focus:ring-offset-2 focus:ring-offset-slate-900 ${
                             isDragging
                                 ? 'border-emerald-400 bg-emerald-400/10'
@@ -1313,11 +1241,12 @@ export default function HomePage() {
                             <FileTree root={torrentInfo.file_tree} totalSize={torrentInfo.total_size} />
                         </div>
                     )}
-                    {torrentInfo?.compat_notice && (
-                        <div className="mt-2 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                            {torrentInfo.compat_notice}
-                        </div>
-                    )}
+                    {torrentInfo?.compat_notice ? (
+                        <WarningBanner className="mt-2">{torrentInfo.compat_notice}</WarningBanner>
+                    ) : null}
+                    {torrentError ? (
+                        <p className="mt-2 text-xs text-rose-400">{torrentError}</p>
+                    ) : null}
                 </section>
 
                 {/* Title Matching */}
@@ -1386,7 +1315,10 @@ export default function HomePage() {
                         <textarea
                             rows={2}
                             value={template.title}
-                            onChange={(e) => updateField('title', e.target.value)}
+                            onChange={(e) => {
+                                manualTitleEditGenerationRef.current += 1;
+                                updateField('title', e.target.value);
+                            }}
                             onBlur={(e) => autosaveTemplate(getTemplateWithFieldValue('title', e.target.value))}
                             placeholder="最终发布标题，可手动编辑或使用上方按钮重新生成"
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y"
@@ -1518,9 +1450,9 @@ export default function HomePage() {
                                                     onClick={() => {
                                                         void handleTestAllSiteLogins();
                                                     }}
-                                                    disabled={!selectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
+                                                    disabled={!readySelectedProfileData || isTestingAllSiteLogins || hasRunningSiteLoginTest}
                                                     title={
-                                                        !selectedProfileData
+                                                        !readySelectedProfileData
                                                             ? '请先选择身份配置'
                                                             : hasRunningSiteLoginTest && !isTestingAllSiteLogins
                                                               ? '请等待当前登录测试完成'
@@ -1558,7 +1490,7 @@ export default function HomePage() {
                                                     {site.label}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-xs text-slate-400">
-                                                    {formatPublishTimestamp(template.publish_history[site.key as keyof SiteSelection].last_published_at)}
+                                                    {formatTemplateTimestamp(template.publish_history[site.key as keyof SiteSelection].last_published_at)}
                                                 </td>
                                                 <td className="px-4 py-3 align-middle text-slate-300">
                                                     {getPublishedVersionLabel(template.publish_history[site.key as keyof SiteSelection])}
@@ -1575,7 +1507,7 @@ export default function HomePage() {
                                                             onClick={() => {
                                                                 void handleSiteLoginTest(site);
                                                             }}
-                                                            disabled={!selectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
+                                                            disabled={!readySelectedProfileData || isTestingAllSiteLogins || loginState?.status === 'testing'}
                                                             title={loginState?.message ?? `测试 ${site.label} 登录`}
                                                             className="inline-flex items-center gap-1.5 rounded-lg border border-cyan-500/40 bg-cyan-500/10 px-3 py-1.5 text-xs font-medium text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                                                         >
@@ -1620,7 +1552,8 @@ export default function HomePage() {
                             !selectedProfile ||
                             !okpExecutablePath ||
                             isPublishing ||
-                            selectedSiteKeys.length === 0
+                            selectedSiteKeys.length === 0 ||
+                            !readySelectedProfileData
                         }
                         className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-600 hover:to-cyan-600 disabled:from-slate-600 disabled:to-slate-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-all shadow-lg shadow-emerald-500/20"
                     >

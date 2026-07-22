@@ -22,6 +22,23 @@ describe('entityNaming', () => {
         expect(Array.from(copyName)).toHaveLength(ENTITY_NAME_MAX_LENGTH);
     });
 
+    it('appends a counter when the copy name already exists', () => {
+        expect(createCopyEntityName('季度模板', '未命名模板')).toBe('季度模板 副本');
+
+        const secondCopy = createCopyEntityName('季度模板', '未命名模板', ENTITY_NAME_MAX_LENGTH, [
+            '季度模板',
+            '季度模板 副本',
+        ]);
+        expect(secondCopy).toBe('季度模板 副本 2');
+
+        const thirdCopy = createCopyEntityName('季度模板', '未命名模板', ENTITY_NAME_MAX_LENGTH, [
+            '季度模板',
+            '季度模板 副本',
+            '季度模板 副本 2',
+        ]);
+        expect(thirdCopy).toBe('季度模板 副本 3');
+    });
+
     it('extracts import conflict names from backend errors', () => {
         expect(parseImportConflictName('IMPORT_CONFLICT:季度模板')).toBe('季度模板');
         expect(parseImportConflictName('普通错误')).toBeNull();

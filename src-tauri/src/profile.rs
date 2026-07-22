@@ -3,6 +3,7 @@ use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 use time::macros::format_description;
 use time::OffsetDateTime;
@@ -608,24 +609,98 @@ fn normalize_store(store: &mut ProfileStore) {
     }
 }
 
-pub fn load_profiles(app: &AppHandle) -> ProfileStore {
-    let path = profile_path(app);
-    let mut store = if path.exists() {
-        let data = std::fs::read_to_string(&path).unwrap_or_default();
-        serde_json::from_str(&data).unwrap_or_default()
-    } else {
-        ProfileStore::default()
-    };
-
-    normalize_store(&mut store);
-    store
+/// Serialize profile-store read-modify-write mutations (same OnceLock pattern as
+/// `config_write_lock`) so concurrent load-mutate-save sequences cannot lose updates.
+/// Lock-ordering note: no code path acquires this lock while holding the config lock
+/// or vice versa (verified by grep: publish flow uses them strictly sequentially).
+pub(crate) fn profile_store_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
-pub fn save_profiles(app: &AppHandle, store: &ProfileStore) {
-    let path = profile_path(app);
-    if let Ok(data) = serde_json::to_string_pretty(store) {
-        std::fs::write(path, data).ok();
+/// Read the profile store from disk. Missing/empty file -> default; parse failure
+/// -> Err so callers never silently treat a corrupt file as an empty store.
+fn read_profile_file(path: &std::path::Path) -> Result<ProfileStore, String> {
+    if !path.exists() {
+        return Ok(ProfileStore::default());
     }
+
+    let data = std::fs::read_to_string(path)
+        .map_err(|error| format!("无法读取身份配置文件: {}", error))?;
+    if data.trim().is_empty() {
+        return Ok(ProfileStore::default());
+    }
+
+    let mut store: ProfileStore = serde_json::from_str(&data).map_err(|error| {
+        format!(
+            "身份配置文件解析失败（已拒绝用默认配置覆盖）: {}",
+            error
+        )
+    })?;
+    normalize_store(&mut store);
+    Ok(store)
+}
+
+/// Fallible load for load-modify-save commands: corrupt files must surface an
+/// error instead of being clobbered by a default store on the next save.
+pub(crate) fn try_load_profiles(app: &AppHandle) -> Result<ProfileStore, String> {
+    read_profile_file(&profile_path(app))
+}
+
+/// Infallible load for read-only commands; logs corruption and returns defaults.
+pub fn load_profiles(app: &AppHandle) -> ProfileStore {
+    match try_load_profiles(app) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("[okpgui] {}", error);
+            ProfileStore::default()
+        }
+    }
+}
+
+fn write_profile_file(path: &std::path::Path, store: &ProfileStore) -> Result<(), String> {
+    let data = serde_json::to_string_pretty(store)
+        .map_err(|error| format!("无法序列化身份配置: {}", error))?;
+
+    crate::atomic_file::write_text_file_atomically(path, &data)
+}
+
+pub fn save_profiles(app: &AppHandle, store: &ProfileStore) -> Result<(), String> {
+    write_profile_file(&profile_path(app), store)
+}
+
+/// Shared mutation for save_profile (including rename continuity).
+/// With no previous name, saving under an existing name fails loudly instead of
+/// silently overwriting the existing profile.
+fn apply_upsert_profile(
+    store: &mut ProfileStore,
+    normalized_name: String,
+    profile: Profile,
+    previous_name: Option<&str>,
+) -> Result<(), String> {
+    if let Some(previous_name) = previous_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if previous_name != normalized_name && store.profiles.contains_key(&normalized_name) {
+            return Err(format!(
+                "已存在同名身份配置: {}（请改名或先重新加载）",
+                normalized_name
+            ));
+        }
+
+        if previous_name != normalized_name {
+            store.profiles.remove(previous_name);
+        }
+    } else if store.profiles.contains_key(&normalized_name) {
+        return Err(format!(
+            "已存在同名身份配置: {}（请改名或先重新加载）",
+            normalized_name
+        ));
+    }
+
+    store.profiles.insert(normalized_name, profile);
+    Ok(())
 }
 
 #[tauri::command]
@@ -636,7 +711,9 @@ pub fn get_profiles(app: AppHandle) -> ProfileStore {
 #[tauri::command]
 pub fn get_profile_list(app: AppHandle) -> Vec<String> {
     let store = load_profiles(&app);
-    store.profiles.keys().cloned().collect()
+    let mut names: Vec<String> = store.profiles.keys().cloned().collect();
+    names.sort();
+    names
 }
 
 #[tauri::command]
@@ -648,22 +725,18 @@ pub fn save_profile(
 ) -> Result<SavedProfilePayload, String> {
     let normalized_name = normalize_profile_name(&name)?;
     sync_profile_cookies(&mut profile);
-    let mut store = load_profiles(&app);
-    if let Some(previous_name) = previous_name.filter(|value| !value.trim().is_empty()) {
-        if previous_name != normalized_name && store.profiles.contains_key(&normalized_name) {
-            return Err(format!("已存在同名身份配置: {}", normalized_name));
-        }
-
-        if previous_name != normalized_name {
-            store.profiles.remove(&previous_name);
-        }
-    }
-
-    store
-        .profiles
-        .insert(normalized_name.clone(), profile.clone());
+    let _guard = profile_store_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut store = try_load_profiles(&app)?;
+    apply_upsert_profile(
+        &mut store,
+        normalized_name.clone(),
+        profile.clone(),
+        previous_name.as_deref(),
+    )?;
     store.last_used = Some(normalized_name.clone());
-    save_profiles(&app, &store);
+    save_profiles(&app, &store)?;
 
     Ok(SavedProfilePayload {
         name: normalized_name,
@@ -672,24 +745,16 @@ pub fn save_profile(
 }
 
 #[tauri::command]
-pub fn delete_profile(app: AppHandle, name: String) {
-    let mut store = load_profiles(&app);
+pub fn delete_profile(app: AppHandle, name: String) -> Result<(), String> {
+    let _guard = profile_store_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mut store = try_load_profiles(&app)?;
     store.profiles.remove(&name);
     if store.last_used.as_deref() == Some(&name) {
         store.last_used = None;
     }
-    save_profiles(&app, &store);
-}
-
-#[tauri::command]
-pub fn update_profile_cookies(app: AppHandle, name: String, cookies: String) {
-    let mut store = load_profiles(&app);
-    if let Some(profile) = store.profiles.get_mut(&name) {
-        profile.cookies = cookies;
-        profile.site_cookies = split_site_cookies(&profile.cookies, &profile.user_agent);
-        sync_profile_cookies(profile);
-        save_profiles(&app, &store);
-    }
+    save_profiles(&app, &store)
 }
 
 #[tauri::command]
@@ -716,6 +781,180 @@ pub fn import_cookie_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_read_profile_file_rejects_corrupt_json_without_defaulting() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-profile-corrupt-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_profile.json");
+        std::fs::write(&path, "{ not valid json").expect("seed corrupt");
+
+        let error = read_profile_file(&path).expect_err("corrupt must fail");
+        assert!(error.contains("解析失败"));
+
+        // File must remain intact (mutate path refuses overwrite with defaults).
+        let on_disk = std::fs::read_to_string(&path).expect("still readable");
+        assert_eq!(on_disk, "{ not valid json");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_read_profile_file_missing_and_empty_files_yield_default() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-profile-missing-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+
+        let missing = dir.join("nope.json");
+        let store = read_profile_file(&missing).expect("missing file yields default");
+        assert!(store.profiles.is_empty());
+
+        let empty = dir.join("okpgui_profile.json");
+        std::fs::write(&empty, "  \n").expect("seed empty");
+        let store = read_profile_file(&empty).expect("empty file yields default");
+        assert!(store.profiles.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_write_profile_file_is_atomic_and_round_trips() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-profile-atomic-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_profile.json");
+
+        let mut store = ProfileStore {
+            last_used: Some("alpha".to_string()),
+            ..ProfileStore::default()
+        };
+        store.profiles.insert(
+            "alpha".to_string(),
+            Profile {
+                dmhy_name: "Uploader".to_string(),
+                ..Profile::default()
+            },
+        );
+
+        write_profile_file(&path, &store).expect("write");
+        assert!(path.exists());
+        assert!(
+            !path.with_extension("json.tmp").exists(),
+            "temp file must be consumed by atomic replace"
+        );
+
+        let restored = read_profile_file(&path).expect("read");
+        assert_eq!(restored.last_used.as_deref(), Some("alpha"));
+        assert_eq!(restored.profiles["alpha"].dmhy_name, "Uploader");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_apply_upsert_profile_rejects_existing_name_without_previous_name() {
+        let mut store = ProfileStore::default();
+        store.profiles.insert(
+            "alpha".to_string(),
+            Profile {
+                dmhy_name: "Original".to_string(),
+                ..Profile::default()
+            },
+        );
+
+        let error = apply_upsert_profile(
+            &mut store,
+            "alpha".to_string(),
+            Profile {
+                dmhy_name: "Overwritten".to_string(),
+                ..Profile::default()
+            },
+            None,
+        )
+        .expect_err("expected duplicate-name save without previous name to be rejected");
+        assert!(error.contains("已存在同名身份配置"));
+        assert!(error.contains("请改名或先重新加载"));
+
+        let error = apply_upsert_profile(
+            &mut store,
+            "alpha".to_string(),
+            Profile::default(),
+            Some("   "),
+        )
+        .expect_err("expected blank previous name to be treated as none");
+        assert!(error.contains("已存在同名身份配置"));
+
+        // Existing profile must remain unchanged.
+        assert_eq!(store.profiles["alpha"].dmhy_name, "Original");
+
+        // Same-name save WITH previous name (normal autosave) still works.
+        apply_upsert_profile(
+            &mut store,
+            "alpha".to_string(),
+            Profile {
+                dmhy_name: "Updated".to_string(),
+                ..Profile::default()
+            },
+            Some("alpha"),
+        )
+        .expect("same-name save with previous name");
+        assert_eq!(store.profiles["alpha"].dmhy_name, "Updated");
+
+        // New name without previous name still works.
+        apply_upsert_profile(&mut store, "beta".to_string(), Profile::default(), None)
+            .expect("new-name save");
+        assert!(store.profiles.contains_key("beta"));
+    }
+
+    #[test]
+    fn test_apply_upsert_profile_rename_moves_entry_and_rejects_collision() {
+        let mut store = ProfileStore::default();
+        store.profiles.insert("old".to_string(), Profile::default());
+        store.profiles.insert("taken".to_string(), Profile::default());
+
+        let error = apply_upsert_profile(
+            &mut store,
+            "taken".to_string(),
+            Profile::default(),
+            Some("old"),
+        )
+        .expect_err("expected rename into existing name to be rejected");
+        assert!(error.contains("已存在同名身份配置"));
+        assert!(store.profiles.contains_key("old"));
+
+        apply_upsert_profile(&mut store, "new".to_string(), Profile::default(), Some("old"))
+            .expect("rename upsert");
+        assert!(!store.profiles.contains_key("old"));
+        assert!(store.profiles.contains_key("new"));
+    }
+
+    #[test]
+    fn test_get_profile_list_names_sorted() {
+        // Sorting logic mirrored from get_profile_list (command needs AppHandle).
+        let mut store = ProfileStore::default();
+        for name in ["zeta", "alpha", "Mike", "默认"] {
+            store.profiles.insert(name.to_string(), Profile::default());
+        }
+
+        let mut names: Vec<String> = store.profiles.keys().cloned().collect();
+        names.sort();
+        assert_eq!(names, vec!["Mike", "alpha", "zeta", "默认"]);
+    }
 
     #[test]
     fn test_default_profile() {
