@@ -29,16 +29,29 @@ jobs:
             os: windows-latest
             slug: windows-x64
             binary_name: okpgui-next.exe
+            mediainfo_target: x86_64-pc-windows-msvc
+            mediainfo_staged: mediainfo-x86_64-pc-windows-msvc.exe
             archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-windows-x64.zip
-          - name: macOS
-            os: macos-latest
-            slug: macos-universal
+          - name: macOS x64
+            os: macos-13
+            slug: macos-x64
             binary_name: okpgui-next
-            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-universal.tar.gz
+            mediainfo_target: x86_64-apple-darwin
+            mediainfo_staged: mediainfo-x86_64-apple-darwin
+            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-x64.tar.gz
+          - name: macOS arm64
+            os: macos-latest
+            slug: macos-arm64
+            binary_name: okpgui-next
+            mediainfo_target: aarch64-apple-darwin
+            mediainfo_staged: mediainfo-aarch64-apple-darwin
+            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-arm64.tar.gz
           - name: Linux
             os: ubuntu-22.04
             slug: linux-x64
             binary_name: okpgui-next
+            mediainfo_target: x86_64-unknown-linux-gnu
+            mediainfo_staged: mediainfo-x86_64-unknown-linux-gnu
             archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-linux-x64.tar.gz
 
     steps:
@@ -64,6 +77,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
@@ -73,6 +88,29 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: MediaInfo sidecar inventory gate
+        run: node scripts/verify-mediainfo-package.mjs --manifest-only
+
+      - name: Stage MediaInfo sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/stage-mediainfo.ps1 -Target '${{ matrix.platform.mediainfo_target }}'
+          node scripts/verify-mediainfo-package.mjs --target '${{ matrix.platform.mediainfo_target }}'
+
+      - name: Stage MediaInfo sidecar (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x scripts/stage-mediainfo.sh
+          ./scripts/stage-mediainfo.sh '${{ matrix.platform.mediainfo_target }}'
+          node scripts/verify-mediainfo-package.mjs --target '${{ matrix.platform.mediainfo_target }}'
+
+      - name: Cargo fmt gate
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Cargo clippy gate
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run frontend tests
         run: pnpm test
@@ -90,15 +128,35 @@ jobs:
           $stagingDir = Join-Path $env:RUNNER_TEMP 'release-windows'
           New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
           Copy-Item "src-tauri/target/release/${{ matrix.platform.binary_name }}" (Join-Path $stagingDir '${{ matrix.platform.binary_name }}')
+          # Package sidecar + redistribution notice alongside the app binary.
+          Copy-Item "src-tauri/binaries/${{ matrix.platform.mediainfo_staged }}" (Join-Path $stagingDir '${{ matrix.platform.mediainfo_staged }}')
+          $noticeDir = Join-Path $stagingDir 'mediainfo'
+          New-Item -ItemType Directory -Path $noticeDir -Force | Out-Null
+          Copy-Item "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html" (Join-Path $noticeDir 'THIRD_PARTY_NOTICES.html')
           Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath "${{ matrix.platform.archive_name }}" -Force
+          # Fail-closed membership gate: app binary, target-named sidecar, notice.
+          node scripts/verify-release-archive.mjs `
+            --archive "${{ matrix.platform.archive_name }}" `
+            --binary "${{ matrix.platform.binary_name }}" `
+            --sidecar "${{ matrix.platform.mediainfo_staged }}" `
+            --notice "mediainfo/THIRD_PARTY_NOTICES.html"
 
       - name: Package Unix asset
         if: runner.os != 'Windows'
         run: |
           staging_dir="${RUNNER_TEMP}/release-${{ matrix.platform.slug }}"
-          mkdir -p "$staging_dir"
+          mkdir -p "$staging_dir/mediainfo"
           cp "src-tauri/target/release/${{ matrix.platform.binary_name }}" "$staging_dir/${{ matrix.platform.binary_name }}"
+          # Package sidecar + redistribution notice alongside the app binary.
+          cp "src-tauri/binaries/${{ matrix.platform.mediainfo_staged }}" "$staging_dir/${{ matrix.platform.mediainfo_staged }}"
+          cp "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html" "$staging_dir/mediainfo/THIRD_PARTY_NOTICES.html"
           tar -C "$staging_dir" -czf "${{ matrix.platform.archive_name }}" .
+          # Fail-closed membership gate: app binary, target-named sidecar, notice.
+          node scripts/verify-release-archive.mjs \
+            --archive "${{ matrix.platform.archive_name }}" \
+            --binary "${{ matrix.platform.binary_name }}" \
+            --sidecar "${{ matrix.platform.mediainfo_staged }}" \
+            --notice "mediainfo/THIRD_PARTY_NOTICES.html"
 
       - name: Upload packaged asset
         uses: actions/upload-artifact@v7

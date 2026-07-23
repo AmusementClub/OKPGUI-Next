@@ -479,6 +479,21 @@ pub struct MediaInfoJobView {
     pub results: Vec<MediaProbeResult>,
 }
 
+/// Backend-owned base directory for packaged MediaInfo resolution.
+///
+/// Prefer Tauri `resource_dir` when available. When that fails (common for
+/// draft-release `--no-bundle` flat layouts), fall back to the directory that
+/// contains `current_exe` so fixed-layout candidates beside the app binary
+/// remain reachable. Never accepts caller/IPC-supplied paths.
+fn media_info_packaged_resource_base(resource_dir: Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(dir) = resource_dir {
+        return Some(dir);
+    }
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|parent| parent.to_path_buf()))
+}
+
 /// Start a backend-owned MediaInfo job (queued/running immediately with job id).
 ///
 /// Disabled AI is a true zero-impact path: no sidecar spawn.
@@ -580,9 +595,11 @@ pub fn ai_start_media_info(
         retain_media_global_state(None, Some(&mut store));
     }
 
-    let resource_dir = match app.path().resource_dir() {
-        Ok(dir) => dir,
-        Err(_) => {
+    // Prefer Tauri resource_dir; when unavailable (e.g. --no-bundle flat archives),
+    // still search fixed current_exe / flat-layout candidates via the shared resolver.
+    let resource_dir = match media_info_packaged_resource_base(app.path().resource_dir().ok()) {
+        Some(dir) => dir,
+        None => {
             let view = finish_media_info_job(
                 &job_id,
                 request.request_generation,
@@ -6025,6 +6042,40 @@ mod media_info_job_tests {
         assert_eq!(terminal.state, AiJobState::Succeeded);
         assert_eq!(terminal.results[0].relative_name, "a.mkv");
         assert_eq!(terminal.results[0].state, MediaProbeState::Measured);
+    }
+
+    #[test]
+    fn media_info_packaged_resource_base_falls_back_to_current_exe_parent() {
+        // When Tauri resource_dir is available, it is preferred as-is.
+        let explicit = PathBuf::from("/tmp/okpgui_tauri_resource_dir_probe");
+        assert_eq!(
+            media_info_packaged_resource_base(Some(explicit.clone())),
+            Some(explicit)
+        );
+
+        // When resource_dir fails, fall back to current_exe parent so flat
+        // --no-bundle archives still reach fixed-layout sidecar candidates.
+        let fallback =
+            media_info_packaged_resource_base(None).expect("current_exe parent fallback");
+        let exe_parent = std::env::current_exe()
+            .expect("current_exe")
+            .parent()
+            .expect("exe parent")
+            .to_path_buf();
+        assert_eq!(fallback, exe_parent);
+
+        // Fallback base must still resolve through the shared fixed-layout
+        // resolver (current_exe-adjacent candidates), not arbitrary paths.
+        let candidates = crate::ai::media::packaged_mediainfo_candidates(&fallback);
+        let exe_dir = exe_parent.to_string_lossy().replace('\\', "/");
+        assert!(
+            candidates.iter().any(|c| {
+                c.to_string_lossy()
+                    .replace('\\', "/")
+                    .starts_with(&exe_dir)
+            }),
+            "fallback resource base must include current_exe parent candidates"
+        );
     }
 }
 

@@ -30,3 +30,7 @@ dist-ssr
 
 .omc/*
 src-tauri/.omc/*
+
+# Staged MediaInfo sidecars (scripts/stage-mediainfo.*); keep directory via .gitkeep.
+src-tauri/binaries/*
+!src-tauri/binaries/.gitkeep

@@ -1,0 +1,74 @@
+{
+  "name": "MediaInfo CLI",
+  "version": "26.05",
+  "vendor": "MediaArea",
+  "homepage": "https://mediaarea.net/en/MediaInfo",
+  "license": {
+    "name": "BSD-2-Clause-style",
+    "source_url": "https://raw.githubusercontent.com/MediaArea/MediaInfo/master/License.html",
+    "notice_path": "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html"
+  },
+  "tauri_external_bin": "binaries/mediainfo",
+  "stage_dir": "src-tauri/binaries",
+  "resources_notice": "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html",
+  "targets": {
+    "x86_64-pc-windows-msvc": {
+      "platform": "windows",
+      "arch": "x64",
+      "archive": {
+        "url": "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Windows_x64.zip",
+        "sha256": "f7f80620ce6d14f4995f0de6f98e3ef18ad29496db01899571152ee3311229f9",
+        "format": "zip"
+      },
+      "extracted": {
+        "path": "MediaInfo.exe",
+        "sha256": "30f2828a45a1895b033c3cd7784581033327e7b393033c55f4a03bb15cab0d89"
+      },
+      "staged_name": "mediainfo-x86_64-pc-windows-msvc.exe"
+    },
+    "x86_64-unknown-linux-gnu": {
+      "platform": "linux",
+      "arch": "x64",
+      "archive": {
+        "url": "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Lambda_x86_64.zip",
+        "sha256": "1ae3744a78c93492b69f0b38bb2d1de1433c3eae04030ff1ea82ee1f60ac9a99",
+        "format": "zip"
+      },
+      "extracted": {
+        "path": "bin/mediainfo",
+        "sha256": "90f25643d43aa4bf7fa14d13f363588edfc27449c97259d376f72f55fbf1e62a"
+      },
+      "staged_name": "mediainfo-x86_64-unknown-linux-gnu"
+    },
+    "x86_64-apple-darwin": {
+      "platform": "macos",
+      "arch": "x86_64",
+      "archive": {
+        "url": "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Mac.dmg",
+        "sha256": "507605a7c8f1054a6996d99a4ef5b5a0711cfbf2f8ca2ef5161d6ee701ea8015",
+        "format": "dmg"
+      },
+      "extracted": {
+        "path": "/usr/local/bin/mediainfo",
+        "sha256": "d070140e4d60b3f49aae1cab752d77dc3611aac451b6109b9d2b1812b602b17e",
+        "note": "Mac CLI page states x86_64 and arm64 (universal binary)"
+      },
+      "staged_name": "mediainfo-x86_64-apple-darwin"
+    },
+    "aarch64-apple-darwin": {
+      "platform": "macos",
+      "arch": "arm64",
+      "archive": {
+        "url": "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Mac.dmg",
+        "sha256": "507605a7c8f1054a6996d99a4ef5b5a0711cfbf2f8ca2ef5161d6ee701ea8015",
+        "format": "dmg"
+      },
+      "extracted": {
+        "path": "/usr/local/bin/mediainfo",
+        "sha256": "d070140e4d60b3f49aae1cab752d77dc3611aac451b6109b9d2b1812b602b17e",
+        "note": "Mac CLI page states x86_64 and arm64 (universal binary)"
+      },
+      "staged_name": "mediainfo-aarch64-apple-darwin"
+    }
+  }
+}

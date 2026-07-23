@@ -530,34 +530,148 @@ pub fn discover_media_probe_requests(
         .collect())
 }
 
-/// Fixed, target-aware filenames accepted for the packaged MediaInfo sidecar.
-fn packaged_mediainfo_file_names() -> &'static [&'static str] {
-    #[cfg(target_os = "windows")]
-    {
-        &["MediaInfo.exe", "mediainfo.exe"]
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        &["MediaInfo", "mediainfo"]
+/// Map a Rust/Tauri target triple to the staged `externalBin` filename.
+/// Returns `None` for unknown targets (fail closed for packaging maps).
+pub fn mediainfo_staged_name_for_target(target: &str) -> Option<&'static str> {
+    match target {
+        "x86_64-pc-windows-msvc" => Some("mediainfo-x86_64-pc-windows-msvc.exe"),
+        "x86_64-unknown-linux-gnu" => Some("mediainfo-x86_64-unknown-linux-gnu"),
+        "x86_64-apple-darwin" => Some("mediainfo-x86_64-apple-darwin"),
+        "aarch64-apple-darwin" => Some("mediainfo-aarch64-apple-darwin"),
+        _ => None,
     }
 }
 
-/// Relative candidate locations under the app resource directory.
+/// Compile-time host target triple used for staged externalBin filenames.
+pub fn packaged_mediainfo_host_target_triple() -> Option<&'static str> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        Some("x86_64-pc-windows-msvc")
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        Some("x86_64-unknown-linux-gnu")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        Some("x86_64-apple-darwin")
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        Some("aarch64-apple-darwin")
+    }
+    #[cfg(not(any(
+        all(target_os = "windows", target_arch = "x86_64"),
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64"),
+    )))]
+    {
+        None
+    }
+}
+
+/// Fixed, target-aware filenames accepted for the packaged MediaInfo sidecar.
+/// Prefers Tauri `externalBin` staged triple names, then runtime bare names.
+fn packaged_mediainfo_file_names() -> &'static [&'static str] {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        &[
+            "mediainfo-x86_64-pc-windows-msvc.exe",
+            "mediainfo.exe",
+            "MediaInfo.exe",
+        ]
+    }
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    {
+        &[
+            "mediainfo-x86_64-unknown-linux-gnu",
+            "mediainfo",
+            "MediaInfo",
+        ]
+    }
+    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
+    {
+        &[
+            "mediainfo-x86_64-apple-darwin",
+            "mediainfo",
+            "MediaInfo",
+        ]
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    {
+        &[
+            "mediainfo-aarch64-apple-darwin",
+            "mediainfo",
+            "MediaInfo",
+        ]
+    }
+    #[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
+    {
+        &["mediainfo.exe", "MediaInfo.exe"]
+    }
+    #[cfg(all(
+        not(target_os = "windows"),
+        not(all(target_os = "linux", target_arch = "x86_64")),
+        not(all(target_os = "macos", target_arch = "x86_64")),
+        not(all(target_os = "macos", target_arch = "aarch64")),
+    ))]
+    {
+        &["mediainfo", "MediaInfo"]
+    }
+}
+
+/// Append fixed MediaInfo search bases under `root` (known layout only).
+fn push_packaged_mediainfo_bases(root: &Path, bases: &mut Vec<PathBuf>) {
+    bases.push(root.to_path_buf());
+    bases.push(root.join("bin"));
+    bases.push(root.join("binaries"));
+    bases.push(root.join("sidecars"));
+    bases.push(root.join("MediaInfo"));
+    bases.push(root.join("mediainfo"));
+}
+
+/// Relative candidate locations under the app resource directory and Tauri layout.
 /// Only these backend-owned paths may be used to spawn MediaInfo.
+///
+/// Also searches next to `std::env::current_exe()` so draft-release `--no-bundle`
+/// flat archives (sidecar beside the app binary) resolve without accepting
+/// arbitrary caller-supplied executable paths.
 pub fn packaged_mediainfo_candidates(resource_dir: &Path) -> Vec<PathBuf> {
+    let mut bases: Vec<PathBuf> = Vec::new();
+    push_packaged_mediainfo_bases(resource_dir, &mut bases);
+    // Tauri `externalBin` is placed next to the executable (sibling of Resources,
+    // or Contents/MacOS on macOS app bundles), not only under resource_dir.
+    if let Some(parent) = resource_dir.parent() {
+        bases.push(parent.to_path_buf());
+        bases.push(parent.join("binaries"));
+        bases.push(parent.join("MacOS"));
+    }
+    // Flat release layout: sidecar packaged next to the running executable.
+    // Derived only from current_exe() — never from IPC / caller paths.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            push_packaged_mediainfo_bases(exe_dir, &mut bases);
+            bases.push(exe_dir.join("MacOS"));
+        }
+    }
+
     let mut candidates = Vec::new();
-    for name in packaged_mediainfo_file_names() {
-        candidates.push(resource_dir.join(name));
-        candidates.push(resource_dir.join("bin").join(name));
-        candidates.push(resource_dir.join("sidecars").join(name));
-        candidates.push(resource_dir.join("MediaInfo").join(name));
-        candidates.push(resource_dir.join("mediainfo").join(name));
+    let mut seen = HashSet::new();
+    for base in bases {
+        for name in packaged_mediainfo_file_names() {
+            let candidate = base.join(name);
+            if seen.insert(candidate.clone()) {
+                candidates.push(candidate);
+            }
+        }
     }
     candidates
 }
 
 /// Resolve MediaInfo from a packaged app resource directory only.
 /// Never accepts a caller-supplied executable path.
+/// Missing sidecar remains an explicit error (non-destructive).
 pub fn resolve_packaged_mediainfo(resource_dir: &Path) -> Result<PathBuf, String> {
     for candidate in packaged_mediainfo_candidates(resource_dir) {
         if candidate.is_file() {
@@ -1156,6 +1270,138 @@ mod tests {
             outsider,
             "outsider must not be selected"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mediainfo_staged_name_for_target_maps_known_triples() {
+        assert_eq!(
+            mediainfo_staged_name_for_target("x86_64-pc-windows-msvc"),
+            Some("mediainfo-x86_64-pc-windows-msvc.exe")
+        );
+        assert_eq!(
+            mediainfo_staged_name_for_target("x86_64-unknown-linux-gnu"),
+            Some("mediainfo-x86_64-unknown-linux-gnu")
+        );
+        assert_eq!(
+            mediainfo_staged_name_for_target("x86_64-apple-darwin"),
+            Some("mediainfo-x86_64-apple-darwin")
+        );
+        assert_eq!(
+            mediainfo_staged_name_for_target("aarch64-apple-darwin"),
+            Some("mediainfo-aarch64-apple-darwin")
+        );
+        assert_eq!(mediainfo_staged_name_for_target("wasm32-unknown-unknown"), None);
+        assert_eq!(mediainfo_staged_name_for_target(""), None);
+    }
+
+    #[test]
+    fn packaged_mediainfo_candidates_include_target_triple_and_layout() {
+        let root = PathBuf::from("/tmp/okpgui_resource_layout_probe");
+        let candidates = packaged_mediainfo_candidates(&root);
+        let rendered: Vec<String> = candidates
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+
+        // Host triple staged name (when supported) must appear under binaries/.
+        if let Some(triple) = packaged_mediainfo_host_target_triple() {
+            let staged = mediainfo_staged_name_for_target(triple).expect("host triple staged name");
+            assert!(
+                rendered.iter().any(|p| p.ends_with(&format!("/binaries/{staged}"))),
+                "expected binaries/{staged} candidate, got {rendered:?}"
+            );
+        }
+
+        // Runtime bare name under resource root remains accepted.
+        #[cfg(target_os = "windows")]
+        {
+            assert!(rendered.iter().any(|p| p.ends_with("/mediainfo.exe") || p.ends_with("/MediaInfo.exe")));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert!(rendered.iter().any(|p| p.ends_with("/mediainfo") || p.ends_with("/MediaInfo")));
+        }
+
+        // Tauri places externalBin beside Resources / in Contents/MacOS.
+        assert!(
+            rendered.iter().any(|p| p.contains("/MacOS/")),
+            "expected MacOS sibling candidate layout"
+        );
+        // Flat --no-bundle archives: candidates include current_exe parent (backend-derived only).
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(exe_dir) = exe.parent() {
+                let exe_dir_s = exe_dir.to_string_lossy().replace('\\', "/");
+                assert!(
+                    rendered.iter().any(|p| p.starts_with(&exe_dir_s)),
+                    "expected current_exe parent candidates for flat release layout, got {rendered:?}"
+                );
+            }
+        }
+        assert!(
+            !rendered.iter().any(|p| p.contains("evil")),
+            "candidates must stay within fixed layout"
+        );
+    }
+
+    #[test]
+    fn packaged_mediainfo_does_not_accept_arbitrary_caller_paths() {
+        // Resolver only searches fixed bases under resource_dir / resource parent /
+        // current_exe parent — never an arbitrary path the caller invents.
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_mediainfo_no_arbitrary_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+
+        let outsider = root.join("not-a-known-layout-dir");
+        std::fs::create_dir_all(&outsider).unwrap();
+        #[cfg(target_os = "windows")]
+        let file_name = "MediaInfo.exe";
+        #[cfg(not(target_os = "windows"))]
+        let file_name = "MediaInfo";
+        let planted = outsider.join(file_name);
+        std::fs::write(&planted, b"placeholder").unwrap();
+
+        // Outsider directory is not a known base; planted binary must never be selected.
+        let candidates = packaged_mediainfo_candidates(&root);
+        assert!(
+            !candidates.iter().any(|c| c == &planted),
+            "planted outsider path must not appear in candidates"
+        );
+        if let Ok(resolved) = resolve_packaged_mediainfo(&root) {
+            assert_ne!(
+                resolved, planted,
+                "arbitrary nested path must not resolve as packaged sidecar"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn packaged_mediainfo_prefers_staged_triple_name_when_present() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_mediainfo_triple_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("binaries")).unwrap();
+
+        let Some(triple) = packaged_mediainfo_host_target_triple() else {
+            // Unsupported host: missing sidecar remains non-destructive.
+            assert!(resolve_packaged_mediainfo(&root).is_err());
+            let _ = std::fs::remove_dir_all(&root);
+            return;
+        };
+        let staged = mediainfo_staged_name_for_target(triple).expect("staged name");
+        let sidecar = root.join("binaries").join(staged);
+        std::fs::write(&sidecar, b"placeholder").unwrap();
+
+        let resolved = resolve_packaged_mediainfo(&root).expect("triple sidecar");
+        assert_eq!(resolved, sidecar);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -1,0 +1,2 @@
+# Keep this directory for Tauri externalBin staging (scripts/stage-mediainfo.*).
+# Do not commit MediaInfo binary artifacts here.

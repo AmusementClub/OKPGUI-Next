@@ -20,12 +20,19 @@ jobs:
           - name: Windows
             os: windows-latest
             artifact_name: okpgui-next-windows-artifact
-          - name: macOS
+            mediainfo_target: x86_64-pc-windows-msvc
+          - name: macOS x64
+            os: macos-13
+            artifact_name: okpgui-next-macos-x64-artifact
+            mediainfo_target: x86_64-apple-darwin
+          - name: macOS arm64
             os: macos-latest
-            artifact_name: okpgui-next-macos-artifact
+            artifact_name: okpgui-next-macos-arm64-artifact
+            mediainfo_target: aarch64-apple-darwin
           - name: Linux
             os: ubuntu-22.04
             artifact_name: okpgui-next-linux-artifact
+            mediainfo_target: x86_64-unknown-linux-gnu
 
     steps:
       - name: Checkout repository
@@ -50,6 +57,8 @@ jobs:
 
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
 
       - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
@@ -59,6 +68,29 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
+
+      - name: MediaInfo sidecar inventory gate
+        run: node scripts/verify-mediainfo-package.mjs --manifest-only
+
+      - name: Stage MediaInfo sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          ./scripts/stage-mediainfo.ps1 -Target '${{ matrix.platform.mediainfo_target }}'
+          node scripts/verify-mediainfo-package.mjs --target '${{ matrix.platform.mediainfo_target }}'
+
+      - name: Stage MediaInfo sidecar (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          chmod +x scripts/stage-mediainfo.sh
+          ./scripts/stage-mediainfo.sh '${{ matrix.platform.mediainfo_target }}'
+          node scripts/verify-mediainfo-package.mjs --target '${{ matrix.platform.mediainfo_target }}'
+
+      - name: Cargo fmt gate
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+
+      - name: Cargo clippy gate
+        run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
       - name: Run frontend tests
         run: pnpm test
@@ -80,3 +112,6 @@ jobs:
           path: |
             src-tauri/target/release/bundle/**
             src-tauri/target/release/okpgui-next*
+            src-tauri/binaries/mediainfo-${{ matrix.platform.mediainfo_target }}
+            src-tauri/binaries/mediainfo-${{ matrix.platform.mediainfo_target }}.exe
+            src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html
