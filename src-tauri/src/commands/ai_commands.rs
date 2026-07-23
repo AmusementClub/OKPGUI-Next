@@ -48,7 +48,7 @@ use crate::ai::template_seed::{
     parse_template_selection, template_selection_schema, TemplateSeed, TemplateSeedRegistry,
 };
 use crate::ai::vision::{
-    extract_final_image_urls, normalize_image, VisionImageInput, VisionImageResult,
+    content_digest, extract_final_image_urls, normalize_image, VisionImageInput, VisionImageResult,
     MAX_DOWNLOAD_BYTES,
 };
 use crate::domain::publish_plan::{get_or_create_registry, PlanAuditEvidence};
@@ -1515,6 +1515,8 @@ pub fn ai_normalize_vision_image(
     Ok(VisionImageResult {
         url: String::new(),
         source: "local".to_string(),
+        content_hash: content_digest(&normalized),
+        mime_type: "image/jpeg".to_string(),
         normalized_bytes: normalized.len(),
         width,
         height,
@@ -3184,8 +3186,13 @@ fn local_audit_result(
             finding
         })
         .collect::<Vec<_>>();
-    // Derive media findings only from backend-owned plan media evidence.
-    findings.extend(load_plan_media_findings(&plan_token));
+    // An AI-disabled plan is a local-only path: do not turn the optional, unrun
+    // MediaInfo check into a new WARNING. Once an AI/media path actually ran (or
+    // already produced a local finding), plan-owned media evidence is advisory.
+    // This preserves the zero-impact disabled contract without trusting client data.
+    if formal_ran || job_id.is_some() || !findings.is_empty() {
+        findings.extend(load_plan_media_findings(&plan_token));
+    }
     let input = sanitize_audit_input(
         AuditInput {
             local_blockers: local_blockers.clone(),
@@ -5051,6 +5058,38 @@ mod formal_audit_lifecycle_tests {
             Some("torrent/video.mkv"),
             "safe relative evidence paths survive default policy"
         );
+    }
+
+    #[test]
+    fn ai_disabled_local_only_result_does_not_invent_media_warning() {
+        let _guard = command_test_guard();
+        let token = {
+            let mut registry = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            registry
+                .prepare_plan("sha256:disabled-media".to_string(), 1)
+                .expect("prepare local-only plan")
+        };
+
+        let result = local_audit_result(
+            token.clone(),
+            "sha256:disabled-media".to_string(),
+            1,
+            Vec::new(),
+            Vec::new(),
+            false,
+            None,
+            &RedactionPolicy::default(),
+        );
+
+        assert_eq!(result.decision, AuditDecision::Go);
+        assert!(result.findings.is_empty());
+
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.invalidate_plan(&token);
     }
 
     #[test]

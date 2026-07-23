@@ -24,6 +24,10 @@ pub struct VisionImageInput {
 pub struct VisionImageResult {
     pub url: String,
     pub source: String,
+    /// SHA-256 of the normalized bytes, never the raw/base64 image payload.
+    pub content_hash: String,
+    /// MIME type of the normalized payload sent to a provider.
+    pub mime_type: String,
     pub normalized_bytes: usize,
     pub width: u32,
     pub height: u32,
@@ -32,6 +36,8 @@ pub struct VisionImageResult {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct VisionBatchResult {
     pub images: Vec<VisionImageResult>,
+    /// Deterministic digest over ordered normalized image content hashes.
+    pub batch_hash: String,
     pub warnings: Vec<String>,
 }
 
@@ -218,14 +224,14 @@ fn extract_quoted_src_attr(tag: &str, tag_lower: &str) -> Option<String> {
 ///
 /// Internal only: digests are never attached to public serialized Vision IPC
 /// structs and never persist raw/base64 image payloads.
-fn content_digest(bytes: &[u8]) -> String {
+pub(crate) fn content_digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
 /// Deterministic batch digest over ordered per-image content digests.
-fn batch_content_digest(image_digests: &[String]) -> String {
+pub(crate) fn batch_content_digest(image_digests: &[String]) -> String {
     let mut hasher = Sha256::new();
     for digest in image_digests {
         hasher.update(digest.as_bytes());
@@ -389,8 +395,6 @@ pub fn prepare_images(
     // Sequential fetch stays within the documented max concurrency of two.
     let mut result = VisionBatchResult::default();
     let mut total_bytes = 0usize;
-    // Internal digests only — not written onto VisionImageResult / VisionBatchResult
-    // so public IPC JSON and struct field sets stay unchanged.
     let mut image_digests = Vec::new();
     for input in inputs {
         if !seen.insert(input.url.clone()) {
@@ -405,16 +409,15 @@ pub fn prepare_images(
         result.images.push(VisionImageResult {
             url: input.url,
             source: input.source,
+            content_hash: image_digests.last().cloned().unwrap_or_default(),
+            mime_type: "image/jpeg".to_string(),
             normalized_bytes: normalized.len(),
             width,
             height,
         });
         // normalized drops here without base64/path persistence.
     }
-    // Touch batch digest so the ordering over image digests is exercised; result
-    // shape is intentionally unchanged (no serialized digest field).
-    let _batch_digest = batch_content_digest(&image_digests);
-    debug_assert!(_batch_digest.starts_with("sha256:"));
+    result.batch_hash = batch_content_digest(&image_digests);
     Ok(result)
 }
 

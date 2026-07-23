@@ -90,6 +90,40 @@ impl PlanMediaEvidence {
     }
 }
 
+/// One backend-fetched, normalized Vision asset bound to a prepared plan.
+/// The URL is retained only inside the Rust plan registry for provider assembly;
+/// it is intentionally omitted from public plan serialization.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanVisionImage {
+    #[serde(skip)]
+    pub url: String,
+    pub source: String,
+    pub content_hash: String,
+    pub mime_type: String,
+    pub normalized_bytes: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Normalized Vision assets bound to a prepared plan before formal audit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanVisionEvidence {
+    /// The plan hash before this evidence is bound.
+    pub snapshot_hash: String,
+    pub request_generation: u64,
+    pub batch_hash: String,
+    #[serde(default)]
+    pub images: Vec<PlanVisionImage>,
+}
+
+const MAX_PLAN_VISION_IMAGES: usize = 5;
+
+impl PlanVisionEvidence {
+    pub fn matches_plan(&self, snapshot_hash: &str, request_generation: u64) -> bool {
+        self.snapshot_hash == snapshot_hash && self.request_generation == request_generation
+    }
+}
+
 impl PlanAuditEvidence {
     /// Authoritative initial evidence bound atomically at `prepare_plan` time.
     ///
@@ -145,6 +179,10 @@ pub struct PublishPlan {
     /// Rust-owned MediaInfo evidence bound only after identity-matched success.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub media_evidence: Option<PlanMediaEvidence>,
+    /// Rust-owned normalized Vision evidence. Its content hash participates in the
+    /// canonical snapshot hash and invalidates any earlier audit evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vision_evidence: Option<PlanVisionEvidence>,
     /// Explicit user acknowledgements recorded against this plan token.
     #[serde(default)]
     pub acknowledgements: Acknowledgements,
@@ -164,6 +202,8 @@ pub struct CanonicalSnapshot {
     pub torrent_digest: String,
     #[serde(default)]
     pub profile_name: String,
+    #[serde(default)]
+    pub vision_batch_hash: String,
 }
 
 /// Private execution binding: raw paths and identity material never leave Rust.
@@ -201,6 +241,7 @@ impl PublishPlan {
             local_execution_binding: None,
             audit_evidence: None,
             media_evidence: None,
+            vision_evidence: None,
             acknowledgements: Acknowledgements::default(),
         }
     }
@@ -273,6 +314,80 @@ impl PublishPlan {
         }
         self.media_evidence = Some(evidence);
         Ok(())
+    }
+
+    /// Bind backend-fetched normalized Vision assets and roll the canonical plan hash.
+    ///
+    /// Vision must be bound before a formal audit starts. Rebinding changes the
+    /// snapshot identity, clears prior audit/acknowledgement state, and returns the
+    /// new hash so callers can start exactly one audit for the new plan.
+    pub fn bind_vision_evidence(&mut self, evidence: PlanVisionEvidence) -> Result<String, String> {
+        if evidence.snapshot_hash != self.snapshot_hash {
+            return Err("vision evidence snapshot_hash does not match prepared plan".to_string());
+        }
+        if evidence.request_generation != self.request_generation {
+            return Err(
+                "vision evidence request_generation does not match prepared plan".to_string(),
+            );
+        }
+        if self
+            .audit_evidence
+            .as_ref()
+            .is_some_and(|audit| audit.job_id.is_some())
+        {
+            return Err("vision evidence must be bound before formal audit starts".to_string());
+        }
+        if evidence.images.len() > MAX_PLAN_VISION_IMAGES {
+            return Err("vision evidence exceeds the five-image limit".to_string());
+        }
+        let hashes = evidence
+            .images
+            .iter()
+            .map(|image| image.content_hash.as_str())
+            .collect::<Vec<_>>();
+        let expected_batch_hash = compute_vision_batch_hash(&hashes);
+        if evidence.batch_hash != expected_batch_hash {
+            return Err("vision evidence batch hash does not match image hashes".to_string());
+        }
+        for image in &evidence.images {
+            if !is_sha256_digest(&image.content_hash)
+                || image.mime_type != "image/jpeg"
+                || image.normalized_bytes == 0
+                || image.normalized_bytes > 1_500_000
+                || image.width == 0
+                || image.height == 0
+            {
+                return Err("vision evidence contains invalid normalized image metadata".to_string());
+            }
+        }
+        let snapshot = self
+            .canonical_snapshot
+            .as_mut()
+            .ok_or_else(|| "prepared plan has no canonical snapshot".to_string())?;
+        let next_hash = compute_canonical_snapshot_hash(
+            &snapshot.torrent_digest,
+            &snapshot.torrent_name,
+            &snapshot.profile_name,
+            &snapshot.template_digest,
+            &snapshot.sites,
+            Some(&evidence.batch_hash),
+        );
+        snapshot.vision_batch_hash = evidence.batch_hash.clone();
+        snapshot.hash = next_hash.clone();
+        self.snapshot_hash = next_hash.clone();
+        let mut evidence = evidence;
+        evidence.snapshot_hash = next_hash.clone();
+        self.vision_evidence = Some(evidence);
+        // The old evidence is tied to the previous snapshot and is no longer valid.
+        self.audit_evidence = None;
+        self.acknowledgements.clear();
+        Ok(next_hash)
+    }
+
+    pub fn has_authoritative_vision_evidence(&self) -> bool {
+        self.vision_evidence.as_ref().is_some_and(|evidence| {
+            evidence.matches_plan(&self.snapshot_hash, self.request_generation)
+        })
     }
 
     /// True when this plan has identity-matched backend-owned MediaInfo evidence.
@@ -360,6 +475,7 @@ impl PublishPlan {
             &request.profile_name,
             &template_digest,
             &sites,
+            None,
         );
         let binding_fingerprint = compute_binding_fingerprint(
             &request,
@@ -377,6 +493,7 @@ impl PublishPlan {
             torrent_name,
             torrent_digest: torrent_identity.digest.clone(),
             profile_name: request.profile_name.clone(),
+            vision_batch_hash: String::new(),
         });
         plan.set_local_binding(LocalExecutionBinding {
             request,
@@ -418,6 +535,9 @@ impl PublishPlan {
                 bytes.extend_from_slice(&(s.len() as u64).to_le_bytes());
                 bytes.extend_from_slice(s);
             }
+            let vision_batch_hash = snapshot.vision_batch_hash.as_bytes();
+            bytes.extend_from_slice(&(vision_batch_hash.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(vision_batch_hash);
         }
         bytes
     }
@@ -625,6 +745,7 @@ fn compute_canonical_snapshot_hash(
     profile_name: &str,
     template_digest: &str,
     sites: &[String],
+    vision_batch_hash: Option<&str>,
 ) -> String {
     #[derive(Serialize)]
     struct CanonicalPayload<'a> {
@@ -634,6 +755,8 @@ fn compute_canonical_snapshot_hash(
         profile_name: &'a str,
         template_digest: &'a str,
         sites: &'a [String],
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vision_batch_hash: Option<&'a str>,
     }
     let payload = CanonicalPayload {
         version: 2,
@@ -642,8 +765,25 @@ fn compute_canonical_snapshot_hash(
         profile_name,
         template_digest,
         sites,
+        vision_batch_hash,
     };
     digest_json(&payload)
+}
+
+fn compute_vision_batch_hash(image_hashes: &[&str]) -> String {
+    let mut hasher = Sha256::new();
+    for digest in image_hashes {
+        hasher.update(digest.as_bytes());
+        hasher.update(b"\n");
+    }
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn is_sha256_digest(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix("sha256:") else {
+        return false;
+    };
+    hex.len() == 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// Private execution binding fingerprint over path + identity + inputs.
@@ -924,6 +1064,37 @@ impl PlanRegistry {
         }
         plan.bind_media_evidence(evidence)?;
         Ok(plan)
+    }
+
+    /// Bind normalized Vision evidence and roll the plan snapshot hash.
+    ///
+    /// The private execution binding is revalidated before any mutation so a
+    /// same-path torrent replacement cannot become part of the Vision snapshot.
+    pub fn bind_vision_evidence(
+        &mut self,
+        token: &str,
+        evidence: PlanVisionEvidence,
+    ) -> Result<String, String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        if self.is_expired(token) {
+            self.remove(token);
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        let plan = self
+            .plans
+            .get_mut(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        if let Some(binding) = plan.get_local_binding() {
+            if let Err(failures) = binding.revalidate() {
+                return Err(failures.join("；"));
+            }
+        } else {
+            return Err("prepared plan has no local execution binding".to_string());
+        }
+        plan.bind_vision_evidence(evidence)
     }
 
     /// Resolve plan identity + private binding for MediaInfo start.
@@ -1691,6 +1862,109 @@ mod tests {
         });
         assert!(!plan.has_authoritative_audit_evidence());
         assert!(!plan.can_publish_now());
+    }
+
+    #[test]
+    fn vision_evidence_rolls_snapshot_hash_and_invalidates_old_audit() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(
+                11,
+                sample_request(torrent_path.clone()),
+                Vec::new(),
+                false,
+                None,
+            )
+            .expect("prepare");
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+        let content_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let batch_hash = compute_vision_batch_hash(&[content_hash]);
+
+        let next_hash = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: old_hash.clone(),
+                    request_generation: 11,
+                    batch_hash: batch_hash.clone(),
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/poster.jpg?token=redacted".into(),
+                        source: "poster".into(),
+                        content_hash: content_hash.into(),
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 1024,
+                        width: 640,
+                        height: 360,
+                    }],
+                },
+            )
+            .expect("bind vision");
+
+        assert_ne!(next_hash, old_hash);
+        let plan = registry.inspect_plan(&token).expect("plan remains live");
+        assert_eq!(plan.snapshot_hash, next_hash);
+        assert!(plan.has_authoritative_vision_evidence());
+        assert!(plan.audit_evidence.is_none());
+        assert_eq!(plan.acknowledgements, Acknowledgements::default());
+        assert_eq!(
+            plan.canonical_snapshot
+                .as_ref()
+                .expect("canonical snapshot")
+                .vision_batch_hash,
+            batch_hash
+        );
+        let public = serde_json::to_string(plan).expect("serialize public plan");
+        assert!(!public.contains("cdn.example.test"));
+        assert!(!public.contains("token=redacted"));
+
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn vision_evidence_rejects_forged_batch_without_mutating_plan() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(
+                12,
+                sample_request(torrent_path.clone()),
+                Vec::new(),
+                false,
+                None,
+            )
+            .expect("prepare");
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+        let error = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: old_hash.clone(),
+                    request_generation: 12,
+                    batch_hash: "sha256:forged".into(),
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/poster.jpg".into(),
+                        source: "poster".into(),
+                        content_hash:
+                            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                                .into(),
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 1024,
+                        width: 640,
+                        height: 360,
+                    }],
+                },
+            )
+            .expect_err("forged batch must fail");
+        assert!(error.contains("batch hash"));
+        let plan = registry.inspect_plan(&token).expect("plan remains live");
+        assert_eq!(plan.snapshot_hash, old_hash);
+        assert!(plan.vision_evidence.is_none());
+        assert!(plan.has_authoritative_audit_evidence());
+
+        let _ = std::fs::remove_file(&torrent_path);
     }
 
     #[test]
