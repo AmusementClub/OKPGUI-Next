@@ -112,14 +112,35 @@ jobs:
       - name: Cargo clippy gate
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      - name: Offline provider/security contract gate
+        run: |
+          node scripts/verify-provider-contract.mjs
+          cargo test --manifest-path src-tauri/Cargo.toml provider_contract -- --nocapture
+
+      - name: Offline UI integration inventory gate
+        run: node scripts/verify-ui-integration-inventory.mjs
+
       - name: Run frontend tests
         run: pnpm test
 
       - name: Build frontend
         run: pnpm build
 
+      - name: Playwright browser/UI integration (mocked Tauri IPC; not desktop E2E)
+        run: |
+          # Browser/UI integration with mocked Tauri IPC only (not desktop E2E).
+          pnpm run test:ui-integration
+
+      - name: Run backend tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml
+
       - name: Build Tauri application binary
         run: pnpm tauri build --no-bundle
+
+      - name: Desktop E2E / macOS packaged smoke (platform-limited notice)
+        if: runner.os == 'Linux'
+        run: |
+          echo "::notice title=Platform-limited gates::Release packaging asserts sidecar/archive membership below. Windows/Linux desktop WebDriver E2E and macOS packaged IPC/keyring smoke remain platform-limited (no in-repo harness)."
 
       - name: Package Windows asset
         if: runner.os == 'Windows'

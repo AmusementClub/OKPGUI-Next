@@ -92,17 +92,41 @@ jobs:
       - name: Cargo clippy gate
         run: cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
 
+      - name: Offline provider/security contract gate
+        run: |
+          node scripts/verify-provider-contract.mjs
+          # Behavioral offline contract (localhost mock only; no live/paid providers).
+          cargo test --manifest-path src-tauri/Cargo.toml provider_contract -- --nocapture
+
+      - name: Offline UI integration inventory gate
+        run: node scripts/verify-ui-integration-inventory.mjs
+
       - name: Run frontend tests
         run: pnpm test
 
       - name: Run frontend build
         run: pnpm build
 
+      - name: Playwright browser/UI integration (mocked Tauri IPC; not desktop E2E)
+        run: |
+          # Uses scripts/run-playwright-ui-integration.mjs so frozen-lockfile installs
+          # still run browser/UI integration without a committed Playwright lock entry.
+          # This is not desktop E2E / WebDriver / packaged-app automation.
+          pnpm run test:ui-integration
+
       - name: Run backend tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Tauri application
         run: pnpm tauri build
+
+      # Platform-limited: true Windows/Linux desktop WebDriver E2E and macOS packaged
+      # IPC/sidecar/keyring smoke require a dedicated runner harness. This workflow does
+      # not claim those layers; report them as not-run here rather than inventing a pass.
+      - name: Desktop E2E / macOS packaged smoke (platform-limited notice)
+        if: runner.os == 'Linux'
+        run: |
+          echo "::notice title=Platform-limited gates::Windows/Linux desktop WebDriver E2E and macOS packaged IPC/sidecar/keyring smoke are not executed in this job (no runner harness in-repo). Browser UI integration above uses a mocked Tauri IPC bridge only."
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v7

@@ -7,7 +7,12 @@
     "version:sync": "node scripts/sync-version.mjs",
     "predev": "node scripts/sync-version.mjs",
     "dev": "vite",
-    "test": "vitest run --environment jsdom",
+    "test": "vitest run --environment jsdom --exclude 'tests/ui-integration/**'",
+    "test:ui-integration": "node scripts/run-playwright-ui-integration.mjs",
+    "test:provider-contract": "node scripts/verify-provider-contract.mjs",
+    "test:security-offline": "node scripts/verify-provider-contract.mjs && node scripts/verify-ui-integration-inventory.mjs",
+    "verify:mediainfo": "node scripts/verify-mediainfo-package.mjs --manifest-only",
+    "verify:ui-integration-inventory": "node scripts/verify-ui-integration-inventory.mjs",
     "prebuild": "node scripts/sync-version.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
@@ -34,6 +39,7 @@
     "react-dom": "^19.2.4"
   },
   "devDependencies": {
+    "@playwright/test": "1.54.2",
     "@tailwindcss/vite": "^4.2.1",
     "@tauri-apps/cli": "^2",
     "@types/markdown-it": "^14.1.2",
