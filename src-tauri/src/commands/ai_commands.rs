@@ -20,7 +20,8 @@ use crate::ai::credentials::{
 };
 use crate::ai::jobs::{
     formal_audit_may_bind_terminal_evidence, media_info_may_report_success,
-    recognition_may_return_result, AiJob, AiJobManager, AiJobState, DebugRecord, JobKind,
+    recognition_may_return_result, AiJob, AiJobManager, AiJobState, DEBUG_EXPORT_RELATIVE_DIR,
+    DEBUG_STORE_RELATIVE_DIR, DebugExportMetadata, DebugRecord, JobKind,
 };
 use crate::ai::media::{
     clamp_media_probe_timeout_ms, discover_media_files, discover_media_probe_requests,
@@ -63,6 +64,21 @@ use tauri::{AppHandle, Manager};
 fn jobs() -> &'static Mutex<AiJobManager> {
     static JOBS: OnceLock<Mutex<AiJobManager>> = OnceLock::new();
     JOBS.get_or_init(|| Mutex::new(AiJobManager::default()))
+}
+
+/// Initialize the optional backend-owned durable AI debug store from
+/// `{app_local_data_dir}/ai/debug`. Safe during setup with AI disabled; no network
+/// and no job-lifecycle side effects beyond loading/pruning non-secret records.
+pub fn init_ai_debug_store(app: &AppHandle) {
+    let Ok(local_dir) = app.path().app_local_data_dir() else {
+        // Optional store: missing path resolution leaves process-memory behavior.
+        return;
+    };
+    let store_dir = local_dir.join(DEBUG_STORE_RELATIVE_DIR);
+    let mut manager = jobs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    manager.init_debug_store(store_dir);
 }
 
 #[cfg(test)]
@@ -4173,13 +4189,36 @@ pub fn ai_list_debug_records() -> Vec<DebugRecord> {
         .list_debug_records()
 }
 
-/// Clear retained non-secret AI job debug records.
+/// Clear retained non-secret AI job debug records (also empties the durable store when configured).
+///
+/// Fail-closed: durable persist failure restores in-memory records and returns `Err`
+/// so the webview does not report success when `records.json` still holds data.
 #[tauri::command]
-pub fn ai_clear_debug_records() {
+pub fn ai_clear_debug_records() -> Result<(), String> {
     jobs()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .clear_debug_records();
+        .clear_debug_records()
+}
+
+/// Read-only export of redacted debug records to an app-local file.
+///
+/// Returns safe basename metadata only — never raw bundle content or absolute paths.
+/// Works with AI disabled (no network / no credential access). Storage or canary
+/// failures surface as `Err` without mutating job lifecycle state.
+#[tauri::command]
+pub fn ai_export_debug_records(app: AppHandle) -> Result<DebugExportMetadata, String> {
+    let local_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|error| format!("debug export unavailable: {error}"))?;
+    let export_dir = local_dir
+        .join(DEBUG_STORE_RELATIVE_DIR)
+        .join(DEBUG_EXPORT_RELATIVE_DIR);
+    let manager = jobs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    manager.export_debug_bundle(export_dir)
 }
 
 /// App-exit hook: cancel queued/running AI jobs so late completions cannot bind.
@@ -4390,6 +4429,13 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
         }
     };
 
+    // Secret-aware policy for every terminal probe summary (request/build/transport/classify).
+    let mut redaction_secrets = Vec::new();
+    if let Some(secret) = secret.as_ref() {
+        redaction_secrets.push(secret.expose().to_string());
+    }
+    let policy = RedactionPolicy::new(redaction_secrets);
+
     let identity = capability_identity(&connection, secret.as_ref());
     let schema = minimal_probe_schema();
     let job_id = {
@@ -4417,18 +4463,19 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
     let client = match build_no_redirect_client() {
         Ok(client) => client,
         Err(error) => {
+            let message = redact_provider_error(&error, &policy);
             let status = persist_probe_outcome(
                 &app,
                 &identity,
                 CapabilityState::Failed,
                 connection.mode,
-                error.clone(),
+                message.clone(),
             );
             let _ = complete_job_backend(
                 &job_id,
                 false,
                 Some("PROVIDER_CLIENT".to_string()),
-                error,
+                message,
             );
             return Ok(status);
         }
@@ -4453,7 +4500,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
                     provider: connection.provider,
                     mode: attempted_mode,
                     status: 0,
-                    message: error,
+                    message: redact_provider_error(&error, &policy),
                     usage: None,
                 });
                 break;
@@ -4471,18 +4518,23 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
         .await;
 
         let probe = match send_result {
-            Ok((status, body)) => classify_and_validate_probe_response(
-                connection.provider,
-                attempted_mode,
-                status,
-                &body,
-            ),
+            Ok((status, body)) => {
+                let mut classified = classify_and_validate_probe_response(
+                    connection.provider,
+                    attempted_mode,
+                    status,
+                    &body,
+                );
+                // Classification messages may echo provider bodies — redact before terminal use.
+                classified.message = redact_provider_error(&classified.message, &policy);
+                classified
+            }
             Err(error) => CapabilityProbeResult {
                 state: CapabilityState::Failed,
                 provider: connection.provider,
                 mode: attempted_mode,
                 status: 0,
-                message: error.chars().take(240).collect(),
+                message: redact_provider_error(&error, &policy),
                 usage: None,
             },
         };
@@ -4531,12 +4583,15 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
         usage: None,
     });
 
+    // Final secret-aware pass before config + job terminal summary retention.
+    let terminal_message = redact_provider_error(&result.message, &policy);
+
     let public = persist_probe_outcome(
         &app,
         &identity,
         result.state,
         result.mode,
-        result.message.clone(),
+        terminal_message.clone(),
     );
 
     let success = result.state == CapabilityState::Ready;
@@ -4551,7 +4606,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
                 _ => "PROBE_FAILED".to_string(),
             })
         },
-        result.message,
+        terminal_message,
     );
 
     Ok(public)
@@ -4609,6 +4664,8 @@ mod debug_record_and_exit_tests {
     #[test]
     fn debug_record_ipc_lists_and_clears_non_secret_metadata() {
         let _guard = command_test_guard();
+        // Isolate global manager records so this IPC contract test stays deterministic.
+        ai_clear_debug_records().expect("clear");
         let job_id = start_job_backend(JobKind::Audit, 9, "sha256:debug-ipc", None);
         complete_job_backend(&job_id, true, None, "debug summary only").unwrap();
 
@@ -4625,8 +4682,34 @@ mod debug_record_and_exit_tests {
         // Shape is non-secret: summary + usage counters only (no body/secret fields).
         assert!(record.usage.is_none());
 
-        ai_clear_debug_records();
+        ai_clear_debug_records().expect("clear");
         assert!(ai_list_debug_records().is_empty());
+    }
+
+    #[test]
+    fn debug_record_ipc_redacts_absolute_paths_in_summary() {
+        let _guard = command_test_guard();
+        ai_clear_debug_records().expect("clear");
+        let job_id = start_job_backend(JobKind::Audit, 10, "sha256:debug-path", None);
+        complete_job_backend(
+            &job_id,
+            false,
+            Some("X".into()),
+            "failed reading /Users/owen/secret/file",
+        )
+        .unwrap();
+        let listed = ai_list_debug_records();
+        let record = listed
+            .iter()
+            .find(|record| record.job_id == job_id)
+            .expect("record");
+        assert!(
+            !record.summary.contains("/Users/owen"),
+            "list IPC must not surface absolute paths: {}",
+            record.summary
+        );
+        assert!(record.summary.contains("[PATH_REDACTED]"));
+        ai_clear_debug_records().expect("clear");
     }
 
     #[test]

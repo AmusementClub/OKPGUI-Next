@@ -20,6 +20,9 @@ pub fn run() {
             // Reconcile any in-flight credential rotation journal before normal AI use.
             // Idempotent / fail closed; never exposes secrets over IPC.
             commands::ai_commands::init_ai_credential_journal_recovery(app.handle().clone());
+            // Optional durable AI debug store under app_local_data_dir.
+            // No network; safe with AI disabled; corrupt store is isolated without panic.
+            commands::ai_commands::init_ai_debug_store(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -101,8 +104,10 @@ pub fn run() {
             commands::ai_commands::ai_list_jobs,
             commands::ai_commands::ai_cancel_job,
             // Non-secret debug-record IPC only (bounded retention; no raw bodies/secrets).
+            // Export returns safe basename metadata only (redacted bundle + canary scan).
             commands::ai_commands::ai_list_debug_records,
             commands::ai_commands::ai_clear_debug_records,
+            commands::ai_commands::ai_export_debug_records,
             commands::ai_commands::ai_build_capability_probe,
             commands::ai_commands::ai_classify_capability_probe,
             commands::ai_commands::ai_list_models,
