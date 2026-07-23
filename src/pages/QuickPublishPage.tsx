@@ -16,6 +16,8 @@ import ConsoleModal from '../components/ConsoleModal';
 import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
 import PublishConfirmModal from '../components/PublishConfirmModal';
+import AiPreflightPanel from '../components/AiPreflightPanel';
+import AiRecognitionPanel from '../components/AiRecognitionPanel';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import WarningBanner from '../components/WarningBanner';
@@ -28,6 +30,8 @@ import {
     usePublishTask,
 } from '../hooks/usePublishTask';
 import { useQuickPublishRuntimeDraft } from '../hooks/useQuickPublishRuntimeDraft';
+import { isPrepareSupersededError, useAiPreflight } from '../hooks/useAiPreflight';
+import { useAiRecognition } from '../hooks/useAiRecognition';
 import { SiteDefinition, siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 import { useSiteRows } from '../hooks/useSiteRows';
 import {
@@ -43,12 +47,26 @@ import {
 import {
     QuickPublishRuntimeDraft,
     QuickPublishTemplate,
+    LegacyPublishTemplatePayload,
     SiteSelection,
     buildLegacyPublishTemplatePayload,
     formatTemplateTimestamp,
     quickPublishSiteKeys,
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
+import {
+    acknowledgeAutoTemplateSeedHydration,
+    clearAutoTemplateSeedHydrationCycle,
+    consumeTemplateSeed,
+    hasAutoTemplateSeedConsumeInFlight,
+    isAiCapabilityReady,
+    peekAutoTemplateSeedHandoff,
+    publishPreparedPlan,
+    readFriendlyError,
+    takeAndConsumeAutoTemplateSeed,
+    takeAutoTemplateSeedHandoff,
+} from '../services/ai';
+import type { PublishRequestPayload } from '../types/ai';
 
 interface PublishAttemptContext {
     publishId: string;
@@ -64,6 +82,11 @@ interface TemplatePublishHistoryUpdate {
     last_published_at: string;
     last_published_episode: string;
     last_published_resolution: string;
+}
+
+interface FrozenPublishPlan {
+    token: string;
+    request: PublishRequestPayload;
 }
 
 function formatBytes(bytes?: number): string {
@@ -105,9 +128,17 @@ export default function QuickPublishPage() {
     const [isDragging, setIsDragging] = useState(false);
     const [showConsole, setShowConsole] = useState(false);
     const [showConfirm, setShowConfirm] = useState(false);
+    const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
+    const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
+    /** Bumps on covered draft mutations so in-flight resolve/prepare cannot freeze stale data. */
+    const coveredEditGenerationRef = useRef(0);
+    const isPreparingPublishRef = useRef(false);
+    // Ref keeps invalidatePreparedOnCoveredEdit stable so drag-drop does not re-register.
+    const showConfirmRef = useRef(showConfirm);
+    showConfirmRef.current = showConfirm;
     // Stable callbacks: an inline onClearError would recreate parseTorrent every render,
     // forcing the drag-drop effect to re-register its listener each time.
     const handleRuntimeError = useCallback((message: string) => setErrorMessage(message), []);
@@ -175,6 +206,86 @@ export default function QuickPublishPage() {
         onError: handleRuntimeError,
         onClearError: handleClearRuntimeError,
     });
+    const preflight = useAiPreflight();
+    const recognition = useAiRecognition();
+    const clearRecognition = recognition.clear;
+    const invalidateRecognitionIfSnapshotMismatch = recognition.invalidateIfSnapshotMismatch;
+
+    const invalidatePreflight = preflight.invalidate;
+    const clearFrozenPreflight = useCallback(() => {
+        invalidatePreflight();
+        frozenPlanRef.current = null;
+        setShowConfirm(false);
+        setConfirmDraft(null);
+    }, [invalidatePreflight]);
+
+    /**
+     * Covered draft/template/torrent/profile/site/content/title/OKP mutations supersede
+     * any live or in-flight resolve/prepare. Confirm-modal episode/resolution history
+     * edits remain non-covered (same as HomePage).
+     * Also clears advisory recognition so stale candidates cannot remain active.
+     */
+    const invalidatePreparedOnCoveredEdit = useCallback(() => {
+        coveredEditGenerationRef.current += 1;
+        clearRecognition();
+        if (frozenPlanRef.current || showConfirmRef.current || isPreparingPublishRef.current) {
+            clearFrozenPreflight();
+        }
+    }, [clearFrozenPreflight, clearRecognition]);
+
+    // Drop recognition when preflight snapshot identity drifts or is cleared.
+    useEffect(() => {
+        invalidateRecognitionIfSnapshotMismatch(preflight.state.snapshot_hash);
+    }, [invalidateRecognitionIfSnapshotMismatch, preflight.state.snapshot_hash]);
+
+    const updateDraftCovered = useCallback(
+        (updater: (current: QuickPublishRuntimeDraft) => QuickPublishRuntimeDraft) => {
+            invalidatePreparedOnCoveredEdit();
+            setDraft(updater);
+        },
+        [invalidatePreparedOnCoveredEdit, setDraft],
+    );
+
+    const parseTorrentCovered = useCallback(
+        async (path: string) => {
+            invalidatePreparedOnCoveredEdit();
+            await parseTorrent(path);
+        },
+        [invalidatePreparedOnCoveredEdit, parseTorrent],
+    );
+
+    const selectTorrentFileCovered = useCallback(async () => {
+        invalidatePreparedOnCoveredEdit();
+        await selectTorrentFile();
+    }, [invalidatePreparedOnCoveredEdit, selectTorrentFile]);
+
+    const generateTitleCovered = useCallback(async () => {
+        invalidatePreparedOnCoveredEdit();
+        await generateTitle(activeTemplate, draft, true);
+    }, [activeTemplate, draft, generateTitle, invalidatePreparedOnCoveredEdit]);
+
+    const switchRuntimeContentTemplateCovered = useCallback(
+        (templateId: string) => {
+            invalidatePreparedOnCoveredEdit();
+            switchRuntimeContentTemplate(templateId);
+        },
+        [invalidatePreparedOnCoveredEdit, switchRuntimeContentTemplate],
+    );
+
+    const resetToTemplateDefaultsCovered = useCallback(() => {
+        invalidatePreparedOnCoveredEdit();
+        resetToTemplateDefaults();
+    }, [invalidatePreparedOnCoveredEdit, resetToTemplateDefaults]);
+
+    const selectOkpExecutableCovered = useCallback(async () => {
+        invalidatePreparedOnCoveredEdit();
+        await selectOkpExecutable();
+    }, [invalidatePreparedOnCoveredEdit, selectOkpExecutable]);
+
+    const clearOkpExecutablePathCovered = useCallback(async () => {
+        invalidatePreparedOnCoveredEdit();
+        await clearOkpExecutablePath();
+    }, [clearOkpExecutablePath, invalidatePreparedOnCoveredEdit]);
 
     const templateOptions = useMemo(
         () => buildTemplateOptions(quickPublishTemplates),
@@ -206,7 +317,7 @@ export default function QuickPublishPage() {
                 const droppedTorrentPath = extractDroppedFilePath(event.payload.paths);
 
                 if (droppedTorrentPath) {
-                    void parseTorrent(droppedTorrentPath);
+                    void parseTorrentCovered(droppedTorrentPath);
                 }
             });
 
@@ -224,7 +335,149 @@ export default function QuickPublishPage() {
             disposed = true;
             unlisten?.();
         };
-    }, [parseTorrent]);
+    }, [parseTorrentCovered]);
+
+    // AutoTemplate seed hydration: wait for catalog load, validate backend metadata
+    // against the currently loaded catalog, then mutate the runtime draft only on success.
+    // Fail-closed paths never mutate runtime and always surface a concise sanitized error.
+    const autoTemplateSeedHandledRef = useRef(false);
+
+    /** User-visible, non-sensitive hydration failures (no paths, secrets, or raw provider bodies). */
+    const reportAutoTemplateHydrationFailure = useCallback((message: string) => {
+        setStatusMessage('');
+        setErrorMessage(message);
+    }, []);
+    useEffect(() => {
+        if (autoTemplateSeedHandledRef.current) {
+            return;
+        }
+
+        let cancelled = false;
+
+        const attemptHydration = async () => {
+            const handoff = peekAutoTemplateSeedHandoff();
+            const inFlight = hasAutoTemplateSeedConsumeInFlight();
+            if (!handoff && !inFlight) {
+                return;
+            }
+
+            // After a StrictMode remount the module-scoped consume may still be in flight
+            // while runtime catalog state is empty again — wait for reload before validating.
+            if (!handoff && inFlight && Object.keys(quickPublishTemplates).length === 0) {
+                return;
+            }
+
+            // When a handoff is still present, wait until the target template is in the
+            // runtime catalog (or confirm it is truly missing after config load).
+            if (handoff) {
+                const catalogTemplate = quickPublishTemplates[handoff.template_id];
+                if (!catalogTemplate) {
+                    try {
+                        const config = await invoke<{
+                            quick_publish_templates?: Record<string, { revision?: number }>;
+                        }>('get_config');
+                        if (cancelled) {
+                            return;
+                        }
+                        const remote = config.quick_publish_templates?.[handoff.template_id];
+                        if (!remote) {
+                            // Template deleted/missing: fail closed, invalidate handoff + seed.
+                            autoTemplateSeedHandledRef.current = true;
+                            const token = handoff.token;
+                            takeAutoTemplateSeedHandoff();
+                            void consumeTemplateSeed(token);
+                            clearAutoTemplateSeedHydrationCycle();
+                            reportAutoTemplateHydrationFailure(
+                                '自动选模板对应的发布模板不存在或已变更，请重新选择模板。',
+                            );
+                            return;
+                        }
+                        // Config has the template but runtime state is not ready yet — wait.
+                        return;
+                    } catch {
+                        return;
+                    }
+                }
+            }
+
+            const consumed = await takeAndConsumeAutoTemplateSeed();
+            if (cancelled) {
+                // StrictMode remount: the shared in-flight promise will be applied by the next effect.
+                return;
+            }
+            if (!consumed || !consumed.template_id || !consumed.torrent_path) {
+                // Transport/invoke failure leaves the opaque handoff in place for remount retry.
+                // Explicit terminal consume rejection already cleared storage — only then finalize.
+                if (peekAutoTemplateSeedHandoff()) {
+                    return;
+                }
+                // Replay / expired / stale / missing: fail closed, do not hydrate as success.
+                autoTemplateSeedHandledRef.current = true;
+                clearAutoTemplateSeedHydrationCycle();
+                reportAutoTemplateHydrationFailure(
+                    '自动选模板结果已失效或无法使用，请重新选择模板。',
+                );
+                return;
+            }
+
+            // Validate backend seed metadata against the currently loaded catalog.
+            const liveTemplate = quickPublishTemplates[consumed.template_id];
+            if (!liveTemplate || liveTemplate.revision !== consumed.template_revision) {
+                // Missing template or revision/digest drift — do not mutate user state.
+                autoTemplateSeedHandledRef.current = true;
+                clearAutoTemplateSeedHydrationCycle();
+                reportAutoTemplateHydrationFailure(
+                    '自动选模板对应的发布模板不存在或已变更，请重新选择模板。',
+                );
+                return;
+            }
+
+            // Validate torrent parse before mutating runtime as a successful seed hydration.
+            // Fail closed on terminal parse errors without acknowledging success.
+            try {
+                await invoke('parse_torrent', { path: consumed.torrent_path });
+            } catch {
+                if (cancelled) {
+                    return;
+                }
+                autoTemplateSeedHandledRef.current = true;
+                clearAutoTemplateSeedHydrationCycle();
+                // Sanitized: never surface absolute paths or raw parse provider bodies.
+                reportAutoTemplateHydrationFailure(
+                    '自动选模板的种子文件无法解析，请重新选择种子或模板。',
+                );
+                return;
+            }
+            if (cancelled) {
+                return;
+            }
+
+            autoTemplateSeedHandledRef.current = true;
+            // Seed hydration mutates template + torrent identity: supersede any prepared plan.
+            coveredEditGenerationRef.current += 1;
+            selectRuntimeTemplate(consumed.template_id);
+            try {
+                await parseTorrentCovered(consumed.torrent_path);
+            } catch {
+                clearAutoTemplateSeedHydrationCycle();
+                reportAutoTemplateHydrationFailure(
+                    '自动选模板的种子文件无法解析，请重新选择种子或模板。',
+                );
+                return;
+            }
+            if (cancelled) {
+                return;
+            }
+            // Acknowledge only after torrent hydration has completed successfully.
+            acknowledgeAutoTemplateSeedHydration();
+        };
+
+        void attemptHydration();
+
+        return () => {
+            cancelled = true;
+        };
+    }, [parseTorrentCovered, quickPublishTemplates, reportAutoTemplateHydrationFailure, selectRuntimeTemplate]);
 
     const siteRows = useSiteRows({
         publishSites,
@@ -247,12 +500,14 @@ export default function QuickPublishPage() {
             return;
         }
 
+        // Template identity mutation supersedes any live or in-flight prepare.
+        invalidatePreparedOnCoveredEdit();
         // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
         setErrorMessage('');
         lastUsedPersistQueueRef.current.enqueue(templateId);
-    }, [quickPublishTemplates, selectRuntimeTemplate]);
+    }, [invalidatePreparedOnCoveredEdit, quickPublishTemplates, selectRuntimeTemplate]);
 
     const finalizePublishHistory = useCallback(async (
         publishId: string,
@@ -321,21 +576,57 @@ export default function QuickPublishPage() {
         return null;
     }
 
-    const startPublish = async (
-        autoOpenConsole: boolean,
+    const buildPublishRequest = useCallback((
         draftToPublish: QuickPublishRuntimeDraft,
-    ) => {
+        publishId: string,
+    ): PublishRequestPayload | null => {
+        if (!activeTemplate) return null;
+        const publishTemplatePayload: LegacyPublishTemplatePayload = buildLegacyPublishTemplatePayload(draftToPublish, activeTemplate);
+        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draftToPublish.sites[siteKey]);
+        if (
+            publishTemplatePayload.description.trim()
+            && !publishTemplatePayload.description_html.trim()
+            && selectedSiteKeys.some((siteKey) => isHtmlPreferredSite(siteKey))
+        ) {
+            publishTemplatePayload.description_html = renderMarkdownToHtml(publishTemplatePayload.description);
+        }
+        return {
+            publish_id: publishId,
+            torrent_path: draftToPublish.torrent_path,
+            profile_name: draftToPublish.profile,
+            template: publishTemplatePayload,
+        };
+    }, [activeTemplate]);
+
+    const startPublish = async (autoOpenConsole: boolean) => {
         if (!activeTemplate) return;
 
-        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draftToPublish.sites[siteKey]);
+        // Publish only the exact prepared request. Never rebuild a mutable draft after confirm.
+        const frozenPlan = frozenPlanRef.current;
+        if (
+            !frozenPlan
+            || !frozenPlan.token
+            || frozenPlan.token !== preflight.state.token
+            || !preflight.canConfirm
+        ) {
+            preflight.invalidate();
+            frozenPlanRef.current = null;
+            setErrorMessage('确认内容已变化或未完成发布前检查，请重新执行发布前检查。');
+            setShowConfirm(false);
+            setConfirmDraft(null);
+            return;
+        }
+
+        const publishRequest = frozenPlan.request;
+        const publishId = publishRequest.publish_id;
+        const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => publishRequest.template.sites[siteKey]);
         const selectedSites = selectedSiteKeys.map((siteKey) => ({
             key: siteKey,
             label: quickPublishSiteLabels[siteKey],
         }));
-        const publishTemplatePayload = buildLegacyPublishTemplatePayload(draftToPublish, activeTemplate);
 
         const contentValidationIssues = validatePublishContentForSites(
-            publishTemplatePayload,
+            publishRequest.template,
             selectedSites,
         );
         if (contentValidationIssues.length > 0) {
@@ -366,19 +657,6 @@ export default function QuickPublishPage() {
             return;
         }
 
-        // Back-fill rendered HTML for HTML-preferring sites so the published
-        // content matches the preview instead of sending raw Markdown.
-        if (
-            publishTemplatePayload.description.trim()
-            && !publishTemplatePayload.description_html.trim()
-            && selectedSiteKeys.some((siteKey) => isHtmlPreferredSite(siteKey))
-        ) {
-            publishTemplatePayload.description_html = renderMarkdownToHtml(
-                publishTemplatePayload.description,
-            );
-        }
-
-        const publishId = createPublishId();
         const nextPublishSites = createPublishConsoleSiteMap(
             selectedSiteKeys.map((siteKey) => ({
                 siteCode: siteKey,
@@ -389,14 +667,20 @@ export default function QuickPublishPage() {
             })),
         );
 
+        const historyDraft = confirmDraft ?? draft;
         publishAttemptRef.current = {
             publishId,
             templateId: activeTemplate.id,
             publishedAt: new Date().toISOString(),
-            publishedEpisode: draftToPublish.episode,
-            publishedResolution: draftToPublish.resolution,
+            publishedEpisode: historyDraft.episode,
+            publishedResolution: historyDraft.resolution,
             siteKeys: selectedSiteKeys,
         };
+
+        // Close confirmation only after freezing history metadata for this attempt.
+        setShowConfirm(false);
+        setConfirmDraft(null);
+
         if (autoOpenConsole) {
             setShowConsole(true);
         }
@@ -404,19 +688,19 @@ export default function QuickPublishPage() {
         setStatusMessage('');
         setErrorMessage('');
 
+        const tokenToPublish = frozenPlan.token;
+        frozenPlanRef.current = null;
         try {
-            await invoke('publish', {
-                request: {
-                    publish_id: publishId,
-                    torrent_path: draftToPublish.torrent_path,
-                    profile_name: draftToPublish.profile,
-                    template: publishTemplatePayload,
-                },
-            });
+            // Pending formal audit + pending ack: cancel the job before publishing the frozen plan.
+            // Late completion must not replace UI or bind a consumed/cancelled plan.
+            await preflight.cancelPendingAuditForPublish();
+            await publishPreparedPlan(tokenToPublish);
+            preflight.invalidate();
         } catch (error) {
-            const message = typeof error === 'string' ? error : '启动发布失败。';
+            const message = readFriendlyError(error, '启动发布失败。');
             setErrorMessage(message);
             failActivePublish(message);
+            preflight.invalidate();
         }
     };
 
@@ -426,44 +710,112 @@ export default function QuickPublishPage() {
             setErrorMessage(error);
             return;
         }
+        // Reject re-entry while resolve/prepare is in flight (HomePage parity).
+        // Check the ref as well so a same-tick second click cannot pass before re-render.
+        if (isPublishing || isPreparingPublish || isPreparingPublishRef.current) return;
         setErrorMessage('');
         setStatusMessage('');
 
+        // Capture covered-edit generation before any async resolve/prepare work.
+        const prepareGeneration = coveredEditGenerationRef.current;
+        isPreparingPublishRef.current = true;
+        setIsPreparingPublish(true);
         try {
             const nextConfirmDraft = await resolvePublishRuntimeDraft(activeTemplate, draft);
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                // Covered edit during resolve superseded this attempt; never open stale confirm.
+                return;
+            }
+            const request = buildPublishRequest(nextConfirmDraft, createPublishId());
+            if (!request) return;
+            const contentValidationIssues = validatePublishContentForSites(
+                request.template,
+                quickPublishSiteKeys
+                    .filter((siteKey) => request.template.sites[siteKey])
+                    .map((siteKey) => ({ key: siteKey, label: quickPublishSiteLabels[siteKey] })),
+            );
+            if (contentValidationIssues.length > 0) {
+                setErrorMessage(contentValidationIssues.map((issue) => issue.message).join('；'));
+                return;
+            }
+            const prepared = await preflight.prepare(request);
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                // Covered edit during prepare: drop any token that may have been committed.
+                clearFrozenPreflight();
+                return;
+            }
+            frozenPlanRef.current = { token: prepared.token, request };
             setConfirmDraft(nextConfirmDraft);
             setShowConfirm(true);
-        } catch {
+        } catch (error) {
+            if (isPrepareSupersededError(error)) {
+                return;
+            }
+            setErrorMessage(readFriendlyError(error, '无法准备发布前检查。'));
             setConfirmDraft(null);
             setShowConfirm(false);
+            frozenPlanRef.current = null;
+        } finally {
+            isPreparingPublishRef.current = false;
+            setIsPreparingPublish(false);
         }
     };
 
     const handleCloseConfirm = () => {
-        setShowConfirm(false);
-        setConfirmDraft(null);
+        clearFrozenPreflight();
     };
 
     const handleReturnToEdit = () => {
         if (confirmDraft) {
+            // History-only episode/resolution return is not a covered identity mutation.
             setDraft((current) => ({
                 ...current,
                 episode: confirmDraft.episode,
                 resolution: confirmDraft.resolution,
             }));
         }
-        setShowConfirm(false);
-        setConfirmDraft(null);
+        clearFrozenPreflight();
     };
 
     const updateConfirmDraftMetadata = useCallback(
         (field: 'episode' | 'resolution', value: string) => {
-            setConfirmDraft((current) => current ? { ...current, [field]: value } : current);
+            // History-only confirm metadata: keep frozen token valid (HomePage parity).
+            // Episode/resolution are local publish-history fields, not covered plan identity.
+            setConfirmDraft((current) => (current ? { ...current, [field]: value } : current));
         },
         [],
     );
 
     const publishPreviewDraft = confirmDraft ?? draft;
+
+    const recognitionPatternsActive = Boolean(
+        activeTemplate
+        && activeTemplate.ep_pattern.trim()
+        && activeTemplate.resolution_pattern.trim()
+        && activeTemplate.title_pattern.trim(),
+    );
+    const recognitionSnapshotHash = preflight.state.snapshot_hash?.trim() || '';
+    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
+    const canRunRecognition = Boolean(
+        torrentInfo?.name?.trim()
+        && recognitionSnapshotHash
+        && recognitionReady
+        && recognitionPatternsActive
+        && !recognition.busy,
+    );
+
+    const handleAiRecognize = useCallback(() => {
+        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionSnapshotHash) {
+            return;
+        }
+        void recognition.recognize({
+            torrentName: torrentInfo.name,
+            epPattern: activeTemplate.ep_pattern,
+            resolutionPattern: activeTemplate.resolution_pattern,
+            titlePattern: activeTemplate.title_pattern,
+            snapshotHash: recognitionSnapshotHash,
+        });
+    }, [activeTemplate, recognition, recognitionSnapshotHash, torrentInfo?.name]);
 
     const selectedSiteSummaries = useMemo(
         () =>
@@ -501,7 +853,7 @@ export default function QuickPublishPage() {
                     </div>
                     <button
                         type="button"
-                        onClick={resetToTemplateDefaults}
+                        onClick={resetToTemplateDefaultsCovered}
                         disabled={!activeTemplate}
                         className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                     >
@@ -568,7 +920,7 @@ export default function QuickPublishPage() {
                             <button
                                 type="button"
                                 onClick={() => {
-                                    void selectTorrentFile();
+                                    void selectTorrentFileCovered();
                                 }}
                                 className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
                             >
@@ -609,7 +961,12 @@ export default function QuickPublishPage() {
                                 <span className="mb-2 block font-mono text-[11px] tracking-[0.08em] uppercase text-slate-500">身份</span>
                                 <select
                                     value={draft.profile}
-                                    onChange={(event) => setDraft((current) => ({ ...current, profile: event.target.value }))}
+                                    onChange={(event) =>
+                                        updateDraftCovered((current) => ({
+                                            ...current,
+                                            profile: event.target.value,
+                                        }))
+                                    }
                                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 xl:flex-1"
                                 >
                                     <option value="">选择身份</option>
@@ -626,7 +983,12 @@ export default function QuickPublishPage() {
                                 <input
                                     type="text"
                                     value={draft.poster}
-                                    onChange={(event) => setDraft((current) => ({ ...current, poster: event.target.value }))}
+                                    onChange={(event) =>
+                                        updateDraftCovered((current) => ({
+                                            ...current,
+                                            poster: event.target.value,
+                                        }))
+                                    }
                                     placeholder="海报图片 URL"
                                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 xl:flex-1"
                                 />
@@ -637,7 +999,12 @@ export default function QuickPublishPage() {
                                 <input
                                     type="text"
                                     value={draft.about}
-                                    onChange={(event) => setDraft((current) => ({ ...current, about: event.target.value }))}
+                                    onChange={(event) =>
+                                        updateDraftCovered((current) => ({
+                                            ...current,
+                                            about: event.target.value,
+                                        }))
+                                    }
                                     placeholder="发布说明"
                                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 xl:flex-1"
                                 />
@@ -648,7 +1015,12 @@ export default function QuickPublishPage() {
                                 <input
                                     type="text"
                                     value={draft.tags}
-                                    onChange={(event) => setDraft((current) => ({ ...current, tags: event.target.value }))}
+                                    onChange={(event) =>
+                                        updateDraftCovered((current) => ({
+                                            ...current,
+                                            tags: event.target.value,
+                                        }))
+                                    }
                                     placeholder="多个标签以英文逗号分隔"
                                     className="w-full rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500 xl:flex-1"
                                 />
@@ -681,13 +1053,34 @@ export default function QuickPublishPage() {
                             <button
                                 type="button"
                                 onClick={() => {
-                                    void generateTitle(activeTemplate, draft, true);
+                                    void generateTitleCovered();
                                 }}
                                 disabled={!activeTemplate || !torrentInfo?.name || isGeneratingTitle}
                                 className="inline-flex items-center gap-2 rounded-xl border border-cyan-500/40 bg-cyan-500/10 px-4 py-2 text-sm text-cyan-100 transition-colors hover:bg-cyan-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                                 {isGeneratingTitle ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
                                 重新生成标题
+                            </button>
+                            <button
+                                type="button"
+                                data-testid="ai-recognize-button"
+                                onClick={handleAiRecognize}
+                                disabled={!canRunRecognition}
+                                title={
+                                    !torrentInfo?.name?.trim()
+                                        ? '需要种子显示名称'
+                                        : !recognitionSnapshotHash
+                                          ? '需要先完成发布前检查以获得快照'
+                                          : !recognitionReady
+                                            ? '需要 AI 能力状态为 Ready'
+                                            : !recognitionPatternsActive
+                                              ? '需要有效的集数/分辨率/标题模板模式'
+                                              : '对当前种子与模板模式运行 AI 识别（仅建议）'
+                                }
+                                className="inline-flex items-center gap-2 rounded-xl border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-sm text-violet-100 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                {recognition.busy ? <Loader2 size={16} className="animate-spin" /> : <RefreshCw size={16} />}
+                                AI 识别
                             </button>
                         </div>
                     </div>
@@ -733,7 +1126,7 @@ export default function QuickPublishPage() {
                             rows={2}
                             value={draft.title}
                             onChange={(event) =>
-                                setDraft((current) => ({
+                                updateDraftCovered((current) => ({
                                     ...current,
                                     title: event.target.value,
                                     is_title_overridden: true,
@@ -743,6 +1136,12 @@ export default function QuickPublishPage() {
                             className="w-full resize-y rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                         />
                     </label>
+
+                    <AiRecognitionPanel
+                        busy={recognition.busy}
+                        error={recognition.error}
+                        result={recognition.result}
+                    />
                 </section>
 
                 {/* 6. Body section — STEP 4 · BODY */}
@@ -758,7 +1157,9 @@ export default function QuickPublishPage() {
                         <div className="flex items-center gap-3">
                             <select
                                 value={draft.shared_content_template_id ?? ''}
-                                onChange={(event) => switchRuntimeContentTemplate(event.target.value)}
+                                onChange={(event) =>
+                                    switchRuntimeContentTemplateCovered(event.target.value)
+                                }
                                 className="rounded-xl border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500"
                             >
                                 <option value="">不使用公共正文模板</option>
@@ -789,14 +1190,14 @@ export default function QuickPublishPage() {
                             markdown={draft.markdown}
                             html={draft.html}
                             onMarkdownChange={(markdown) =>
-                                setDraft((current) => ({
+                                updateDraftCovered((current) => ({
                                     ...current,
                                     markdown,
                                     is_content_overridden: true,
                                 }))
                             }
                             onHtmlChange={(html) =>
-                                setDraft((current) => ({
+                                updateDraftCovered((current) => ({
                                     ...current,
                                     html,
                                     is_content_overridden: true,
@@ -859,7 +1260,7 @@ export default function QuickPublishPage() {
                                                     checked={draft.sites[site.key as keyof SiteSelection]}
                                                     disabled={!selectable}
                                                     onChange={(event) =>
-                                                        setDraft((current) => ({
+                                                        updateDraftCovered((current) => ({
                                                             ...current,
                                                             sites: {
                                                                 ...current.sites,
@@ -933,7 +1334,7 @@ export default function QuickPublishPage() {
                     </div>
                     <button
                         type="button"
-                        onClick={() => void selectOkpExecutable()}
+                        onClick={() => void selectOkpExecutableCovered()}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200 hover:bg-slate-700"
                     >
                         <FolderOpen size={14} />
@@ -941,7 +1342,7 @@ export default function QuickPublishPage() {
                     </button>
                     <button
                         type="button"
-                        onClick={() => void clearOkpExecutablePath()}
+                        onClick={() => void clearOkpExecutablePathCovered()}
                         disabled={!okpExecutablePath}
                         className="inline-flex items-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-xs text-slate-200 hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-50"
                     >
@@ -971,10 +1372,10 @@ export default function QuickPublishPage() {
                     <button
                         type="button"
                         onClick={() => handlePublishClick()}
-                        disabled={isPublishing || !activeTemplate}
+                        disabled={isPublishing || isPreparingPublish || !activeTemplate}
                         className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/40 bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                     >
-                        {isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
+                        {isPreparingPublish || isPublishing ? <Loader2 size={16} className="animate-spin" /> : <Send size={16} />}
                         发布已选站点
                     </button>
                 </div>
@@ -992,10 +1393,7 @@ export default function QuickPublishPage() {
                 onClose={handleCloseConfirm}
                 onReturnToEdit={handleReturnToEdit}
                 onConfirm={({ autoOpenConsole }) => {
-                    const draftToPublish = confirmDraft ?? draft;
-                    setShowConfirm(false);
-                    setConfirmDraft(null);
-                    void startPublish(autoOpenConsole, draftToPublish);
+                    void startPublish(autoOpenConsole);
                 }}
                 title={publishPreviewDraft.title}
                 templateLabel={activeTemplate ? (activeTemplate.name || activeTemplate.id) : ''}
@@ -1014,6 +1412,15 @@ export default function QuickPublishPage() {
                 profile={publishPreviewDraft.profile}
                 okpPath={okpExecutablePath}
                 selectedSites={selectedSiteSummaries}
+                preflight={(
+                    <AiPreflightPanel
+                        state={preflight.state}
+                        configured={preflight.isConfigured}
+                        canConfirm={preflight.canConfirm}
+                        onAcknowledgementChange={preflight.setAcknowledgement}
+                    />
+                )}
+                confirmDisabled={isPublishing || isPreparingPublish || !preflight.canConfirm}
             />
         </div>
     );

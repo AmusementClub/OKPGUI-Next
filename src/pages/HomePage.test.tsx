@@ -1009,9 +1009,12 @@ describe('HomePage publish content pipeline', () => {
         options: {
             extraProfiles?: Record<string, Record<string, unknown>>;
             saveTemplateResult?: (args: Record<string, unknown>) => unknown;
+            aiSettings?: Record<string, unknown> | null;
+            auditDecision?: string;
         } = {},
     ) {
         const extraProfiles = options.extraProfiles ?? {};
+        const auditDecision = options.auditDecision ?? 'GO';
         invokeMock.mockImplementation((command: string, args) => {
             const typedArgs = args as Record<string, unknown> | undefined;
             switch (command) {
@@ -1024,6 +1027,7 @@ describe('HomePage publish content pipeline', () => {
                                 profile: 'p1',
                                 description: '**markdown 简介**',
                                 description_html: '',
+                                title: '发布标题',
                                 ...templateOverrides,
                             },
                         },
@@ -1048,6 +1052,61 @@ describe('HomePage publish content pipeline', () => {
                     });
                 case 'parse_title_details':
                     return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                case 'ai_get_settings':
+                    return Promise.resolve(
+                        options.aiSettings === undefined
+                            ? {
+                                provider: 'open_ai',
+                                endpoint: 'https://api.openai.com/v1',
+                                model: '',
+                                mode: 'auto',
+                                auth_mode: 'bearer',
+                                custom_header_name: null,
+                                credential_ref: null,
+                                enabled: false,
+                            }
+                            : options.aiSettings,
+                    );
+                case 'prepare_plan':
+                    return Promise.resolve({
+                        token: 'prepared-token',
+                        snapshot_hash: 'sha256:backend-authoritative',
+                        request_generation: 1,
+                        local_blockers: [],
+                        has_blockers: false,
+                    });
+                case 'ai_compute_audit':
+                case 'ai_start_formal_audit':
+                    return Promise.resolve({
+                        decision: auditDecision,
+                        findings: auditDecision === 'WARNING'
+                            ? [{ code: 'W1', severity: 'WARNING', message: '标题可能不完整' }]
+                            : [],
+                        unknown_codes: [],
+                        local_blockers: [],
+                        formal_ran: auditDecision !== 'GO',
+                        job_id: auditDecision === 'GO' ? null : 'job-1',
+                        plan_token: 'prepared-token',
+                        snapshot_hash: 'sha256:backend-authoritative',
+                        request_generation: 1,
+                    });
+                case 'set_plan_acknowledgements':
+                    return Promise.resolve(null);
+                case 'ai_poll_formal_audit':
+                    return Promise.resolve(null);
+                case 'ai_cancel_job':
+                    return Promise.resolve({
+                        id: 'job-1',
+                        kind: 'audit',
+                        state: 'cancelled',
+                        request_generation: 1,
+                        snapshot_hash: 'sha256:backend-authoritative',
+                        progress: 100,
+                    });
+                case 'invalidate_plan':
+                    return Promise.resolve(true);
+                case 'publish_prepared_plan':
+                    return Promise.resolve(null);
                 default:
                     return Promise.resolve(null);
             }
@@ -1060,7 +1119,7 @@ describe('HomePage publish content pipeline', () => {
             .map(([, args]) => args as Record<string, unknown>);
     }
 
-    async function selectTorrentAndPublish(container: HTMLElement, siteLabel: string) {
+    async function selectTorrentAndOpenConfirm(container: HTMLElement, siteLabel: string) {
         // Toggle the site on after the profile loads (selectable rows only).
         const checkbox = container.querySelector<HTMLInputElement>(
             `input[type="checkbox"][title="选择 ${siteLabel}"]`,
@@ -1090,6 +1149,182 @@ describe('HomePage publish content pipeline', () => {
         await flushAsync(20);
     }
 
+    async function confirmPublishInModal() {
+        const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+            (button) => button.textContent?.includes('确认发布'),
+        );
+        expect(confirmButton).toBeTruthy();
+        expect(confirmButton!.disabled).toBe(false);
+        await act(async () => {
+            confirmButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        });
+        await flushAsync(20);
+    }
+
+    it('does not publish before explicit confirmation and wires prepared token + audit', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            const prepareCalls = findInvokeArgs('prepare_plan');
+            const auditCalls = findInvokeArgs('ai_start_formal_audit');
+            const publishPreparedCalls = findInvokeArgs('publish_prepared_plan');
+            expect(prepareCalls).toHaveLength(1);
+            expect(auditCalls).toHaveLength(1);
+            expect(publishPreparedCalls).toHaveLength(0);
+
+            const prepareArgs = prepareCalls[0] as {
+                request: {
+                    request_generation?: number;
+                    snapshot_hash?: string;
+                    request: { template: { description_html: string } };
+                };
+            };
+            // Client must not supply a snapshot_hash; backend owns plan identity.
+            expect(prepareArgs.request.snapshot_hash).toBeUndefined();
+            expect(prepareArgs.request.request_generation).toEqual(expect.any(Number));
+
+            const auditArgs = auditCalls[0] as {
+                request: { plan_token?: string; snapshot_hash?: string };
+            };
+            expect(auditArgs.request.plan_token).toBe('prepared-token');
+            // Formal audit is token-bound; client snapshot authority is not accepted.
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).not.toBeNull();
+
+            await confirmPublishInModal();
+            expect(findInvokeArgs('publish_prepared_plan')).toEqual([{ token: 'prepared-token' }]);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('invalidates the prepared token on cancel and never leaves it live', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+
+            const cancelButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '取消',
+            );
+            expect(cancelButton).toBeTruthy();
+            await act(async () => {
+                cancelButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            // Security invariants remain valid during the modal leave transition;
+            // do not assert ai-preflight-panel unmount (Headless UI leave keeps DOM briefly).
+            const invalidateCalls = findInvokeArgs('invalidate_plan');
+            expect(invalidateCalls.some((args) => args.token === 'prepared-token')).toBe(true);
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('invalidates the prepared token when a covered site selection changes', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc', acgrip_api_token: 'token-acgrip' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+
+            const acgrip = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACG.RIP"]',
+            );
+            expect(acgrip).not.toBeNull();
+            await act(async () => {
+                acgrip!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            expect(findInvokeArgs('invalidate_plan').some((args) => args.token === 'prepared-token')).toBe(true);
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('requires acknowledgement for WARNING before publishing the frozen token', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' }, { auditDecision: 'WARNING' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeTruthy();
+            expect(confirmButton!.disabled).toBe(true);
+
+            const warningAck = Array.from(document.body.querySelectorAll('label')).find(
+                (label) => label.textContent?.includes('我已阅读提醒'),
+            );
+            expect(warningAck).toBeTruthy();
+            const checkbox = warningAck!.querySelector<HTMLInputElement>('input[type="checkbox"]');
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            expect(findInvokeArgs('set_plan_acknowledgements').length).toBeGreaterThanOrEqual(1);
+            expect(confirmButton!.disabled).toBe(false);
+
+            await confirmPublishInModal();
+            expect(findInvokeArgs('publish_prepared_plan')).toEqual([{ token: 'prepared-token' }]);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('keeps AI-disabled publish compatible via local GO audit without inventing client hashes', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' }, {
+            aiSettings: {
+                provider: 'open_ai',
+                endpoint: '',
+                model: '',
+                mode: 'auto',
+                auth_mode: 'bearer',
+                custom_header_name: null,
+                credential_ref: null,
+                enabled: false,
+            },
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(findInvokeArgs('ai_start_formal_audit')).toHaveLength(1);
+            expect(document.body.textContent).toContain('AI 未启用');
+
+            await confirmPublishInModal();
+            expect(findInvokeArgs('publish_prepared_plan')).toEqual([{ token: 'prepared-token' }]);
+            // No client snapshot_hash authority in prepare.
+            const prepareArgs = findInvokeArgs('prepare_plan')[0] as {
+                request: { snapshot_hash?: string };
+            };
+            expect(prepareArgs.request.snapshot_hash).toBeUndefined();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
     it('back-fills rendered HTML into the persisted and published template for HTML-preferring sites', async () => {
         vi.useFakeTimers();
         mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
@@ -1098,18 +1333,30 @@ describe('HomePage publish content pipeline', () => {
         try {
             await flushAsync();
 
-            await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+            await confirmPublishInModal();
 
             const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
             const saveCalls = findInvokeArgs('save_template');
-            const publishCalls = findInvokeArgs('publish');
+            const prepareCalls = findInvokeArgs('prepare_plan');
+            const publishPreparedCalls = findInvokeArgs('publish_prepared_plan');
             expect(saveCalls.length).toBeGreaterThanOrEqual(1);
-            expect(publishCalls).toHaveLength(1);
+            expect(prepareCalls).toHaveLength(1);
+            expect(publishPreparedCalls).toEqual([{ token: 'prepared-token' }]);
 
             const persistedTemplate = (saveCalls[saveCalls.length - 1] as { template: { description_html: string } }).template;
             expect(persistedTemplate.description_html).toBe(expectedHtml);
 
-            const publishRequest = (publishCalls[0] as { request: { template: { description_html: string; description: string } } }).request;
+            const prepareArgs = prepareCalls[0] as {
+                request: {
+                    request_generation?: number;
+                    snapshot_hash?: string;
+                    request: { template: { description_html: string; description: string } };
+                };
+            };
+            // Client must not supply a snapshot_hash; backend owns plan identity.
+            expect(prepareArgs.request.snapshot_hash).toBeUndefined();
+            const publishRequest = prepareArgs.request.request;
             expect(publishRequest.template.description).toBe('**markdown 简介**');
             expect(publishRequest.template.description_html).toBe(expectedHtml);
 
@@ -1132,11 +1379,21 @@ describe('HomePage publish content pipeline', () => {
         const rendered = await renderElement(<HomePage />);
         await flushAsync();
 
-        await selectTorrentAndPublish(rendered.container, 'Nyaa');
+        await selectTorrentAndOpenConfirm(rendered.container, 'Nyaa');
+        await confirmPublishInModal();
 
-        const publishCalls = findInvokeArgs('publish');
-        expect(publishCalls).toHaveLength(1);
-        const publishRequest = (publishCalls[0] as { request: { template: { description_html: string } } }).request;
+        const prepareCalls = findInvokeArgs('prepare_plan');
+        const publishPreparedCalls = findInvokeArgs('publish_prepared_plan');
+        expect(prepareCalls).toHaveLength(1);
+        expect(publishPreparedCalls).toEqual([{ token: 'prepared-token' }]);
+        const prepareArgs = prepareCalls[0] as {
+            request: {
+                snapshot_hash?: string;
+                request: { template: { description_html: string } };
+            };
+        };
+        expect(prepareArgs.request.snapshot_hash).toBeUndefined();
+        const publishRequest = prepareArgs.request.request;
         expect(publishRequest.template.description_html).toBe('');
 
         await rendered.unmount();
@@ -1148,7 +1405,8 @@ describe('HomePage publish content pipeline', () => {
         const rendered = await renderElement(<HomePage />);
         await flushAsync();
 
-        await selectTorrentAndPublish(rendered.container, 'ACGNx Asia');
+        await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+        await confirmPublishInModal();
 
         const expectedHtml = renderMarkdownToHtml('**markdown 简介**');
         const savesBefore = findInvokeArgs('save_template').length;
@@ -1210,5 +1468,797 @@ describe('HomePage publish content pipeline', () => {
         expect(findAboutInput(rendered.container).value).toBe('后端改写');
 
         await rendered.unmount();
+    });
+
+    it('builds the prepare payload from the backend-normalized saved template', async () => {
+        mountWithTemplate(
+            { about: '编辑器侧 about' },
+            { acgnx_asia_token: 'token-abc' },
+            {
+                saveTemplateResult: (args) => ({
+                    name: args.name,
+                    template: {
+                        ...(args.template as Record<string, unknown>),
+                        about: '后端规范化 about',
+                        tags: 'backend,normalized',
+                    },
+                }),
+            },
+        );
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            const prepareCalls = findInvokeArgs('prepare_plan');
+            expect(prepareCalls).toHaveLength(1);
+            const prepareArgs = prepareCalls[0] as {
+                request: {
+                    request: { template: { about: string; tags: string } };
+                };
+            };
+            expect(prepareArgs.request.request.template.about).toBe('后端规范化 about');
+            expect(prepareArgs.request.request.template.tags).toBe('backend,normalized');
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).not.toBeNull();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('suppresses stale confirmation when a covered edit happens during save or prepare', async () => {
+        const pendingSave = deferred<{ name: string; template: Record<string, unknown> }>();
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+        let holdPublishSave = false;
+        let publishSaveHeld = false;
+
+        // Custom mount so save_template / prepare_plan can race a covered editor edit.
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve({
+                        last_used_template: 'default',
+                        okp_executable_path: '/okp',
+                        templates: {
+                            default: {
+                                profile: 'p1',
+                                description: '**markdown 简介**',
+                                description_html: '',
+                                title: '发布标题',
+                            },
+                        },
+                    });
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({ profiles: { p1: { ...buildProfile(), acgnx_asia_token: 'token-abc' } } });
+                case 'save_template':
+                    if (holdPublishSave && !publishSaveHeld) {
+                        publishSaveHeld = true;
+                        return pendingSave.promise;
+                    }
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details':
+                    return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                case 'ai_get_settings':
+                    return Promise.resolve({
+                        provider: 'open_ai',
+                        endpoint: '',
+                        model: '',
+                        mode: 'auto',
+                        auth_mode: 'bearer',
+                        custom_header_name: null,
+                        credential_ref: null,
+                        enabled: false,
+                    });
+                case 'prepare_plan':
+                    return pendingPrepare.promise;
+                case 'ai_compute_audit':
+                case 'ai_start_formal_audit':
+                    return Promise.resolve({
+                        decision: 'GO',
+                        findings: [],
+                        unknown_codes: [],
+                        local_blockers: [],
+                        formal_ran: false,
+                        job_id: null,
+                        plan_token: 'prepared-token',
+                        snapshot_hash: 'sha256:backend-authoritative',
+                        request_generation: 1,
+                    });
+                case 'set_plan_acknowledgements':
+                    return Promise.resolve(null);
+                case 'invalidate_plan':
+                    return Promise.resolve(true);
+                case 'publish_prepared_plan':
+                    return Promise.resolve(null);
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            // Hold only the next save (publish path); site-toggle autosave already completed.
+            holdPublishSave = true;
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+                button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(5);
+            expect(publishSaveHeld).toBe(true);
+
+            // Covered editor mutation while publish save is in flight.
+            const title = rendered.container.querySelector<HTMLTextAreaElement>(
+                'textarea[placeholder^="最终发布标题"]',
+            );
+            expect(title).not.toBeNull();
+            await act(async () => {
+                setTextareaValue(title!, 'covered-edit-during-save');
+            });
+            await flushAsync();
+
+            const saveCalls = findInvokeArgs('save_template');
+            const heldSaveArgs = saveCalls[saveCalls.length - 1] as {
+                name?: string;
+                template?: Record<string, unknown>;
+            } | undefined;
+            await act(async () => {
+                pendingSave.resolve({
+                    name: String(heldSaveArgs?.name ?? 'default'),
+                    template: heldSaveArgs?.template ?? {},
+                });
+            });
+            // If prepare was reached despite the generation guard, resolve it so the race settles.
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            await flushAsync(20);
+
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeUndefined();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('suppresses stale confirmation when TemplateSelect switches identity during held publish save', async () => {
+        const pendingSave = deferred<{ name: string; template: Record<string, unknown> }>();
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+        let holdPublishSave = false;
+        let publishSaveHeld = false;
+        const config = {
+            last_used_template: 'alpha',
+            okp_executable_path: '/okp',
+            templates: {
+                alpha: {
+                    profile: 'p1',
+                    description: '**markdown 简介**',
+                    description_html: '',
+                    title: '发布标题',
+                    about: '模板 A',
+                },
+                beta: {
+                    profile: 'p1',
+                    description: '模板 B 描述',
+                    description_html: '',
+                    title: '模板 B 标题',
+                    about: '模板 B',
+                },
+            },
+        };
+
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve(config);
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        profiles: { p1: { ...buildProfile(), acgnx_asia_token: 'token-abc' } },
+                    });
+                case 'save_template':
+                    if (holdPublishSave && !publishSaveHeld) {
+                        publishSaveHeld = true;
+                        return pendingSave.promise;
+                    }
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details':
+                    return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                case 'ai_get_settings':
+                    return Promise.resolve({
+                        provider: 'open_ai',
+                        endpoint: '',
+                        model: '',
+                        mode: 'auto',
+                        auth_mode: 'bearer',
+                        custom_header_name: null,
+                        credential_ref: null,
+                        enabled: false,
+                    });
+                case 'prepare_plan':
+                    return pendingPrepare.promise;
+                case 'ai_compute_audit':
+                case 'ai_start_formal_audit':
+                    return Promise.resolve({
+                        decision: 'GO',
+                        findings: [],
+                        unknown_codes: [],
+                        local_blockers: [],
+                        formal_ran: false,
+                        job_id: null,
+                        plan_token: 'stale-prepared-token',
+                        snapshot_hash: 'sha256:stale',
+                        request_generation: 1,
+                    });
+                case 'set_plan_acknowledgements':
+                    return Promise.resolve(null);
+                case 'invalidate_plan':
+                    return Promise.resolve(true);
+                case 'publish_prepared_plan':
+                    return Promise.resolve(null);
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            // Hold only the publish-path save; site-toggle autosave already finished.
+            holdPublishSave = true;
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+                button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(5);
+            expect(publishSaveHeld).toBe(true);
+
+            // Template identity switch while publish preparation is mid-save.
+            const templateSelect = rendered.container.querySelector<HTMLSelectElement>(
+                'select[aria-label="选择模板"]',
+            );
+            expect(templateSelect).not.toBeNull();
+            await act(async () => {
+                templateSelect!.value = 'beta';
+                templateSelect!.dispatchEvent(new Event('change', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const saveCalls = findInvokeArgs('save_template');
+            const heldSaveArgs = saveCalls[saveCalls.length - 1] as {
+                name?: string;
+                template?: Record<string, unknown>;
+            } | undefined;
+            await act(async () => {
+                pendingSave.resolve({
+                    name: String(heldSaveArgs?.name ?? 'alpha'),
+                    template: heldSaveArgs?.template ?? {},
+                });
+            });
+            // Settle any prepare that might have been reached before the generation guard.
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            await flushAsync(20);
+
+            // Identity switch supersedes the in-flight prepare: no confirm UI, no publish.
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeUndefined();
+            // Selection should land on beta after the held save drains.
+            expect(templateSelect!.value).toBe('beta');
+            expect(findAboutInput(rendered.container).value).toBe('模板 B');
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('suppresses stale confirmation when a covered edit happens during deferred prepare_plan', async () => {
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+        const pendingAudit = deferred<{
+            decision: string;
+            findings: unknown[];
+            unknown_codes: unknown[];
+            local_blockers: unknown[];
+            formal_ran: boolean;
+            job_id: string | null;
+            plan_token: string;
+            snapshot_hash: string;
+            request_generation: number;
+        }>();
+        let prepareHeld = false;
+
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve({
+                        last_used_template: 'default',
+                        okp_executable_path: '/okp',
+                        templates: {
+                            default: {
+                                profile: 'p1',
+                                description: '**markdown 简介**',
+                                description_html: '',
+                                title: '发布标题',
+                            },
+                        },
+                    });
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        profiles: { p1: { ...buildProfile(), acgnx_asia_token: 'token-abc' } },
+                    });
+                case 'save_template':
+                    // Save completes immediately so publish reaches prepare_plan.
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details':
+                    return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                case 'ai_get_settings':
+                    return Promise.resolve({
+                        provider: 'open_ai',
+                        endpoint: '',
+                        model: '',
+                        mode: 'auto',
+                        auth_mode: 'bearer',
+                        custom_header_name: null,
+                        credential_ref: null,
+                        enabled: false,
+                    });
+                case 'prepare_plan':
+                    prepareHeld = true;
+                    return pendingPrepare.promise;
+                case 'ai_compute_audit':
+                case 'ai_start_formal_audit':
+                    return pendingAudit.promise;
+                case 'ai_poll_formal_audit':
+                    return Promise.resolve(null);
+                case 'ai_cancel_job':
+                    return Promise.resolve({
+                        id: 'job-x',
+                        kind: 'audit',
+                        state: 'cancelled',
+                        request_generation: 1,
+                        snapshot_hash: 'sha256:x',
+                        progress: 100,
+                    });
+                case 'set_plan_acknowledgements':
+                    return Promise.resolve(null);
+                case 'invalidate_plan':
+                    return Promise.resolve(true);
+                case 'publish_prepared_plan':
+                    return Promise.resolve(null);
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+                button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(20);
+            expect(prepareHeld).toBe(true);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+
+            // Covered editor mutation while prepare_plan is still pending.
+            const title = rendered.container.querySelector<HTMLTextAreaElement>(
+                'textarea[placeholder^="最终发布标题"]',
+            );
+            expect(title).not.toBeNull();
+            await act(async () => {
+                setTextareaValue(title!, 'covered-edit-during-prepare');
+            });
+            await flushAsync();
+
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            // If audit is reached despite the generation guard, resolve it so the race settles.
+            await act(async () => {
+                pendingAudit.resolve({
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    local_blockers: [],
+                    formal_ran: false,
+                    job_id: null,
+                    plan_token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale',
+                    request_generation: 1,
+                });
+            });
+            await flushAsync(20);
+
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeUndefined();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('suppresses stale confirmation when late auto-title applies during in-flight publish preparation', async () => {
+        // Race: title generation starts (pending parse_title_details), publish save/prepare
+        // begins while that request is still open, then the late generated title applies and
+        // must supersede the covered in-flight preflight (apply-time generation bump).
+        const pendingTitle = deferred<{ title: string; episode: string; resolution: string }>();
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+        const pendingAudit = deferred<{
+            decision: string;
+            findings: unknown[];
+            unknown_codes: unknown[];
+            local_blockers: unknown[];
+            formal_ran: boolean;
+            job_id: string | null;
+            plan_token: string;
+            snapshot_hash: string;
+            request_generation: number;
+        }>();
+        let titleGenerationHeld = false;
+        let prepareHeld = false;
+
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve({
+                        last_used_template: 'default',
+                        okp_executable_path: '/okp',
+                        templates: {
+                            default: {
+                                profile: 'p1',
+                                description: '**markdown 简介**',
+                                description_html: '',
+                                // Non-empty so torrent parse does not auto-call parse_title_details;
+                                // only the explicit generate-title path holds the deferred request.
+                                title: '发布标题',
+                            },
+                        },
+                    });
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        profiles: { p1: { ...buildProfile(), acgnx_asia_token: 'token-abc' } },
+                    });
+                case 'save_template':
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details': {
+                    // Title generation matches the torrent filename; publish metadata parsing
+                    // uses the current title string when non-empty. Hold only the generation path
+                    // so publish can reach prepare while title generation is still pending.
+                    const filename = String(typedArgs?.filename ?? '');
+                    if (filename === 'release.mkv') {
+                        titleGenerationHeld = true;
+                        return pendingTitle.promise;
+                    }
+                    return Promise.resolve({
+                        title: filename || '发布标题',
+                        episode: '01',
+                        resolution: '1080p',
+                    });
+                }
+                case 'ai_get_settings':
+                    return Promise.resolve({
+                        provider: 'open_ai',
+                        endpoint: '',
+                        model: '',
+                        mode: 'auto',
+                        auth_mode: 'bearer',
+                        custom_header_name: null,
+                        credential_ref: null,
+                        enabled: false,
+                    });
+                case 'prepare_plan':
+                    prepareHeld = true;
+                    return pendingPrepare.promise;
+                case 'ai_compute_audit':
+                case 'ai_start_formal_audit':
+                    return pendingAudit.promise;
+                case 'ai_poll_formal_audit':
+                    return Promise.resolve(null);
+                case 'ai_cancel_job':
+                    return Promise.resolve({
+                        id: 'job-x',
+                        kind: 'audit',
+                        state: 'cancelled',
+                        request_generation: 1,
+                        snapshot_hash: 'sha256:x',
+                        progress: 100,
+                    });
+                case 'set_plan_acknowledgements':
+                    return Promise.resolve(null);
+                case 'invalidate_plan':
+                    return Promise.resolve(true);
+                case 'publish_prepared_plan':
+                    return Promise.resolve(null);
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const title = rendered.container.querySelector<HTMLTextAreaElement>(
+                'textarea[placeholder^="最终发布标题"]',
+            );
+            expect(title).not.toBeNull();
+            expect(title!.value).toBe('发布标题');
+
+            // Start title generation and keep parse_title_details pending.
+            const generateButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('重新生成标题'),
+            );
+            expect(generateButton).toBeTruthy();
+            await act(async () => {
+                generateButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+            expect(titleGenerationHeld).toBe(true);
+            expect(generateButton!.disabled).toBe(true);
+
+            // Publish preparation starts while title generation is still in flight.
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+                button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(20);
+            // Reach prepare (not merely an unstarted click): save + resolve must have completed.
+            expect(prepareHeld).toBe(true);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(findInvokeArgs('save_template').length).toBeGreaterThanOrEqual(1);
+
+            // Late generated title applies mid-prepare; apply-time covered mutation must win.
+            await act(async () => {
+                pendingTitle.resolve({
+                    title: '迟到自动生成标题',
+                    episode: '02',
+                    resolution: '1080p',
+                });
+            });
+            await flushAsync();
+
+            // Settle any prepare/audit that raced past the generation guard.
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale-title-race',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            await act(async () => {
+                pendingAudit.resolve({
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    local_blockers: [],
+                    formal_ran: false,
+                    job_id: null,
+                    plan_token: 'stale-prepared-token',
+                    snapshot_hash: 'sha256:stale-title-race',
+                    request_generation: 1,
+                });
+            });
+            await flushAsync(20);
+
+            // Generated title applied; in-flight prepare must not leave confirm UI live.
+            expect(title!.value).toBe('迟到自动生成标题');
+            expect(generateButton!.disabled).toBe(false);
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+            expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeUndefined();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('keeps the frozen publish token valid after history-only episode/resolution edits', async () => {
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+
+            const episodeInput = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录集数"]',
+            );
+            const resolutionInput = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录分辨率"]',
+            );
+            expect(episodeInput).not.toBeNull();
+            expect(resolutionInput).not.toBeNull();
+
+            const invalidateBefore = findInvokeArgs('invalidate_plan').length;
+            await act(async () => {
+                setInputValue(episodeInput!, '12');
+                setInputValue(resolutionInput!, '2160p');
+            });
+            await flushAsync();
+
+            // History-only fields must not kill the prepared token or close the modal.
+            expect(findInvokeArgs('invalidate_plan')).toHaveLength(invalidateBefore);
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).not.toBeNull();
+            expect(episodeInput!.value).toBe('12');
+            expect(resolutionInput!.value).toBe('2160p');
+
+            await confirmPublishInModal();
+            expect(findInvokeArgs('publish_prepared_plan')).toEqual([{ token: 'prepared-token' }]);
+        } finally {
+            await rendered.unmount();
+        }
     });
 });

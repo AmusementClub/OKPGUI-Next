@@ -15,6 +15,9 @@ import {
 import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
+import AiPreflightPanel from '../components/AiPreflightPanel';
+import AiRecognitionPanel from '../components/AiRecognitionPanel';
+import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
@@ -26,6 +29,8 @@ import {
     createPublishId,
     usePublishTask,
 } from '../hooks/usePublishTask';
+import { isPrepareSupersededError, useAiPreflight } from '../hooks/useAiPreflight';
+import { useAiRecognition } from '../hooks/useAiRecognition';
 import { useNoticeDialog } from '../hooks/useNoticeDialog';
 import { SiteCookies } from '../utils/cookieUtils';
 import {
@@ -58,7 +63,10 @@ import {
     resolvePublishTitleMetadata,
 } from '../utils/publishTitleMetadata';
 import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
-import { buildSortedTemplateSelectOptions } from '../utils/templateSelectOptions';
+import {
+    buildSortedTemplateSelectOptions,
+    getLatestPublishTimestamp,
+} from '../utils/templateSelectOptions';
 import { extractDroppedFilePath } from '../utils/drop';
 import {
     createDefaultPublishHistory,
@@ -69,6 +77,12 @@ import {
     SitePublishHistory,
     SiteSelection,
 } from '../utils/quickPublish';
+import {
+    isAiCapabilityReady,
+    publishPreparedPlan,
+    readFriendlyError,
+} from '../services/ai';
+import type { PublishRequestPayload } from '../types/ai';
 
 interface Template {
     ep_pattern: string;
@@ -110,6 +124,32 @@ interface TemplatePublishHistoryUpdate {
     last_published_at: string;
     last_published_episode: string;
     last_published_resolution: string;
+}
+
+interface FrozenPublishPlan {
+    token: string;
+    request: PublishRequestPayload;
+}
+
+/** Local history metadata kept beside the frozen request for confirm-time history writes. */
+interface ConfirmPublishMeta {
+    templateName: string;
+    episode: string;
+    resolution: string;
+}
+
+function formatBytes(bytes?: number): string {
+    if (bytes === undefined || bytes === null || !Number.isFinite(bytes) || bytes <= 0) {
+        return '未知';
+    }
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let size = bytes;
+    let unitIndex = 0;
+    while (size >= 1024 && unitIndex < units.length - 1) {
+        size /= 1024;
+        unitIndex += 1;
+    }
+    return `${size.toFixed(size >= 100 ? 0 : size >= 10 ? 1 : 2)} ${units[unitIndex]}`;
 }
 
 interface Profile {
@@ -229,6 +269,11 @@ export default function HomePage() {
 
     // Modal state
     const [showConsole, setShowConsole] = useState(false);
+    const [showConfirm, setShowConfirm] = useState(false);
+    const [confirmMeta, setConfirmMeta] = useState<ConfirmPublishMeta | null>(null);
+    /** Immutable request preview bound to the prepared token (render state, not ref). */
+    const [confirmRequest, setConfirmRequest] = useState<PublishRequestPayload | null>(null);
+    const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [isDragging, setIsDragging] = useState(false);
     const [isGeneratingTitle, setIsGeneratingTitle] = useState(false);
     const {
@@ -240,6 +285,10 @@ export default function HomePage() {
         handleSiteLoginTest: hookHandleSiteLoginTest,
         handleTestAllSiteLogins: hookHandleTestAllSiteLogins,
     } = useSiteLoginTest();
+    const preflight = useAiPreflight();
+    const recognition = useAiRecognition();
+    const clearRecognition = recognition.clear;
+    const invalidateRecognitionIfSnapshotMismatch = recognition.invalidateIfSnapshotMismatch;
     const templateRef = useLatest(template);
     const currentTemplateNameRef = useLatest(currentTemplateName);
     const torrentInfoRef = useLatest(torrentInfo);
@@ -247,6 +296,10 @@ export default function HomePage() {
     const lastPersistedDescriptionRef = useRef(defaultTemplate.description);
     const lastPersistedDescriptionHtmlRef = useRef(defaultTemplate.description_html);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
+    const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
+    /** Bumps on covered editor mutations so in-flight prepare/save cannot freeze stale data. */
+    const coveredEditGenerationRef = useRef(0);
+    const isPreparingPublishRef = useRef(false);
     const lastUsedPersistQueueRef = useRef(
         createLatestValuePersistQueue({
             persist: async (name) => {
@@ -272,6 +325,33 @@ export default function HomePage() {
     const titleGenerationRef = useRef(0);
     const manualTitleEditGenerationRef = useRef(0);
     const profileLoadGenerationRef = useRef(0);
+
+    const invalidatePreflight = preflight.invalidate;
+    const clearFrozenPreflight = useCallback(() => {
+        invalidatePreflight();
+        frozenPlanRef.current = null;
+        setShowConfirm(false);
+        setConfirmMeta(null);
+        setConfirmRequest(null);
+    }, [invalidatePreflight]);
+
+    /**
+     * Covered editor mutations supersede any live or in-flight prepare.
+     * History-only episode/resolution edits in the confirm modal are not covered.
+     * Also clears advisory recognition so stale candidates cannot remain active.
+     */
+    const invalidatePreparedOnCoveredEdit = useCallback(() => {
+        coveredEditGenerationRef.current += 1;
+        clearRecognition();
+        if (frozenPlanRef.current || showConfirm || isPreparingPublishRef.current) {
+            clearFrozenPreflight();
+        }
+    }, [clearFrozenPreflight, clearRecognition, showConfirm]);
+
+    // Drop recognition when preflight snapshot identity drifts or is cleared.
+    useEffect(() => {
+        invalidateRecognitionIfSnapshotMismatch(preflight.state.snapshot_hash);
+    }, [invalidateRecognitionIfSnapshotMismatch, preflight.state.snapshot_hash]);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -432,6 +512,10 @@ export default function HomePage() {
                 const nextTemplate = normalizeTemplate(config.templates[name]);
                 lastPersistedDescriptionRef.current = nextTemplate.description;
                 lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
+                // Apply-time bump: close the window after selection intent before identity lands.
+                invalidatePreparedOnCoveredEdit();
+                // Template identity change supersedes any prepared HomePage plan.
+                clearFrozenPreflight();
                 setCurrentTemplateName(name);
                 setNewTemplateName('');
                 setTemplate(nextTemplate);
@@ -449,6 +533,8 @@ export default function HomePage() {
 
     /** User dropdown selection only — never called from restore/import/loadLastConfig. */
     const handleTemplateSelection = (name: string) => {
+        // Selection intent is a template-identity mutation: supersede in-flight prepare immediately.
+        invalidatePreparedOnCoveredEdit();
         const selectionGeneration = ++templateSelectionGenerationRef.current;
         const runSelection = async () => {
             const failureGeneration = templateSaveFailureGenerationRef.current;
@@ -571,8 +657,12 @@ export default function HomePage() {
 
     const deleteTemplate = async () => {
         if (!currentTemplateName) return;
+        // Identity mutation: bump before async delete can complete so stale prepare cannot confirm.
+        invalidatePreparedOnCoveredEdit();
         try {
             await invoke('delete_template', { name: currentTemplateName });
+            // Apply-time bump: close the window after intent before default identity lands.
+            invalidatePreparedOnCoveredEdit();
             setCurrentTemplateName('');
             setNewTemplateName('');
             lastPersistedDescriptionRef.current = defaultTemplate.description;
@@ -628,6 +718,14 @@ export default function HomePage() {
         const generation = ++parseGenerationRef.current;
         titleGenerationRef.current += 1;
         setIsGeneratingTitle(false);
+        // Torrent generation change supersedes any prepared HomePage plan.
+        coveredEditGenerationRef.current += 1;
+        clearRecognition();
+        invalidatePreflight();
+        frozenPlanRef.current = null;
+        setShowConfirm(false);
+        setConfirmMeta(null);
+        setConfirmRequest(null);
         setTorrentPath('');
         setTorrentInfo(null);
         setTorrentError('');
@@ -640,6 +738,7 @@ export default function HomePage() {
             setTorrentInfo(info);
             setTorrentError('');
             // Only prefill an empty title; never overwrite a user-edited final title.
+            // Advisory recognition must never write into the draft title.
             const activeTemplate = templateRef.current;
             if (!activeTemplate.title.trim() && activeTemplate.title_pattern.trim()) {
                 const manualTitleEditGeneration = manualTitleEditGenerationRef.current;
@@ -661,7 +760,7 @@ export default function HomePage() {
             setTorrentPath('');
             setTorrentError(typeof e === 'string' ? e : '解析种子文件失败。');
         }
-    }, [matchTitle, templateRef]);
+    }, [clearRecognition, invalidatePreflight, matchTitle, templateRef]);
 
     useEffect(() => {
         let disposed = false;
@@ -743,6 +842,9 @@ export default function HomePage() {
                 return;
             }
 
+            // Identity mutation: bump before async import can complete so stale prepare cannot confirm.
+            invalidatePreparedOnCoveredEdit();
+
             const importTemplateWithStrategy = (conflictStrategy: 'reject' | 'overwrite' | 'copy') =>
                 invoke<ImportedTemplatePayload>('import_template_from_file', {
                     path: importPath,
@@ -767,6 +869,8 @@ export default function HomePage() {
             }
             const nextTemplate = normalizeTemplate(imported.template);
 
+            // Apply-time bump: close the window after path intent before imported identity lands.
+            invalidatePreparedOnCoveredEdit();
             lastPersistedDescriptionRef.current = nextTemplate.description;
             lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
             setCurrentTemplateName(imported.name);
@@ -906,6 +1010,9 @@ export default function HomePage() {
             return;
         }
 
+        // Title-generation intent is a covered mutation: supersede live/in-flight prepare immediately.
+        invalidatePreparedOnCoveredEdit();
+
         const requestId = ++titleGenerationRef.current;
         const capturedTemplateName = currentTemplateNameRef.current;
         const capturedTorrentName = torrentInfoRef.current?.name ?? '';
@@ -930,6 +1037,8 @@ export default function HomePage() {
                 return;
             }
 
+            // Apply-time bump: a late title must not leave a prepare that raced after intent live.
+            invalidatePreparedOnCoveredEdit();
             const nextTemplate = withSelectedProfile({ ...templateRef.current, title: generatedTitle });
             setTemplate(nextTemplate);
             await persistTemplateToDisk(nextTemplate);
@@ -939,6 +1048,41 @@ export default function HomePage() {
             }
         }
     };
+
+    const recognitionPatternsActive = Boolean(
+        template.ep_pattern.trim()
+        && template.resolution_pattern.trim()
+        && template.title_pattern.trim(),
+    );
+    const recognitionSnapshotHash = preflight.state.snapshot_hash?.trim() || '';
+    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
+    const canRunRecognition = Boolean(
+        torrentInfo?.name?.trim()
+        && recognitionSnapshotHash
+        && recognitionReady
+        && recognitionPatternsActive
+        && !recognition.busy,
+    );
+
+    const handleAiRecognize = useCallback(() => {
+        if (!torrentInfo?.name?.trim() || !recognitionSnapshotHash) {
+            return;
+        }
+        void recognition.recognize({
+            torrentName: torrentInfo.name,
+            epPattern: template.ep_pattern,
+            resolutionPattern: template.resolution_pattern,
+            titlePattern: template.title_pattern,
+            snapshotHash: recognitionSnapshotHash,
+        });
+    }, [
+        recognition,
+        recognitionSnapshotHash,
+        template.ep_pattern,
+        template.resolution_pattern,
+        template.title_pattern,
+        torrentInfo?.name,
+    ]);
 
     const getErrorMessage = (error: unknown) => {
         if (typeof error === 'string') {
@@ -992,18 +1136,21 @@ export default function HomePage() {
             return;
         }
 
+        // Site reconciliation is a covered mutation of the publish selection.
+        invalidatePreparedOnCoveredEdit();
         const nextTemplate = { ...currentTemplate, sites: nextSites };
         setTemplate(nextTemplate);
         autosaveTemplate(withSelectedProfile(nextTemplate));
-    }, [siteRows]);
+    }, [invalidatePreparedOnCoveredEdit, siteRows]);
 
-    // Publish
-    const handlePublish = async () => {
+    // Publish intent: persist + normalize, prepare backend-bound plan, then open confirmation.
+    // Never start the publish task or call publish_prepared_plan before explicit modal confirm.
+    const handlePublishClick = async () => {
         if (!torrentPath) return;
         if (!selectedProfile) return;
         if (!okpExecutablePath) return;
         if (selectedSiteKeys.length === 0) return;
-        if (isPublishing) return;
+        if (isPublishing || isPreparingPublish) return;
 
         const publishTemplateName = getTemplateName();
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
@@ -1053,30 +1200,171 @@ export default function HomePage() {
             return;
         }
 
-        const saved = await persistTemplateToDisk(
-            templateToPublish,
-            publishTemplateName,
-            preBackfillSnapshot,
-        );
-        if (!saved) {
+        // Capture covered-edit generation before any async save/resolve/prepare work.
+        const prepareGeneration = coveredEditGenerationRef.current;
+        isPreparingPublishRef.current = true;
+        setIsPreparingPublish(true);
+        try {
+            const saved = await persistTemplateToDisk(
+                templateToPublish,
+                publishTemplateName,
+                preBackfillSnapshot,
+            );
+            if (!saved) {
+                return;
+            }
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                // Covered edit during save superseded this attempt; never open stale confirm.
+                return;
+            }
+
+            // Plan input must be the backend-normalized saved template, not the pre-save editor object.
+            const frozenTemplate = saved.template;
+            // profile_name must match the frozen saved template, not click-time selectedProfile.
+            const frozenProfileName = frozenTemplate.profile;
+            if (!frozenProfileName) {
+                // Fail closed: never prepare/confirm without a frozen profile, but surface a notice.
+                clearFrozenPreflight();
+                showNotice({
+                    title: '发布前检查失败',
+                    message: '保存后的模板缺少身份配置，请选择身份配置后重试。',
+                });
+                return;
+            }
+            const finalTitle = frozenTemplate.title.trim();
+            const publishDetails = await resolvePublishDetails(
+                frozenTemplate,
+                finalTitle ? undefined : torrentInfo?.name,
+            );
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                return;
+            }
+
+            const publishId = createPublishId();
+
+            // Freeze the exact request that will be published; do not rebuild after confirm.
+            const publishRequest: PublishRequestPayload = {
+                publish_id: publishId,
+                torrent_path: torrentPath,
+                profile_name: frozenProfileName,
+                template: frozenTemplate,
+            };
+
+            // Shared preflight state machine (same as QuickPublish): prepare + formal audit.
+            const prepared = await preflight.prepare(publishRequest);
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                // Covered edit during prepare: drop any token that may have been committed.
+                clearFrozenPreflight();
+                return;
+            }
+
+            frozenPlanRef.current = { token: prepared.token, request: publishRequest };
+            setConfirmRequest(publishRequest);
+            setConfirmMeta({
+                templateName: saved.name,
+                episode: publishDetails.episode,
+                resolution: publishDetails.resolution,
+            });
+            setShowConfirm(true);
+        } catch (error) {
+            if (isPrepareSupersededError(error)) {
+                return;
+            }
+            frozenPlanRef.current = null;
+            setShowConfirm(false);
+            setConfirmMeta(null);
+            setConfirmRequest(null);
+            showNotice({
+                title: '发布前检查失败',
+                message: readFriendlyError(error, '无法准备发布前检查。'),
+            });
+        } finally {
+            isPreparingPublishRef.current = false;
+            setIsPreparingPublish(false);
+        }
+    };
+
+    const startPublish = async (autoOpenConsole: boolean) => {
+        // Publish only the exact prepared request. Never rebuild from mutable editor state.
+        const frozenPlan = frozenPlanRef.current;
+        const historyMeta = confirmMeta;
+        if (
+            !frozenPlan
+            || !frozenPlan.token
+            || frozenPlan.token !== preflight.state.token
+            || !preflight.canConfirm
+            || !historyMeta
+        ) {
+            clearFrozenPreflight();
+            showNotice({
+                title: '无法确认发布',
+                message: '确认内容已变化或未完成发布前检查，请重新执行发布前检查。',
+            });
             return;
         }
 
-        const finalTitle = templateToPublish.title.trim();
-        const publishDetails = await resolvePublishDetails(
-            templateToPublish,
-            finalTitle ? undefined : torrentInfo?.name,
-        );
-        const publishId = createPublishId();
+        const publishRequest = frozenPlan.request;
+        const selectedSiteKeysForPublish = siteDefinitions
+            .filter((site) => publishRequest.template.sites[site.key as keyof SiteSelection])
+            .map((site) => site.key as keyof SiteSelection);
+        const selectedSites = selectedSiteKeysForPublish.map((siteKey) => {
+            const definition = siteDefinitions.find((site) => site.key === siteKey);
+            return {
+                key: siteKey,
+                label: definition?.label ?? siteKey,
+            };
+        });
 
+        const contentValidationIssues = validatePublishContentForSites(
+            publishRequest.template,
+            selectedSites,
+        );
+        if (contentValidationIssues.length > 0) {
+            const issueMessageMap = new Map(
+                contentValidationIssues.map((issue) => [issue.siteCode, issue.message]),
+            );
+            const combinedMessage = contentValidationIssues.map((issue) => issue.message).join('；');
+
+            showPublishResult(
+                createPublishConsoleSiteMap(
+                    selectedSites.map((site) => {
+                        const siteMessage = issueMessageMap.get(site.key) ?? '发布已取消：发布内容校验未通过。';
+                        return {
+                            siteCode: site.key,
+                            siteLabel: site.label,
+                            lines: [{ text: siteMessage, isError: true }],
+                            status: 'error' as const,
+                            message: siteMessage,
+                        };
+                    }),
+                ),
+                {
+                    success: false,
+                    message: combinedMessage,
+                },
+            );
+            setShowConsole(true);
+            return;
+        }
+
+        const publishId = publishRequest.publish_id;
         publishAttemptRef.current = {
             publishId,
-            templateName: saved.name,
+            templateName: historyMeta.templateName,
             publishedAt: new Date().toISOString(),
-            publishedEpisode: publishDetails.episode,
-            publishedResolution: publishDetails.resolution,
-            siteKeys: selectedSites.map((site) => site.key as keyof SiteSelection),
+            publishedEpisode: historyMeta.episode,
+            publishedResolution: historyMeta.resolution,
+            siteKeys: selectedSiteKeysForPublish,
         };
+
+        // Console/history start only at explicit confirmation — not at prepare time.
+        setShowConfirm(false);
+        setConfirmMeta(null);
+        setConfirmRequest(null);
+
+        if (autoOpenConsole) {
+            setShowConsole(true);
+        }
         startPublishTask(
             publishId,
             createPublishConsoleSiteMap(
@@ -1089,22 +1377,37 @@ export default function HomePage() {
                 })),
             ),
         );
-        setShowConsole(true);
 
+        const tokenToPublish = frozenPlan.token;
+        frozenPlanRef.current = null;
         try {
-            await invoke('publish', {
-                request: {
-                    publish_id: publishId,
-                    torrent_path: torrentPath,
-                    profile_name: selectedProfile,
-                    template: templateToPublish,
-                },
-            });
-        } catch (e) {
-            console.error('发布失败:', e);
-            failActivePublish(getErrorMessage(e));
+            // Pending formal audit + pending ack: cancel the job before publishing the frozen plan.
+            // Late completion must not replace UI or bind a consumed/cancelled plan.
+            await preflight.cancelPendingAuditForPublish();
+            await publishPreparedPlan(tokenToPublish);
+            preflight.invalidate();
+        } catch (error) {
+            console.error('发布失败:', error);
+            failActivePublish(getErrorMessage(error));
+            preflight.invalidate();
         }
     };
+
+    const handleCloseConfirm = () => {
+        clearFrozenPreflight();
+    };
+
+    const handleReturnToEdit = () => {
+        clearFrozenPreflight();
+    };
+
+    const updateConfirmHistoryField = useCallback(
+        (field: 'episode' | 'resolution', value: string) => {
+            // History-only metadata applied at confirm/finalize time — keep frozen token valid.
+            setConfirmMeta((current) => (current ? { ...current, [field]: value } : current));
+        },
+        [],
+    );
     // Drag and drop is handled by the Tauri window drag-drop listener above;
     // HTML5 drop events never fire while Tauri dragDropEnabled is on.
     const handleTorrentPickerKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
@@ -1117,6 +1420,7 @@ export default function HomePage() {
     };
 
     const updateField = (field: keyof Template, value: string) => {
+        invalidatePreparedOnCoveredEdit();
         setTemplate((t) => ({ ...t, [field]: value }));
     };
 
@@ -1129,6 +1433,7 @@ export default function HomePage() {
             return;
         }
 
+        invalidatePreparedOnCoveredEdit();
         const currentTemplate = templateRef.current;
         const nextTemplate = {
             ...currentTemplate,
@@ -1168,9 +1473,26 @@ export default function HomePage() {
                             onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
                             onBlur={(e) => {
                                 const trimmedName = trimEntityName(e.target.value);
-                                if (trimmedName) {
-                                    autosaveTemplate(withSelectedProfile(templateRef.current), trimmedName);
+                                if (!trimmedName) {
+                                    return;
                                 }
+                                // Explicit name create/rename is an identity mutation; same-name blur is not.
+                                const previousName = trimEntityName(currentTemplateNameRef.current);
+                                const isIdentityMutation = trimmedName !== previousName;
+                                if (isIdentityMutation) {
+                                    // Intent: supersede live/in-flight prepare before async identity save.
+                                    invalidatePreparedOnCoveredEdit();
+                                }
+                                void (async () => {
+                                    const saved = await persistTemplateToDisk(
+                                        withSelectedProfile(templateRef.current),
+                                        trimmedName,
+                                    );
+                                    if (saved && isIdentityMutation) {
+                                        // Apply-time: a prepare that raced after intent cannot survive identity land.
+                                        invalidatePreparedOnCoveredEdit();
+                                    }
+                                })();
                             }}
                             placeholder="新模板名称（失焦自动创建）"
                             className="w-56 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
@@ -1296,19 +1618,42 @@ export default function HomePage() {
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                         />
                     </div>
-                    <div className="mt-2 flex items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 text-xs text-slate-500">
-                        <span>自动生成仅用于填充建议标题；最终发布时始终以你手动编辑后的“发布标题”为准。</span>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void handleGenerateTitle();
-                            }}
-                            disabled={!torrentInfo?.name || !template.title_pattern.trim() || isGeneratingTitle}
-                            className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
-                        >
-                            {isGeneratingTitle ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
-                            重新生成标题
-                        </button>
+                    <div className="mt-2 flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-slate-900/50 px-3 py-2 text-xs text-slate-500">
+                        <span>自动生成仅用于填充建议标题；最终发布时始终以你手动编辑后的“发布标题”为准。AI 识别仅供参考，不会改写草稿。</span>
+                        <div className="flex shrink-0 flex-wrap items-center gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void handleGenerateTitle();
+                                }}
+                                disabled={!torrentInfo?.name || !template.title_pattern.trim() || isGeneratingTitle}
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs font-medium text-emerald-100 transition-colors hover:bg-emerald-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                {isGeneratingTitle ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                                重新生成标题
+                            </button>
+                            <button
+                                type="button"
+                                data-testid="ai-recognize-button"
+                                onClick={handleAiRecognize}
+                                disabled={!canRunRecognition}
+                                title={
+                                    !torrentInfo?.name?.trim()
+                                        ? '需要种子显示名称'
+                                        : !recognitionSnapshotHash
+                                          ? '需要先完成发布前检查以获得快照'
+                                          : !recognitionReady
+                                            ? '需要 AI 能力状态为 Ready'
+                                            : !recognitionPatternsActive
+                                              ? '需要有效的集数/分辨率/标题模板模式'
+                                              : '对当前种子与模板模式运行 AI 识别（仅建议）'
+                                }
+                                className="inline-flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-100 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
+                            >
+                                {recognition.busy ? <Loader2 size={12} className="animate-spin" /> : <RefreshCw size={12} />}
+                                AI 识别
+                            </button>
+                        </div>
                     </div>
                     <div className="mt-2">
                         <label className="text-xs text-slate-500 mb-1 block">发布标题</label>
@@ -1324,6 +1669,11 @@ export default function HomePage() {
                             className="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 resize-y"
                         />
                     </div>
+                    <AiRecognitionPanel
+                        busy={recognition.busy}
+                        error={recognition.error}
+                        result={recognition.result}
+                    />
                 </section>
 
                 {/* Content Fields */}
@@ -1386,6 +1736,7 @@ export default function HomePage() {
                                 value={selectedProfile}
                                 onChange={(e) => {
                                     const profileName = e.target.value;
+                                    invalidatePreparedOnCoveredEdit();
                                     setSelectedProfile(profileName);
                                     autosaveTemplate(withSelectedProfile(templateRef.current, profileName));
                                 }}
@@ -1546,18 +1897,22 @@ export default function HomePage() {
 
                 <section>
                     <button
-                        onClick={handlePublish}
+                        type="button"
+                        onClick={() => {
+                            void handlePublishClick();
+                        }}
                         disabled={
                             !torrentPath ||
                             !selectedProfile ||
                             !okpExecutablePath ||
                             isPublishing ||
+                            isPreparingPublish ||
                             selectedSiteKeys.length === 0 ||
                             !readySelectedProfileData
                         }
                         className="w-full flex items-center justify-center gap-2 px-4 py-3 bg-gradient-to-r from-emerald-500 to-cyan-500 hover:from-emerald-600 hover:to-cyan-600 disabled:from-slate-600 disabled:to-slate-600 disabled:cursor-not-allowed text-white font-medium rounded-lg transition-all shadow-lg shadow-emerald-500/20"
                     >
-                        <Send size={18} />
+                        {isPreparingPublish ? <Loader2 size={18} className="animate-spin" /> : <Send size={18} />}
                         发布已选站点
                     </button>
                 </section>
@@ -1571,6 +1926,57 @@ export default function HomePage() {
                     .filter((site): site is PublishConsoleSite => Boolean(site))}
                 isComplete={isPublishComplete}
                 result={publishResult}
+            />
+            <PublishConfirmModal
+                isOpen={showConfirm}
+                onClose={handleCloseConfirm}
+                onReturnToEdit={handleReturnToEdit}
+                onConfirm={({ autoOpenConsole }) => {
+                    void startPublish(autoOpenConsole);
+                }}
+                title={confirmRequest?.template.title ?? template.title}
+                templateLabel={confirmMeta?.templateName || currentTemplateName}
+                templateLatestPublishedAtLabel={formatTemplateTimestamp(
+                    getLatestPublishTimestamp(
+                        quickPublishSiteKeys.map(
+                            (siteKey) => (
+                                confirmRequest?.template.publish_history
+                                ?? template.publish_history
+                            )[siteKey].last_published_at,
+                        ),
+                    )?.value ?? '',
+                )}
+                torrentPath={confirmRequest?.torrent_path || torrentPath}
+                torrentTotalSizeLabel={formatBytes(torrentInfo?.total_size)}
+                episode={confirmMeta?.episode ?? ''}
+                resolution={confirmMeta?.resolution ?? ''}
+                onEpisodeChange={(value) => updateConfirmHistoryField('episode', value)}
+                onResolutionChange={(value) => updateConfirmHistoryField('resolution', value)}
+                about={confirmRequest?.template.about ?? template.about}
+                tags={confirmRequest?.template.tags ?? template.tags}
+                poster={confirmRequest?.template.poster ?? template.poster}
+                profile={confirmRequest?.profile_name || selectedProfile}
+                okpPath={okpExecutablePath}
+                selectedSites={siteRows
+                    .filter((row) => {
+                        const sites = confirmRequest?.template.sites ?? template.sites;
+                        return sites[row.site.key as keyof SiteSelection];
+                    })
+                    .map((row) => ({
+                        key: row.site.key as keyof SiteSelection,
+                        label: row.site.label,
+                        identityText: row.identityText,
+                        identityToneClass: row.identityClass,
+                    }))}
+                preflight={(
+                    <AiPreflightPanel
+                        state={preflight.state}
+                        configured={preflight.isConfigured}
+                        canConfirm={preflight.canConfirm}
+                        onAcknowledgementChange={preflight.setAcknowledgement}
+                    />
+                )}
+                confirmDisabled={isPublishing || isPreparingPublish || !preflight.canConfirm}
             />
             {importConflictDialog}
             {noticeDialog}
