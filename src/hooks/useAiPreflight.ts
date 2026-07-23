@@ -107,6 +107,8 @@ function clearTokenSideEffects(token: string | null) {
 
 export function useAiPreflight() {
     const [state, setState] = useState<AiPreflightState>(initialState);
+    const stateRef = useRef<AiPreflightState>(initialState);
+    stateRef.current = state;
     const generationRef = useRef(0);
     const tokenRef = useRef<string | null>(null);
     const jobIdRef = useRef<string | null>(null);
@@ -547,14 +549,17 @@ export function useAiPreflight() {
             }
 
             // Start formal audit with plan_token only after Vision bind (or skip).
-            preparedToken = null;
-            return await runFormalAfterVision(
+            // Keep the token armed until the audit has committed so a start failure
+            // still invalidates the prepared plan in the catch path.
+            const result = await runFormalAfterVision(
                 token,
                 requestGeneration,
                 nextSnapshotHash,
                 prepared.local_blockers,
                 vision,
             );
+            preparedToken = null;
+            return result;
         } catch (error) {
             // Failed or uncommitted preflight must not leave a publishable orphan token.
             if (preparedToken) {
@@ -622,13 +627,26 @@ export function useAiPreflight() {
         const requestGeneration = generationRef.current;
         const token = tokenRef.current;
 
-        // Capture current selection from React state through a synchronous updater read.
-        let selection: {
+        const current = stateRef.current;
+        if (
+            !token
+            || current.vision.status !== 'needs_selection'
+            || !current.token
+            || current.token !== token
+        ) {
+            return;
+        }
+        const selection: {
             urls: string[];
             maxImages: number;
             candidates: VisionPreflightState['candidates'];
             fallbackHash: string;
-        } | null = null;
+        } = {
+            urls: [...current.vision.selectedUrls],
+            maxImages: current.vision.maxImages,
+            candidates: current.vision.candidates,
+            fallbackHash: current.snapshot_hash ?? '',
+        };
         setState((current) => {
             if (
                 current.vision.status !== 'needs_selection'
@@ -637,12 +655,6 @@ export function useAiPreflight() {
             ) {
                 return current;
             }
-            selection = {
-                urls: [...current.vision.selectedUrls],
-                maxImages: current.vision.maxImages,
-                candidates: current.vision.candidates,
-                fallbackHash: current.snapshot_hash ?? '',
-            };
             return {
                 ...current,
                 checking: true,

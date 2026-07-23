@@ -733,6 +733,12 @@ export default function QuickPublishPage() {
             setErrorMessage(error);
             return;
         }
+        const template = activeTemplate;
+        if (!template) {
+            // Keep the template reference stable across the async prepare sequence.
+            setErrorMessage('请先选择一个快速发布模板。');
+            return;
+        }
         // Reject re-entry while resolve/prepare is in flight (HomePage parity).
         // Check the ref as well so a same-tick second click cannot pass before re-render.
         if (isPublishing || isPreparingPublish || isPreparingPublishRef.current) return;
@@ -744,7 +750,7 @@ export default function QuickPublishPage() {
         isPreparingPublishRef.current = true;
         setIsPreparingPublish(true);
         try {
-            const resolvedDraft = await resolvePublishRuntimeDraft(activeTemplate, draft);
+            const resolvedDraft = await resolvePublishRuntimeDraft(template, draft);
             if (prepareGeneration !== coveredEditGenerationRef.current) {
                 // Covered edit during resolve superseded this attempt; never open stale confirm.
                 return;
@@ -755,7 +761,7 @@ export default function QuickPublishPage() {
             const publishDetails = await resolvePublishTitleMetadata({
                 finalTitle: resolvedDraft.title,
                 fallbackFilename: torrentInfo?.name,
-                template: activeTemplate,
+                template,
                 parseTitleDetails: (request) =>
                     invoke<ParsedTitleDetails>('parse_title_details', {
                         filename: request.filename,
