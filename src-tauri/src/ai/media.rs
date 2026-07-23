@@ -1,3 +1,5 @@
+use crate::ai::redaction::RedactionPolicy;
+use crate::domain::publish_plan::{PlanMediaEvidence, PlanMediaStatus, PlanMediaSummary};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -93,6 +95,83 @@ pub struct MediaInfoSummary {
     pub audio_codecs: Vec<String>,
     pub subtitle_languages: Vec<String>,
     pub scan_type: Option<String>,
+}
+
+/// Build plan-owned media evidence from a Succeeded MediaInfo terminal result set.
+///
+/// Only `Measured` rows with redacted relative names and normalized summaries are kept.
+/// Absolute paths never enter the plan. Empty measured set → `CheckFailed` (still a
+/// successful job bind so formal/local audit can derive `MEDIA_CHECK_FAILED`).
+///
+/// Callers must gate with `media_info_may_bind_plan_evidence` and identity-match
+/// before binding; this helper does not consult plan tokens.
+pub fn build_plan_media_evidence(
+    job_id: &str,
+    snapshot_hash: &str,
+    request_generation: u64,
+    results: &[MediaProbeResult],
+    policy: &RedactionPolicy,
+) -> PlanMediaEvidence {
+    let summaries = redacted_plan_media_summaries(results, policy);
+    let status = if summaries.is_empty() {
+        PlanMediaStatus::CheckFailed
+    } else {
+        PlanMediaStatus::Tested
+    };
+    PlanMediaEvidence {
+        job_id: job_id.to_string(),
+        snapshot_hash: snapshot_hash.to_string(),
+        request_generation,
+        status,
+        summaries,
+    }
+}
+
+/// Extract redacted relative Measured summaries only (path-free).
+pub fn redacted_plan_media_summaries(
+    results: &[MediaProbeResult],
+    policy: &RedactionPolicy,
+) -> Vec<PlanMediaSummary> {
+    results
+        .iter()
+        .filter(|item| item.state == MediaProbeState::Measured)
+        .filter_map(|item| {
+            let summary = item.summary.as_ref()?;
+            let relative_name = safe_relative_name(&item.relative_name);
+            if relative_name == "[invalid]" {
+                return None;
+            }
+            // Secret-only redaction preserves multi-component relative path shape.
+            let relative_name = policy.redact_secret_substrings(&relative_name);
+            if !is_safe_relative_name(&relative_name) {
+                return None;
+            }
+            Some(PlanMediaSummary {
+                relative_name,
+                duration_ms: summary.duration_ms,
+                width: summary.width,
+                height: summary.height,
+                video_codec: summary
+                    .video_codec
+                    .as_deref()
+                    .map(|value| policy.redact_text(value)),
+                audio_codecs: summary
+                    .audio_codecs
+                    .iter()
+                    .map(|value| policy.redact_text(value))
+                    .collect(),
+                subtitle_languages: summary
+                    .subtitle_languages
+                    .iter()
+                    .map(|value| policy.redact_text(value))
+                    .collect(),
+                scan_type: summary
+                    .scan_type
+                    .as_deref()
+                    .map(|value| policy.redact_text(value)),
+            })
+        })
+        .collect()
 }
 
 pub fn discover_media_files(torrent_path: &str, manual_paths: &[String]) -> Result<Vec<MediaCandidate>, String> {
@@ -1133,6 +1212,75 @@ mod tests {
         assert_eq!(normalized.duration_ms, Some(1_234_500));
         assert_eq!(normalized.width, Some(1920));
         assert!(!serde_json::to_string(&normalized).unwrap().contains("/private"));
+    }
+
+    #[test]
+    fn plan_media_evidence_binds_only_redacted_measured_summaries() {
+        let policy = RedactionPolicy::new(["sk-secret-token"]);
+        let results = vec![
+            MediaProbeResult {
+                relative_name: "show/ep01.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(MediaInfoSummary {
+                    duration_ms: Some(2_000),
+                    width: Some(1920),
+                    height: Some(1080),
+                    video_codec: Some("AV1 sk-secret-token".into()),
+                    audio_codecs: vec!["AAC".into()],
+                    subtitle_languages: vec![],
+                    scan_type: None,
+                }),
+                message: None,
+            },
+            MediaProbeResult {
+                relative_name: "/private/tmp/secret.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(MediaInfoSummary {
+                    duration_ms: Some(1),
+                    ..MediaInfoSummary::default()
+                }),
+                message: None,
+            },
+            MediaProbeResult {
+                relative_name: "show/ep02.mkv".into(),
+                state: MediaProbeState::TimedOut,
+                summary: None,
+                message: Some("timeout".into()),
+            },
+            MediaProbeResult {
+                relative_name: "missing.mkv".into(),
+                state: MediaProbeState::MissingFile,
+                summary: None,
+                message: None,
+            },
+        ];
+        let evidence = build_plan_media_evidence("job-1", "sha256:snap", 3, &results, &policy);
+        assert_eq!(evidence.status, PlanMediaStatus::Tested);
+        assert_eq!(evidence.summaries.len(), 1);
+        assert_eq!(evidence.summaries[0].relative_name, "show/ep01.mkv");
+        assert!(!evidence.summaries[0]
+            .video_codec
+            .as_deref()
+            .unwrap_or("")
+            .contains("sk-secret-token"));
+        let serialized = serde_json::to_string(&evidence).unwrap();
+        assert!(!serialized.contains("/private"));
+        assert!(!serialized.contains("sk-secret-token"));
+
+        let empty = build_plan_media_evidence(
+            "job-2",
+            "sha256:snap",
+            3,
+            &[MediaProbeResult {
+                relative_name: "gone.mkv".into(),
+                state: MediaProbeState::MissingFile,
+                summary: None,
+                message: None,
+            }],
+            &policy,
+        );
+        assert_eq!(empty.status, PlanMediaStatus::CheckFailed);
+        assert!(empty.summaries.is_empty());
     }
 
     #[test]

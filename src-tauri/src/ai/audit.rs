@@ -150,6 +150,46 @@ pub fn can_publish(decision: AuditDecision, acknowledgements: Acknowledgements) 
     }
 }
 
+/// Plan-owned MediaInfo audit state for formal/local finding derivation.
+///
+/// Constructed only from backend `PlanMediaEvidence` (see `publish_plan`), never from
+/// client probe snapshots. Keeps audit free of a module cycle with domain types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaEvidenceAuditState {
+    /// No identity-matched media evidence on the plan.
+    NotTested,
+    /// Succeeded MediaInfo bound with no usable measured summaries.
+    CheckFailed,
+    /// Succeeded MediaInfo bound with at least one redacted measured summary.
+    Tested,
+}
+
+/// Derive MediaInfo audit findings solely from plan-owned media audit state.
+///
+/// - `NotTested` → `MEDIA_NOT_TESTED`
+/// - `CheckFailed` → `MEDIA_CHECK_FAILED`
+/// - `Tested` → no media finding
+///
+/// Never consults client probe snapshots, absolute paths, or free-text heuristics.
+/// Callers merge these into formal/local audit inputs before `compute_decision`.
+pub fn media_findings_from_plan_evidence(state: MediaEvidenceAuditState) -> Vec<Finding> {
+    match state {
+        MediaEvidenceAuditState::NotTested => vec![Finding {
+            code: "MEDIA_NOT_TESTED".to_string(),
+            severity: FindingSeverity::Warning,
+            message: "MediaInfo has not been bound to this prepared plan".to_string(),
+            evidence_path: None,
+        }],
+        MediaEvidenceAuditState::CheckFailed => vec![Finding {
+            code: "MEDIA_CHECK_FAILED".to_string(),
+            severity: FindingSeverity::Warning,
+            message: "MediaInfo completed without usable measured media summaries".to_string(),
+            evidence_path: None,
+        }],
+        MediaEvidenceAuditState::Tested => Vec::new(),
+    }
+}
+
 /// Strict JSON schema for formal AI audit structured output.
 pub fn formal_audit_schema() -> Value {
     json!({
@@ -897,5 +937,34 @@ mod tests {
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].severity, FindingSeverity::Critical);
         assert_eq!(findings[0].evidence_path.as_deref(), Some("any/path.mkv"));
+    }
+
+    #[test]
+    fn media_findings_derive_only_from_plan_owned_evidence() {
+        let not_tested = media_findings_from_plan_evidence(MediaEvidenceAuditState::NotTested);
+        assert_eq!(not_tested.len(), 1);
+        assert_eq!(not_tested[0].code, "MEDIA_NOT_TESTED");
+        assert_eq!(not_tested[0].severity, FindingSeverity::Warning);
+        assert!(not_tested[0].evidence_path.is_none());
+
+        let failed = media_findings_from_plan_evidence(MediaEvidenceAuditState::CheckFailed);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].code, "MEDIA_CHECK_FAILED");
+        assert_eq!(failed[0].severity, FindingSeverity::Warning);
+
+        let tested = media_findings_from_plan_evidence(MediaEvidenceAuditState::Tested);
+        assert!(
+            tested.is_empty(),
+            "tested plan media must not inject media findings"
+        );
+
+        // Decision path: MEDIA_NOT_TESTED alone yields WARNING, never GO.
+        let decision = compute_decision(&AuditInput {
+            local_blockers: vec![],
+            findings: not_tested,
+            checking: false,
+        });
+        assert_eq!(decision.decision, AuditDecision::Warning);
+        assert_ne!(decision.decision, AuditDecision::Go);
     }
 }

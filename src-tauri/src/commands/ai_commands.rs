@@ -19,15 +19,15 @@ use crate::ai::credentials::{
     OsCredentialStore, PublicCapabilityStatus, PublicConnectionConfig, SecretStore, SecretValue,
 };
 use crate::ai::jobs::{
-    formal_audit_may_bind_terminal_evidence, media_info_may_report_success,
-    recognition_may_return_result, AiJob, AiJobManager, AiJobState, DEBUG_EXPORT_RELATIVE_DIR,
-    DEBUG_STORE_RELATIVE_DIR, DebugExportMetadata, DebugRecord, JobKind,
+    formal_audit_may_bind_terminal_evidence, media_info_may_bind_plan_evidence,
+    media_info_may_report_success, recognition_may_return_result, AiJob, AiJobManager, AiJobState,
+    DEBUG_EXPORT_RELATIVE_DIR, DEBUG_STORE_RELATIVE_DIR, DebugExportMetadata, DebugRecord, JobKind,
 };
 use crate::ai::media::{
-    clamp_media_probe_timeout_ms, discover_media_files, discover_media_probe_requests,
-    probe_media_files_with_progress, resolve_media_relative_entries, resolve_packaged_mediainfo,
-    MediaCandidate, MediaProbeRequest, MediaProbeResult, MediaProbeState, MediaRelativeEntry,
-    MAX_MEDIA_RELATIVE_ENTRIES,
+    build_plan_media_evidence, clamp_media_probe_timeout_ms, discover_media_files,
+    discover_media_probe_requests, probe_media_files_with_progress, resolve_media_relative_entries,
+    resolve_packaged_mediainfo, MediaCandidate, MediaProbeRequest, MediaProbeResult,
+    MediaProbeState, MediaRelativeEntry, MAX_MEDIA_RELATIVE_ENTRIES,
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client, build_probe_request,
@@ -114,6 +114,8 @@ const MAX_PENDING_MEDIA_INFO_WORK: usize = 64;
 /// Deferred MediaInfo probe work for jobs still `Queued` under AiJobManager concurrency.
 struct PendingMediaInfoWork {
     job_id: String,
+    /// Opaque plan token captured at start; bind uses backend plan identity only.
+    plan_token: String,
     request_generation: u64,
     snapshot_hash: String,
     probe_requests: Vec<MediaProbeRequest>,
@@ -620,25 +622,34 @@ pub fn ai_discover_media(
     discover_media_files(&torrent_path, &manual_paths)
 }
 
-/// Start request for a backend-owned MediaInfo job.
+/// Start request for a backend-owned MediaInfo job bound to a prepared plan.
 ///
-/// Absolute per-file probe paths are never accepted as authority. Callers supply
-/// torrent-relative video entries (and optional content root directory); Rust maps
-/// them under allowed torrent/content roots and exposes only relative results.
+/// `plan_token` is the only plan identity. Backend resolves snapshot_hash,
+/// request_generation, and torrent path from `PlanRegistry` / `LocalExecutionBinding`.
+/// Client snapshot_hash, request_generation, torrent_path, relative paths, and
+/// content_root are never plan identity (deprecated fields accepted for wire
+/// compatibility and ignored for identity).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfoStartRequest {
-    /// Local torrent path used solely for content-root resolution (never sent to AI).
-    pub torrent_path: String,
-    /// Torrent-relative video entries. Empty means discover videos under allowed roots.
+    /// Opaque prepared-plan token. Backend identity + binding are authoritative.
+    pub plan_token: String,
+    /// Deprecated: ignored for identity. Torrent path comes from plan binding only.
+    #[serde(default)]
+    pub torrent_path: Option<String>,
+    /// Optional torrent-relative video entries under binding-derived roots.
+    /// Empty means discover videos under allowed roots. Never plan identity.
     /// Explicit batches are capped at `MAX_MEDIA_RELATIVE_ENTRIES` (256).
     #[serde(default)]
     pub relative_entries: Vec<MediaRelativeEntry>,
-    /// Optional user-selected content root directory (directory only, not a probe file).
-    /// Filesystem / drive roots are rejected.
+    /// Deprecated: ignored for identity and root expansion. Binding torrent only.
     #[serde(default)]
     pub content_root: Option<String>,
-    pub request_generation: u64,
-    pub snapshot_hash: String,
+    /// Deprecated: ignored. Plan request_generation is authoritative.
+    #[serde(default)]
+    pub request_generation: Option<u64>,
+    /// Deprecated: ignored. Plan snapshot_hash is authoritative.
+    #[serde(default)]
+    pub snapshot_hash: Option<String>,
     /// Optional per-file timeout override (ms). Defaults to 30s; clamped to
     /// 100ms..=300_000 (`MAX_MEDIA_PROBE_TIMEOUT_MS`).
     #[serde(default)]
@@ -649,6 +660,8 @@ pub struct MediaInfoStartRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaInfoJobView {
     pub job_id: String,
+    /// Backend-issued plan token echoed for client correlation (not a client authority).
+    pub plan_token: String,
     pub state: AiJobState,
     pub request_generation: u64,
     pub snapshot_hash: String,
@@ -675,6 +688,12 @@ fn media_info_packaged_resource_base(resource_dir: Option<PathBuf>) -> Option<Pa
 
 /// Start a backend-owned MediaInfo job (queued/running immediately with job id).
 ///
+/// Requires an opaque `plan_token`. Backend resolves identity through `PlanRegistry`
+/// and reuses the plan's private `LocalExecutionBinding` + current snapshot/generation.
+/// Client snapshot_hash / request_generation / torrent_path / content_root are never
+/// plan identity. MediaInfo remains a local capability: AI must be enabled, but
+/// provider Ready is **not** required.
+///
 /// Disabled AI is a true zero-impact path: no sidecar spawn.
 /// Cancellation is cooperative and reaches the child MediaInfo process.
 #[tauri::command]
@@ -682,27 +701,30 @@ pub fn ai_start_media_info(
     app: AppHandle,
     request: MediaInfoStartRequest,
 ) -> Result<MediaInfoJobView, String> {
-    let snapshot_hash = request.snapshot_hash.trim().to_string();
-    if snapshot_hash.is_empty() {
-        return Err("media info requires a non-empty snapshot_hash".to_string());
-    }
-    let torrent_path = request.torrent_path.trim().to_string();
-    if torrent_path.is_empty() {
-        return Err("media info requires a torrent path for content-root resolution".to_string());
+    let plan_token = request.plan_token.trim().to_string();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required for media info".to_string());
     }
 
     let connection = ai_get_settings(app.clone());
     // Disabled AI must not launch MediaInfo (zero behavioral impact).
+    // Local MediaInfo does not require provider Ready — only that AI is enabled.
     if !connection.enabled {
         return Err("AI is disabled; MediaInfo is not launched".to_string());
     }
 
-    let content_root = request
-        .content_root
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
+    // Backend plan identity is authoritative — never trust client snapshot/generation/paths.
+    let (snapshot_hash, request_generation, binding) = {
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.resolve_for_media_info(&plan_token)?
+    };
+    // Private binding path only; never echo absolute paths on the public IPC path.
+    let torrent_path = binding.request().torrent_path.clone();
+    if torrent_path.trim().is_empty() {
+        return Err("prepared plan has no bound torrent path".to_string());
+    }
 
     if request.relative_entries.len() > MAX_MEDIA_RELATIVE_ENTRIES {
         return Err(format!(
@@ -710,18 +732,18 @@ pub fn ai_start_media_info(
         ));
     }
 
-    // Resolve relative entries under allowed roots before starting the job so
-    // absolute caller paths never become probe authority.
+    // Resolve relative entries under binding-derived roots only. Client content_root
+    // and torrent_path are ignored so they cannot expand probe authority or plan identity.
     let (probe_requests, mut pre_results) = if request.relative_entries.is_empty() {
         (
-            discover_media_probe_requests(torrent_path.as_str(), content_root.as_deref())?,
+            discover_media_probe_requests(torrent_path.as_str(), None)?,
             Vec::new(),
         )
     } else {
         let batch = resolve_media_relative_entries(
             torrent_path.as_str(),
             &request.relative_entries,
-            content_root.as_deref(),
+            None,
         )?;
         (batch.requests, batch.pre_results)
     };
@@ -732,7 +754,7 @@ pub fn ai_start_media_info(
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
         manager.start(
             JobKind::MediaInfo,
-            request.request_generation,
+            request_generation,
             snapshot_hash.clone(),
             None,
         )
@@ -759,8 +781,9 @@ pub fn ai_start_media_info(
     };
     let initial = MediaInfoJobView {
         job_id: job_id.clone(),
+        plan_token: plan_token.clone(),
         state: manager_state,
-        request_generation: request.request_generation,
+        request_generation,
         snapshot_hash: snapshot_hash.clone(),
         progress: 0,
         error_code: None,
@@ -781,7 +804,8 @@ pub fn ai_start_media_info(
         None => {
             let view = finish_media_info_job(
                 &job_id,
-                request.request_generation,
+                &plan_token,
+                request_generation,
                 &snapshot_hash,
                 false,
                 Some("MISSING_SIDECAR".to_string()),
@@ -801,7 +825,8 @@ pub fn ai_start_media_info(
         Err(error) => {
             let view = finish_media_info_job(
                 &job_id,
-                request.request_generation,
+                &plan_token,
+                request_generation,
                 &snapshot_hash,
                 false,
                 Some("MISSING_SIDECAR".to_string()),
@@ -822,7 +847,8 @@ pub fn ai_start_media_info(
     if probe_requests.is_empty() {
         let view = finish_media_info_job(
             &job_id,
-            request.request_generation,
+            &plan_token,
+            request_generation,
             &snapshot_hash,
             true,
             None,
@@ -838,7 +864,8 @@ pub fn ai_start_media_info(
 
     let work = PendingMediaInfoWork {
         job_id: job_id.clone(),
-        request_generation: request.request_generation,
+        plan_token: plan_token.clone(),
+        request_generation,
         snapshot_hash: snapshot_hash.clone(),
         probe_requests,
         pre_results: std::mem::take(&mut pre_results),
@@ -930,6 +957,7 @@ fn spawn_media_info_worker(work: PendingMediaInfoWork) {
     std::thread::spawn(move || {
         let PendingMediaInfoWork {
             job_id: bg_job_id,
+            plan_token: bg_plan_token,
             request_generation: bg_generation,
             snapshot_hash: bg_snapshot,
             probe_requests,
@@ -961,8 +989,10 @@ fn spawn_media_info_worker(work: PendingMediaInfoWork) {
                     manager.cancel(&bg_job_id)
                 };
                 let sanitized = sanitize_media_results_for_non_success(bg_pre);
+                // Cancel never mutates plan-owned media evidence.
                 store_media_info_view(
                     &bg_job_id,
+                    &bg_plan_token,
                     bg_generation,
                     &bg_snapshot,
                     AiJobState::Cancelled,
@@ -1023,9 +1053,11 @@ fn spawn_media_info_worker(work: PendingMediaInfoWork) {
                 manager.cancel(&bg_job_id)
             };
             // Cancellation cannot report a successful media result: strip measured summaries.
+            // Cancel never mutates plan-owned media evidence.
             let sanitized = sanitize_media_results_for_non_success(results);
             store_media_info_view(
                 &bg_job_id,
+                &bg_plan_token,
                 bg_generation,
                 &bg_snapshot,
                 AiJobState::Cancelled,
@@ -1063,6 +1095,7 @@ fn spawn_media_info_worker(work: PendingMediaInfoWork) {
         };
         let _ = finish_media_info_job(
             &bg_job_id,
+            &bg_plan_token,
             bg_generation,
             &bg_snapshot,
             success,
@@ -1178,6 +1211,7 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
         .cloned();
     let mut view = stored.unwrap_or(MediaInfoJobView {
         job_id: job.id.clone(),
+        plan_token: String::new(),
         state: job.state,
         request_generation: job.request_generation,
         snapshot_hash: job.snapshot_hash.clone(),
@@ -1214,6 +1248,7 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
 
 fn finish_media_info_job(
     job_id: &str,
+    plan_token: &str,
     request_generation: u64,
     snapshot_hash: &str,
     success: bool,
@@ -1245,8 +1280,23 @@ fn finish_media_info_job(
     if !media_info_may_report_success(job.state) {
         results = sanitize_media_results_for_non_success(results);
     }
+
+    // Bind plan-owned redacted media evidence only on Succeeded terminal jobs.
+    // Cancel / timeout / nonzero / malformed / oversized / Failed never mutate the plan.
+    // Identity mismatch or drift also leave plan media evidence unchanged.
+    if media_info_may_bind_plan_evidence(job.state) {
+        let _ = try_bind_media_evidence_to_plan(
+            plan_token,
+            job_id,
+            &job.snapshot_hash,
+            job.request_generation,
+            &results,
+        );
+    }
+
     let view = store_media_info_view(
         job_id,
+        plan_token,
         job.request_generation,
         &job.snapshot_hash,
         job.state,
@@ -1258,8 +1308,39 @@ fn finish_media_info_job(
     view
 }
 
+/// Attempt to bind redacted MediaInfo summaries to the matching prepared plan.
+///
+/// Failures (token mismatch, identity drift, missing binding) return `Err` without
+/// mutating plan state. Never trusts client snapshot_hash as identity — the job's
+/// backend-assigned identity must match the live plan token.
+fn try_bind_media_evidence_to_plan(
+    plan_token: &str,
+    job_id: &str,
+    snapshot_hash: &str,
+    request_generation: u64,
+    results: &[MediaProbeResult],
+) -> Result<(), String> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required".to_string());
+    }
+    let evidence = build_plan_media_evidence(
+        job_id,
+        snapshot_hash,
+        request_generation,
+        results,
+        &RedactionPolicy::default(),
+    );
+    let mut guard = get_or_create_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    guard.bind_media_evidence(plan_token, evidence)?;
+    Ok(())
+}
+
 fn store_media_info_view(
     job_id: &str,
+    plan_token: &str,
     request_generation: u64,
     snapshot_hash: &str,
     state: AiJobState,
@@ -1268,6 +1349,7 @@ fn store_media_info_view(
 ) -> MediaInfoJobView {
     let view = MediaInfoJobView {
         job_id: job_id.to_string(),
+        plan_token: plan_token.to_string(),
         state,
         request_generation,
         snapshot_hash: snapshot_hash.to_string(),
@@ -3078,6 +3160,9 @@ pub fn ai_connection_is_configured_for_app(app: &AppHandle) -> bool {
 /// Build a formal-audit result after sanitizing findings with the active policy.
 /// Callers pass the secret-aware policy when a credential is in scope; otherwise default.
 /// Sanitization runs before decision calculation so bind + IPC never see raw canaries.
+///
+/// Plan-owned MediaInfo state contributes `MEDIA_NOT_TESTED` / `MEDIA_CHECK_FAILED`
+/// via [`media_findings_from_plan_evidence`] — never client probe values.
 fn local_audit_result(
     plan_token: String,
     snapshot_hash: String,
@@ -3090,7 +3175,7 @@ fn local_audit_result(
 ) -> AiFormalAuditResult {
     // Secret-aware substring redaction on evidence_path preserves relative path shape
     // (full redact_text would path-mangle "torrent/file.mkv"); messages use full policy.
-    let findings = findings
+    let mut findings = findings
         .into_iter()
         .map(|mut finding| {
             if let Some(path) = finding.evidence_path.as_ref() {
@@ -3098,7 +3183,9 @@ fn local_audit_result(
             }
             finding
         })
-        .collect();
+        .collect::<Vec<_>>();
+    // Derive media findings only from backend-owned plan media evidence.
+    findings.extend(load_plan_media_findings(&plan_token));
     let input = sanitize_audit_input(
         AuditInput {
             local_blockers: local_blockers.clone(),
@@ -3119,6 +3206,25 @@ fn local_audit_result(
         snapshot_hash,
         request_generation,
     }
+}
+
+/// Load plan-owned MediaInfo findings for formal/local audit derivation.
+///
+/// Missing / expired tokens yield no media findings (caller already failed closed on
+/// plan identity). Live plans derive `MEDIA_NOT_TESTED` / `MEDIA_CHECK_FAILED` from
+/// identity-matched plan-owned media evidence only.
+fn load_plan_media_findings(plan_token: &str) -> Vec<Finding> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Vec::new();
+    }
+    let mut guard = get_or_create_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(plan) = guard.inspect_plan(plan_token) else {
+        return Vec::new();
+    };
+    plan.media_audit_findings()
 }
 
 fn bind_audit_to_plan(result: &AiFormalAuditResult) -> Result<(), String> {
@@ -4067,6 +4173,7 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
                     id.clone(),
                     MediaInfoJobView {
                         job_id: id.clone(),
+                        plan_token: String::new(),
                         state: job.state,
                         request_generation: job.request_generation,
                         snapshot_hash: job.snapshot_hash.clone(),
@@ -5535,6 +5642,7 @@ mod media_info_job_tests {
             job_id.clone(),
             MediaInfoJobView {
                 job_id: job_id.clone(),
+                plan_token: "plan_test_media".into(),
                 state: AiJobState::Running,
                 request_generation: 7,
                 snapshot_hash: "sha256:media".into(),
@@ -5588,6 +5696,7 @@ mod media_info_job_tests {
             job_id.clone(),
             MediaInfoJobView {
                 job_id: job_id.clone(),
+                plan_token: "plan_test_media_ok".into(),
                 state: AiJobState::Succeeded,
                 request_generation: 11,
                 snapshot_hash: "sha256:media-ok".into(),
@@ -5665,6 +5774,7 @@ mod media_info_job_tests {
             media_id.clone(),
             MediaInfoJobView {
                 job_id: media_id.clone(),
+                plan_token: "plan_queued_media".into(),
                 state: AiJobState::Queued,
                 request_generation: generation,
                 snapshot_hash: snapshot_hash.to_string(),
@@ -5677,6 +5787,7 @@ mod media_info_job_tests {
         // Deferred work is registered but must not run while Queued.
         enqueue_pending_media_info_work(PendingMediaInfoWork {
             job_id: media_id.clone(),
+            plan_token: "plan_queued_media".into(),
             request_generation: generation,
             snapshot_hash: snapshot_hash.to_string(),
             // Empty probes: worker finishes quickly without spawning a real sidecar.
@@ -5845,6 +5956,7 @@ mod media_info_job_tests {
                     id.clone(),
                     PendingMediaInfoWork {
                         job_id: id,
+                        plan_token: format!("plan_pad_{index}"),
                         request_generation: index as u64,
                         snapshot_hash: format!("sha256:pad-{index}"),
                         probe_requests: Vec::new(),
@@ -5877,6 +5989,7 @@ mod media_info_job_tests {
             media_id.clone(),
             MediaInfoJobView {
                 job_id: media_id.clone(),
+                plan_token: "plan_bound_media".into(),
                 state: AiJobState::Queued,
                 request_generation: 9,
                 snapshot_hash: "sha256:bound-media".into(),
@@ -5888,6 +6001,7 @@ mod media_info_job_tests {
 
         let err = enqueue_pending_media_info_work(PendingMediaInfoWork {
             job_id: media_id.clone(),
+            plan_token: "plan_bound_media".into(),
             request_generation: 9,
             snapshot_hash: "sha256:bound-media".into(),
             probe_requests: Vec::new(),
@@ -5972,6 +6086,7 @@ mod media_info_job_tests {
             media_id.clone(),
             MediaInfoJobView {
                 job_id: media_id.clone(),
+                plan_token: "plan_toctou".into(),
                 // Stale view still shows Queued; coordination must not trust it.
                 state: AiJobState::Queued,
                 request_generation: 7,
@@ -5984,6 +6099,7 @@ mod media_info_job_tests {
 
         park_pending_media_info_and_drain(PendingMediaInfoWork {
             job_id: media_id.clone(),
+            plan_token: "plan_toctou".into(),
             request_generation: 7,
             snapshot_hash: "sha256:toctou-live-handoff".into(),
             probe_requests: Vec::new(),
@@ -6039,6 +6155,7 @@ mod media_info_job_tests {
             media_id.clone(),
             MediaInfoJobView {
                 job_id: media_id.clone(),
+                plan_token: "plan_toctou_terminal".into(),
                 state: AiJobState::Cancelled,
                 request_generation: 8,
                 snapshot_hash: "sha256:toctou-terminal-before".into(),
@@ -6050,6 +6167,7 @@ mod media_info_job_tests {
 
         park_pending_media_info_and_drain(PendingMediaInfoWork {
             job_id: media_id.clone(),
+            plan_token: "plan_toctou_terminal".into(),
             request_generation: 8,
             snapshot_hash: "sha256:toctou-terminal-before".into(),
             probe_requests: Vec::new(),
@@ -6111,6 +6229,7 @@ mod media_info_job_tests {
             media_q.clone(),
             MediaInfoJobView {
                 job_id: media_q.clone(),
+                plan_token: "plan_overflow_q".into(),
                 state: AiJobState::Queued,
                 request_generation: 2,
                 snapshot_hash: "sha256:overflow-queued".into(),
@@ -6129,6 +6248,7 @@ mod media_info_job_tests {
             media_reject.clone(),
             MediaInfoJobView {
                 job_id: media_reject.clone(),
+                plan_token: "plan_overflow_r".into(),
                 state: AiJobState::Running,
                 request_generation: 1,
                 snapshot_hash: "sha256:overflow-reject".into(),
@@ -6147,6 +6267,7 @@ mod media_info_job_tests {
                 media_q.clone(),
                 PendingMediaInfoWork {
                     job_id: media_q.clone(),
+                    plan_token: "plan_overflow_q".into(),
                     request_generation: 2,
                     snapshot_hash: "sha256:overflow-queued".into(),
                     probe_requests: Vec::new(),
@@ -6162,6 +6283,7 @@ mod media_info_job_tests {
                     id.clone(),
                     PendingMediaInfoWork {
                         job_id: id,
+                        plan_token: format!("plan_pad_overflow_{index}"),
                         request_generation: index as u64,
                         snapshot_hash: format!("sha256:pad-overflow-{index}"),
                         probe_requests: Vec::new(),
@@ -6178,6 +6300,7 @@ mod media_info_job_tests {
 
         let err = park_pending_media_info_and_drain(PendingMediaInfoWork {
             job_id: media_reject.clone(),
+            plan_token: "plan_overflow_r".into(),
             request_generation: 1,
             snapshot_hash: "sha256:overflow-reject".into(),
             probe_requests: Vec::new(),
@@ -6232,6 +6355,7 @@ mod media_info_job_tests {
             active.clone(),
             MediaInfoJobView {
                 job_id: active.clone(),
+                plan_token: "plan_active_retain".into(),
                 state: AiJobState::Running,
                 request_generation: 1,
                 snapshot_hash: "sha256:active-retain".into(),
@@ -6254,6 +6378,7 @@ mod media_info_job_tests {
                     id.clone(),
                     MediaInfoJobView {
                         job_id: id,
+                        plan_token: format!("plan_terminal_{index}"),
                         state: AiJobState::Succeeded,
                         request_generation: index as u64,
                         snapshot_hash: format!("sha256:t-{index}"),
@@ -6298,6 +6423,7 @@ mod media_info_job_tests {
             job_id.clone(),
             MediaInfoJobView {
                 job_id: job_id.clone(),
+                plan_token: "plan_poll_media".into(),
                 state: AiJobState::Running,
                 request_generation: 1,
                 snapshot_hash: "sha256:poll-media".into(),
@@ -6310,6 +6436,7 @@ mod media_info_job_tests {
 
         store_media_info_view(
             &job_id,
+            "plan_poll_media",
             1,
             "sha256:poll-media",
             AiJobState::Succeeded,
@@ -6359,6 +6486,308 @@ mod media_info_job_tests {
                     .starts_with(&exe_dir)
             }),
             "fallback resource base must include current_exe parent candidates"
+        );
+    }
+}
+
+#[cfg(test)]
+mod media_info_plan_bind_tests {
+    use super::*;
+    use crate::config::Template;
+    use crate::domain::publish_plan::PlanMediaStatus;
+    use crate::publish::PublishRequest;
+
+    fn reset_media_job_globals() {
+        if let Ok(flags) = media_cancel_flags().lock() {
+            for flag in flags.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        {
+            let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
+            manager.cancel_unfinished();
+        }
+        media_pending_work()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        media_job_results()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        media_cancel_flags()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+    }
+
+    fn write_temp_torrent(contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "okpgui-media-bind-{}-{}.torrent",
+            std::process::id(),
+            now_unix()
+        ));
+        std::fs::write(&path, contents).expect("write temp torrent");
+        path
+    }
+
+    fn prepare_bound_plan(generation: u64) -> (String, String, PathBuf) {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = PublishRequest {
+            publish_id: "pub".into(),
+            torrent_path: torrent_path.display().to_string(),
+            profile_name: "profile".into(),
+            template: Template::default(),
+        };
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let prepared = guard
+            .prepare_plan_with_request_and_blockers(generation, request, Vec::new(), false, None)
+            .expect("prepare");
+        (prepared.token, prepared.snapshot_hash, torrent_path)
+    }
+
+    #[test]
+    fn success_finish_binds_redacted_media_evidence_to_plan() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
+        let (token, snapshot_hash, torrent_path) = prepare_bound_plan(4);
+        let job_id = start_job_backend(JobKind::MediaInfo, 4, &snapshot_hash, None);
+
+        let view = finish_media_info_job(
+            &job_id,
+            &token,
+            4,
+            &snapshot_hash,
+            true,
+            None,
+            "measured",
+            vec![MediaProbeResult {
+                relative_name: "show/ep01.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(9_000),
+                    width: Some(1920),
+                    height: Some(1080),
+                    video_codec: Some("AV1".into()),
+                    audio_codecs: vec!["AAC".into()],
+                    subtitle_languages: vec![],
+                    scan_type: None,
+                }),
+                message: None,
+            }],
+        );
+        assert_eq!(view.state, AiJobState::Succeeded);
+        assert_eq!(view.plan_token, token);
+        let view_json = serde_json::to_string(&view).unwrap();
+        assert!(!view_json.contains(torrent_path.to_string_lossy().as_ref()));
+        assert!(!view_json.contains("/Users/"));
+
+        {
+            let mut reg = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let plan = reg.inspect_plan(&token).expect("plan");
+            let media = plan.media_evidence.as_ref().expect("media bound");
+            assert_eq!(media.status, PlanMediaStatus::Tested);
+            assert_eq!(media.job_id, job_id);
+            assert_eq!(media.summaries[0].relative_name, "show/ep01.mkv");
+            let findings = plan.media_audit_findings();
+            assert!(
+                findings.is_empty(),
+                "tested media must not yield media findings: {findings:?}"
+            );
+            let public = serde_json::to_string(plan).unwrap();
+            assert!(!public.contains(torrent_path.to_string_lossy().as_ref()));
+            assert!(!public.contains("/Users/"));
+        }
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn cancel_and_failure_finish_do_not_bind_media_evidence() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
+        let (token, snapshot_hash, torrent_path) = prepare_bound_plan(5);
+
+        // Failed finish (timeout / nonzero class) must not mutate the plan.
+        let fail_id = start_job_backend(JobKind::MediaInfo, 5, &snapshot_hash, None);
+        let failed = finish_media_info_job(
+            &fail_id,
+            &token,
+            5,
+            &snapshot_hash,
+            false,
+            Some("PROBE_FAILED".into()),
+            "timeout",
+            vec![MediaProbeResult {
+                relative_name: "ep.mkv".into(),
+                state: MediaProbeState::TimedOut,
+                summary: None,
+                message: Some("timed out".into()),
+            }],
+        );
+        assert_eq!(failed.state, AiJobState::Failed);
+        assert!(
+            get_or_create_registry()
+                .lock()
+                .unwrap()
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.clone())
+                .is_none(),
+            "failed MediaInfo must not bind plan media evidence"
+        );
+
+        // Cancelled store path must not bind either.
+        let cancel_id = start_job_backend(JobKind::MediaInfo, 5, &snapshot_hash, None);
+        ai_cancel_job(cancel_id.clone()).unwrap();
+        store_media_info_view(
+            &cancel_id,
+            &token,
+            5,
+            &snapshot_hash,
+            AiJobState::Cancelled,
+            Some("CANCELLED".into()),
+            sanitize_media_results_for_non_success(vec![MediaProbeResult {
+                relative_name: "ep.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(1),
+                    ..crate::ai::media::MediaInfoSummary::default()
+                }),
+                message: None,
+            }]),
+        );
+        assert!(
+            !media_info_may_bind_plan_evidence(AiJobState::Cancelled)
+                && !media_info_may_bind_plan_evidence(AiJobState::Failed)
+        );
+        assert!(
+            get_or_create_registry()
+                .lock()
+                .unwrap()
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.clone())
+                .is_none(),
+            "cancel/failure must leave plan media evidence unset"
+        );
+        // Formal/local audit can still derive MEDIA_NOT_TESTED from unbound plan state.
+        let findings = get_or_create_registry()
+            .lock()
+            .unwrap()
+            .inspect_plan(&token)
+            .map(|plan| plan.media_audit_findings())
+            .expect("plan");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "MEDIA_NOT_TESTED");
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn token_mismatch_and_identity_drift_reject_bind_without_mutating() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
+        let (token, snapshot_hash, torrent_path) = prepare_bound_plan(6);
+        let job_id = start_job_backend(JobKind::MediaInfo, 6, &snapshot_hash, None);
+
+        // Wrong plan token: bind rejected, plan unchanged.
+        let err = try_bind_media_evidence_to_plan(
+            "plan_not_this_token",
+            &job_id,
+            &snapshot_hash,
+            6,
+            &[MediaProbeResult {
+                relative_name: "ep.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(1),
+                    ..crate::ai::media::MediaInfoSummary::default()
+                }),
+                message: None,
+            }],
+        )
+        .expect_err("unknown token");
+        assert!(
+            err.contains("missing") || err.contains("expired") || err.contains("required"),
+            "{err}"
+        );
+
+        // Forged client snapshot as bind identity: rejected.
+        let err = try_bind_media_evidence_to_plan(
+            &token,
+            &job_id,
+            "sha256:forged-client-hash",
+            6,
+            &[MediaProbeResult {
+                relative_name: "ep.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(1),
+                    ..crate::ai::media::MediaInfoSummary::default()
+                }),
+                message: None,
+            }],
+        )
+        .expect_err("forged snapshot");
+        assert!(err.contains("identity") || err.contains("snapshot"), "{err}");
+
+        // Identity drift: mutate torrent after start, bind must fail closed.
+        std::fs::write(&torrent_path, b"d4:infod4:name7:changedee").expect("mutate");
+        let err = try_bind_media_evidence_to_plan(
+            &token,
+            &job_id,
+            &snapshot_hash,
+            6,
+            &[MediaProbeResult {
+                relative_name: "ep.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(1),
+                    ..crate::ai::media::MediaInfoSummary::default()
+                }),
+                message: None,
+            }],
+        )
+        .expect_err("drift");
+        assert!(!err.is_empty());
+
+        {
+            let mut reg = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let plan = reg.inspect_plan(&token).expect("plan still live");
+            assert!(plan.media_evidence.is_none());
+            assert!(plan.has_authoritative_audit_evidence());
+            assert_eq!(plan.media_audit_findings()[0].code, "MEDIA_NOT_TESTED");
+        }
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn media_info_start_request_ignores_client_identity_fields_on_deserialize() {
+        let raw = serde_json::json!({
+            "plan_token": "plan_only_authority",
+            "torrent_path": "/Users/forged/secret.torrent",
+            "content_root": "/Users/forged/media",
+            "snapshot_hash": "sha256:client-forged",
+            "request_generation": 999,
+            "relative_entries": [],
+            "timeout_ms": 1000
+        });
+        let request: MediaInfoStartRequest =
+            serde_json::from_value(raw).expect("deserialize start request");
+        assert_eq!(request.plan_token, "plan_only_authority");
+        // Deprecated client identity fields may deserialize for wire compat but must not
+        // become plan identity (start path uses PlanRegistry only).
+        assert_eq!(
+            request.snapshot_hash.as_deref(),
+            Some("sha256:client-forged")
+        );
+        assert_eq!(request.request_generation, Some(999));
+        assert_eq!(
+            request.torrent_path.as_deref(),
+            Some("/Users/forged/secret.torrent")
         );
     }
 }

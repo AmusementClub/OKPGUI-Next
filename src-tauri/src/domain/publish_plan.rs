@@ -8,7 +8,10 @@ use std::sync::{
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::ai::audit::{Acknowledgements, AuditDecision, Finding};
+use crate::ai::audit::{
+    media_findings_from_plan_evidence, Acknowledgements, AuditDecision, Finding,
+    MediaEvidenceAuditState,
+};
 use crate::config::{SiteSelection, Template};
 use crate::publish::{OkpExecutableIdentity, PublishRequest, ResolvedOkpExecutable};
 
@@ -26,6 +29,65 @@ pub struct PlanAuditEvidence {
     /// Must equal the plan's snapshot_hash at bind time.
     pub snapshot_hash: String,
     pub request_generation: u64,
+}
+
+/// Outcome of a plan-owned MediaInfo bind (only written on Succeeded terminal jobs).
+///
+/// Formal/local audit derives `MEDIA_NOT_TESTED` / `MEDIA_CHECK_FAILED` from this
+/// plan state — never from client probe snapshots or string heuristics.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanMediaStatus {
+    /// At least one redacted Measured summary was bound.
+    Tested,
+    /// Terminal MediaInfo success with no usable measured media.
+    CheckFailed,
+}
+
+/// Redacted, relative, normalized media summary owned by a prepared plan.
+/// Absolute paths never appear; codec/language strings are free-text only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PlanMediaSummary {
+    pub relative_name: String,
+    pub duration_ms: Option<u64>,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    pub video_codec: Option<String>,
+    #[serde(default)]
+    pub audio_codecs: Vec<String>,
+    #[serde(default)]
+    pub subtitle_languages: Vec<String>,
+    pub scan_type: Option<String>,
+}
+
+/// Backend-owned MediaInfo evidence bound to a prepared plan token.
+///
+/// Only identity-matched Succeeded terminal results may bind. Cancel / timeout /
+/// nonzero / malformed / oversized / Failed results must leave this field untouched.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PlanMediaEvidence {
+    pub job_id: String,
+    /// Must equal the plan's snapshot_hash at bind time.
+    pub snapshot_hash: String,
+    pub request_generation: u64,
+    pub status: PlanMediaStatus,
+    /// Redacted relative measured summaries only (never absolute paths).
+    #[serde(default)]
+    pub summaries: Vec<PlanMediaSummary>,
+}
+
+impl PlanMediaEvidence {
+    pub fn matches_plan(&self, snapshot_hash: &str, request_generation: u64) -> bool {
+        self.snapshot_hash == snapshot_hash && self.request_generation == request_generation
+    }
+
+    /// Map identity-matched plan media evidence to formal/local audit state.
+    pub fn audit_state(&self) -> MediaEvidenceAuditState {
+        match self.status {
+            PlanMediaStatus::Tested => MediaEvidenceAuditState::Tested,
+            PlanMediaStatus::CheckFailed => MediaEvidenceAuditState::CheckFailed,
+        }
+    }
 }
 
 impl PlanAuditEvidence {
@@ -80,6 +142,9 @@ pub struct PublishPlan {
     /// Rust-owned audit result bound to this plan (formal or local-only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub audit_evidence: Option<PlanAuditEvidence>,
+    /// Rust-owned MediaInfo evidence bound only after identity-matched success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub media_evidence: Option<PlanMediaEvidence>,
     /// Explicit user acknowledgements recorded against this plan token.
     #[serde(default)]
     pub acknowledgements: Acknowledgements,
@@ -135,6 +200,7 @@ impl PublishPlan {
             canonical_snapshot: None,
             local_execution_binding: None,
             audit_evidence: None,
+            media_evidence: None,
             acknowledgements: Acknowledgements::default(),
         }
     }
@@ -181,6 +247,55 @@ impl PublishPlan {
         // New audit invalidates prior acknowledgements.
         self.acknowledgements.clear();
         Ok(())
+    }
+
+    /// Bind redacted MediaInfo summaries to this plan. Rejects identity mismatch.
+    ///
+    /// Does not consume the plan token, clear audit evidence, or weaken blockers.
+    /// Callers must only invoke this for Succeeded terminal MediaInfo jobs after
+    /// revalidating the private local execution binding.
+    pub fn bind_media_evidence(&mut self, evidence: PlanMediaEvidence) -> Result<(), String> {
+        if evidence.snapshot_hash != self.snapshot_hash {
+            return Err(
+                "media evidence snapshot_hash does not match prepared plan".to_string(),
+            );
+        }
+        if evidence.request_generation != self.request_generation {
+            return Err(
+                "media evidence request_generation does not match prepared plan".to_string(),
+            );
+        }
+        // Defense in depth: only relative measured labels may be stored.
+        for summary in &evidence.summaries {
+            if !is_safe_plan_media_relative_name(&summary.relative_name) {
+                return Err("media evidence contains unsafe relative path".to_string());
+            }
+        }
+        self.media_evidence = Some(evidence);
+        Ok(())
+    }
+
+    /// True when this plan has identity-matched backend-owned MediaInfo evidence.
+    pub fn has_authoritative_media_evidence(&self) -> bool {
+        self.media_evidence.as_ref().is_some_and(|evidence| {
+            evidence.matches_plan(&self.snapshot_hash, self.request_generation)
+        })
+    }
+
+    /// Derive MediaInfo findings from this plan's identity-matched media evidence only.
+    ///
+    /// Missing or identity-mismatched media evidence yields `MEDIA_NOT_TESTED`.
+    /// Never uses client probe snapshots or free-text heuristics.
+    pub fn media_audit_findings(&self) -> Vec<Finding> {
+        let state = self
+            .media_evidence
+            .as_ref()
+            .filter(|evidence| {
+                evidence.matches_plan(&self.snapshot_hash, self.request_generation)
+            })
+            .map(PlanMediaEvidence::audit_state)
+            .unwrap_or(MediaEvidenceAuditState::NotTested);
+        media_findings_from_plan_evidence(state)
     }
 
     pub fn set_acknowledgements(&mut self, acknowledgements: Acknowledgements) {
@@ -766,6 +881,81 @@ impl PlanRegistry {
         Ok(plan)
     }
 
+    /// Bind redacted MediaInfo evidence to a live prepared plan token.
+    ///
+    /// Fail-closed:
+    /// - empty / missing / expired token → error (no plan leak; plan state untouched)
+    /// - identity mismatch (snapshot_hash / request_generation) → error without mutation
+    /// - binding revalidation failure (identity drift) → error without mutation
+    ///
+    /// Does not consume the plan token or alter audit evidence / acknowledgements.
+    pub fn bind_media_evidence(
+        &mut self,
+        token: &str,
+        evidence: PlanMediaEvidence,
+    ) -> Result<&PublishPlan, String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        if self.is_expired(token) {
+            self.remove(token);
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        let plan = self
+            .plans
+            .get_mut(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        // Identity must match the plan's current backend-owned snapshot before any write.
+        if evidence.snapshot_hash != plan.snapshot_hash
+            || evidence.request_generation != plan.request_generation
+        {
+            return Err(
+                "media evidence identity does not match prepared plan".to_string(),
+            );
+        }
+        // Revalidate private binding so same-path replacements fail closed without bind.
+        if let Some(binding) = plan.get_local_binding() {
+            if let Err(failures) = binding.revalidate() {
+                return Err(failures.join("；"));
+            }
+        } else {
+            return Err("prepared plan has no local execution binding".to_string());
+        }
+        plan.bind_media_evidence(evidence)?;
+        Ok(plan)
+    }
+
+    /// Resolve plan identity + private binding for MediaInfo start.
+    ///
+    /// Backend snapshot_hash / request_generation / torrent_path come only from the
+    /// prepared plan. Client-supplied hashes, generations, torrent paths, relative
+    /// paths, and content roots are never plan identity.
+    ///
+    /// Does not consume the token. Revalidates the binding so drift fails closed
+    /// before a job starts (plan state is not weakened on failure).
+    pub fn resolve_for_media_info(
+        &mut self,
+        token: &str,
+    ) -> Result<(String, u64, LocalExecutionBinding), String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        let plan = self
+            .inspect_plan(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        let snapshot_hash = plan.snapshot_hash.clone();
+        let request_generation = plan.request_generation;
+        let binding = plan.get_local_binding_owned().ok_or_else(|| {
+            "prepared plan has no local execution binding".to_string()
+        })?;
+        if let Err(failures) = binding.revalidate() {
+            return Err(failures.join("；"));
+        }
+        Ok((snapshot_hash, request_generation, binding))
+    }
+
     /// Record explicit acknowledgements against a live prepared plan token.
     pub fn set_acknowledgements(
         &mut self,
@@ -831,6 +1021,31 @@ fn new_opaque_token() -> String {
     hasher.update(timestamp.to_le_bytes());
     hasher.update(counter.to_le_bytes());
     format!("plan_{}", hex::encode(hasher.finalize()))
+}
+
+/// Safe relative media labels for plan-owned evidence (no absolute / traversal forms).
+fn is_safe_plan_media_relative_name(path: &str) -> bool {
+    if path.is_empty() || path.trim().is_empty() {
+        return false;
+    }
+    if path != path.trim() {
+        return false;
+    }
+    if path.chars().any(|character| character.is_control()) {
+        return false;
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    if path.contains(':') {
+        return false;
+    }
+    for component in path.split(['/', '\\']) {
+        if component.is_empty() || component == ".." {
+            return false;
+        }
+    }
+    path.chars().count() <= 256
 }
 
 #[cfg(test)]
@@ -1476,6 +1691,207 @@ mod tests {
         });
         assert!(!plan.has_authoritative_audit_evidence());
         assert!(!plan.can_publish_now());
+    }
+
+    #[test]
+    fn media_evidence_success_bind_is_identity_matched_and_path_free() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(torrent_path.clone());
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(5, request, Vec::new(), false, None)
+            .expect("prepare");
+        let token = prepared.token;
+        let audit_before = registry
+            .inspect_plan(&token)
+            .and_then(|plan| plan.audit_evidence.clone())
+            .expect("initial audit");
+
+        registry
+            .bind_media_evidence(
+                &token,
+                PlanMediaEvidence {
+                    job_id: "media-job-1".into(),
+                    snapshot_hash: prepared.snapshot_hash.clone(),
+                    request_generation: 5,
+                    status: PlanMediaStatus::Tested,
+                    summaries: vec![PlanMediaSummary {
+                        relative_name: "show/ep01.mkv".into(),
+                        duration_ms: Some(1_000),
+                        width: Some(1920),
+                        height: Some(1080),
+                        video_codec: Some("AV1".into()),
+                        audio_codecs: vec!["AAC".into()],
+                        subtitle_languages: vec![],
+                        scan_type: None,
+                    }],
+                },
+            )
+            .expect("bind media");
+
+        {
+            let plan = registry.inspect_plan(&token).expect("plan");
+            assert!(plan.has_authoritative_media_evidence());
+            let media = plan.media_evidence.as_ref().expect("media");
+            assert_eq!(media.status, PlanMediaStatus::Tested);
+            assert_eq!(media.summaries[0].relative_name, "show/ep01.mkv");
+            // Audit evidence must remain unchanged by a media bind.
+            assert_eq!(plan.audit_evidence.as_ref(), Some(&audit_before));
+            let public = serde_json::to_string(plan).expect("serialize");
+            assert!(!public.contains(torrent_path.to_string_lossy().as_ref()));
+            assert!(!public.contains("/private"));
+            assert!(!public.contains("/Users"));
+        }
+        // Token remains live after media bind.
+        assert!(registry.inspect_plan(&token).is_some());
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn media_evidence_token_mismatch_and_identity_mismatch_do_not_mutate() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(torrent_path.clone());
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(8, request, Vec::new(), false, None)
+            .expect("prepare");
+        let token = prepared.token;
+
+        // Unknown token: no mutation path available.
+        let err = registry
+            .bind_media_evidence(
+                "plan_not_real",
+                PlanMediaEvidence {
+                    job_id: "j".into(),
+                    snapshot_hash: prepared.snapshot_hash.clone(),
+                    request_generation: 8,
+                    status: PlanMediaStatus::Tested,
+                    summaries: vec![],
+                },
+            )
+            .expect_err("unknown token");
+        assert!(
+            err.contains("missing") || err.contains("expired"),
+            "{err}"
+        );
+
+        // Snapshot mismatch must leave media_evidence unset.
+        let err = registry
+            .bind_media_evidence(
+                &token,
+                PlanMediaEvidence {
+                    job_id: "j".into(),
+                    snapshot_hash: "sha256:forged-client-hash".into(),
+                    request_generation: 8,
+                    status: PlanMediaStatus::Tested,
+                    summaries: vec![PlanMediaSummary {
+                        relative_name: "ep.mkv".into(),
+                        ..PlanMediaSummary::default()
+                    }],
+                },
+            )
+            .expect_err("forged snapshot");
+        assert!(err.contains("identity") || err.contains("snapshot"), "{err}");
+        assert!(
+            registry
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.as_ref())
+                .is_none(),
+            "mismatch must not bind media evidence"
+        );
+
+        // Generation mismatch.
+        let err = registry
+            .bind_media_evidence(
+                &token,
+                PlanMediaEvidence {
+                    job_id: "j".into(),
+                    snapshot_hash: prepared.snapshot_hash.clone(),
+                    request_generation: 999,
+                    status: PlanMediaStatus::CheckFailed,
+                    summaries: vec![],
+                },
+            )
+            .expect_err("forged generation");
+        assert!(
+            err.contains("identity") || err.contains("generation"),
+            "{err}"
+        );
+        assert!(
+            registry
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.as_ref())
+                .is_none()
+        );
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn media_evidence_identity_drift_after_start_does_not_bind() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(torrent_path.clone());
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(2, request, Vec::new(), false, None)
+            .expect("prepare");
+        let token = prepared.token;
+        let (snap, gen, _binding) = registry
+            .resolve_for_media_info(&token)
+            .expect("resolve at start");
+        assert_eq!(snap, prepared.snapshot_hash);
+        assert_eq!(gen, 2);
+
+        // Replace torrent bytes so revalidation fails (identity drift).
+        std::fs::write(&torrent_path, b"d4:infod4:name7:changedee").expect("mutate");
+        let err = registry
+            .bind_media_evidence(
+                &token,
+                PlanMediaEvidence {
+                    job_id: "media-drift".into(),
+                    snapshot_hash: prepared.snapshot_hash.clone(),
+                    request_generation: 2,
+                    status: PlanMediaStatus::Tested,
+                    summaries: vec![PlanMediaSummary {
+                        relative_name: "ep.mkv".into(),
+                        duration_ms: Some(1),
+                        ..PlanMediaSummary::default()
+                    }],
+                },
+            )
+            .expect_err("drift must reject bind");
+        assert!(!err.is_empty());
+        assert!(
+            registry
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.as_ref())
+                .is_none(),
+            "drift must leave media evidence unset"
+        );
+        // Plan token and audit evidence remain live (not consumed / not weakened).
+        let plan = registry.inspect_plan(&token).expect("plan still live");
+        assert!(plan.has_authoritative_audit_evidence());
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn resolve_for_media_info_rejects_client_identity_and_lightweight_prepare() {
+        let mut registry = PlanRegistry::default();
+        // Lightweight prepare has no LocalExecutionBinding.
+        let light = registry
+            .prepare_plan("sha256:client-forged".into(), 1)
+            .expect("light prepare");
+        let err = registry
+            .resolve_for_media_info(&light)
+            .expect_err("lightweight plan cannot start media");
+        assert!(
+            err.contains("local execution binding") || err.contains("binding"),
+            "{err}"
+        );
+
+        let empty = registry
+            .resolve_for_media_info("  ")
+            .expect_err("empty token");
+        assert!(empty.contains("required"), "{empty}");
     }
 
     #[test]

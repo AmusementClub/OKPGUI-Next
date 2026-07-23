@@ -66,6 +66,15 @@ pub fn media_info_may_report_success(state: AiJobState) -> bool {
     matches!(state, AiJobState::Succeeded)
 }
 
+/// Whether a terminal MediaInfo job may bind redacted summaries onto a PublishPlan.
+///
+/// Same gate as [`media_info_may_report_success`]: only `Succeeded` may bind.
+/// Cancel / timeout / nonzero / malformed / oversized / Failed / Stale must leave
+/// plan-owned media evidence unchanged.
+pub fn media_info_may_bind_plan_evidence(state: AiJobState) -> bool {
+    media_info_may_report_success(state)
+}
+
 /// Whether a Recognition job may surface a validated redacted `RecognitionResult`.
 ///
 /// Only `Succeeded` qualifies. `Cancelled` / `Stale` / `Failed` (and non-terminal states)
@@ -1023,6 +1032,11 @@ mod tests {
         assert!(!media_info_may_report_success(AiJobState::Stale));
         assert!(!media_info_may_report_success(AiJobState::Running));
         assert!(!media_info_may_report_success(AiJobState::Queued));
+        // Plan bind uses the same Succeeded-only gate.
+        assert!(media_info_may_bind_plan_evidence(AiJobState::Succeeded));
+        assert!(!media_info_may_bind_plan_evidence(AiJobState::Failed));
+        assert!(!media_info_may_bind_plan_evidence(AiJobState::Cancelled));
+        assert!(!media_info_may_bind_plan_evidence(AiJobState::Stale));
     }
 
     #[test]
