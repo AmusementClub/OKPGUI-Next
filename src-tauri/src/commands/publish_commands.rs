@@ -273,3 +273,112 @@ fn publish_gate_error(plan: &PublishPlan) -> String {
         AuditDecision::Go => "prepared plan cannot be published".to_string(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::audit::{AuditDecision, Finding, FindingSeverity};
+    use crate::domain::publish_plan::PlanAuditEvidence;
+
+    fn evidence(
+        decision: AuditDecision,
+        snapshot_hash: &str,
+        request_generation: u64,
+    ) -> PlanAuditEvidence {
+        PlanAuditEvidence {
+            decision,
+            findings: Vec::<Finding>::new(),
+            unknown_codes: Vec::new(),
+            formal_ran: true,
+            job_id: Some("job-test".to_string()),
+            snapshot_hash: snapshot_hash.to_string(),
+            request_generation,
+        }
+    }
+
+    fn plan_with_decision(decision: AuditDecision) -> PublishPlan {
+        let mut plan = PublishPlan::new("sha256:plan".to_string(), 7);
+        plan.bind_audit_evidence(evidence(decision, "sha256:plan", 7))
+            .expect("identity-matched evidence");
+        plan
+    }
+
+    #[test]
+    fn evidence_gate_rejects_missing_and_mismatched_evidence() {
+        let missing = PublishPlan::new("sha256:plan".to_string(), 7);
+        let missing_error = publish_evidence_gate(&missing).expect_err("missing evidence");
+        assert!(missing_error.contains("missing authoritative audit evidence"));
+
+        let mut mismatched = PublishPlan::new("sha256:plan".to_string(), 7);
+        mismatched.audit_evidence = Some(evidence(AuditDecision::Go, "sha256:other", 7));
+        let mismatch_error = publish_evidence_gate(&mismatched).expect_err("mismatched evidence");
+        assert!(mismatch_error.contains("does not match plan identity"));
+    }
+
+    #[test]
+    fn warning_pending_and_no_go_require_their_matching_acknowledgement() {
+        let mut warning = plan_with_decision(AuditDecision::Warning);
+        assert!(!warning.can_publish_now());
+        assert!(publish_gate_error(&warning).contains("warning acknowledgement"));
+        warning.set_acknowledgements(Acknowledgements {
+            warning: true,
+            ..Acknowledgements::default()
+        });
+        assert!(warning.can_publish_now());
+
+        let mut pending = plan_with_decision(AuditDecision::Pending);
+        assert!(!pending.can_publish_now());
+        assert!(publish_gate_error(&pending).contains("pending acknowledgement"));
+        pending.set_acknowledgements(Acknowledgements {
+            pending: true,
+            ..Acknowledgements::default()
+        });
+        assert!(pending.can_publish_now());
+
+        let mut no_go = plan_with_decision(AuditDecision::NoGo);
+        no_go.audit_evidence.as_mut().unwrap().findings.push(Finding {
+            code: "TEST_CRITICAL".to_string(),
+            severity: FindingSeverity::Critical,
+            message: "blocked".to_string(),
+            evidence_path: None,
+        });
+        assert!(!no_go.can_publish_now());
+        assert!(publish_gate_error(&no_go).contains("critical acknowledgement"));
+        no_go.set_acknowledgements(Acknowledgements {
+            critical: true,
+            ..Acknowledgements::default()
+        });
+        assert!(no_go.can_publish_now());
+    }
+
+    #[test]
+    fn failed_pre_consume_gate_does_not_mutate_or_consume_plan() {
+        let mut registry = PlanRegistry::default();
+        let token = registry
+            .prepare_plan("sha256:plan".to_string(), 7)
+            .expect("prepare plan");
+        registry
+            .bind_audit_evidence(&token, evidence(AuditDecision::Pending, "sha256:plan", 7))
+            .expect("bind pending evidence");
+        let plan_before = registry.inspect_plan(&token).cloned().expect("plan");
+        assert!(publish_evidence_gate(&plan_before).is_ok());
+        assert!(!plan_before.can_publish_now());
+        assert!(publish_gate_error(&plan_before).contains("pending acknowledgement"));
+
+        let plan_after = registry.inspect_plan(&token).expect("failed gate preserves plan");
+        assert_eq!(plan_after.snapshot_hash, plan_before.snapshot_hash);
+        assert_eq!(plan_after.request_generation, plan_before.request_generation);
+        assert!(registry.publish_plan(&token).is_some());
+    }
+
+    #[test]
+    fn prepared_plan_consumption_is_one_shot_and_replay_fails_closed() {
+        let mut registry = PlanRegistry::default();
+        let token = registry
+            .prepare_plan("sha256:plan".to_string(), 7)
+            .expect("prepare plan");
+        assert!(registry.publish_plan(&token).is_some());
+        assert!(registry.inspect_plan(&token).is_none());
+        assert!(registry.publish_plan(&token).is_none());
+    }
+}

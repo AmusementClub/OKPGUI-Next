@@ -1260,7 +1260,9 @@ mod tests {
         let sidecar = root.join("sidecars").join(file_name);
         std::fs::write(&sidecar, b"placeholder").unwrap();
         let resolved = resolve_packaged_mediainfo(&root).expect("packaged sidecar");
-        assert_eq!(resolved, sidecar);
+        // macOS's default case-insensitive filesystem may resolve the lower-case
+        // candidate spelling to the same file as the fixture's `MediaInfo` name.
+        assert_eq!(resolved.canonicalize().unwrap(), sidecar.canonicalize().unwrap());
 
         // Arbitrary paths outside the fixed candidate set must not resolve.
         let outsider = root.join("evil-bin");

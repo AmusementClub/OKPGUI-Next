@@ -1383,7 +1383,6 @@ pub(crate) fn run_site_publish(
     }
 }
 
-#[tauri::command]
 pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), String> {
     crate::commands::publish_commands::publish_legacy(app, request).await
 }
