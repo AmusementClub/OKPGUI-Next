@@ -66,7 +66,14 @@ import {
     takeAndConsumeAutoTemplateSeed,
     takeAutoTemplateSeedHandoff,
 } from '../services/ai';
-import type { PublishRequestPayload } from '../types/ai';
+import {
+    buildRecognitionDraftIdentity,
+    type PublishRequestPayload,
+} from '../types/ai';
+import {
+    resolvePublishTitleMetadata,
+    type ParsedTitleDetails,
+} from '../utils/publishTitleMetadata';
 
 interface PublishAttemptContext {
     publishId: string;
@@ -209,7 +216,23 @@ export default function QuickPublishPage() {
     const preflight = useAiPreflight();
     const recognition = useAiRecognition();
     const clearRecognition = recognition.clear;
-    const invalidateRecognitionIfSnapshotMismatch = recognition.invalidateIfSnapshotMismatch;
+    const invalidateRecognitionIfDraftMismatch = recognition.invalidateIfDraftMismatch;
+    /**
+     * Explicit episode/resolution adopts applied as history metadata.
+     * Survive unrelated covered edits (e.g. title override) but clear on torrent/template
+     * identity change and on a new recognition request.
+     */
+    const [adoptedHistory, setAdoptedHistory] = useState<{ episode: string; resolution: string }>({
+        episode: '',
+        resolution: '',
+    });
+    const adoptedHistoryRef = useRef(adoptedHistory);
+    adoptedHistoryRef.current = adoptedHistory;
+    const clearAdoptedHistory = useCallback(() => {
+        const empty = { episode: '', resolution: '' };
+        adoptedHistoryRef.current = empty;
+        setAdoptedHistory(empty);
+    }, []);
 
     const invalidatePreflight = preflight.invalidate;
     const clearFrozenPreflight = useCallback(() => {
@@ -223,20 +246,19 @@ export default function QuickPublishPage() {
      * Covered draft/template/torrent/profile/site/content/title/OKP mutations supersede
      * any live or in-flight resolve/prepare. Confirm-modal episode/resolution history
      * edits remain non-covered (same as HomePage).
-     * Also clears advisory recognition so stale candidates cannot remain active.
+     * Clears advisory recognition candidates; already-applied history adopts stay unless
+     * clearHistoryAdopts (torrent/template identity).
      */
-    const invalidatePreparedOnCoveredEdit = useCallback(() => {
+    const invalidatePreparedOnCoveredEdit = useCallback((options?: { clearHistoryAdopts?: boolean }) => {
         coveredEditGenerationRef.current += 1;
-        clearRecognition();
+        clearRecognition({ resetOrigins: Boolean(options?.clearHistoryAdopts) });
+        if (options?.clearHistoryAdopts) {
+            clearAdoptedHistory();
+        }
         if (frozenPlanRef.current || showConfirmRef.current || isPreparingPublishRef.current) {
             clearFrozenPreflight();
         }
-    }, [clearFrozenPreflight, clearRecognition]);
-
-    // Drop recognition when preflight snapshot identity drifts or is cleared.
-    useEffect(() => {
-        invalidateRecognitionIfSnapshotMismatch(preflight.state.snapshot_hash);
-    }, [invalidateRecognitionIfSnapshotMismatch, preflight.state.snapshot_hash]);
+    }, [clearAdoptedHistory, clearFrozenPreflight, clearRecognition]);
 
     const updateDraftCovered = useCallback(
         (updater: (current: QuickPublishRuntimeDraft) => QuickPublishRuntimeDraft) => {
@@ -248,14 +270,15 @@ export default function QuickPublishPage() {
 
     const parseTorrentCovered = useCallback(
         async (path: string) => {
-            invalidatePreparedOnCoveredEdit();
+            // Torrent identity change: drop history adopts with recognition candidates.
+            invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
             await parseTorrent(path);
         },
         [invalidatePreparedOnCoveredEdit, parseTorrent],
     );
 
     const selectTorrentFileCovered = useCallback(async () => {
-        invalidatePreparedOnCoveredEdit();
+        invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
         await selectTorrentFile();
     }, [invalidatePreparedOnCoveredEdit, selectTorrentFile]);
 
@@ -500,8 +523,8 @@ export default function QuickPublishPage() {
             return;
         }
 
-        // Template identity mutation supersedes any live or in-flight prepare.
-        invalidatePreparedOnCoveredEdit();
+        // Template identity mutation supersedes any live or in-flight prepare and history adopts.
+        invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
         // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
@@ -721,11 +744,46 @@ export default function QuickPublishPage() {
         isPreparingPublishRef.current = true;
         setIsPreparingPublish(true);
         try {
-            const nextConfirmDraft = await resolvePublishRuntimeDraft(activeTemplate, draft);
+            const resolvedDraft = await resolvePublishRuntimeDraft(activeTemplate, draft);
             if (prepareGeneration !== coveredEditGenerationRef.current) {
                 // Covered edit during resolve superseded this attempt; never open stale confirm.
                 return;
             }
+            // Deterministic history reparse (HomePage parity): never let leftover draft chips from a
+            // prior AI adopt survive into confirm after re-recognize cleared page-side adopts.
+            // Explicit adopt / confirm manual-edit provenance still wins via adoptedHistory.
+            const publishDetails = await resolvePublishTitleMetadata({
+                finalTitle: resolvedDraft.title,
+                fallbackFilename: torrentInfo?.name,
+                template: activeTemplate,
+                parseTitleDetails: (request) =>
+                    invoke<ParsedTitleDetails>('parse_title_details', {
+                        filename: request.filename,
+                        epPattern: request.epPattern,
+                        resolutionPattern: request.resolutionPattern,
+                        titlePattern: request.titlePattern,
+                    }),
+            });
+            if (prepareGeneration !== coveredEditGenerationRef.current) {
+                return;
+            }
+            // Prefer latest page-side adopts only (ref may advance if adopt lands during awaits).
+            // Do not restore a start-of-prepare snapshot: mid-prepare re-recognize clears
+            // adoptedHistory and must not re-seed the old adopt into live draft chips.
+            const latestAdopts = adoptedHistoryRef.current;
+            const nextConfirmDraft = {
+                ...resolvedDraft,
+                episode: latestAdopts.episode.trim() || publishDetails.episode,
+                resolution: latestAdopts.resolution.trim() || publishDetails.resolution,
+            };
+            // Sync live chips after title-metadata parse while this prepare generation is still
+            // valid: current explicit adopts win when present; otherwise deterministic reparse.
+            // Never leave stale pre-clear adopt values on the live draft when adopts were cleared.
+            setDraft((current) => ({
+                ...current,
+                episode: latestAdopts.episode.trim() || publishDetails.episode,
+                resolution: latestAdopts.resolution.trim() || publishDetails.resolution,
+            }));
             const request = buildPublishRequest(nextConfirmDraft, createPublishId());
             if (!request) return;
             const contentValidationIssues = validatePublishContentForSites(
@@ -744,8 +802,25 @@ export default function QuickPublishPage() {
                 clearFrozenPreflight();
                 return;
             }
+            // Re-read adopts after prepare awaits so mid-flight adopts still win over reparse.
+            // A re-recognize after the post-parse live sync may have cleared page-side adopts
+            // without bumping covered-edit generation — confirm + live chips must both follow
+            // current adopts (or deterministic reparse), never the pre-clear AI adopt snapshot.
+            const finalAdopts = adoptedHistoryRef.current;
+            const finalEpisode = finalAdopts.episode.trim() || publishDetails.episode;
+            const finalResolution = finalAdopts.resolution.trim() || publishDetails.resolution;
+            const finalConfirmDraft = {
+                ...nextConfirmDraft,
+                episode: finalEpisode,
+                resolution: finalResolution,
+            };
+            setDraft((current) => ({
+                ...current,
+                episode: finalEpisode,
+                resolution: finalResolution,
+            }));
             frozenPlanRef.current = { token: prepared.token, request };
-            setConfirmDraft(nextConfirmDraft);
+            setConfirmDraft(finalConfirmDraft);
             setShowConfirm(true);
         } catch (error) {
             if (isPrepareSupersededError(error)) {
@@ -781,9 +856,16 @@ export default function QuickPublishPage() {
         (field: 'episode' | 'resolution', value: string) => {
             // History-only confirm metadata: keep frozen token valid (HomePage parity).
             // Episode/resolution are local publish-history fields, not covered plan identity.
+            // Manual edit is explicit provenance — never auto-filled from recognition.
+            recognition.markFieldManualEdit(field);
             setConfirmDraft((current) => (current ? { ...current, [field]: value } : current));
+            setAdoptedHistory((current) => {
+                const next = { ...current, [field]: value };
+                adoptedHistoryRef.current = next;
+                return next;
+            });
         },
-        [],
+        [recognition],
     );
 
     const publishPreviewDraft = confirmDraft ?? draft;
@@ -794,28 +876,102 @@ export default function QuickPublishPage() {
         && activeTemplate.resolution_pattern.trim()
         && activeTemplate.title_pattern.trim(),
     );
-    const recognitionSnapshotHash = preflight.state.snapshot_hash?.trim() || '';
+    const recognitionDraftIdentity = useMemo(() => {
+        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionPatternsActive) {
+            return '';
+        }
+        return buildRecognitionDraftIdentity({
+            torrentName: torrentInfo.name,
+            epPattern: activeTemplate.ep_pattern,
+            resolutionPattern: activeTemplate.resolution_pattern,
+            titlePattern: activeTemplate.title_pattern,
+        });
+    }, [
+        activeTemplate,
+        recognitionPatternsActive,
+        torrentInfo?.name,
+    ]);
+    // Drop recognition when torrent/template draft identity drifts; also drop page-side adopts.
+    const previousRecognitionIdentityRef = useRef(recognitionDraftIdentity);
+    useEffect(() => {
+        const previous = previousRecognitionIdentityRef.current;
+        previousRecognitionIdentityRef.current = recognitionDraftIdentity;
+        if (previous && previous !== recognitionDraftIdentity) {
+            clearAdoptedHistory();
+        }
+        invalidateRecognitionIfDraftMismatch(recognitionDraftIdentity || null);
+    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionDraftIdentity]);
     const recognitionReady = isAiCapabilityReady(preflight.state.settings);
     const canRunRecognition = Boolean(
         torrentInfo?.name?.trim()
-        && recognitionSnapshotHash
+        && recognitionDraftIdentity
         && recognitionReady
         && recognitionPatternsActive
         && !recognition.busy,
     );
+    // canAdopt = candidate present for explicit user action; never auto-fills; manual may re-adopt.
+    const canAdoptEpisode = Boolean(
+        !recognition.busy
+        && recognition.result
+        && recognition.result.episode?.value?.trim(),
+    );
+    const canAdoptResolution = Boolean(
+        !recognition.busy
+        && recognition.result
+        && recognition.result.resolution?.value?.trim(),
+    );
 
     const handleAiRecognize = useCallback(() => {
-        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionSnapshotHash) {
+        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionDraftIdentity) {
             return;
+        }
+        // New recognition request: clear page-side adopts so prior adopt cannot outlive this run.
+        // Also clear live draft chips only when they still match those adopts (AI-adopt provenance).
+        // Unrelated user/manual values that differ from the dropped adopts are left alone.
+        const adoptsBeingCleared = adoptedHistoryRef.current;
+        clearAdoptedHistory();
+        const clearedEpisode = adoptsBeingCleared.episode.trim();
+        const clearedResolution = adoptsBeingCleared.resolution.trim();
+        if (clearedEpisode || clearedResolution) {
+            setDraft((current) => {
+                let changed = false;
+                const next = { ...current };
+                if (clearedEpisode && current.episode === adoptsBeingCleared.episode) {
+                    next.episode = '';
+                    changed = true;
+                }
+                if (clearedResolution && current.resolution === adoptsBeingCleared.resolution) {
+                    next.resolution = '';
+                    changed = true;
+                }
+                return changed ? next : current;
+            });
         }
         void recognition.recognize({
             torrentName: torrentInfo.name,
             epPattern: activeTemplate.ep_pattern,
             resolutionPattern: activeTemplate.resolution_pattern,
             titlePattern: activeTemplate.title_pattern,
-            snapshotHash: recognitionSnapshotHash,
+            draftIdentity: recognitionDraftIdentity,
         });
-    }, [activeTemplate, recognition, recognitionSnapshotHash, torrentInfo?.name]);
+    }, [activeTemplate, clearAdoptedHistory, recognition, recognitionDraftIdentity, setDraft, torrentInfo?.name]);
+
+    const handleAdoptRecognitionField = useCallback((field: 'episode' | 'resolution') => {
+        const value = recognition.adoptField(field);
+        if (value == null) {
+            return;
+        }
+        // Episode/resolution are history metadata, not covered plan identity — do not clear recognition.
+        setAdoptedHistory((current) => {
+            const next = { ...current, [field]: value };
+            adoptedHistoryRef.current = next;
+            return next;
+        });
+        setDraft((current) => ({ ...current, [field]: value }));
+        if (confirmDraft) {
+            setConfirmDraft((current) => (current ? { ...current, [field]: value } : current));
+        }
+    }, [confirmDraft, recognition, setDraft]);
 
     const selectedSiteSummaries = useMemo(
         () =>
@@ -1069,13 +1225,11 @@ export default function QuickPublishPage() {
                                 title={
                                     !torrentInfo?.name?.trim()
                                         ? '需要种子显示名称'
-                                        : !recognitionSnapshotHash
-                                          ? '需要先完成发布前检查以获得快照'
-                                          : !recognitionReady
-                                            ? '需要 AI 能力状态为 Ready'
-                                            : !recognitionPatternsActive
-                                              ? '需要有效的集数/分辨率/标题模板模式'
-                                              : '对当前种子与模板模式运行 AI 识别（仅建议）'
+                                        : !recognitionReady
+                                          ? '需要 AI 能力状态为 Ready'
+                                          : !recognitionPatternsActive
+                                            ? '需要有效的集数/分辨率/标题模板模式'
+                                            : '对当前种子与模板模式运行 AI 识别（仅建议，不自动写入）'
                                 }
                                 className="inline-flex items-center gap-2 rounded-xl border border-violet-500/40 bg-violet-500/10 px-4 py-2 text-sm text-violet-100 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-50"
                             >
@@ -1141,6 +1295,12 @@ export default function QuickPublishPage() {
                         busy={recognition.busy}
                         error={recognition.error}
                         result={recognition.result}
+                        onAdoptEpisode={() => handleAdoptRecognitionField('episode')}
+                        onAdoptResolution={() => handleAdoptRecognitionField('resolution')}
+                        episodeAdopted={recognition.adopted.episode}
+                        resolutionAdopted={recognition.adopted.resolution}
+                        canAdoptEpisode={canAdoptEpisode}
+                        canAdoptResolution={canAdoptResolution}
                     />
                 </section>
 

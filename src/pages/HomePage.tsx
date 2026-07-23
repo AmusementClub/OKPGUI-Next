@@ -82,7 +82,10 @@ import {
     publishPreparedPlan,
     readFriendlyError,
 } from '../services/ai';
-import type { PublishRequestPayload } from '../types/ai';
+import {
+    buildRecognitionDraftIdentity,
+    type PublishRequestPayload,
+} from '../types/ai';
 
 interface Template {
     ep_pattern: string;
@@ -288,7 +291,23 @@ export default function HomePage() {
     const preflight = useAiPreflight();
     const recognition = useAiRecognition();
     const clearRecognition = recognition.clear;
-    const invalidateRecognitionIfSnapshotMismatch = recognition.invalidateIfSnapshotMismatch;
+    const invalidateRecognitionIfDraftMismatch = recognition.invalidateIfDraftMismatch;
+    /** Editor-side history metadata for explicit recognition adopt (not plan identity). */
+    const [adoptedHistory, setAdoptedHistory] = useState<{ episode: string; resolution: string }>({
+        episode: '',
+        resolution: '',
+    });
+    /**
+     * Always-current adopt values for prepare: adoption may occur during awaits, and
+     * render-closure state would silently publish stale empty history metadata.
+     */
+    const adoptedHistoryRef = useRef(adoptedHistory);
+    adoptedHistoryRef.current = adoptedHistory;
+    const clearAdoptedHistory = useCallback(() => {
+        const empty = { episode: '', resolution: '' };
+        adoptedHistoryRef.current = empty;
+        setAdoptedHistory(empty);
+    }, []);
     const templateRef = useLatest(template);
     const currentTemplateNameRef = useLatest(currentTemplateName);
     const torrentInfoRef = useLatest(torrentInfo);
@@ -338,20 +357,21 @@ export default function HomePage() {
     /**
      * Covered editor mutations supersede any live or in-flight prepare.
      * History-only episode/resolution edits in the confirm modal are not covered.
-     * Also clears advisory recognition so stale candidates cannot remain active.
+     * Clears advisory recognition candidates so they cannot remain active, but keeps
+     * already-applied history adopts (page-side) unless identityClear is requested
+     * (torrent/template pattern identity change).
      */
-    const invalidatePreparedOnCoveredEdit = useCallback(() => {
+    const invalidatePreparedOnCoveredEdit = useCallback((options?: { clearHistoryAdopts?: boolean }) => {
         coveredEditGenerationRef.current += 1;
-        clearRecognition();
+        // Drop candidates/panel flags; origins reset only when history adopts are also cleared.
+        clearRecognition({ resetOrigins: Boolean(options?.clearHistoryAdopts) });
+        if (options?.clearHistoryAdopts) {
+            clearAdoptedHistory();
+        }
         if (frozenPlanRef.current || showConfirm || isPreparingPublishRef.current) {
             clearFrozenPreflight();
         }
-    }, [clearFrozenPreflight, clearRecognition, showConfirm]);
-
-    // Drop recognition when preflight snapshot identity drifts or is cleared.
-    useEffect(() => {
-        invalidateRecognitionIfSnapshotMismatch(preflight.state.snapshot_hash);
-    }, [invalidateRecognitionIfSnapshotMismatch, preflight.state.snapshot_hash]);
+    }, [clearAdoptedHistory, clearFrozenPreflight, clearRecognition, showConfirm]);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -513,7 +533,8 @@ export default function HomePage() {
                 lastPersistedDescriptionRef.current = nextTemplate.description;
                 lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
                 // Apply-time bump: close the window after selection intent before identity lands.
-                invalidatePreparedOnCoveredEdit();
+                // Template identity change also drops history adopts.
+                invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
                 // Template identity change supersedes any prepared HomePage plan.
                 clearFrozenPreflight();
                 setCurrentTemplateName(name);
@@ -534,7 +555,7 @@ export default function HomePage() {
     /** User dropdown selection only — never called from restore/import/loadLastConfig. */
     const handleTemplateSelection = (name: string) => {
         // Selection intent is a template-identity mutation: supersede in-flight prepare immediately.
-        invalidatePreparedOnCoveredEdit();
+        invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
         const selectionGeneration = ++templateSelectionGenerationRef.current;
         const runSelection = async () => {
             const failureGeneration = templateSaveFailureGenerationRef.current;
@@ -658,11 +679,11 @@ export default function HomePage() {
     const deleteTemplate = async () => {
         if (!currentTemplateName) return;
         // Identity mutation: bump before async delete can complete so stale prepare cannot confirm.
-        invalidatePreparedOnCoveredEdit();
+        invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
         try {
             await invoke('delete_template', { name: currentTemplateName });
             // Apply-time bump: close the window after intent before default identity lands.
-            invalidatePreparedOnCoveredEdit();
+            invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
             setCurrentTemplateName('');
             setNewTemplateName('');
             lastPersistedDescriptionRef.current = defaultTemplate.description;
@@ -718,9 +739,10 @@ export default function HomePage() {
         const generation = ++parseGenerationRef.current;
         titleGenerationRef.current += 1;
         setIsGeneratingTitle(false);
-        // Torrent generation change supersedes any prepared HomePage plan.
+        // Torrent generation change supersedes any prepared HomePage plan and history adopts.
         coveredEditGenerationRef.current += 1;
-        clearRecognition();
+        clearRecognition({ resetOrigins: true });
+        clearAdoptedHistory();
         invalidatePreflight();
         frozenPlanRef.current = null;
         setShowConfirm(false);
@@ -760,7 +782,7 @@ export default function HomePage() {
             setTorrentPath('');
             setTorrentError(typeof e === 'string' ? e : '解析种子文件失败。');
         }
-    }, [clearRecognition, invalidatePreflight, matchTitle, templateRef]);
+    }, [clearAdoptedHistory, clearRecognition, invalidatePreflight, matchTitle, templateRef]);
 
     useEffect(() => {
         let disposed = false;
@@ -843,7 +865,7 @@ export default function HomePage() {
             }
 
             // Identity mutation: bump before async import can complete so stale prepare cannot confirm.
-            invalidatePreparedOnCoveredEdit();
+            invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
 
             const importTemplateWithStrategy = (conflictStrategy: 'reject' | 'overwrite' | 'copy') =>
                 invoke<ImportedTemplatePayload>('import_template_from_file', {
@@ -870,7 +892,7 @@ export default function HomePage() {
             const nextTemplate = normalizeTemplate(imported.template);
 
             // Apply-time bump: close the window after path intent before imported identity lands.
-            invalidatePreparedOnCoveredEdit();
+            invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
             lastPersistedDescriptionRef.current = nextTemplate.description;
             lastPersistedDescriptionHtmlRef.current = nextTemplate.description_html;
             setCurrentTemplateName(imported.name);
@@ -1054,35 +1076,90 @@ export default function HomePage() {
         && template.resolution_pattern.trim()
         && template.title_pattern.trim(),
     );
-    const recognitionSnapshotHash = preflight.state.snapshot_hash?.trim() || '';
-    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
-    const canRunRecognition = Boolean(
-        torrentInfo?.name?.trim()
-        && recognitionSnapshotHash
-        && recognitionReady
-        && recognitionPatternsActive
-        && !recognition.busy,
-    );
-
-    const handleAiRecognize = useCallback(() => {
-        if (!torrentInfo?.name?.trim() || !recognitionSnapshotHash) {
-            return;
+    const recognitionDraftIdentity = useMemo(() => {
+        if (!torrentInfo?.name?.trim() || !recognitionPatternsActive) {
+            return '';
         }
-        void recognition.recognize({
+        return buildRecognitionDraftIdentity({
             torrentName: torrentInfo.name,
             epPattern: template.ep_pattern,
             resolutionPattern: template.resolution_pattern,
             titlePattern: template.title_pattern,
-            snapshotHash: recognitionSnapshotHash,
         });
     }, [
-        recognition,
-        recognitionSnapshotHash,
+        recognitionPatternsActive,
         template.ep_pattern,
         template.resolution_pattern,
         template.title_pattern,
         torrentInfo?.name,
     ]);
+    // Drop recognition when torrent/template draft identity drifts; also drop page-side history adopts.
+    const previousRecognitionIdentityRef = useRef(recognitionDraftIdentity);
+    useEffect(() => {
+        const previous = previousRecognitionIdentityRef.current;
+        previousRecognitionIdentityRef.current = recognitionDraftIdentity;
+        if (previous && previous !== recognitionDraftIdentity) {
+            clearAdoptedHistory();
+        }
+        invalidateRecognitionIfDraftMismatch(recognitionDraftIdentity || null);
+    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionDraftIdentity]);
+    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
+    const canRunRecognition = Boolean(
+        torrentInfo?.name?.trim()
+        && recognitionDraftIdentity
+        && recognitionReady
+        && recognitionPatternsActive
+        && !recognition.busy,
+    );
+    // canAdopt tracks live candidate availability only — never auto-fills; manual origin may still re-adopt.
+    const canAdoptEpisode = Boolean(
+        !recognition.busy
+        && recognition.result
+        && recognition.result.episode?.value?.trim(),
+    );
+    const canAdoptResolution = Boolean(
+        !recognition.busy
+        && recognition.result
+        && recognition.result.resolution?.value?.trim(),
+    );
+
+    const handleAiRecognize = useCallback(() => {
+        if (!torrentInfo?.name?.trim() || !recognitionDraftIdentity) {
+            return;
+        }
+        // New recognition request: drop page-side adopts so a prior adopt cannot outlive this run.
+        // Hook recognize() also clears panel adopted flags for the new generation.
+        clearAdoptedHistory();
+        void recognition.recognize({
+            torrentName: torrentInfo.name,
+            epPattern: template.ep_pattern,
+            resolutionPattern: template.resolution_pattern,
+            titlePattern: template.title_pattern,
+            draftIdentity: recognitionDraftIdentity,
+        });
+    }, [
+        clearAdoptedHistory,
+        recognition,
+        recognitionDraftIdentity,
+        template.ep_pattern,
+        template.resolution_pattern,
+        template.title_pattern,
+        torrentInfo?.name,
+    ]);
+
+    const handleAdoptRecognitionField = useCallback((field: 'episode' | 'resolution') => {
+        const value = recognition.adoptField(field);
+        if (value == null) {
+            return;
+        }
+        setAdoptedHistory((current) => {
+            const next = { ...current, [field]: value };
+            adoptedHistoryRef.current = next;
+            return next;
+        });
+        // If confirm modal is open, update history metadata without invalidating the plan.
+        setConfirmMeta((current) => (current ? { ...current, [field]: value } : current));
+    }, [recognition]);
 
     const getErrorMessage = (error: unknown) => {
         if (typeof error === 'string') {
@@ -1150,7 +1227,9 @@ export default function HomePage() {
         if (!selectedProfile) return;
         if (!okpExecutablePath) return;
         if (selectedSiteKeys.length === 0) return;
-        if (isPublishing || isPreparingPublish) return;
+        // Reject re-entry while resolve/prepare is in flight (QuickPublish parity).
+        // Check the ref as well so a same-tick second click cannot pass before re-render.
+        if (isPublishing || isPreparingPublish || isPreparingPublishRef.current) return;
 
         const publishTemplateName = getTemplateName();
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
@@ -1260,10 +1339,13 @@ export default function HomePage() {
 
             frozenPlanRef.current = { token: prepared.token, request: publishRequest };
             setConfirmRequest(publishRequest);
+            // Read latest adopts via ref: adoption may have landed during save/resolve/prepare awaits.
+            const latestAdopts = adoptedHistoryRef.current;
             setConfirmMeta({
                 templateName: saved.name,
-                episode: publishDetails.episode,
-                resolution: publishDetails.resolution,
+                // Prefer explicit recognition adopts over re-resolved deterministic metadata.
+                episode: latestAdopts.episode.trim() || publishDetails.episode,
+                resolution: latestAdopts.resolution.trim() || publishDetails.resolution,
             });
             setShowConfirm(true);
         } catch (error) {
@@ -1404,9 +1486,16 @@ export default function HomePage() {
     const updateConfirmHistoryField = useCallback(
         (field: 'episode' | 'resolution', value: string) => {
             // History-only metadata applied at confirm/finalize time — keep frozen token valid.
+            // Manual edit: provenance flips to manual; value remains explicit (never auto-filled).
+            recognition.markFieldManualEdit(field);
             setConfirmMeta((current) => (current ? { ...current, [field]: value } : current));
+            setAdoptedHistory((current) => {
+                const next = { ...current, [field]: value };
+                adoptedHistoryRef.current = next;
+                return next;
+            });
         },
-        [],
+        [recognition],
     );
     // Drag and drop is handled by the Tauri window drag-drop listener above;
     // HTML5 drop events never fire while Tauri dragDropEnabled is on.
@@ -1640,13 +1729,11 @@ export default function HomePage() {
                                 title={
                                     !torrentInfo?.name?.trim()
                                         ? '需要种子显示名称'
-                                        : !recognitionSnapshotHash
-                                          ? '需要先完成发布前检查以获得快照'
-                                          : !recognitionReady
-                                            ? '需要 AI 能力状态为 Ready'
-                                            : !recognitionPatternsActive
-                                              ? '需要有效的集数/分辨率/标题模板模式'
-                                              : '对当前种子与模板模式运行 AI 识别（仅建议）'
+                                        : !recognitionReady
+                                          ? '需要 AI 能力状态为 Ready'
+                                          : !recognitionPatternsActive
+                                            ? '需要有效的集数/分辨率/标题模板模式'
+                                            : '对当前种子与模板模式运行 AI 识别（仅建议，不自动写入）'
                                 }
                                 className="inline-flex items-center gap-1.5 rounded-lg border border-violet-500/40 bg-violet-500/10 px-3 py-1.5 text-xs font-medium text-violet-100 transition-colors hover:bg-violet-500/20 disabled:cursor-not-allowed disabled:opacity-40"
                             >
@@ -1673,6 +1760,12 @@ export default function HomePage() {
                         busy={recognition.busy}
                         error={recognition.error}
                         result={recognition.result}
+                        onAdoptEpisode={() => handleAdoptRecognitionField('episode')}
+                        onAdoptResolution={() => handleAdoptRecognitionField('resolution')}
+                        episodeAdopted={recognition.adopted.episode}
+                        resolutionAdopted={recognition.adopted.resolution}
+                        canAdoptEpisode={canAdoptEpisode}
+                        canAdoptResolution={canAdoptResolution}
                     />
                 </section>
 

@@ -214,9 +214,71 @@ export interface RecognitionCandidate {
 }
 
 /**
+ * Provenance of a draft field that recognition may advise on.
+ * Title is always deterministic/manual and is never adopted from recognition.
+ */
+export type FieldOrigin = 'empty' | 'deterministic' | 'manual' | 'adopted';
+
+/** Fields that support explicit per-field adoption (title is never adopted). */
+export type RecognitionAdoptableField = 'episode' | 'resolution';
+
+/** Edit-generation metadata for a single draft field. */
+export interface FieldEditMeta {
+    origin: FieldOrigin;
+    /** Monotonic generation; bumps on manual edits to block silent late overwrites. */
+    editGeneration: number;
+}
+
+export function createEmptyFieldEditMeta(): FieldEditMeta {
+    return { origin: 'empty', editGeneration: 0 };
+}
+
+export function markFieldManual(meta: FieldEditMeta): FieldEditMeta {
+    return {
+        origin: 'manual',
+        editGeneration: meta.editGeneration + 1,
+    };
+}
+
+export function markFieldAdopted(meta: FieldEditMeta): FieldEditMeta {
+    return {
+        origin: 'adopted',
+        editGeneration: meta.editGeneration,
+    };
+}
+
+/**
+ * Backend-safe recognition draft identity (not a publish-plan token or authority).
+ * Derived only from recognition request context: torrent display name + template patterns.
+ * Sent as `snapshot_hash` on the recognition wire for stale-result binding only.
+ */
+export function buildRecognitionDraftIdentity(input: {
+    torrentName: string;
+    epPattern: string;
+    resolutionPattern: string;
+    titlePattern: string;
+}): string {
+    const raw = [
+        'recognition_v1',
+        input.torrentName.trim(),
+        input.epPattern.trim(),
+        input.resolutionPattern.trim(),
+        input.titlePattern.trim(),
+    ].join('\u0001');
+
+    // FNV-1a 32-bit — stable, sync, path-free; not cryptographic.
+    let hash = 0x811c9dc5;
+    for (let i = 0; i < raw.length; i += 1) {
+        hash ^= raw.charCodeAt(i);
+        hash = Math.imul(hash, 0x01000193);
+    }
+    return `rec:${(hash >>> 0).toString(16).padStart(8, '0')}`;
+}
+
+/**
  * One-shot release recognition request (mirrors Rust AiRecognizeRequest).
  * Display torrent name + template patterns only — never absolute paths or publish tokens.
- * snapshot_hash binds identity for stale-result rejection (caller-supplied; not publish authority).
+ * snapshot_hash binds draft identity for stale-result rejection (caller-supplied; not publish authority).
  */
 export interface AiRecognizeRequest {
     /** Display torrent name only (never a filesystem path). */
@@ -229,7 +291,10 @@ export interface AiRecognizeRequest {
     title_pattern: string;
     /** Client edit/request generation for stale-result binding. */
     request_generation: number;
-    /** Preflight/backend snapshot identity for stale binding. */
+    /**
+     * Draft-identity binding for stale rejection only.
+     * Prefer `buildRecognitionDraftIdentity(...)`; never a publish-plan token.
+     */
     snapshot_hash: string;
 }
 

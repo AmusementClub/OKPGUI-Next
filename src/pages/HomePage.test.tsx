@@ -6,17 +6,25 @@ import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
 import { renderMarkdownToHtml } from '../utils/markdown';
 import HomePage from './HomePage';
 
-const { invokeMock, openMock } = vi.hoisted(() => ({
-    invokeMock: vi.fn(),
-    openMock: vi.fn<() => Promise<string | null>>(() => Promise.resolve(null)),
-}));
+const { invokeMock, openMock, listenMock, publishEventHandlers } = vi.hoisted(() => {
+    const publishEventHandlers: Record<string, (event: { payload: Record<string, unknown> }) => void> = {};
+    return {
+        invokeMock: vi.fn(),
+        openMock: vi.fn<() => Promise<string | null>>(() => Promise.resolve(null)),
+        publishEventHandlers,
+        listenMock: vi.fn((eventName: string, handler: (event: { payload: Record<string, unknown> }) => void) => {
+            publishEventHandlers[eventName] = handler;
+            return Promise.resolve(vi.fn());
+        }),
+    };
+});
 
 vi.mock('@tauri-apps/api/core', () => ({
     invoke: invokeMock,
 }));
 
 vi.mock('@tauri-apps/api/event', () => ({
-    listen: vi.fn(() => Promise.resolve(vi.fn())),
+    listen: listenMock,
 }));
 
 vi.mock('@tauri-apps/api/window', () => ({
@@ -1001,6 +1009,10 @@ describe('HomePage publish content pipeline', () => {
         invokeMock.mockReset();
         openMock.mockReset();
         openMock.mockResolvedValue('/tmp/a.torrent');
+        listenMock.mockClear();
+        for (const key of Object.keys(publishEventHandlers)) {
+            delete publishEventHandlers[key];
+        }
     });
 
     function mountWithTemplate(
@@ -2257,6 +2269,709 @@ describe('HomePage publish content pipeline', () => {
 
             await confirmPublishInModal();
             expect(findInvokeArgs('publish_prepared_plan')).toEqual([{ token: 'prepared-token' }]);
+
+            // Successful publish path must write the manually edited history values, not only the plan token.
+            const prepareArgs = findInvokeArgs('prepare_plan')[0] as {
+                request: { request: { publish_id: string } };
+            };
+            const publishId = prepareArgs.request.request.publish_id;
+            expect(publishId).toBeTruthy();
+            expect(publishEventHandlers['publish-site-complete']).toBeTypeOf('function');
+            expect(publishEventHandlers['publish-complete']).toBeTypeOf('function');
+
+            await act(async () => {
+                publishEventHandlers['publish-site-complete']!({
+                    payload: {
+                        publish_id: publishId,
+                        site_code: 'acgnx_asia',
+                        site_label: 'ACGNx Asia',
+                        success: true,
+                        message: '发布成功',
+                    },
+                });
+                publishEventHandlers['publish-complete']!({
+                    payload: {
+                        publish_id: publishId,
+                        success: true,
+                        message: '发布完成',
+                    },
+                });
+            });
+            await flushAsync(20);
+
+            const historyCalls = findInvokeArgs('update_template_publish_history');
+            expect(historyCalls).toHaveLength(1);
+            expect(historyCalls[0]).toEqual({
+                name: 'default',
+                updates: [
+                    expect.objectContaining({
+                        site_key: 'acgnx_asia',
+                        last_published_episode: '12',
+                        last_published_resolution: '2160p',
+                    }),
+                ],
+            });
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('runs recognition pre-confirm with draft identity and explicit episode adopt (no plan token)', async () => {
+        const { buildRecognitionDraftIdentity } = await import('../types/ai');
+        const draftIdentity = buildRecognitionDraftIdentity({
+            torrentName: 'release.mkv',
+            epPattern: 'E(\\d+)',
+            resolutionPattern: '(\\d{3,4}p)',
+            titlePattern: '{title} - {ep}',
+        });
+
+        mountWithTemplate(
+            {
+                ep_pattern: 'E(\\d+)',
+                resolution_pattern: '(\\d{3,4}p)',
+                title_pattern: '{title} - {ep}',
+                title: 'User Title Stays',
+            },
+            { acgnx_asia_token: 'token-abc' },
+            {
+                aiSettings: {
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                    capability: {
+                        state: 'ready',
+                        identity_digest: 'dig',
+                        message: 'ready',
+                        identity_matches: true,
+                    },
+                },
+            },
+        );
+
+        // Extend mock for recognition start after mountWithTemplate.
+        const baseImpl = invokeMock.getMockImplementation();
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'ai_start_recognition') {
+                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
+                const reqGen = request?.request_generation ?? 1;
+                return Promise.resolve({
+                    job_id: 'job-rec-home',
+                    state: 'succeeded',
+                    request_generation: reqGen,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                    error_code: null,
+                    message: 'ok',
+                    result: {
+                        schema_version: 'recognition_v1',
+                        episode: { value: '12', confidence: 0.95, evidence: 'E12' },
+                        resolution: { value: '1080p', confidence: 0.9, evidence: '1080p' },
+                        suggested_title: { value: 'AI TITLE MUST NOT APPLY', confidence: 1, evidence: 'x' },
+                        request_generation: reqGen,
+                        snapshot_hash: draftIdentity,
+                        job_id: 'job-rec-home',
+                    },
+                });
+            }
+            if (command === 'ai_cancel_job') {
+                return Promise.resolve({
+                    id: 'job-rec-home',
+                    kind: 'recognition',
+                    state: 'cancelled',
+                    request_generation: 1,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                });
+            }
+            return baseImpl ? baseImpl(command, args) : Promise.resolve(null);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            // Select torrent via open dialog (pre-confirm editor).
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const recognizeButton = rendered.container.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognize-button"]',
+            );
+            expect(recognizeButton).not.toBeNull();
+            expect(recognizeButton!.disabled).toBe(false);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(0);
+
+            const title = rendered.container.querySelector<HTMLTextAreaElement>(
+                'textarea[placeholder="最终发布标题，可手动编辑或使用上方按钮重新生成"]',
+            );
+            expect(title?.value).toBe('User Title Stays');
+
+            await act(async () => {
+                recognizeButton!.click();
+            });
+            await flushAsync();
+
+            const startCalls = invokeMock.mock.calls.filter(([command]) => command === 'ai_start_recognition');
+            expect(startCalls.length).toBeGreaterThanOrEqual(1);
+            const payload = startCalls[0][1] as {
+                request: { torrent_name: string; snapshot_hash: string; plan_token?: string };
+            };
+            expect(payload.request.torrent_name).toBe('release.mkv');
+            expect(payload.request.snapshot_hash).toBe(draftIdentity);
+            expect(payload.request.plan_token).toBeUndefined();
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(0);
+
+            // Title remains deterministic/manual; suggested_title never auto-applies.
+            expect(title?.value).toBe('User Title Stays');
+            expect(document.body.querySelector('[data-testid="ai-recognition-suggested-title-adopt"]')).toBeNull();
+
+            const adoptEpisode = document.body.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognition-episode-adopt"]',
+            );
+            expect(adoptEpisode).not.toBeNull();
+            await act(async () => {
+                adoptEpisode!.click();
+            });
+            await flushAsync();
+            expect(adoptEpisode!.textContent).toContain('已采用');
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('disables recognition when capability is not Ready even with torrent + patterns', async () => {
+        mountWithTemplate(
+            {
+                ep_pattern: 'E(\\d+)',
+                resolution_pattern: '(\\d{3,4}p)',
+                title_pattern: '{title} - {ep}',
+                title: 'User Title Stays',
+            },
+            { acgnx_asia_token: 'token-abc' },
+            {
+                aiSettings: {
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                    capability: {
+                        state: 'failed',
+                        identity_digest: 'dig',
+                        message: 'not ready',
+                        identity_matches: false,
+                    },
+                },
+            },
+        );
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const recognizeButton = rendered.container.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognize-button"]',
+            );
+            expect(recognizeButton).not.toBeNull();
+            expect(recognizeButton!.disabled).toBe(true);
+            expect(findInvokeArgs('ai_start_recognition')).toHaveLength(0);
+            expect(document.body.querySelector('[data-testid="ai-recognition-panel"]')).toBeNull();
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('rejects a concurrent second publish click while prepare is deferred', async () => {
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+        const pendingAudit = deferred<{
+            decision: string;
+            findings: unknown[];
+            unknown_codes: unknown[];
+            local_blockers: unknown[];
+            formal_ran: boolean;
+            job_id: string | null;
+            plan_token: string;
+            snapshot_hash: string;
+            request_generation: number;
+        }>();
+        let prepareHeld = false;
+
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+        const baseImpl = invokeMock.getMockImplementation();
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'prepare_plan') {
+                prepareHeld = true;
+                return pendingPrepare.promise;
+            }
+            if (command === 'ai_compute_audit' || command === 'ai_start_formal_audit') {
+                return pendingAudit.promise;
+            }
+            return baseImpl ? baseImpl(command, args) : Promise.resolve(null);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(20);
+            expect(prepareHeld).toBe(true);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+
+            // While prepare is in flight the bar must stay disabled and confirm closed.
+            expect(publishButton!.disabled).toBe(true);
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+            const confirmDuringPrepare = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmDuringPrepare).toBeUndefined();
+
+            // A second click must not start another prepare (same-tick ref guard).
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(5);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(publishButton!.disabled).toBe(true);
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).toBeNull();
+
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'prepared-token',
+                    snapshot_hash: 'sha256:held',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            await act(async () => {
+                pendingAudit.resolve({
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    local_blockers: [],
+                    formal_ran: false,
+                    job_id: null,
+                    plan_token: 'prepared-token',
+                    snapshot_hash: 'sha256:held',
+                    request_generation: 1,
+                });
+            });
+            await flushAsync(20);
+
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(document.body.querySelector('[data-testid="ai-preflight-panel"]')).not.toBeNull();
+            expect(publishButton!.disabled).toBe(false);
+
+            const confirmButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('确认发布'),
+            );
+            expect(confirmButton).toBeTruthy();
+            expect(confirmButton!.disabled).toBe(false);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('clears page-side adopted history on re-recognize and preserves it across title covered edits into confirm', async () => {
+        const { buildRecognitionDraftIdentity } = await import('../types/ai');
+        const draftIdentity = buildRecognitionDraftIdentity({
+            torrentName: 'release.mkv',
+            epPattern: 'E(\\d+)',
+            resolutionPattern: '(\\d{3,4}p)',
+            titlePattern: '{title} - {ep}',
+        });
+
+        let recognitionGeneration = 0;
+        mountWithTemplate(
+            {
+                ep_pattern: 'E(\\d+)',
+                resolution_pattern: '(\\d{3,4}p)',
+                title_pattern: '{title} - {ep}',
+                title: 'User Title Stays',
+            },
+            { acgnx_asia_token: 'token-abc' },
+            {
+                aiSettings: {
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                    capability: {
+                        state: 'ready',
+                        identity_digest: 'dig',
+                        message: 'ready',
+                        identity_matches: true,
+                    },
+                },
+            },
+        );
+
+        const baseImpl = invokeMock.getMockImplementation();
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'ai_start_recognition') {
+                recognitionGeneration += 1;
+                const gen = recognitionGeneration;
+                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
+                const reqGen = request?.request_generation ?? gen;
+                return Promise.resolve({
+                    job_id: `job-rec-home-${gen}`,
+                    state: 'succeeded',
+                    request_generation: reqGen,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                    error_code: null,
+                    message: 'ok',
+                    result: {
+                        schema_version: 'recognition_v1',
+                        episode: {
+                            value: gen === 1 ? '12' : '99',
+                            confidence: 0.95,
+                            evidence: `E${gen === 1 ? '12' : '99'}`,
+                        },
+                        resolution: { value: '1080p', confidence: 0.9, evidence: '1080p' },
+                        suggested_title: { value: 'AI TITLE', confidence: 1, evidence: 'x' },
+                        request_generation: reqGen,
+                        snapshot_hash: draftIdentity,
+                        job_id: `job-rec-home-${gen}`,
+                    },
+                });
+            }
+            if (command === 'ai_cancel_job') {
+                return Promise.resolve({
+                    id: 'job-rec-home',
+                    kind: 'recognition',
+                    state: 'cancelled',
+                    request_generation: recognitionGeneration,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                });
+            }
+            return baseImpl ? baseImpl(command, args) : Promise.resolve(null);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            // Select site so publish can open confirm after adopt + title edit.
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const recognizeButton = rendered.container.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognize-button"]',
+            );
+            expect(recognizeButton).not.toBeNull();
+            await act(async () => {
+                recognizeButton!.click();
+            });
+            await flushAsync();
+
+            const adoptEpisode = document.body.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognition-episode-adopt"]',
+            );
+            expect(adoptEpisode).not.toBeNull();
+            await act(async () => {
+                adoptEpisode!.click();
+            });
+            await flushAsync();
+            expect(adoptEpisode!.textContent).toContain('已采用');
+
+            // Covered title edit must not wipe already-applied history adopt.
+            const title = rendered.container.querySelector<HTMLTextAreaElement>(
+                'textarea[placeholder="最终发布标题，可手动编辑或使用上方按钮重新生成"]',
+            );
+            expect(title).not.toBeNull();
+            await act(async () => {
+                const valueSetter = Object.getOwnPropertyDescriptor(
+                    window.HTMLTextAreaElement.prototype,
+                    'value',
+                )!.set!;
+                valueSetter.call(title!, 'Manual Title Override');
+                title!.dispatchEvent(new Event('input', { bubbles: true }));
+            });
+            await flushAsync();
+
+            // Publish → confirm must surface adopted episode 12 over deterministic 01.
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(20);
+
+            const episodeInput = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录集数"]',
+            );
+            expect(episodeInput).not.toBeNull();
+            expect(episodeInput!.value).toBe('12');
+
+            // Close confirm and re-recognize: page-side adopt must clear with the new request.
+            const cancelButton = Array.from(document.body.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '取消',
+            );
+            expect(cancelButton).toBeTruthy();
+            await act(async () => {
+                cancelButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            await act(async () => {
+                recognizeButton!.click();
+            });
+            await flushAsync();
+
+            const adoptAfterRerun = document.body.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognition-episode-adopt"]',
+            );
+            // New result: adopt flag reset (not already adopted from prior run).
+            expect(adoptAfterRerun).not.toBeNull();
+            expect(adoptAfterRerun!.disabled).toBe(false);
+            expect(adoptAfterRerun!.textContent).not.toContain('已采用');
+            expect(document.body.querySelector('[data-testid="ai-recognition-episode-value"]')?.textContent)
+                .toContain('99');
+
+            // Without re-adopting, prepare must not reuse the prior adopt (12).
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(20);
+            const episodeAfterRerun = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录集数"]',
+            );
+            expect(episodeAfterRerun).not.toBeNull();
+            // Deterministic reparse (01) — not stale adopt 12, and not unadopted candidate 99.
+            expect(episodeAfterRerun!.value).toBe('01');
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('reads latest adopted history via ref when adopt lands during held prepare', async () => {
+        const { buildRecognitionDraftIdentity } = await import('../types/ai');
+        const draftIdentity = buildRecognitionDraftIdentity({
+            torrentName: 'release.mkv',
+            epPattern: 'E(\\d+)',
+            resolutionPattern: '(\\d{3,4}p)',
+            titlePattern: '{title} - {ep}',
+        });
+
+        const pendingPrepare = deferred<{
+            token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            local_blockers: string[];
+            has_blockers: boolean;
+        }>();
+
+        mountWithTemplate(
+            {
+                ep_pattern: 'E(\\d+)',
+                resolution_pattern: '(\\d{3,4}p)',
+                title_pattern: '{title} - {ep}',
+                title: 'User Title Stays',
+            },
+            { acgnx_asia_token: 'token-abc' },
+            {
+                aiSettings: {
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                    capability: {
+                        state: 'ready',
+                        identity_digest: 'dig',
+                        message: 'ready',
+                        identity_matches: true,
+                    },
+                },
+            },
+        );
+
+        const baseImpl = invokeMock.getMockImplementation();
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'ai_start_recognition') {
+                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
+                const reqGen = request?.request_generation ?? 1;
+                return Promise.resolve({
+                    job_id: 'job-rec-during-prepare',
+                    state: 'succeeded',
+                    request_generation: reqGen,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                    error_code: null,
+                    message: 'ok',
+                    result: {
+                        schema_version: 'recognition_v1',
+                        episode: { value: '07', confidence: 0.95, evidence: 'E07' },
+                        resolution: { value: '2160p', confidence: 0.9, evidence: '4K' },
+                        suggested_title: { value: 'AI', confidence: 1, evidence: 'x' },
+                        request_generation: reqGen,
+                        snapshot_hash: draftIdentity,
+                        job_id: 'job-rec-during-prepare',
+                    },
+                });
+            }
+            if (command === 'prepare_plan') {
+                return pendingPrepare.promise;
+            }
+            if (command === 'ai_cancel_job') {
+                return Promise.resolve({
+                    id: 'job-rec-during-prepare',
+                    kind: 'recognition',
+                    state: 'cancelled',
+                    request_generation: 1,
+                    snapshot_hash: draftIdentity,
+                    progress: 100,
+                });
+            }
+            return baseImpl ? baseImpl(command, args) : Promise.resolve(null);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+
+            const checkbox = rendered.container.querySelector<HTMLInputElement>(
+                'input[type="checkbox"][title="选择 ACGNx Asia"]',
+            );
+            expect(checkbox).not.toBeNull();
+            await act(async () => {
+                checkbox!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const picker = rendered.container.querySelector<HTMLElement>('div[aria-label="选择种子文件"]');
+            expect(picker).not.toBeNull();
+            await act(async () => {
+                picker!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            // Recognize + adopt before prepare so result is available; then hold prepare and
+            // adopt resolution mid-flight to prove ref reads latest values.
+            const recognizeButton = rendered.container.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-recognize-button"]',
+            );
+            await act(async () => {
+                recognizeButton!.click();
+            });
+            await flushAsync();
+
+            await act(async () => {
+                document.body.querySelector<HTMLButtonElement>(
+                    '[data-testid="ai-recognition-episode-adopt"]',
+                )!.click();
+            });
+            await flushAsync();
+
+            const publishButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.includes('发布已选站点'),
+            );
+            expect(publishButton).toBeTruthy();
+            await act(async () => {
+                publishButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(5);
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+
+            // Mid-prepare adopt of resolution must still land in confirm meta via ref.
+            await act(async () => {
+                document.body.querySelector<HTMLButtonElement>(
+                    '[data-testid="ai-recognition-resolution-adopt"]',
+                )!.click();
+            });
+            await flushAsync();
+
+            await act(async () => {
+                pendingPrepare.resolve({
+                    token: 'prepared-token',
+                    snapshot_hash: 'sha256:backend-authoritative',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            });
+            await flushAsync(20);
+
+            const episodeInput = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录集数"]',
+            );
+            const resolutionInput = document.body.querySelector<HTMLInputElement>(
+                'input[aria-label="本地发布记录分辨率"]',
+            );
+            expect(episodeInput?.value).toBe('07');
+            expect(resolutionInput?.value).toBe('2160p');
         } finally {
             await rendered.unmount();
         }
