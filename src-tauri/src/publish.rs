@@ -1,11 +1,13 @@
+use crate::ai::redaction::RedactionPolicy;
 use crate::config::{load_config, Template};
 use crate::profile::{
-    get_site_cookie_text, normalize_site_cookie_text, resolve_site_cookie_user_agent,
-    site_cookie_has_entries, Profile,
+    get_site_cookie_text, load_profiles, normalize_site_cookie_text,
+    resolve_site_cookie_user_agent, site_cookie_has_entries, Profile,
 };
 use encoding_rs::GB18030;
 use semver::Version;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -62,8 +64,9 @@ pub struct PublishComplete {
     pub message: String,
 }
 
-#[derive(Debug, Clone)]
-enum OkpLaunchMode {
+/// Direct native binary vs `dotnet` DLL launch for the selected OKP.Core.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OkpLaunchMode {
     Direct,
     DotnetDll,
 }
@@ -73,6 +76,170 @@ pub(crate) struct ResolvedOkpExecutable {
     executable_path: PathBuf,
     working_dir: PathBuf,
     launch_mode: OkpLaunchMode,
+}
+
+/// Private OKP executable identity bound into a prepared plan.
+/// Never serialized into public plan DTOs (raw paths must not leave Rust).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OkpExecutableIdentity {
+    /// Canonical selected executable path (private; never exposed in plan responses).
+    canonical_path: PathBuf,
+    /// Direct binary vs `dotnet` DLL launch mode captured at bind time.
+    launch_mode: OkpLaunchMode,
+    /// SHA-256 of executable file bytes at bind time (`sha256:<hex>`).
+    executable_digest: String,
+}
+
+impl OkpExecutableIdentity {
+    /// Capture identity from an already-resolved OKP executable.
+    pub(crate) fn from_resolved(resolved: &ResolvedOkpExecutable) -> Result<Self, String> {
+        let executable_digest = hash_okp_executable_bytes(&resolved.executable_path)?;
+        Ok(Self {
+            canonical_path: resolved.executable_path.clone(),
+            launch_mode: resolved.launch_mode,
+            executable_digest,
+        })
+    }
+
+    pub(crate) fn launch_mode(&self) -> OkpLaunchMode {
+        self.launch_mode
+    }
+
+    pub(crate) fn executable_digest(&self) -> &str {
+        &self.executable_digest
+    }
+
+    /// Re-resolve the **bound** path (never live app config) through the normal
+    /// OKP flow and verify path / launch mode / file-byte digest have not changed.
+    /// On success returns the exact `ResolvedOkpExecutable` that was revalidated,
+    /// so prepared-plan publish can launch identity A without re-reading config B.
+    /// Error messages never include the raw executable path.
+    pub(crate) fn revalidate(&self) -> Result<ResolvedOkpExecutable, String> {
+        let path_str = self.canonical_path.to_string_lossy();
+        let resolved = resolve_selected_okp_executable(&path_str)
+            .map_err(|_| "OKP 可执行文件已失效，请重新执行发布前检查。".to_string())?;
+        if resolved.executable_path != self.canonical_path {
+            return Err("OKP 可执行文件已失效，请重新执行发布前检查。".to_string());
+        }
+        if resolved.launch_mode != self.launch_mode {
+            return Err("OKP 可执行文件启动方式已变化，请重新执行发布前检查。".to_string());
+        }
+        let digest = hash_okp_executable_bytes(&resolved.executable_path)
+            .map_err(|_| "无法验证 OKP 可执行文件身份，请重新执行发布前检查。".to_string())?;
+        if digest != self.executable_digest {
+            return Err("OKP 可执行文件已被替换，请重新执行发布前检查。".to_string());
+        }
+        Ok(resolved)
+    }
+}
+
+/// Outcome of binding the live-configured OKP into a prepared plan.
+///
+/// Produced from **one** live resolve so prepare never mixes two independent
+/// resolves (blocker collection vs identity capture). Carries the same
+/// `ResolvedOkpExecutable` used for OKP local checks when resolution succeeds.
+#[derive(Debug, Clone)]
+pub(crate) enum ConfiguredOkpBindResult {
+    /// Private identity + the resolved executable used to capture it.
+    Bound {
+        identity: OkpExecutableIdentity,
+        resolved: ResolvedOkpExecutable,
+    },
+    /// Live config could not resolve OKP. `error` is from that single resolve
+    /// (legacy live-config message shape); caller must add it as a local blocker.
+    Unresolved { error: String },
+    /// Resolved locally but path/mode/digest capture failed — must not leave unbound.
+    /// `resolved` is still usable for OKP local checks (e.g. version gates).
+    IdentityCaptureFailed { resolved: ResolvedOkpExecutable },
+}
+
+/// Domain-safe bridge: resolve the selected OKP path/launch mode and capture
+/// private executable identity (path + mode + file-byte SHA-256).
+pub(crate) fn capture_okp_executable_identity(
+    configured_path: &str,
+) -> Result<OkpExecutableIdentity, String> {
+    let resolved = resolve_selected_okp_executable(configured_path)?;
+    OkpExecutableIdentity::from_resolved(&resolved)
+}
+
+/// Capture identity for the currently configured OKP executable, if any.
+pub(crate) fn capture_configured_okp_identity(
+    app: &AppHandle,
+) -> Result<OkpExecutableIdentity, String> {
+    let resolved = find_okp_executable(app)?;
+    OkpExecutableIdentity::from_resolved(&resolved)
+}
+
+/// Pure bind from an already-attempted resolve (single-resolve contract for prepare).
+/// Used by [`bind_configured_okp_for_prepare`] and unit tests — never re-resolves.
+pub(crate) fn bind_resolved_okp_for_prepare(
+    resolved: Result<ResolvedOkpExecutable, String>,
+) -> ConfiguredOkpBindResult {
+    match resolved {
+        Err(error) => ConfiguredOkpBindResult::Unresolved { error },
+        Ok(resolved) => match OkpExecutableIdentity::from_resolved(&resolved) {
+            Ok(identity) => ConfiguredOkpBindResult::Bound { identity, resolved },
+            Err(_) => ConfiguredOkpBindResult::IdentityCaptureFailed { resolved },
+        },
+    }
+}
+
+/// Resolve live-configured OKP once and capture private identity for plan prepare.
+/// Callers must use the returned resolved executable for OKP local checks — do not
+/// call [`find_okp_executable`] / [`collect_publish_local_blockers`] again.
+pub(crate) fn bind_configured_okp_for_prepare(app: &AppHandle) -> ConfiguredOkpBindResult {
+    bind_resolved_okp_for_prepare(find_okp_executable(app))
+}
+
+/// Apply a single prepare-time OKP bind result into identity + local blockers.
+///
+/// Performs **no second live OKP resolve**. Bound/capture-failed reuse the same
+/// resolved executable for OKP local checks; unresolved injects the single resolve
+/// error (legacy live-config message) plus non-OKP local checks.
+pub(crate) fn prepare_local_blockers_and_okp_identity(
+    app: &AppHandle,
+    request: &PublishRequest,
+    bind: ConfiguredOkpBindResult,
+) -> (Option<OkpExecutableIdentity>, Vec<String>) {
+    match bind {
+        ConfiguredOkpBindResult::Bound { identity, resolved } => {
+            let blockers =
+                collect_publish_local_blockers_with_resolved_okp(app, request, &resolved);
+            (Some(identity), blockers)
+        }
+        ConfiguredOkpBindResult::IdentityCaptureFailed { resolved } => {
+            let mut blockers =
+                collect_publish_local_blockers_with_resolved_okp(app, request, &resolved);
+            let capture = okp_identity_capture_blocker();
+            if !blockers.contains(&capture) {
+                blockers.push(capture);
+            }
+            (None, blockers)
+        }
+        ConfiguredOkpBindResult::Unresolved { error } => {
+            let blockers =
+                collect_publish_local_blockers_with_okp_resolve_error(app, request, error);
+            (None, blockers)
+        }
+    }
+}
+
+/// Path-free local blocker when OKP resolved but identity digest/hash could not be captured.
+pub(crate) fn okp_identity_capture_blocker() -> String {
+    "无法验证 OKP 可执行文件身份，请重新执行发布前检查。".to_string()
+}
+
+/// Path-free gate when a prepared plan has no bound OKP identity at publish time.
+pub(crate) fn okp_identity_unbound_blocker() -> String {
+    "OKP 可执行文件身份未绑定，请重新执行发布前检查。".to_string()
+}
+
+fn hash_okp_executable_bytes(path: &Path) -> Result<String, String> {
+    let bytes = std::fs::read(path)
+        .map_err(|_| "无法读取 OKP 可执行文件身份，请重新执行发布前检查。".to_string())?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +376,15 @@ fn okp_selection_label() -> &'static str {
 }
 
 impl ResolvedOkpExecutable {
+    /// Private path of the selected executable (never for public serialization).
+    pub(crate) fn executable_path(&self) -> &Path {
+        &self.executable_path
+    }
+
+    pub(crate) fn launch_mode(&self) -> OkpLaunchMode {
+        self.launch_mode
+    }
+
     fn preview_parts(&self, arguments: &[String]) -> Vec<String> {
         match self.launch_mode {
             OkpLaunchMode::Direct => std::iter::once(self.executable_path.display().to_string())
@@ -593,6 +769,171 @@ pub(crate) fn collect_site_publish_configs(
             uses_cookie: false,
         },
     ]
+}
+
+/// Collect the checks that must pass before a prepared plan can be confirmed.
+/// This is a pre-consume mirror of deterministic local publish gates (including the
+/// side-effect-light OKP version query for ACG.RIP API Token). Publish execution
+/// performs the same checks again immediately before consuming the one-shot plan token.
+///
+/// Resolves OKP from **live app config**. Use this for legacy `run_publish` paths.
+/// Prepare-time binding must use [`bind_configured_okp_for_prepare`] +
+/// [`prepare_local_blockers_and_okp_identity`] (single resolve). Prepared-plan
+/// publish after identity bind must use
+/// [`collect_publish_local_blockers_with_resolved_okp`] with the bound executable
+/// so live-config drift cannot false-block or leak a config-path error.
+pub(crate) fn collect_publish_local_blockers(
+    app: &AppHandle,
+    request: &PublishRequest,
+) -> Vec<String> {
+    // Resolve OKP once so the acgrip API-token version gate can reuse it.
+    let resolved_okp = find_okp_executable(app);
+    match resolved_okp {
+        Ok(okp) => collect_publish_local_blockers_with_resolved_okp(app, request, &okp),
+        Err(error) => collect_publish_local_blockers_with_okp_resolve_error(app, request, error),
+    }
+}
+
+/// Collect local blockers when live OKP resolve already failed (legacy message).
+/// Does not re-resolve OKP.
+pub(crate) fn collect_publish_local_blockers_with_okp_resolve_error(
+    app: &AppHandle,
+    request: &PublishRequest,
+    okp_resolve_error: String,
+) -> Vec<String> {
+    let profiles = load_profiles(app);
+    let profile = profiles.profiles.get(&request.profile_name);
+    let selected_sites = profile
+        .map(|profile| {
+            collect_site_publish_configs(&request.template, profile)
+                .into_iter()
+                .filter(|site| site.enabled)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    collect_publish_local_blockers_with(
+        request,
+        profile,
+        selected_sites,
+        None,
+        Some(okp_resolve_error),
+    )
+}
+
+/// Collect local blockers using a caller-supplied already-resolved OKP executable.
+///
+/// Prepared-plan publish must call this with the bound/revalidated identity A so
+/// OKP-related local checks (including the acgrip API-token version gate) never
+/// re-resolve from live app config. Live config may have switched to another valid
+/// executable B or become missing/invalid; that must not false-block a plan bound
+/// to A, nor surface a live-config path error. Invalid bound A still fails closed
+/// via identity revalidation before this helper runs (or via version gates on A).
+pub(crate) fn collect_publish_local_blockers_with_resolved_okp(
+    app: &AppHandle,
+    request: &PublishRequest,
+    resolved_okp: &ResolvedOkpExecutable,
+) -> Vec<String> {
+    let profiles = load_profiles(app);
+    let profile = profiles.profiles.get(&request.profile_name);
+    let selected_sites = profile
+        .map(|profile| {
+            collect_site_publish_configs(&request.template, profile)
+                .into_iter()
+                .filter(|site| site.enabled)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    collect_publish_local_blockers_with(request, profile, selected_sites, Some(resolved_okp), None)
+}
+
+/// Core local-blocker collection used by the live-config and bound-OKP helpers
+/// and unit tests. When `resolved_okp` is `Some`, OKP-related checks use that
+/// executable only — callers must not pass a live-config resolve error alongside it.
+/// `selected_sites` are the enabled sites to validate; when empty and a profile is present,
+/// an "at least one site" blocker is produced.
+fn collect_publish_local_blockers_with(
+    request: &PublishRequest,
+    profile: Option<&Profile>,
+    selected_sites: Vec<SitePublishConfig>,
+    resolved_okp: Option<&ResolvedOkpExecutable>,
+    okp_resolve_error: Option<String>,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let redaction_policy = RedactionPolicy::default();
+    let mut add_blocker = |message: String| {
+        let message = redaction_policy.redact_text(&message);
+        if !blockers.contains(&message) {
+            blockers.push(message);
+        }
+    };
+
+    if let Some(error) = okp_resolve_error {
+        add_blocker(error);
+    }
+    if let Err(error) = validate_torrent_path(&request.torrent_path) {
+        add_blocker(error);
+    }
+    if request.template.title.trim().is_empty() {
+        add_blocker("标题不能为空，请先填写标题。".to_string());
+    }
+
+    let Some(profile) = profile else {
+        add_blocker(format!("配置不存在: {}", request.profile_name));
+        return blockers;
+    };
+
+    if selected_sites.is_empty() {
+        add_blocker("至少选择一个发布站点后才能发布。".to_string());
+        return blockers;
+    }
+
+    let mut acgrip_version_checked = false;
+    for site in selected_sites {
+        let has_token = site
+            .token
+            .as_deref()
+            .and_then(optional_trimmed)
+            .or_else(|| site.api_token.as_deref().and_then(optional_trimmed))
+            .is_some();
+        if !site.uses_cookie && !has_token {
+            add_blocker(format!("{} 的 API Token 不能为空。", site.label));
+        }
+        if site.uses_cookie {
+            if let Err(error) = build_site_publish_cookie_text(&site, profile) {
+                add_blocker(error);
+            }
+        }
+
+        // Mirror run_site_publish: when acgrip uses a non-empty API token, gate on OKP version
+        // before the plan token is consumed. Reuse the already-resolved executable and query
+        // the version at most once even if multiple acgrip API-token sites are present.
+        if site_requires_okp_acgrip_api_token_support(&site) && !acgrip_version_checked {
+            acgrip_version_checked = true;
+            if let Some(okp_core) = resolved_okp {
+                if let Err(error) = ensure_okp_supports_acgrip_api_token(okp_core) {
+                    add_blocker(error);
+                }
+            }
+        }
+
+        let markdown = request.template.description.trim();
+        let html = request.template.description_html.trim();
+        if matches!(site.code, "nyaa" | "acgrip") && markdown.is_empty() {
+            add_blocker(format!(
+                "{} 需要 Markdown 发布内容，请先填写 Markdown，或不要只保留 HTML。",
+                site.label
+            ));
+        }
+        if site_prefers_html_content(site.code) && markdown.is_empty() && html.is_empty() {
+            add_blocker(format!(
+                "{} 需要 HTML 内容，或可转换为 HTML 的 Markdown 发布内容，请先填写 HTML 或 Markdown。",
+                site.label
+            ));
+        }
+    }
+
+    blockers
 }
 
 fn build_site_publish_cookie_text(
@@ -1044,7 +1385,7 @@ pub(crate) fn run_site_publish(
 
 #[tauri::command]
 pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), String> {
-    crate::commands::publish_commands::publish(app, request).await
+    crate::commands::publish_commands::publish_legacy(app, request).await
 }
 
 #[cfg(test)]
@@ -1165,6 +1506,200 @@ mod tests {
         assert!(error.contains(">= 1.2.1"), "unexpected error: {error}");
         assert!(error.contains("Cookie"), "unexpected error: {error}");
 
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_publish_local_blockers_old_okp_blocks_acgrip_api_token_once() {
+        let counter_path = std::env::temp_dir().join(format!(
+            "okpgui-next-okp-version-count-{}-{}",
+            std::process::id(),
+            TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&counter_path);
+        let executable_path =
+            create_test_okp_version_script_with_counter("1.2.0+old-build", 0, &counter_path);
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected test OKP path to resolve");
+
+        let torrent_path = std::env::temp_dir().join(format!(
+            "okpgui-next-publish-blocker-torrent-{}-{}.torrent",
+            std::process::id(),
+            TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&torrent_path, b"d4:infod4:name4:testee").expect("expected torrent fixture");
+
+        let profile = Profile {
+            acgrip_name: "Uploader".to_string(),
+            acgrip_api_token: "api-token-123".to_string(),
+            ..Profile::default()
+        };
+        let mut template = Template::default();
+        template.title = "Example Release".to_string();
+        template.description = "# markdown description".to_string();
+        template.sites.acgrip = true;
+
+        // Two enabled acgrip API-token sites: version must be queried once.
+        let selected_sites = vec![
+            SitePublishConfig {
+                code: "acgrip",
+                label: "ACG.RIP",
+                account_name: "Uploader".to_string(),
+                token: None,
+                api_token: Some("api-token-123".to_string()),
+                enabled: true,
+                uses_cookie: false,
+            },
+            SitePublishConfig {
+                code: "acgrip",
+                label: "ACG.RIP Mirror",
+                account_name: "Uploader".to_string(),
+                token: None,
+                api_token: Some("api-token-456".to_string()),
+                enabled: true,
+                uses_cookie: false,
+            },
+        ];
+
+        let request = PublishRequest {
+            publish_id: "test-publish".to_string(),
+            torrent_path: torrent_path.display().to_string(),
+            profile_name: "default".to_string(),
+            template,
+        };
+
+        let blockers = collect_publish_local_blockers_with(
+            &request,
+            Some(&profile),
+            selected_sites,
+            Some(&resolved),
+            None,
+        );
+
+        let version_blocker = blockers
+            .iter()
+            .find(|blocker| blocker.contains("1.2.0+old-build") || blocker.contains(">= 1.2.1"))
+            .cloned()
+            .expect("expected old OKP.Core version blocker for acgrip API token");
+        assert!(
+            version_blocker.contains("1.2.0+old-build"),
+            "unexpected blocker: {version_blocker}"
+        );
+        assert!(
+            version_blocker.contains(">= 1.2.1"),
+            "unexpected blocker: {version_blocker}"
+        );
+        // Deduped: one blocker even with two acgrip API-token sites.
+        let version_blocker_count = blockers
+            .iter()
+            .filter(|blocker| blocker.contains(">= 1.2.1"))
+            .count();
+        assert_eq!(version_blocker_count, 1);
+
+        let counter = std::fs::read_to_string(&counter_path).unwrap_or_default();
+        let query_count = counter.lines().filter(|line| !line.is_empty()).count();
+        assert_eq!(
+            query_count, 1,
+            "expected a single OKP --version probe, got {query_count}: {counter:?}"
+        );
+
+        let _ = std::fs::remove_file(&torrent_path);
+        let _ = std::fs::remove_file(&counter_path);
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
+
+    /// Prepared-plan local checks must use the bound/resolved OKP only.
+    /// A live-config resolve error (missing path, switched invalid B, etc.) must not
+    /// be mixed in when the caller already supplies identity A.
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_publish_local_blockers_with_bound_okp_ignores_live_config_resolve_error() {
+        let executable_path = create_test_okp_version_script("1.2.1+bound-a", 0);
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("expected bound OKP A to resolve");
+
+        let torrent_path = std::env::temp_dir().join(format!(
+            "okpgui-next-publish-blocker-bound-{}-{}.torrent",
+            std::process::id(),
+            TEST_PATH_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&torrent_path, b"d4:infod4:name4:testee").expect("expected torrent fixture");
+
+        let profile = Profile {
+            acgrip_name: "Uploader".to_string(),
+            acgrip_api_token: "api-token-123".to_string(),
+            ..Profile::default()
+        };
+        let mut template = Template::default();
+        template.title = "Example Release".to_string();
+        template.description = "# markdown description".to_string();
+        template.sites.acgrip = true;
+
+        let selected_sites = vec![SitePublishConfig {
+            code: "acgrip",
+            label: "ACG.RIP",
+            account_name: "Uploader".to_string(),
+            token: None,
+            api_token: Some("api-token-123".to_string()),
+            enabled: true,
+            uses_cookie: false,
+        }];
+
+        let request = PublishRequest {
+            publish_id: "test-publish-bound".to_string(),
+            torrent_path: torrent_path.display().to_string(),
+            profile_name: "default".to_string(),
+            template,
+        };
+
+        // Bound-path contract: Some(resolved A) + None resolve error.
+        // Even if live config would report a missing/invalid path, prepared publish
+        // must not inject that error when checking against bound A.
+        let live_config_error =
+            "未选择 OKP 可执行文件，请先在首页选择 OKP.Core 可执行文件或 DLL。".to_string();
+        let blockers_bound = collect_publish_local_blockers_with(
+            &request,
+            Some(&profile),
+            selected_sites.clone(),
+            Some(&resolved),
+            None,
+        );
+        assert!(
+            blockers_bound
+                .iter()
+                .all(|b| !b.contains("未选择 OKP") && !b.contains("不存在")),
+            "bound OKP path must not surface live-config resolve errors: {blockers_bound:?}"
+        );
+        assert!(
+            blockers_bound
+                .iter()
+                .all(|b| !b.contains(">= 1.2.1") && !b.contains("1.2.0")),
+            "sufficient bound OKP A must not version-block: {blockers_bound:?}"
+        );
+
+        // Contrast: live-config helper path surfaces the resolve error when no OKP is bound.
+        let blockers_live_err = collect_publish_local_blockers_with(
+            &request,
+            Some(&profile),
+            selected_sites,
+            None,
+            Some(live_config_error.clone()),
+        );
+        assert!(
+            blockers_live_err.iter().any(|b| b.contains("未选择 OKP")),
+            "live-config path should still surface resolve errors: {blockers_live_err:?}"
+        );
+
+        let _ = std::fs::remove_file(&torrent_path);
         let _ = std::fs::remove_dir_all(
             executable_path
                 .parent()
@@ -1393,12 +1928,27 @@ mod tests {
 
     #[cfg(unix)]
     fn create_test_okp_version_script(version_output: &str, exit_code: i32) -> PathBuf {
+        create_test_okp_version_script_with_counter(version_output, exit_code, Path::new(""))
+    }
+
+    #[cfg(unix)]
+    fn create_test_okp_version_script_with_counter(
+        version_output: &str,
+        exit_code: i32,
+        counter_path: &Path,
+    ) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
 
         let executable_path = create_test_okp_layout("OKP.Core");
+        let counter_line = if counter_path.as_os_str().is_empty() {
+            String::new()
+        } else {
+            // Record each --version invocation so tests can assert single-probe behavior.
+            format!("printf '1\\n' >> '{}'\n", counter_path.display())
+        };
         let script = format!(
-            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\nprintf '%s\\n' '{}'\nexit {}\n",
-            version_output, exit_code
+            "#!/bin/sh\n[ \"$1\" = \"--version\" ] || exit 64\n{}printf '%s\\n' '{}'\nexit {}\n",
+            counter_line, version_output, exit_code
         );
         std::fs::write(&executable_path, script)
             .expect("expected test OKP version script to be written");
@@ -1733,5 +2283,157 @@ mod tests {
                 .expect("expected executable parent")
                 .to_path_buf(),
         );
+    }
+
+    #[test]
+    fn okp_identity_revalidation_passes_when_unchanged() {
+        let executable_path = create_test_okp_layout("OKP.Core.dll");
+        let identity = capture_okp_executable_identity(&executable_path.display().to_string())
+            .expect("expected OKP identity capture");
+        assert_eq!(identity.launch_mode(), OkpLaunchMode::DotnetDll);
+        assert!(identity.executable_digest().starts_with("sha256:"));
+        let resolved = identity
+            .revalidate()
+            .expect("unchanged executable identity must revalidate");
+        assert_eq!(resolved.executable_path(), executable_path.as_path());
+        assert_eq!(resolved.launch_mode(), OkpLaunchMode::DotnetDll);
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
+
+    #[test]
+    fn okp_identity_revalidation_detects_same_path_replacement() {
+        let executable_path = create_test_okp_layout("OKP.Core.dll");
+        let path_str = executable_path.display().to_string();
+        let identity =
+            capture_okp_executable_identity(&path_str).expect("expected OKP identity capture");
+        // Same path, different file bytes (replacement attack).
+        std::fs::write(&executable_path, b"replaced-okp-bytes").expect("replace executable");
+        let error = identity
+            .revalidate()
+            .expect_err("replaced executable must fail revalidation");
+        assert!(
+            error.contains("替换") || error.contains("重新执行"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !error.contains(&path_str),
+            "revalidation error must not expose OKP path: {error}"
+        );
+        let _ = std::fs::remove_dir_all(
+            executable_path
+                .parent()
+                .expect("expected executable parent"),
+        );
+    }
+
+    #[test]
+    fn okp_identity_revalidate_returns_bound_executable_despite_alternate_valid_path() {
+        // Config drift regression: revalidate must resolve identity A's bound path,
+        // not switch to another valid executable B that live config might point at.
+        let path_a = create_test_okp_layout("OKP.Core.dll");
+        let path_b = create_test_okp_layout("OKP.Core.dll");
+        assert_ne!(path_a, path_b);
+        let identity = capture_okp_executable_identity(&path_a.display().to_string())
+            .expect("capture identity A");
+        // Alternate valid executable B exists; identity remains bound to A.
+        let _ = capture_okp_executable_identity(&path_b.display().to_string())
+            .expect("B is independently valid");
+        let resolved = identity
+            .revalidate()
+            .expect("bound A must still revalidate");
+        assert_eq!(
+            resolved.executable_path(),
+            path_a.as_path(),
+            "revalidate-and-resolve must return bound A, not alternate B"
+        );
+        assert_ne!(resolved.executable_path(), path_b.as_path());
+        let _ = std::fs::remove_dir_all(path_a.parent().expect("parent A"));
+        let _ = std::fs::remove_dir_all(path_b.parent().expect("parent B"));
+    }
+
+    #[test]
+    fn okp_identity_capture_blocker_messages_are_path_free() {
+        let path = "/secret/path/to/OKP.Core.dll";
+        let capture_msg = okp_identity_capture_blocker();
+        let unbound_msg = okp_identity_unbound_blocker();
+        assert!(!capture_msg.contains(path));
+        assert!(!unbound_msg.contains(path));
+        assert!(capture_msg.contains("OKP"));
+        assert!(unbound_msg.contains("OKP"));
+    }
+
+    #[test]
+    fn bind_resolved_okp_for_prepare_unresolved_fail_closed_preserves_error() {
+        // Single-resolve contract: Unresolved carries the one resolve error and never
+        // produces an identity. Prepare must inject that error as a local blocker so a
+        // plan cannot be publishable with okp_identity=None after an unresolved bind.
+        let error = "未选择 OKP 可执行文件，请先在首页选择 OKP.Core 可执行文件或 DLL。".to_string();
+        let bind = bind_resolved_okp_for_prepare(Err(error.clone()));
+        match bind {
+            ConfiguredOkpBindResult::Unresolved { error: got } => assert_eq!(got, error),
+            other => panic!("expected Unresolved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn bind_resolved_okp_for_prepare_bound_reuses_same_resolved_executable() {
+        // Bound identity and resolved executable come from the same resolve — prepare
+        // must use this resolved path for OKP local checks (no second live resolve).
+        let executable_path = create_test_okp_layout("OKP.Core.dll");
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("resolve test OKP");
+        let expected_path = resolved.executable_path().to_path_buf();
+        let bind = bind_resolved_okp_for_prepare(Ok(resolved));
+        match bind {
+            ConfiguredOkpBindResult::Bound { identity, resolved } => {
+                assert_eq!(resolved.executable_path(), expected_path.as_path());
+                let revalidated = identity.revalidate().expect("identity revalidates");
+                assert_eq!(revalidated.executable_path(), expected_path.as_path());
+                assert_eq!(
+                    revalidated.executable_path(),
+                    resolved.executable_path(),
+                    "identity binding and prepare local-check executable must be the same path"
+                );
+            }
+            other => panic!("expected Bound, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(executable_path.parent().expect("parent"));
+    }
+
+    #[test]
+    fn prepare_bind_unresolved_never_yields_identity() {
+        // Fail-closed: any Unresolved bind result has no identity material for the plan.
+        let bind = bind_resolved_okp_for_prepare(Err(
+            "已选择的 OKP 可执行文件不存在：/secret/okp/OKP.Core.dll，请重新选择。".into(),
+        ));
+        assert!(matches!(bind, ConfiguredOkpBindResult::Unresolved { .. }));
+        if let ConfiguredOkpBindResult::Unresolved { error } = bind {
+            // Legacy live-config error shape is preserved from the single resolve.
+            assert!(error.contains("不存在"));
+        }
+    }
+
+    #[test]
+    fn bind_resolved_okp_for_prepare_identity_capture_failed_keeps_resolved_path() {
+        // Resolve succeeds, then the executable vanishes before hash capture.
+        // Prepare must keep the resolved executable for OKP local checks and treat
+        // identity as unbound (caller adds path-free capture blocker).
+        let executable_path = create_test_okp_layout("OKP.Core.dll");
+        let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
+            .expect("resolve");
+        let expected_path = resolved.executable_path().to_path_buf();
+        let _ = std::fs::remove_file(&executable_path);
+        let bind = bind_resolved_okp_for_prepare(Ok(resolved));
+        match bind {
+            ConfiguredOkpBindResult::IdentityCaptureFailed { resolved } => {
+                assert_eq!(resolved.executable_path(), expected_path.as_path());
+            }
+            other => panic!("expected IdentityCaptureFailed, got {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(executable_path.parent().expect("parent"));
     }
 }

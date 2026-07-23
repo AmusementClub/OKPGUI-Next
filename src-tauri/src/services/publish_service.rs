@@ -5,13 +5,27 @@ use crate::publish::publish_events::emit_publish_site_complete;
 use crate::publish::publish_history::{build_publish_summary, persist_updated_site_cookies};
 use crate::publish::{
     collect_site_publish_configs, find_okp_executable, run_site_publish, validate_torrent_path,
-    PublishGuard, PublishRequest,
+    PublishGuard, PublishRequest, ResolvedOkpExecutable,
 };
 
+/// Legacy / non-prepared publish path: resolve OKP from the live app config.
+/// Prepared-plan callers must use [`run_publish_with_resolved_okp`] with the
+/// already-revalidated bound executable so config drift cannot switch binaries.
 pub fn run_publish(app: &AppHandle, request: &PublishRequest) -> Result<String, String> {
+    let okp_core = find_okp_executable(app)?;
+    run_publish_with_resolved_okp(app, request, okp_core)
+}
+
+/// Execute publish with a caller-supplied resolved OKP executable.
+/// Used by prepared-plan publish after identity revalidate-and-resolve so the
+/// launched binary is exactly the one whose private identity was revalidated.
+pub(crate) fn run_publish_with_resolved_okp(
+    app: &AppHandle,
+    request: &PublishRequest,
+    okp_core: ResolvedOkpExecutable,
+) -> Result<String, String> {
     let _publish_guard = PublishGuard::acquire()?;
 
-    let okp_core = find_okp_executable(app)?;
     let torrent_path = validate_torrent_path(&request.torrent_path)?;
     let profiles = load_profiles(app);
     let profile = profiles

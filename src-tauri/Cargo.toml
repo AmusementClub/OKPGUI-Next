@@ -30,9 +30,19 @@ tokio = { version = "1", features = ["time", "sync", "macros"] }
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 tungstenite = "0.23"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "gzip", "brotli", "deflate", "charset"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "blocking", "gzip", "brotli", "deflate", "charset"] }
 encoding_rs = "0.8"
 semver = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
+sha2 = { version = "0.10", features = ["std"] }
+hex = "0.4"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["linux-native", "sync-secret-service", "crypto-rust"] }

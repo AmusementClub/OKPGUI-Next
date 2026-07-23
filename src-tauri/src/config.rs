@@ -34,7 +34,9 @@ struct PortableTemplate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContentTemplate {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub summary: String,
@@ -52,7 +54,9 @@ pub struct ContentTemplate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct QuickPublishTemplate {
+    #[serde(default)]
     pub id: String,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub summary: String,
@@ -279,17 +283,25 @@ pub struct TemplatePublishHistoryUpdate {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Template {
+    #[serde(default)]
     pub ep_pattern: String,
     #[serde(default)]
     pub resolution_pattern: String,
+    #[serde(default)]
     pub title_pattern: String,
+    #[serde(default)]
     pub poster: String,
+    #[serde(default)]
     pub about: String,
+    #[serde(default)]
     pub tags: String,
+    #[serde(default)]
     pub description: String,
     #[serde(default)]
     pub description_html: String,
+    #[serde(default)]
     pub profile: String,
+    #[serde(default)]
     pub title: String,
     #[serde(default)]
     pub publish_history: SitePublishHistory,
@@ -327,6 +339,75 @@ pub struct AppConfig {
     pub quick_publish_templates: HashMap<String, QuickPublishTemplate>,
     #[serde(default)]
     pub content_templates: HashMap<String, ContentTemplate>,
+    #[serde(default)]
+    pub ai: AIConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct CredentialBundleRef {
+    pub provider: String,
+    #[serde(default)]
+    pub key_ref: Option<String>,
+}
+
+/// Non-secret persisted capability probe outcome for the active connection.
+/// Identity digest fingerprints endpoint/auth/model/mode/secret without storing secrets.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+pub struct AiCapabilityConfig {
+    /// `unknown` | `probing` | `ready` | `unsupported` | `failed`
+    #[serde(default)]
+    pub state: String,
+    /// Exact `CapabilityIdentity.digest` that was Ready (or last probed).
+    #[serde(default)]
+    pub identity_digest: String,
+    /// Resolved provider mode that passed the probe (e.g. `chat` after Auto fallback).
+    #[serde(default)]
+    pub resolved_mode: String,
+    /// Sanitized user-facing message; never a provider body or secret.
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub probed_at_unix: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AIConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_ai_provider")]
+    pub provider: String,
+    #[serde(default)]
+    pub credential_ref: Option<CredentialBundleRef>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default = "default_ai_mode")]
+    pub mode: String,
+    #[serde(default = "default_ai_auth_mode")]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub custom_header_name: Option<String>,
+    /// Last successful strict capability probe for the active connection (non-secret).
+    #[serde(default)]
+    pub capability: Option<AiCapabilityConfig>,
+    /// Cached model ids from the last discovery refresh (non-secret).
+    #[serde(default)]
+    pub discovered_models: Vec<String>,
+    #[serde(default)]
+    pub models_fetched_at_unix: Option<u64>,
+}
+
+fn default_ai_provider() -> String {
+    "openai".to_string()
+}
+
+fn default_ai_mode() -> String {
+    "auto".to_string()
+}
+
+fn default_ai_auth_mode() -> String {
+    "bearer".to_string()
 }
 
 impl Default for AppConfig {
@@ -340,6 +421,7 @@ impl Default for AppConfig {
             templates: HashMap::new(),
             quick_publish_templates: HashMap::new(),
             content_templates: HashMap::new(),
+            ai: AIConfig::default(),
         }
     }
 }
@@ -867,6 +949,58 @@ fn save_config_to_disk(app: &AppHandle, config: &AppConfig) -> Result<(), String
 #[tauri::command]
 pub fn get_config(app: AppHandle) -> AppConfig {
     load_config(&app)
+}
+
+/// Persist AI connection settings. Internal helper for `ai_save_settings` only —
+/// not registered as a Tauri IPC command (avoids a bypass of the settings path).
+pub fn save_ai_config(app: AppHandle, ai: AIConfig) -> Result<(), String> {
+    if ai.enabled && ai.model.trim().is_empty() {
+        return Err("启用 AI 前必须配置模型。".to_string());
+    }
+    if ai.endpoint.trim().is_empty() && ai.enabled {
+        return Err("启用 AI 前必须配置接口地址。".to_string());
+    }
+
+    mutate_config(&app, |config| {
+        config.ai = ai;
+        Ok(((), true))
+    })
+}
+
+/// Persist non-secret capability probe metadata only (never secrets or response bodies).
+pub fn save_ai_capability(
+    app: &AppHandle,
+    capability: Option<AiCapabilityConfig>,
+) -> Result<(), String> {
+    mutate_config(app, |config| {
+        config.ai.capability = capability;
+        Ok(((), true))
+    })
+}
+
+/// Persist non-secret discovered model ids from the Models API refresh.
+pub fn save_ai_discovered_models(
+    app: &AppHandle,
+    models: Vec<String>,
+    fetched_at_unix: Option<u64>,
+) -> Result<(), String> {
+    mutate_config(app, |config| {
+        config.ai.discovered_models = models;
+        config.ai.models_fetched_at_unix = fetched_at_unix;
+        Ok(((), true))
+    })
+}
+
+/// Whether two AI connection snapshots differ in fields that key capability identity.
+pub fn ai_connection_identity_fields_changed(before: &AIConfig, after: &AIConfig) -> bool {
+    before.provider != after.provider
+        || before.endpoint.trim_end_matches('/') != after.endpoint.trim_end_matches('/')
+        || before.model != after.model
+        || before.mode != after.mode
+        || before.auth_mode != after.auth_mode
+        || before.custom_header_name != after.custom_header_name
+        || before.credential_ref != after.credential_ref
+        || before.enabled != after.enabled
 }
 
 #[tauri::command]
@@ -1949,6 +2083,73 @@ mod tests {
         let (raw_id, _) = resolve_import_id_and_template(empty_raw, "fallback-stem");
         assert_eq!(wrapped_id, "fallback-stem");
         assert_eq!(raw_id, wrapped_id);
+    }
+
+    #[test]
+    fn test_legacy_ai_config_deserializes_without_capability_fields() {
+        // Pre-M4 configs omit capability / discovered_models; defaults must keep AI off.
+        // Serde field defaults supply provider/mode/auth_mode (openai/auto/bearer).
+        // AIConfig::default() is derive-based (empty strings) and is not the legacy baseline.
+        let config: AppConfig = serde_json::from_str(
+            r#"{
+                "proxy": { "proxy_type": "none", "proxy_host": "" },
+                "ai": {
+                    "enabled": false,
+                    "model": "",
+                    "endpoint": ""
+                }
+            }"#,
+        )
+        .expect("legacy AI config should deserialize");
+
+        assert!(!config.ai.enabled);
+        assert_eq!(config.ai.provider, "openai");
+        assert_eq!(config.ai.mode, "auto");
+        assert_eq!(config.ai.auth_mode, "bearer");
+        assert_eq!(config.ai.model, "");
+        assert_eq!(config.ai.endpoint, "");
+        assert!(config.ai.capability.is_none());
+        assert!(config.ai.discovered_models.is_empty());
+        assert!(config.ai.models_fetched_at_unix.is_none());
+        // Same-identity baseline: clone must not report identity change.
+        let same_identity = config.ai.clone();
+        assert!(!ai_connection_identity_fields_changed(
+            &config.ai,
+            &same_identity
+        ));
+    }
+
+    #[test]
+    fn test_ai_capability_identity_field_change_detection() {
+        let base = AIConfig {
+            enabled: true,
+            provider: "openai".into(),
+            model: "gpt-4o".into(),
+            endpoint: "https://api.openai.com/v1".into(),
+            mode: "auto".into(),
+            auth_mode: "bearer".into(),
+            capability: Some(AiCapabilityConfig {
+                state: "ready".into(),
+                identity_digest: "sha256:abc".into(),
+                resolved_mode: "chat".into(),
+                message: "ok".into(),
+                probed_at_unix: Some(1),
+            }),
+            discovered_models: vec!["gpt-4o".into()],
+            models_fetched_at_unix: Some(1),
+            ..AIConfig::default()
+        };
+        let mut same = base.clone();
+        same.discovered_models = vec!["other".into()];
+        same.capability = None;
+        assert!(
+            !ai_connection_identity_fields_changed(&base, &same),
+            "non-identity metadata must not invalidate capability keys"
+        );
+
+        let mut model_changed = base.clone();
+        model_changed.model = "gpt-4o-mini".into();
+        assert!(ai_connection_identity_fields_changed(&base, &model_changed));
     }
 
     #[test]

@@ -266,6 +266,220 @@ pub fn parse_torrent(path: String) -> Result<TorrentInfo, String> {
     torrent_to_info(torrent, compat_notice)
 }
 
+/// One allowlisted relative file entry for AI context (never absolute).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SafeRelativeFileMeta {
+    pub relative_path: String,
+    pub size: u64,
+}
+
+/// Path-free, allowlisted torrent metadata for plan-owned AI context projection.
+/// Never includes trackers, announce lists, raw bencode, piece hashes, or absolute paths.
+#[derive(Debug, Clone, Serialize)]
+pub struct SafeTorrentProjection {
+    pub name: String,
+    pub total_size: u64,
+    /// Nested tree of safe relative components only (`name`, `size`, `is_file`, `children`).
+    pub tree: serde_json::Value,
+    pub files: Vec<SafeRelativeFileMeta>,
+}
+
+/// Parse a bound torrent path into allowlisted relative metadata for AI context.
+///
+/// Failure messages are path-free (safe for public IPC). Absolute paths, trackers,
+/// raw bencode, and piece material never appear in the result.
+pub fn project_safe_torrent_context(path: &str) -> Result<SafeTorrentProjection, String> {
+    validate_torrent_path_for_context(path)?;
+    let (torrent, _compat_notice) = read_torrent_compat_path_free(path)?;
+    let info = torrent_to_info(torrent, None).map_err(|_| {
+        "无法解析种子文件内容，请重新执行发布前检查。".to_string()
+    })?;
+    safe_projection_from_torrent_info(&info)
+}
+
+fn validate_torrent_path_for_context(path: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("未选择种子文件，请先选择 .torrent 文件。".to_string());
+    }
+    let torrent = std::path::PathBuf::from(path);
+    if !torrent.exists() {
+        return Err("种子文件不存在，请重新执行发布前检查。".to_string());
+    }
+    let metadata = std::fs::metadata(&torrent)
+        .map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
+    if !metadata.is_file() {
+        return Err("种子路径不是文件，请重新执行发布前检查。".to_string());
+    }
+    let is_torrent = torrent
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("torrent"))
+        .unwrap_or(false);
+    if !is_torrent {
+        return Err("所选文件不是 .torrent 文件，请重新执行发布前检查。".to_string());
+    }
+    Ok(())
+}
+
+/// Same as `read_torrent_compat` but maps all failures to path-free messages.
+fn read_torrent_compat_path_free(path: &str) -> Result<(Torrent, Option<String>), String> {
+    match Torrent::read_from_file(path) {
+        Ok(torrent) => Ok((torrent, None)),
+        Err(_strict_error) => {
+            let bytes = std::fs::read(path)
+                .map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
+            let Some(normalized) = sort_top_level_bencode_dictionary(&bytes) else {
+                return Err("无法解析种子文件内容，请重新执行发布前检查。".to_string());
+            };
+            let torrent = Torrent::read_from_bytes(normalized).map_err(|_| {
+                "无法解析种子文件内容，请重新执行发布前检查。".to_string()
+            })?;
+            Ok((
+                torrent,
+                Some(
+                    "该种子文件不符合 BEP 3（顶层字典键未按字节排序）。界面已用内存修正后的副本读取；磁盘上的原文件未改动，发布时仍上传原文件。建议重新生成规范种子。"
+                        .to_string(),
+                ),
+            ))
+        }
+    }
+}
+
+fn safe_projection_from_torrent_info(info: &TorrentInfo) -> Result<SafeTorrentProjection, String> {
+    if !is_safe_path_component(&info.name) {
+        return Err("种子名称包含不安全路径成分，请重新执行发布前检查。".to_string());
+    }
+
+    let mut files = Vec::new();
+    collect_safe_relative_files(&info.file_tree, &mut files)?;
+    let tree = file_tree_to_allowlisted_json(&info.file_tree)?;
+
+    Ok(SafeTorrentProjection {
+        name: info.name.clone(),
+        total_size: info.total_size,
+        tree,
+        files,
+    })
+}
+
+/// Collect file entries as relative paths under the torrent root.
+/// Single-file torrents use the torrent name as the sole relative path.
+/// Multi-file torrents exclude the root directory name from relative paths.
+fn collect_safe_relative_files(
+    root: &FileTreeNode,
+    out: &mut Vec<SafeRelativeFileMeta>,
+) -> Result<(), String> {
+    if !is_safe_path_component(&root.name) {
+        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+    }
+    if root.is_file {
+        if !is_safe_relative_torrent_path(&root.name) {
+            return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+        }
+        out.push(SafeRelativeFileMeta {
+            relative_path: root.name.clone(),
+            size: root.size.unwrap_or(0),
+        });
+        return Ok(());
+    }
+    for child in &root.children {
+        collect_safe_relative_files_under(child, "", out)?;
+    }
+    Ok(())
+}
+
+fn collect_safe_relative_files_under(
+    node: &FileTreeNode,
+    parent_rel: &str,
+    out: &mut Vec<SafeRelativeFileMeta>,
+) -> Result<(), String> {
+    if !is_safe_path_component(&node.name) {
+        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+    }
+    let relative_path = if parent_rel.is_empty() {
+        node.name.clone()
+    } else {
+        format!("{parent_rel}/{}", node.name)
+    };
+    if !is_safe_relative_torrent_path(&relative_path) {
+        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+    }
+    if node.is_file {
+        out.push(SafeRelativeFileMeta {
+            relative_path,
+            size: node.size.unwrap_or(0),
+        });
+        return Ok(());
+    }
+    for child in &node.children {
+        collect_safe_relative_files_under(child, &relative_path, out)?;
+    }
+    Ok(())
+}
+
+fn file_tree_to_allowlisted_json(node: &FileTreeNode) -> Result<serde_json::Value, String> {
+    if !is_safe_path_component(&node.name) {
+        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+    }
+    let mut children = Vec::with_capacity(node.children.len());
+    for child in &node.children {
+        children.push(file_tree_to_allowlisted_json(child)?);
+    }
+    Ok(serde_json::json!({
+        "name": node.name,
+        "size": node.size,
+        "is_file": node.is_file,
+        "children": children,
+    }))
+}
+
+fn is_safe_path_component(name: &str) -> bool {
+    if name.is_empty() || name.trim().is_empty() {
+        return false;
+    }
+    if name != name.trim() {
+        return false;
+    }
+    if name == "." || name == ".." {
+        return false;
+    }
+    if name.contains('/') || name.contains('\\') || name.contains(':') {
+        return false;
+    }
+    if name.chars().any(|character| character.is_control()) {
+        return false;
+    }
+    name.chars().count() <= 256
+}
+
+fn is_safe_relative_torrent_path(path: &str) -> bool {
+    if path.is_empty() || path.trim().is_empty() {
+        return false;
+    }
+    if path != path.trim() {
+        return false;
+    }
+    if path.starts_with('/') || path.starts_with('\\') {
+        return false;
+    }
+    if path.contains(':') {
+        return false;
+    }
+    if path.chars().any(|character| character.is_control()) {
+        return false;
+    }
+    for component in path.split(['/', '\\']) {
+        if component.is_empty() || component == "." || component == ".." {
+            return false;
+        }
+        if !is_safe_path_component(component) {
+            return false;
+        }
+    }
+    path.chars().count() <= 1024
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -385,5 +599,65 @@ mod tests {
         }
         assert_eq!(depth, MAX_PATH_DEPTH);
         assert_eq!(node.size, Some(1));
+    }
+
+    fn write_minimal_single_file_torrent(name: &str) -> std::path::PathBuf {
+        let mut bytes = format!(
+            "d4:infod6:lengthi1e4:name{}:{}12:piece lengthi1e6:pieces20:",
+            name.len(),
+            name
+        )
+        .into_bytes();
+        bytes.extend_from_slice(&[0xff; 20]);
+        bytes.extend_from_slice(b"ee");
+        let path = std::env::temp_dir().join(format!(
+            "okpgui-safe-ctx-{}-{}.torrent",
+            std::process::id(),
+            name
+        ));
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn project_safe_torrent_context_is_relative_only_and_path_free_on_errors() {
+        let path = write_minimal_single_file_torrent("video.mkv");
+        let abs = path.to_string_lossy().to_string();
+        let projection = project_safe_torrent_context(&abs).expect("safe projection");
+        assert_eq!(projection.name, "video.mkv");
+        assert_eq!(projection.files.len(), 1);
+        assert_eq!(projection.files[0].relative_path, "video.mkv");
+        assert!(!projection.files[0].relative_path.starts_with('/'));
+        let serialized = serde_json::to_string(&projection).unwrap();
+        assert!(
+            !serialized.contains(&abs),
+            "absolute path must not appear in projection: {serialized}"
+        );
+        let _ = std::fs::remove_file(&path);
+
+        let missing = project_safe_torrent_context("/tmp/definitely-missing-okpgui.torrent");
+        let err = missing.expect_err("missing torrent");
+        assert!(!err.contains("/tmp/"), "error must be path-free: {err}");
+    }
+
+    #[test]
+    fn project_safe_torrent_context_rejects_unsafe_relative_components() {
+        // Manually craft a tree via torrent_to_info path: multi-file with ".." component.
+        let mut bytes = b"d4:infod5:filesld6:lengthi1e4:pathl2:..4:evileee4:name4:root12:piece lengthi1e6:pieces20:".to_vec();
+        bytes.extend_from_slice(&[0xff; 20]);
+        bytes.extend_from_slice(b"ee");
+        let path = std::env::temp_dir().join(format!(
+            "okpgui-unsafe-rel-{}-.torrent",
+            std::process::id()
+        ));
+        std::fs::write(&path, &bytes).unwrap();
+        let result = project_safe_torrent_context(&path.to_string_lossy());
+        let _ = std::fs::remove_file(&path);
+        let err = result.expect_err(".. path must fail closed");
+        assert!(
+            err.contains("不安全") || err.contains("无法解析"),
+            "unexpected: {err}"
+        );
+        assert!(!err.contains(".."), "should not echo raw path in public error");
     }
 }
