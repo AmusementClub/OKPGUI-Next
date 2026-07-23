@@ -45,6 +45,7 @@ pub struct VisionBatchResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum VisionError {
     TooManyImages(usize),
     UnsafeUrl(String),
@@ -348,7 +349,8 @@ pub fn fetch_image(url: &str, timeout: Duration) -> Result<(String, Vec<u8>), Vi
 }
 
 fn read_body_bounded(source: &mut impl Read, max_bytes: usize) -> Result<Vec<u8>, VisionError> {
-    let mut limited = source.take(max_bytes as u64 + 1);
+    let take_limit = (max_bytes as u64).saturating_add(1);
+    let mut limited = source.take(take_limit);
     let mut bytes = Vec::new();
     limited
         .read_to_end(&mut bytes)
@@ -396,6 +398,7 @@ pub fn normalize_image(
     Ok((output, width, height))
 }
 
+#[allow(dead_code)]
 pub fn prepare_images(
     inputs: Vec<VisionImageInput>,
     timeout: Duration,
@@ -405,7 +408,7 @@ pub fn prepare_images(
         return Err(VisionError::TooManyImages(inputs.len()));
     }
     // Sequential fetch stays within the documented max concurrency of two.
-    let mut result = VisionBatchResult::default();
+    let mut images = Vec::new();
     let mut total_bytes = 0usize;
     let mut image_digests = Vec::new();
     for input in inputs {
@@ -415,13 +418,14 @@ pub fn prepare_images(
         let (content_type, bytes) = fetch_image(&input.url, timeout)?;
         let (normalized, width, height) = normalize_image(&content_type, &bytes)?;
         // Digest normalized bytes; keep payload only in-memory for plan bind / request assembly.
-        image_digests.push(content_digest(&normalized));
+        let digest = content_digest(&normalized);
+        image_digests.push(digest.clone());
         total_bytes = total_bytes.saturating_add(normalized.len());
         enforce_aggregate_limit(total_bytes)?;
-        result.images.push(VisionImageResult {
+        images.push(VisionImageResult {
             url: input.url,
             source: input.source,
-            content_hash: image_digests.last().cloned().unwrap_or_default(),
+            content_hash: digest,
             mime_type: "image/jpeg".to_string(),
             normalized_bytes: normalized.len(),
             width,
@@ -429,8 +433,11 @@ pub fn prepare_images(
             payload: normalized,
         });
     }
-    result.batch_hash = batch_content_digest(&image_digests);
-    Ok(result)
+    Ok(VisionBatchResult {
+        images,
+        batch_hash: batch_content_digest(&image_digests),
+        warnings: Vec::new(),
+    })
 }
 
 /// Soft-failing per-image preparation: unsafe/oversized/invalid images become warnings
@@ -443,21 +450,21 @@ pub fn prepare_images_soft(
         return Err(VisionError::TooManyImages(inputs.len()));
     }
     let mut seen = HashSet::new();
-    let mut result = VisionBatchResult::default();
+    let mut images = Vec::new();
+    let mut warnings = Vec::new();
     let mut total_bytes = 0usize;
     let mut image_digests = Vec::new();
     for input in inputs {
         if !seen.insert(input.url.clone()) {
             continue;
         }
-        match fetch_image(&input.url, timeout).and_then(|(content_type, bytes)| {
-            normalize_image(&content_type, &bytes)
-                .map(|(normalized, width, height)| (normalized, width, height))
-        }) {
+        match fetch_image(&input.url, timeout)
+            .and_then(|(content_type, bytes)| normalize_image(&content_type, &bytes))
+        {
             Ok((normalized, width, height)) => {
                 let next_total = total_bytes.saturating_add(normalized.len());
                 if next_total > MAX_TOTAL_BYTES {
-                    result.warnings.push(format!(
+                    warnings.push(format!(
                         "IMAGE_FETCH_FAILED: aggregate normalized image bytes exceed 7.5 MiB ({})",
                         input.source
                     ));
@@ -466,7 +473,7 @@ pub fn prepare_images_soft(
                 total_bytes = next_total;
                 let digest = content_digest(&normalized);
                 image_digests.push(digest.clone());
-                result.images.push(VisionImageResult {
+                images.push(VisionImageResult {
                     url: input.url,
                     source: input.source,
                     content_hash: digest,
@@ -478,14 +485,15 @@ pub fn prepare_images_soft(
                 });
             }
             Err(error) => {
-                result
-                    .warnings
-                    .push(format!("IMAGE_FETCH_FAILED: {error} ({})", input.source));
+                warnings.push(format!("IMAGE_FETCH_FAILED: {error} ({})", input.source));
             }
         }
     }
-    result.batch_hash = batch_content_digest(&image_digests);
-    Ok(result)
+    Ok(VisionBatchResult {
+        images,
+        batch_hash: batch_content_digest(&image_digests),
+        warnings,
+    })
 }
 
 /// Resolve which candidate URLs may be fetched for a prepared plan.
@@ -537,6 +545,7 @@ pub fn resolve_selected_vision_inputs(
     Ok(resolved)
 }
 
+#[allow(dead_code)]
 fn enforce_aggregate_limit(total_bytes: usize) -> Result<(), VisionError> {
     if total_bytes > MAX_TOTAL_BYTES {
         Err(VisionError::TooLarge(

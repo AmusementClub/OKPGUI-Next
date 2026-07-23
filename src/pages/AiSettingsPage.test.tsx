@@ -156,4 +156,34 @@ describe('AiSettingsPage model discovery and capability probe', () => {
         expect(refresh).toHaveProperty('disabled', true);
         expect(invokeMock.mock.calls.every(([command]) => command === 'ai_get_settings')).toBe(true);
     });
+
+    it('keeps capability probe disabled and zero-network when AI is off (release-gate regression)', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') {
+                return baseSettings({
+                    enabled: false,
+                    model: '',
+                    credential_ref: null,
+                    capability: null,
+                    discovered_models: [],
+                });
+            }
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const probe = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('运行探测'),
+        );
+        expect(probe).toBeTruthy();
+        expect(probe).toHaveProperty('disabled', true);
+        // Click must not schedule formal probe IPC while disabled.
+        probe!.click();
+        await flushAsync();
+        expect(invokeMock.mock.calls.every(([command]) => command === 'ai_get_settings')).toBe(true);
+        expect(rendered.container.textContent).not.toContain('sk-');
+        expect(rendered.container.textContent).toMatch(/未探测|未知/);
+    });
 });

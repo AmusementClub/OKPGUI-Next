@@ -46,7 +46,7 @@ pub enum PlanMediaStatus {
 
 /// Redacted, relative, normalized media summary owned by a prepared plan.
 /// Absolute paths never appear; codec/language strings are free-text only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct PlanMediaSummary {
     pub relative_name: String,
     pub duration_ms: Option<u64>,
@@ -79,6 +79,23 @@ pub struct PlanMediaEvidence {
 impl PlanMediaEvidence {
     pub fn matches_plan(&self, snapshot_hash: &str, request_generation: u64) -> bool {
         self.snapshot_hash == snapshot_hash && self.request_generation == request_generation
+    }
+
+    /// Digest only the normalized media outcome, excluding job identity and plan identity.
+    /// Sorting makes equivalent probe batches hash identically even if completion order differs.
+    pub fn canonical_content_hash(&self) -> String {
+        #[derive(Serialize)]
+        struct MediaPayload<'a> {
+            status: PlanMediaStatus,
+            summaries: &'a [PlanMediaSummary],
+        }
+
+        let mut summaries = self.summaries.clone();
+        summaries.sort();
+        digest_json(&MediaPayload {
+            status: self.status,
+            summaries: &summaries,
+        })
     }
 
     /// Map identity-matched plan media evidence to formal/local audit state.
@@ -201,6 +218,7 @@ pub struct PublishPlan {
     pub request_generation: u64,
     pub local_blockers: Vec<String>,
     #[serde(skip)]
+    #[allow(dead_code)]
     prepare_token: Option<String>,
     #[serde(skip)]
     publish_token: Option<String>,
@@ -239,6 +257,9 @@ pub struct CanonicalSnapshot {
     pub profile_name: String,
     #[serde(default)]
     pub vision_batch_hash: String,
+    /// Digest of Rust-owned normalized MediaInfo status/summaries, when measured.
+    #[serde(default)]
+    pub media_evidence_hash: String,
 }
 
 /// Private execution binding: raw paths and identity material never leave Rust.
@@ -327,10 +348,11 @@ impl PublishPlan {
 
     /// Bind redacted MediaInfo summaries to this plan. Rejects identity mismatch.
     ///
-    /// Does not consume the plan token, clear audit evidence, or weaken blockers.
+    /// A changed normalized media outcome rolls the plan snapshot hash and invalidates
+    /// previous audit evidence/acknowledgements. Rebinding identical media is idempotent.
     /// Callers must only invoke this for Succeeded terminal MediaInfo jobs after
     /// revalidating the private local execution binding.
-    pub fn bind_media_evidence(&mut self, evidence: PlanMediaEvidence) -> Result<(), String> {
+    pub fn bind_media_evidence(&mut self, evidence: PlanMediaEvidence) -> Result<String, String> {
         if evidence.snapshot_hash != self.snapshot_hash {
             return Err("media evidence snapshot_hash does not match prepared plan".to_string());
         }
@@ -345,8 +367,32 @@ impl PublishPlan {
                 return Err("media evidence contains unsafe relative path".to_string());
             }
         }
+        let media_evidence_hash = evidence.canonical_content_hash();
+        let snapshot = self
+            .canonical_snapshot
+            .as_mut()
+            .ok_or_else(|| "prepared plan has no canonical snapshot".to_string())?;
+        let media_changed = snapshot.media_evidence_hash != media_evidence_hash;
+        let next_hash = compute_canonical_snapshot_hash(
+            &snapshot.torrent_digest,
+            &snapshot.torrent_name,
+            &snapshot.profile_name,
+            &snapshot.template_digest,
+            &snapshot.sites,
+            (!snapshot.vision_batch_hash.is_empty()).then_some(snapshot.vision_batch_hash.as_str()),
+            Some(&media_evidence_hash),
+        );
+        snapshot.media_evidence_hash = media_evidence_hash;
+        snapshot.hash = next_hash.clone();
+        self.snapshot_hash = next_hash.clone();
+        let mut evidence = evidence;
+        evidence.snapshot_hash = next_hash.clone();
         self.media_evidence = Some(evidence);
-        Ok(())
+        if media_changed {
+            self.audit_evidence = None;
+            self.acknowledgements.clear();
+        }
+        Ok(next_hash)
     }
 
     /// Bind backend-fetched normalized Vision assets and roll the canonical plan hash.
@@ -421,6 +467,8 @@ impl PublishPlan {
             &snapshot.template_digest,
             &snapshot.sites,
             Some(&evidence.batch_hash),
+            (!snapshot.media_evidence_hash.is_empty())
+                .then_some(snapshot.media_evidence_hash.as_str()),
         );
         snapshot.vision_batch_hash = evidence.batch_hash.clone();
         snapshot.hash = next_hash.clone();
@@ -473,6 +521,7 @@ impl PublishPlan {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn has_authoritative_vision_evidence(&self) -> bool {
         self.vision_evidence.as_ref().is_some_and(|evidence| {
             evidence.matches_plan(&self.snapshot_hash, self.request_generation)
@@ -495,6 +544,7 @@ impl PublishPlan {
     }
 
     /// True when this plan has identity-matched backend-owned MediaInfo evidence.
+    #[allow(dead_code)]
     pub fn has_authoritative_media_evidence(&self) -> bool {
         self.media_evidence.as_ref().is_some_and(|evidence| {
             evidence.matches_plan(&self.snapshot_hash, self.request_generation)
@@ -578,6 +628,7 @@ impl PublishPlan {
             &template_digest,
             &sites,
             None,
+            None,
         );
         let binding_fingerprint = compute_binding_fingerprint(
             &request,
@@ -596,6 +647,7 @@ impl PublishPlan {
             torrent_digest: torrent_identity.digest.clone(),
             profile_name: request.profile_name.clone(),
             vision_batch_hash: String::new(),
+            media_evidence_hash: String::new(),
         });
         plan.set_local_binding(LocalExecutionBinding {
             request,
@@ -607,6 +659,7 @@ impl PublishPlan {
         Ok(plan)
     }
 
+    #[allow(dead_code)]
     fn to_deterministic_bytes(&self) -> Vec<u8> {
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&self.version.to_le_bytes());
@@ -640,10 +693,14 @@ impl PublishPlan {
             let vision_batch_hash = snapshot.vision_batch_hash.as_bytes();
             bytes.extend_from_slice(&(vision_batch_hash.len() as u64).to_le_bytes());
             bytes.extend_from_slice(vision_batch_hash);
+            let media_evidence_hash = snapshot.media_evidence_hash.as_bytes();
+            bytes.extend_from_slice(&(media_evidence_hash.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(media_evidence_hash);
         }
         bytes
     }
 
+    #[allow(dead_code)]
     pub fn compute_deterministic_hash(&self) -> String {
         let bytes = self.to_deterministic_bytes();
         let mut hasher = Sha256::new();
@@ -669,14 +726,17 @@ impl LocalExecutionBinding {
         &self.request
     }
 
+    #[allow(dead_code)]
     pub(crate) fn torrent_digest(&self) -> &str {
         &self.torrent_digest
     }
 
+    #[allow(dead_code)]
     pub(crate) fn binding_fingerprint(&self) -> &str {
         &self.binding_fingerprint
     }
 
+    #[allow(dead_code)]
     pub(crate) fn okp_identity(&self) -> Option<&OkpExecutableIdentity> {
         self.okp_identity.as_ref()
     }
@@ -848,6 +908,7 @@ fn compute_canonical_snapshot_hash(
     template_digest: &str,
     sites: &[String],
     vision_batch_hash: Option<&str>,
+    media_evidence_hash: Option<&str>,
 ) -> String {
     #[derive(Serialize)]
     struct CanonicalPayload<'a> {
@@ -859,6 +920,8 @@ fn compute_canonical_snapshot_hash(
         sites: &'a [String],
         #[serde(skip_serializing_if = "Option::is_none")]
         vision_batch_hash: Option<&'a str>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        media_evidence_hash: Option<&'a str>,
     }
     let payload = CanonicalPayload {
         version: 2,
@@ -868,6 +931,7 @@ fn compute_canonical_snapshot_hash(
         template_digest,
         sites,
         vision_batch_hash,
+        media_evidence_hash,
     };
     digest_json(&payload)
 }
@@ -1004,6 +1068,7 @@ pub struct PlanRegistry {
 }
 
 impl PlanRegistry {
+    #[allow(dead_code)]
     pub fn prepare_plan_with_request(
         &mut self,
         request_generation: u64,
@@ -1075,6 +1140,7 @@ impl PlanRegistry {
 
     /// Lightweight prepare without a publish request binding.
     /// Always binds local-only initial evidence (not AI-pending) so the token is never unbound.
+    #[allow(dead_code)]
     pub fn prepare_plan(
         &mut self,
         snapshot_hash: String,
@@ -1156,12 +1222,13 @@ impl PlanRegistry {
     /// - identity mismatch (snapshot_hash / request_generation) → error without mutation
     /// - binding revalidation failure (identity drift) → error without mutation
     ///
-    /// Does not consume the plan token or alter audit evidence / acknowledgements.
+    /// A changed normalized media outcome rolls the plan snapshot hash and invalidates
+    /// earlier audit evidence/acknowledgements; identical media rebinds are idempotent.
     pub fn bind_media_evidence(
         &mut self,
         token: &str,
         evidence: PlanMediaEvidence,
-    ) -> Result<&PublishPlan, String> {
+    ) -> Result<String, String> {
         let token = token.trim();
         if token.is_empty() {
             return Err("prepared plan token is required".to_string());
@@ -1188,8 +1255,7 @@ impl PlanRegistry {
         } else {
             return Err("prepared plan has no local execution binding".to_string());
         }
-        plan.bind_media_evidence(evidence)?;
-        Ok(plan)
+        plan.bind_media_evidence(evidence)
     }
 
     /// Bind normalized Vision evidence and roll the plan snapshot hash.
@@ -2544,11 +2610,6 @@ mod tests {
             .prepare_plan_with_request_and_blockers(5, request, Vec::new(), false, None)
             .expect("prepare");
         let token = prepared.token;
-        let audit_before = registry
-            .inspect_plan(&token)
-            .and_then(|plan| plan.audit_evidence.clone())
-            .expect("initial audit");
-
         registry
             .bind_media_evidence(
                 &token,
@@ -2577,8 +2638,13 @@ mod tests {
             let media = plan.media_evidence.as_ref().expect("media");
             assert_eq!(media.status, PlanMediaStatus::Tested);
             assert_eq!(media.summaries[0].relative_name, "show/ep01.mkv");
-            // Audit evidence must remain unchanged by a media bind.
-            assert_eq!(plan.audit_evidence.as_ref(), Some(&audit_before));
+            assert_ne!(plan.snapshot_hash, prepared.snapshot_hash);
+            assert!(plan.audit_evidence.is_none());
+            assert!(plan.acknowledgements == Acknowledgements::default());
+            assert_ne!(
+                plan.media_evidence.as_ref().unwrap().snapshot_hash,
+                prepared.snapshot_hash
+            );
             let public = serde_json::to_string(plan).expect("serialize");
             assert!(!public.contains(torrent_path.to_string_lossy().as_ref()));
             assert!(!public.contains("/private"));

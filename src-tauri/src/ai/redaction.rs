@@ -28,6 +28,7 @@ impl RedactionPolicy {
         redact_value(value, self)
     }
 
+    #[allow(dead_code)]
     pub fn redact_json_text(&self, text: &str) -> String {
         match serde_json::from_str::<Value>(text) {
             Ok(value) => serde_json::to_string(&self.redact_value(&value))
@@ -248,7 +249,7 @@ fn is_data_image(value: &str) -> bool {
 }
 
 fn looks_like_base64(value: &str) -> bool {
-    if value.len() < 96 || value.len() % 4 != 0 {
+    if value.len() < 96 || !value.len().is_multiple_of(4) {
         return false;
     }
     value
@@ -269,7 +270,7 @@ fn looks_like_windows_root_relative_path(value: &str) -> bool {
         return false;
     }
     // `\Component\...` — second separator after a non-empty first component.
-    bytes[1..].iter().any(|&byte| byte == b'\\')
+    bytes[1..].contains(&b'\\')
 }
 
 fn looks_like_absolute_path(value: &str) -> bool {

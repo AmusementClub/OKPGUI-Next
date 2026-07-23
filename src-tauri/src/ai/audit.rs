@@ -80,6 +80,34 @@ const KNOWN_CODES: &[&str] = &[
     "PROVIDER_WARNING",
 ];
 
+const CRITICAL_CODES: &[&str] = &[
+    "MISSING_TITLE",
+    "MISSING_EPISODE",
+    "MISSING_RESOLUTION",
+    "MISSING_POSTER",
+    "MISSING_DESCRIPTION",
+    "TEMPLATE_STALE",
+    "TORRENT_STALE",
+];
+
+const WARNING_CODES: &[&str] = &[
+    "MEDIA_NOT_TESTED",
+    "MEDIA_CHECK_FAILED",
+    "VISION_WARNING",
+    "PAYLOAD_TOO_LARGE",
+    "PROVIDER_WARNING",
+];
+
+fn authoritative_severity(code: &str) -> Option<FindingSeverity> {
+    if CRITICAL_CODES.contains(&code) {
+        Some(FindingSeverity::Critical)
+    } else if WARNING_CODES.contains(&code) {
+        Some(FindingSeverity::Warning)
+    } else {
+        None
+    }
+}
+
 /// Redact caller-supplied text at audit ingress so secrets/paths cannot leave
 /// the backend via decision findings. Safe relative evidence paths are preserved
 /// for later validation by [`compute_decision`].
@@ -100,10 +128,9 @@ pub fn sanitize_audit_input(mut input: AuditInput, policy: &RedactionPolicy) -> 
 pub fn compute_decision(input: &AuditInput) -> ValidatedAudit {
     let mut findings = Vec::with_capacity(input.findings.len());
     let mut unknown_codes = Vec::new();
-    let known = KNOWN_CODES.iter().copied().collect::<HashSet<_>>();
 
     for mut finding in input.findings.clone() {
-        if !known.contains(finding.code.as_str()) {
+        if authoritative_severity(&finding.code).is_none() {
             unknown_codes.push(finding.code.clone());
             finding.severity = FindingSeverity::Warning;
         }
@@ -391,7 +418,7 @@ fn is_safe_json_pointer(path: &str) -> bool {
     }
     // Empty components mean `//`; reject traversal-like segments.
     for component in std::iter::once(first).chain(components) {
-        if component.is_empty() || component == ".." || component == "." {
+        if component.is_empty() || matches!(component, "." | "..") {
             return false;
         }
     }
@@ -449,15 +476,15 @@ pub fn parse_formal_audit_findings(value: &Value) -> Vec<Finding> {
                 "finding code and message must be non-empty strings",
             )];
         }
-        let severity = match item.severity.trim().to_ascii_uppercase().as_str() {
-            "CRITICAL" => FindingSeverity::Critical,
-            "WARNING" => FindingSeverity::Warning,
+        match item.severity.trim().to_ascii_uppercase().as_str() {
+            "CRITICAL" | "WARNING" => {}
             other => {
                 return vec![provider_schema_warning(&format!(
                     "finding severity must be WARNING or CRITICAL, got {other}"
                 ))];
             }
         };
+        let severity = authoritative_severity(&code).unwrap_or(FindingSeverity::Warning);
         findings.push(Finding {
             code,
             severity,
@@ -601,6 +628,35 @@ mod tests {
             result.findings[0].evidence_path,
             Some("torrent/video.mkv".into())
         );
+    }
+
+    #[test]
+    fn known_code_severity_is_rust_owned() {
+        let parsed = parse_formal_audit_findings(&serde_json::json!({
+            "findings": [{
+                "code": "MISSING_TITLE",
+                "severity": "WARNING",
+                "message": "title is missing"
+            }, {
+                "code": "PROVIDER_WARNING",
+                "severity": "CRITICAL",
+                "message": "provider warning"
+            }]
+        }));
+        assert_eq!(parsed[0].severity, FindingSeverity::Critical);
+        assert_eq!(parsed[1].severity, FindingSeverity::Warning);
+
+        let result = compute_decision(&AuditInput {
+            local_blockers: Vec::new(),
+            findings: parsed,
+            checking: false,
+        });
+        assert_eq!(result.findings[0].severity, FindingSeverity::Critical);
+        assert_eq!(result.findings[1].severity, FindingSeverity::Warning);
+        assert_eq!(result.decision, AuditDecision::NoGo);
+        assert!(KNOWN_CODES
+            .iter()
+            .all(|code| authoritative_severity(code).is_some()));
     }
 
     #[test]

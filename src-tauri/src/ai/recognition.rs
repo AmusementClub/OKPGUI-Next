@@ -400,10 +400,17 @@ mod tests {
     #[test]
     fn parse_accepts_valid_candidates() {
         let output = parse_recognition(&valid_payload()).expect("valid");
-        assert_eq!(output.episode.as_ref().unwrap().value, "01");
-        assert!((output.episode.as_ref().unwrap().confidence - 0.91).abs() < f64::EPSILON);
-        assert_eq!(output.resolution.as_ref().unwrap().value, "1080p");
-        assert_eq!(output.suggested_title.as_ref().unwrap().value, "Show Name");
+        let episode = output.episode.as_ref().expect("episode");
+        assert_eq!(episode.value, "01");
+        assert!((episode.confidence - 0.91).abs() < f64::EPSILON);
+        assert_eq!(
+            output.resolution.as_ref().expect("resolution").value,
+            "1080p"
+        );
+        assert_eq!(
+            output.suggested_title.as_ref().expect("title").value,
+            "Show Name"
+        );
     }
 
     #[test]

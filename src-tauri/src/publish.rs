@@ -4,7 +4,6 @@ use crate::profile::{
     get_site_cookie_text, load_profiles, normalize_site_cookie_text,
     resolve_site_cookie_user_agent, site_cookie_has_entries, Profile,
 };
-use encoding_rs::GB18030;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -101,10 +100,14 @@ impl OkpExecutableIdentity {
         })
     }
 
+    /// Compatibility accessor for tests and identity diagnostics (field stays private).
+    #[allow(dead_code)] // test + diagnostic helper; production uses fields directly
     pub(crate) fn launch_mode(&self) -> OkpLaunchMode {
         self.launch_mode
     }
 
+    /// Compatibility accessor for tests and identity diagnostics (field stays private).
+    #[allow(dead_code)] // test + diagnostic helper; production uses fields directly
     pub(crate) fn executable_digest(&self) -> &str {
         &self.executable_digest
     }
@@ -155,6 +158,7 @@ pub(crate) enum ConfiguredOkpBindResult {
 
 /// Domain-safe bridge: resolve the selected OKP path/launch mode and capture
 /// private executable identity (path + mode + file-byte SHA-256).
+#[allow(dead_code)]
 pub(crate) fn capture_okp_executable_identity(
     configured_path: &str,
 ) -> Result<OkpExecutableIdentity, String> {
@@ -163,6 +167,10 @@ pub(crate) fn capture_okp_executable_identity(
 }
 
 /// Capture identity for the currently configured OKP executable, if any.
+///
+/// Compatibility helper retained for call sites that need live-config identity
+/// without going through prepare bind; prepare uses [`bind_configured_okp_for_prepare`].
+#[allow(dead_code)] // compatibility helper; prepare path uses bind_configured_okp_for_prepare
 pub(crate) fn capture_configured_okp_identity(
     app: &AppHandle,
 ) -> Result<OkpExecutableIdentity, String> {
@@ -377,10 +385,14 @@ fn okp_selection_label() -> &'static str {
 
 impl ResolvedOkpExecutable {
     /// Private path of the selected executable (never for public serialization).
+    /// Retained for crate tests and binding revalidation assertions.
+    #[allow(dead_code)] // test + binding helper; launch paths use fields directly
     pub(crate) fn executable_path(&self) -> &Path {
         &self.executable_path
     }
 
+    /// Launch mode of the selected executable (never for public serialization).
+    #[allow(dead_code)] // test + binding helper; launch paths use fields directly
     pub(crate) fn launch_mode(&self) -> OkpLaunchMode {
         self.launch_mode
     }
@@ -782,6 +794,7 @@ pub(crate) fn collect_site_publish_configs(
 /// publish after identity bind must use
 /// [`collect_publish_local_blockers_with_resolved_okp`] with the bound executable
 /// so live-config drift cannot false-block or leak a config-path error.
+#[allow(dead_code)]
 pub(crate) fn collect_publish_local_blockers(
     app: &AppHandle,
     request: &PublishRequest,
@@ -1383,6 +1396,7 @@ pub(crate) fn run_site_publish(
     }
 }
 
+#[allow(dead_code)]
 pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), String> {
     crate::commands::publish_commands::publish_legacy(app, request).await
 }
@@ -1390,6 +1404,7 @@ pub async fn publish(app: AppHandle, request: PublishRequest) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SiteSelection;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1538,10 +1553,15 @@ mod tests {
             acgrip_api_token: "api-token-123".to_string(),
             ..Profile::default()
         };
-        let mut template = Template::default();
-        template.title = "Example Release".to_string();
-        template.description = "# markdown description".to_string();
-        template.sites.acgrip = true;
+        let template = Template {
+            title: "Example Release".to_string(),
+            description: "# markdown description".to_string(),
+            sites: SiteSelection {
+                acgrip: true,
+                ..SiteSelection::default()
+            },
+            ..Template::default()
+        };
 
         // Two enabled acgrip API-token sites: version must be queried once.
         let selected_sites = vec![
@@ -1638,10 +1658,15 @@ mod tests {
             acgrip_api_token: "api-token-123".to_string(),
             ..Profile::default()
         };
-        let mut template = Template::default();
-        template.title = "Example Release".to_string();
-        template.description = "# markdown description".to_string();
-        template.sites.acgrip = true;
+        let template = Template {
+            title: "Example Release".to_string(),
+            description: "# markdown description".to_string(),
+            sites: SiteSelection {
+                acgrip: true,
+                ..SiteSelection::default()
+            },
+            ..Template::default()
+        };
 
         let selected_sites = vec![SitePublishConfig {
             code: "acgrip",
@@ -1749,8 +1774,13 @@ mod tests {
 
     #[test]
     fn test_collect_acgrip_publish_config_prefers_api_token() {
-        let mut template = Template::default();
-        template.sites.acgrip = true;
+        let template = Template {
+            sites: SiteSelection {
+                acgrip: true,
+                ..SiteSelection::default()
+            },
+            ..Template::default()
+        };
         let profile = Profile {
             acgrip_name: "Uploader".to_string(),
             acgrip_api_token: "  api-token-123  ".to_string(),
@@ -2259,8 +2289,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(
             executable_path
                 .parent()
-                .expect("expected executable parent")
-                .to_path_buf(),
+                .expect("expected executable parent"),
         );
     }
 
@@ -2279,8 +2308,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(
             executable_path
                 .parent()
-                .expect("expected executable parent")
-                .to_path_buf(),
+                .expect("expected executable parent"),
         );
     }
 

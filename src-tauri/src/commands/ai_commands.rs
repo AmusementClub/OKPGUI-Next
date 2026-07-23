@@ -63,7 +63,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use std::time::Instant;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -93,15 +95,24 @@ fn command_test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|error| error.into_inner())
 }
 
+/// Process-global cancel flags keyed by job id.
+type JobCancelFlagMap = HashMap<String, Arc<AtomicBool>>;
+/// Process-global MediaInfo results keyed by job id.
+type MediaInfoResultMap = HashMap<String, MediaInfoJobView>;
+/// Process-global template-selection results keyed by job id.
+type TemplateSelectionResultMap = HashMap<String, TemplateSelectionJobView>;
+/// Process-global recognition results keyed by job id.
+type RecognitionResultMap = HashMap<String, RecognitionJobView>;
+
 /// Cooperative cancel flags for in-flight MediaInfo child probes (job_id → flag).
-fn media_cancel_flags() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    static FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+fn media_cancel_flags() -> &'static Mutex<JobCancelFlagMap> {
+    static FLAGS: OnceLock<Mutex<JobCancelFlagMap>> = OnceLock::new();
     FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Terminal / in-flight MediaInfo results keyed by job id (relative labels only; no absolute paths).
-fn media_job_results() -> &'static Mutex<HashMap<String, MediaInfoJobView>> {
-    static RESULTS: OnceLock<Mutex<HashMap<String, MediaInfoJobView>>> = OnceLock::new();
+fn media_job_results() -> &'static Mutex<MediaInfoResultMap> {
+    static RESULTS: OnceLock<Mutex<MediaInfoResultMap>> = OnceLock::new();
     RESULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -222,14 +233,14 @@ fn template_seeds() -> &'static Mutex<TemplateSeedRegistry> {
 }
 
 /// Cooperative cancel flags for in-flight TemplateSelection provider work (job_id → flag).
-fn template_cancel_flags() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    static FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+fn template_cancel_flags() -> &'static Mutex<JobCancelFlagMap> {
+    static FLAGS: OnceLock<Mutex<JobCancelFlagMap>> = OnceLock::new();
     FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Terminal / in-flight TemplateSelection views keyed by job id (seed only when Succeeded).
-fn template_job_results() -> &'static Mutex<HashMap<String, TemplateSelectionJobView>> {
-    static RESULTS: OnceLock<Mutex<HashMap<String, TemplateSelectionJobView>>> = OnceLock::new();
+fn template_job_results() -> &'static Mutex<TemplateSelectionResultMap> {
+    static RESULTS: OnceLock<Mutex<TemplateSelectionResultMap>> = OnceLock::new();
     RESULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -245,14 +256,14 @@ fn template_selection_may_return_seed(state: AiJobState) -> bool {
 }
 
 /// Cooperative cancel flags for in-flight Recognition provider work (job_id → flag).
-fn recognition_cancel_flags() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
-    static FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
+fn recognition_cancel_flags() -> &'static Mutex<JobCancelFlagMap> {
+    static FLAGS: OnceLock<Mutex<JobCancelFlagMap>> = OnceLock::new();
     FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// Terminal / in-flight Recognition views keyed by job id (result only when Succeeded).
-fn recognition_job_results() -> &'static Mutex<HashMap<String, RecognitionJobView>> {
-    static RESULTS: OnceLock<Mutex<HashMap<String, RecognitionJobView>>> = OnceLock::new();
+fn recognition_job_results() -> &'static Mutex<RecognitionResultMap> {
+    static RESULTS: OnceLock<Mutex<RecognitionResultMap>> = OnceLock::new();
     RESULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -619,9 +630,14 @@ pub fn ai_clear_secret(reference: CredentialRef) -> Result<(), String> {
 
 #[tauri::command]
 pub fn ai_discover_media(
+    app: AppHandle,
     torrent_path: String,
     manual_paths: Vec<String>,
 ) -> Result<Vec<MediaCandidate>, String> {
+    let connection = ai_get_settings(app);
+    if !connection.enabled {
+        return Err("AI is disabled; media discovery is unavailable".to_string());
+    }
     // Discovery returns relative labels + sizes only (no absolute paths).
     discover_media_files(&torrent_path, &manual_paths)
 }
@@ -878,9 +894,7 @@ pub fn ai_start_media_info(
     // Do not branch on the stale `manager_state` snapshot taken before the unlocked
     // resource/sidecar window. Always park work, then drain against live manager state
     // after the pending lock is released (Running spawns, Queued waits, terminal discards).
-    if let Err(error) = park_pending_media_info_and_drain(work) {
-        return Err(error);
-    }
+    park_pending_media_info_and_drain(work)?;
 
     media_job_results()
         .lock()
@@ -1024,7 +1038,11 @@ fn spawn_media_info_worker(work: PendingMediaInfoWork) {
                 let progress = if all == 0 {
                     100
                 } else {
-                    ((completed.saturating_mul(100)) / all).min(100) as u8
+                    completed
+                        .saturating_mul(100)
+                        .checked_div(all)
+                        .unwrap_or(0)
+                        .min(100) as u8
                 };
                 let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
                 let _ = manager.update_progress(&bg_job_id, progress);
@@ -1244,6 +1262,7 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
     Ok(view)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish_media_info_job(
     job_id: &str,
     plan_token: &str,
@@ -1284,21 +1303,24 @@ fn finish_media_info_job(
     // Bind plan-owned redacted media evidence only on Succeeded terminal jobs.
     // Cancel / timeout / nonzero / malformed / oversized / Failed never mutate the plan.
     // Identity mismatch or drift also leave plan media evidence unchanged.
-    if media_info_may_bind_plan_evidence(job.state) {
-        let _ = try_bind_media_evidence_to_plan(
+    let bound_snapshot_hash = if media_info_may_bind_plan_evidence(job.state) {
+        try_bind_media_evidence_to_plan(
             plan_token,
             job_id,
             &job.snapshot_hash,
             job.request_generation,
             &results,
-        );
-    }
+        )
+        .unwrap_or_else(|_| job.snapshot_hash.clone())
+    } else {
+        job.snapshot_hash.clone()
+    };
 
     let view = store_media_info_view(
         job_id,
         plan_token,
         job.request_generation,
-        &job.snapshot_hash,
+        &bound_snapshot_hash,
         job.state,
         job.error_code.clone(),
         results,
@@ -1319,7 +1341,7 @@ fn try_bind_media_evidence_to_plan(
     snapshot_hash: &str,
     request_generation: u64,
     results: &[MediaProbeResult],
-) -> Result<(), String> {
+) -> Result<String, String> {
     let plan_token = plan_token.trim();
     if plan_token.is_empty() {
         return Err("prepared plan token is required".to_string());
@@ -1334,8 +1356,7 @@ fn try_bind_media_evidence_to_plan(
     let mut guard = get_or_create_registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
-    guard.bind_media_evidence(plan_token, evidence)?;
-    Ok(())
+    guard.bind_media_evidence(plan_token, evidence)
 }
 
 fn store_media_info_view(
@@ -1372,8 +1393,8 @@ fn store_media_info_view(
 /// Active (non-terminal) job entries are never deleted. Only surplus terminal
 /// result rows and cancel flags for jobs that are no longer active are pruned.
 fn retain_media_global_state(
-    flags: Option<&mut HashMap<String, Arc<AtomicBool>>>,
-    results: Option<&mut HashMap<String, MediaInfoJobView>>,
+    flags: Option<&mut JobCancelFlagMap>,
+    results: Option<&mut MediaInfoResultMap>,
 ) {
     let active_ids: std::collections::HashSet<String> = {
         let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -2143,6 +2164,7 @@ fn finish_template_selection_failure(
 
 /// Mint a seed only when the job is still non-terminal; complete as Succeeded only then.
 /// Late cancel between mint and complete drops the seed (fail closed).
+#[allow(clippy::too_many_arguments)]
 fn finish_template_selection_success(
     job_id: &str,
     request_generation: u64,
@@ -2274,8 +2296,8 @@ fn finish_template_selection_cancelled(
 }
 
 fn retain_template_global_state(
-    flags: Option<&mut HashMap<String, Arc<AtomicBool>>>,
-    results: Option<&mut HashMap<String, TemplateSelectionJobView>>,
+    flags: Option<&mut JobCancelFlagMap>,
+    results: Option<&mut TemplateSelectionResultMap>,
 ) {
     let active_ids: std::collections::HashSet<String> = {
         let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -2309,6 +2331,7 @@ fn retain_template_global_state(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_template_selection_worker(
     app: AppHandle,
     connection: PublicConnectionConfig,
@@ -2963,8 +2986,8 @@ fn finish_recognition_cancelled(
 }
 
 fn retain_recognition_global_state(
-    flags: Option<&mut HashMap<String, Arc<AtomicBool>>>,
-    results: Option<&mut HashMap<String, RecognitionJobView>>,
+    flags: Option<&mut JobCancelFlagMap>,
+    results: Option<&mut RecognitionResultMap>,
 ) {
     let active_ids: std::collections::HashSet<String> = {
         let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -2998,6 +3021,7 @@ fn retain_recognition_global_state(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_recognition_worker(
     connection: PublicConnectionConfig,
     secret: Option<SecretValue>,
@@ -3409,6 +3433,7 @@ pub fn ai_connection_is_configured_for_app(app: &AppHandle) -> bool {
 /// via [`media_findings_from_plan_evidence`] — never client probe values.
 /// Plan-owned soft Vision warnings contribute `VISION_WARNING` findings — never from
 /// a frontend round trip. Warning merge does not introduce a second provider request.
+#[allow(clippy::too_many_arguments)]
 fn local_audit_result(
     plan_token: String,
     snapshot_hash: String,
@@ -3621,6 +3646,7 @@ fn plan_identity(token: &str) -> Result<(String, u64, Vec<String>), String> {
 /// Resolve plan identity + local/sync formal-audit short-circuits (disabled AI, incomplete
 /// config, missing credential, or local blockers). Returns `Ok(Some(result))` when the audit
 /// finished without a provider job; `Ok(None)` means a configured formal job should start.
+#[allow(clippy::type_complexity)]
 fn resolve_local_formal_audit(
     app: &AppHandle,
     plan_token: &str,
@@ -4334,8 +4360,12 @@ pub async fn ai_compute_audit(
     .await
 }
 
-/// Local decision helper retained for unit-style callers; not a public IPC surface for publish.
-#[allow(dead_code)]
+/// Local decision helper retained for unit-style / compatibility callers.
+/// Not a public IPC surface for publish (decision authority stays on prepared plans).
+///
+/// Narrow allow: kept for in-crate compatibility with audit unit tests and future
+/// local-only callers; intentionally unregistered so webview cannot forge decisions.
+#[allow(dead_code)] // compatibility API: not referenced by production IPC path
 pub fn ai_compute_audit_local(input: AuditInput) -> Result<ValidatedAudit, String> {
     let policy = RedactionPolicy::default();
     let sanitized = sanitize_audit_input(input, &policy);
@@ -4343,7 +4373,11 @@ pub fn ai_compute_audit_local(input: AuditInput) -> Result<ValidatedAudit, Strin
 }
 
 /// Crate-private job lifecycle: only backend workers may start jobs.
-#[allow(dead_code)]
+///
+/// Narrow allow on the lib target: heavily used by `#[cfg(test)]` suites under
+/// `--all-targets`, but not by the production webview IPC surface (webview may
+/// only start formal tasks through dedicated command entry points).
+#[allow(dead_code)] // test + worker helper; not an IPC export
 pub(crate) fn start_job_backend(
     kind: JobKind,
     request_generation: u64,
@@ -4380,7 +4414,10 @@ pub(crate) fn complete_job_backend(
 ///
 /// Stale transitions free capacity via `promote_next`; drain deferred MediaInfo work
 /// after releasing the manager lock so promoted jobs are not left without a worker.
-#[allow(dead_code)]
+///
+/// Narrow allow on the lib target: exercised by unit tests and exit cleanup paths
+/// that mark unfinished jobs stale; webview cannot call this directly.
+#[allow(dead_code)] // test + exit-cleanup helper; not an IPC export
 pub(crate) fn mark_job_stale_backend(id: &str, reason: impl Into<String>) -> Result<AiJob, String> {
     let job = jobs()
         .lock()
@@ -5449,7 +5486,12 @@ pub fn ai_connection_identity(
     )
 }
 
-#[allow(dead_code)]
+/// Compile-time / type-privacy canary: ensures `SecretValue` stays private to this
+/// module and Debug formatting never becomes a public IPC export path.
+///
+/// Narrow allow: intentionally unreferenced at runtime; retained so refactors that
+/// accidentally make `SecretValue` public or loggable fail review of this sentinel.
+#[allow(dead_code)] // type-privacy sentinel; not a runtime path
 fn _secret_type_is_private(secret: SecretValue) -> String {
     format!("{secret:?}")
 }
@@ -7350,19 +7392,21 @@ mod plan_vision_command_tests {
         markdown: &str,
         html: &str,
     ) -> PublishRequest {
-        let mut template = Template::default();
-        template.poster = poster.into();
-        template.description = markdown.into();
-        template.description_html = html.into();
-        template.title = "Title".into();
-        template.profile = "profile".into();
-        template.sites = SiteSelection {
-            dmhy: false,
-            nyaa: true,
-            acgrip: false,
-            bangumi: false,
-            acgnx_asia: false,
-            acgnx_global: false,
+        let template = Template {
+            poster: poster.into(),
+            description: markdown.into(),
+            description_html: html.into(),
+            title: "Title".into(),
+            profile: "profile".into(),
+            sites: SiteSelection {
+                dmhy: false,
+                nyaa: true,
+                acgrip: false,
+                bangumi: false,
+                acgnx_asia: false,
+                acgnx_global: false,
+            },
+            ..Template::default()
         };
         PublishRequest {
             publish_id: "vision-test".into(),

@@ -7,17 +7,13 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum AuthMode {
+    #[default]
     Bearer,
     AnthropicApiKey,
     CustomHeader,
     None,
-}
-
-impl Default for AuthMode {
-    fn default() -> Self {
-        Self::Bearer
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -171,6 +167,7 @@ impl SecretStore for SessionSecretStore {
 /// Non-secret public view of where credentials may live. Never includes secret material.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[allow(dead_code)]
 pub enum CredentialStorageBackend {
     /// Platform keyring / Secret Service when available.
     OsKeyring,
@@ -180,6 +177,7 @@ pub enum CredentialStorageBackend {
 
 /// Non-secret store status for diagnostics / settings UI. No secret ids or values.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[allow(dead_code)]
 pub struct CredentialStorePublicStatus {
     pub backend: CredentialStorageBackend,
     /// True when Linux keyring operational failures use the session-only path.
@@ -211,6 +209,7 @@ pub struct OsCredentialStore {
     session_fallback: SessionSecretStore,
     /// Linux dual-store: ids suppressed after non-durable OS delete so get cannot
     /// resurrect a stale OS secret. Cleared only by durable OS write/delete success.
+    #[allow(dead_code)]
     linux_tombstones: Arc<Mutex<HashSet<String>>>,
 }
 
@@ -224,6 +223,7 @@ impl OsCredentialStore {
     }
 
     /// Non-secret backend description only (never lists keys or values).
+    #[allow(dead_code)]
     pub fn public_status(&self) -> CredentialStorePublicStatus {
         #[cfg(target_os = "linux")]
         {
@@ -234,10 +234,10 @@ impl OsCredentialStore {
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            return CredentialStorePublicStatus {
+            CredentialStorePublicStatus {
                 backend: CredentialStorageBackend::OsKeyring,
                 linux_session_fallback_enabled: false,
-            };
+            }
         }
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
         {
@@ -270,6 +270,7 @@ impl OsCredentialStore {
             .map_err(|error| format!("credential store entry failed: {error}"))
     }
 
+    #[allow(dead_code)]
     fn clear_local_overlay(&self, reference: &CredentialRef) {
         let _ = self.session_fallback.delete(reference);
         if let Ok(mut tombstones) = self.linux_tombstones.lock() {
@@ -277,6 +278,7 @@ impl OsCredentialStore {
         }
     }
 
+    #[allow(dead_code)]
     fn mark_session_authoritative(
         &self,
         reference: &CredentialRef,
@@ -288,6 +290,7 @@ impl OsCredentialStore {
         self.session_fallback.set(reference, value)
     }
 
+    #[allow(dead_code)]
     fn mark_tombstone(&self, reference: &CredentialRef) {
         let _ = self.session_fallback.delete(reference);
         if let Ok(mut tombstones) = self.linux_tombstones.lock() {
@@ -295,6 +298,7 @@ impl OsCredentialStore {
         }
     }
 
+    #[allow(dead_code)]
     fn local_overlay_for(&self, reference: &CredentialRef) -> LinuxLocalOverlay {
         let tombstoned = self
             .linux_tombstones
@@ -402,10 +406,9 @@ impl SecretStore for OsCredentialStore {
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            return self
-                .entry(reference)?
+            self.entry(reference)?
                 .set_password(value.expose())
-                .map_err(|error| format!("credential store write failed: {error}"));
+                .map_err(|error| format!("credential store write failed: {error}"))
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -422,11 +425,11 @@ impl SecretStore for OsCredentialStore {
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            return match self.entry(reference)?.get_password() {
+            match self.entry(reference)?.get_password() {
                 Ok(value) => Ok(Some(SecretValue::new(value))),
                 Err(error) if is_missing_credential_error(&error.to_string()) => Ok(None),
                 Err(error) => Err(format!("credential store read failed: {error}")),
-            };
+            }
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -445,11 +448,11 @@ impl SecretStore for OsCredentialStore {
         {
             // Missing-entry delete is idempotent success (matches Linux/session), so
             // ConfigCommitted cleanup retries and rollback of already-gone candidates succeed.
-            return match self.entry(reference)?.delete_credential() {
+            match self.entry(reference)?.delete_credential() {
                 Ok(()) => Ok(()),
                 Err(error) if is_missing_credential_error(&error.to_string()) => Ok(()),
                 Err(error) => Err(format!("credential store delete failed: {error}")),
-            };
+            }
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -466,11 +469,13 @@ fn is_missing_credential_error(error: &str) -> bool {
 
 /// Pure classifier: missing-entry vs operational keyring failure (Linux fallback decisions).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum KeyringErrorClass {
     MissingEntry,
     OperationalFailure,
 }
 
+#[allow(dead_code)]
 pub fn classify_keyring_error(error: &str) -> KeyringErrorClass {
     if is_missing_credential_error(error) {
         KeyringErrorClass::MissingEntry
@@ -480,6 +485,7 @@ pub fn classify_keyring_error(error: &str) -> KeyringErrorClass {
 }
 
 /// Linux get/set/delete: operational failures use session fallback; missing is not an error.
+#[allow(dead_code)]
 pub fn linux_keyring_should_use_session_fallback(error: &str) -> bool {
     matches!(
         classify_keyring_error(error),
@@ -489,6 +495,7 @@ pub fn linux_keyring_should_use_session_fallback(error: &str) -> bool {
 
 /// Local dual-store overlay for a credential id (Linux reconciliation policy).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxLocalOverlay {
     /// No local state; OS keyring is consulted.
     None,
@@ -500,6 +507,7 @@ pub enum LinuxLocalOverlay {
 
 /// Observed OS keyring get outcome (no secret material).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxOsGetObservation {
     Present,
     Missing,
@@ -508,6 +516,7 @@ pub enum LinuxOsGetObservation {
 
 /// Observed OS keyring write outcome (no secret material).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxOsWriteObservation {
     Success,
     OperationalFailure,
@@ -515,6 +524,7 @@ pub enum LinuxOsWriteObservation {
 
 /// Observed OS keyring delete outcome (no secret material).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxOsDeleteObservation {
     /// Deleted successfully or already missing (idempotent durable success).
     DeletedOrMissing,
@@ -523,6 +533,7 @@ pub enum LinuxOsDeleteObservation {
 
 /// Get decision after reconciling local overlay with OS observation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxGetDecision {
     /// Return the session overlay secret (caller must have one).
     UseSession,
@@ -536,6 +547,7 @@ pub enum LinuxGetDecision {
 
 /// Set decision after an OS write attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxSetDecision {
     /// OS write durable; clear session value and tombstone for this id.
     DurableClearLocal,
@@ -545,6 +557,7 @@ pub enum LinuxSetDecision {
 
 /// Delete decision after an OS delete attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum LinuxDeleteDecision {
     /// Durable delete (or missing); clear all local state and report success.
     DurableClearLocal,
@@ -553,6 +566,7 @@ pub enum LinuxDeleteDecision {
 }
 
 /// Session fallback is authoritative when present; tombstones suppress OS resurrection.
+#[allow(dead_code)]
 pub fn linux_reconcile_get(
     overlay: LinuxLocalOverlay,
     os: LinuxOsGetObservation,
@@ -569,6 +583,7 @@ pub fn linux_reconcile_get(
     }
 }
 
+#[allow(dead_code)]
 pub fn linux_reconcile_set(os: LinuxOsWriteObservation) -> LinuxSetDecision {
     match os {
         LinuxOsWriteObservation::Success => LinuxSetDecision::DurableClearLocal,
@@ -576,6 +591,7 @@ pub fn linux_reconcile_set(os: LinuxOsWriteObservation) -> LinuxSetDecision {
     }
 }
 
+#[allow(dead_code)]
 pub fn linux_reconcile_delete(os: LinuxOsDeleteObservation) -> LinuxDeleteDecision {
     match os {
         LinuxOsDeleteObservation::DeletedOrMissing => LinuxDeleteDecision::DurableClearLocal,
@@ -584,6 +600,7 @@ pub fn linux_reconcile_delete(os: LinuxOsDeleteObservation) -> LinuxDeleteDecisi
 }
 
 /// Next local overlay after applying a set decision.
+#[allow(dead_code)]
 pub fn linux_overlay_after_set(decision: LinuxSetDecision) -> LinuxLocalOverlay {
     match decision {
         LinuxSetDecision::DurableClearLocal => LinuxLocalOverlay::None,
@@ -592,6 +609,7 @@ pub fn linux_overlay_after_set(decision: LinuxSetDecision) -> LinuxLocalOverlay 
 }
 
 /// Next local overlay after applying a delete decision.
+#[allow(dead_code)]
 pub fn linux_overlay_after_delete(decision: LinuxDeleteDecision) -> LinuxLocalOverlay {
     match decision {
         LinuxDeleteDecision::DurableClearLocal => LinuxLocalOverlay::None,
@@ -962,6 +980,7 @@ impl CredentialRotationJournal {
         }
     }
 
+    #[allow(dead_code)]
     pub fn is_expired(&self, now_unix: u64) -> bool {
         now_unix > self.expires_at_unix
     }
@@ -1119,10 +1138,7 @@ pub fn apply_credential_journal_recovery(
                 // Never delete the live active secret if it still equals old (should not
                 // happen when config_points_to_journal_next, but guard anyway).
                 if active_ref != Some(old_id.as_str()) {
-                    if let Err(error) = store.delete(&CredentialRef { id: old_id.clone() }) {
-                        // Keep journal so the next startup can retry old cleanup.
-                        return Err(error);
-                    }
+                    store.delete(&CredentialRef { id: old_id.clone() })?
                 }
             }
             clear_credential_journal(path)?;
@@ -1796,9 +1812,9 @@ mod tests {
 
     #[test]
     fn public_session_only_flag_is_non_secret_and_defaults_false() {
+        let store = OsCredentialStore::new("com.okpgui.test.session-flag");
         let mut connection = PublicConnectionConfig::default();
         assert!(!connection.credential_session_only);
-        let store = OsCredentialStore::new("com.okpgui.test.session-flag");
         apply_public_credential_session_flag(&mut connection, &store);
         assert!(!connection.credential_session_only);
 
@@ -1809,8 +1825,12 @@ mod tests {
         store
             .seed_session_only_for_tests(&reference, SecretValue::new("must-not-leak"))
             .unwrap();
-        connection.credential_ref = Some(reference);
-        connection.auth_mode = AuthMode::Bearer;
+        // Rebuild with the session-backed ref rather than field-reassign-from-default.
+        connection = PublicConnectionConfig {
+            credential_ref: Some(reference),
+            auth_mode: AuthMode::Bearer,
+            ..PublicConnectionConfig::default()
+        };
         apply_public_credential_session_flag(&mut connection, &store);
         assert!(connection.credential_session_only);
         let encoded = to_string(&connection).unwrap();

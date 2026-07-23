@@ -299,7 +299,7 @@ fn manual_relative_label(path: &Path, used_names: &mut HashSet<String>) -> Strin
     let sanitized: String = raw
         .chars()
         .map(|character| {
-            if character == '/' || character == '\\' || character == ':' || character.is_control() {
+            if matches!(character, '/' | '\\' | ':') || character.is_control() {
                 '_'
             } else {
                 character
@@ -470,8 +470,7 @@ fn push_canonical_dir(path: &Path, roots: &mut Vec<PathBuf>) {
 pub fn clamp_media_probe_timeout_ms(timeout_ms: Option<u64>) -> u64 {
     timeout_ms
         .unwrap_or(DEFAULT_MEDIA_PROBE_TIMEOUT_MS)
-        .max(100)
-        .min(MAX_MEDIA_PROBE_TIMEOUT_MS)
+        .clamp(100, MAX_MEDIA_PROBE_TIMEOUT_MS)
 }
 
 /// Map torrent-relative video entries to backend-resolved probe requests.
@@ -645,6 +644,7 @@ pub fn discover_media_probe_requests(
 
 /// Map a Rust/Tauri target triple to the staged `externalBin` filename.
 /// Returns `None` for unknown targets (fail closed for packaging maps).
+#[allow(dead_code)]
 pub fn mediainfo_staged_name_for_target(target: &str) -> Option<&'static str> {
     match target {
         "x86_64-pc-windows-msvc" => Some("mediainfo-x86_64-pc-windows-msvc.exe"),
@@ -656,6 +656,7 @@ pub fn mediainfo_staged_name_for_target(target: &str) -> Option<&'static str> {
 }
 
 /// Compile-time host target triple used for staged externalBin filenames.
+#[allow(dead_code)]
 pub fn packaged_mediainfo_host_target_triple() -> Option<&'static str> {
     #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
     {
@@ -791,6 +792,7 @@ pub fn resolve_packaged_mediainfo(resource_dir: &Path) -> Result<PathBuf, String
 ///
 /// Concurrency is capped at [`MEDIA_PROBE_CONCURRENCY`]. Cancellation is checked
 /// between chunks and inside each child waiter so kill reaches the probe process.
+#[allow(dead_code)]
 pub fn probe_media_files(
     requests: Vec<MediaProbeRequest>,
     sidecar: &Path,
@@ -1711,11 +1713,11 @@ mod tests {
             .collect();
         // Parent-root candidate stays filename-only; torrent-dir child keeps the folder prefix.
         assert!(
-            names.iter().any(|n| *n == "parent_video.mkv"),
+            names.contains(&"parent_video.mkv"),
             "missing parent-root candidate in {names:?}"
         );
         assert!(
-            names.iter().any(|n| *n == "release/child_video.mkv"),
+            names.contains(&"release/child_video.mkv"),
             "missing torrent-dir candidate in {names:?}"
         );
 
@@ -1812,7 +1814,9 @@ mod tests {
         assert_eq!(MAX_MEDIA_PROBE_TIMEOUT_MS, 300_000);
         assert_eq!(MAX_MEDIA_RELATIVE_ENTRIES, 256);
         assert_eq!(MEDIA_PROBE_CONCURRENCY, 2);
-        assert!(MAX_MEDIA_PROBE_TIMEOUT_MS >= DEFAULT_MEDIA_PROBE_TIMEOUT_MS);
+        const {
+            assert!(MAX_MEDIA_PROBE_TIMEOUT_MS >= DEFAULT_MEDIA_PROBE_TIMEOUT_MS);
+        }
     }
 
     #[test]

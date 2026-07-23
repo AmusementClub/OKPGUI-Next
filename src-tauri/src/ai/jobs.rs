@@ -212,14 +212,15 @@ impl AiJobManager {
         self.sanitize_loaded_summaries();
         // Do not immediately rewrite an empty envelope over a just-quarantined
         // corrupt file; a later complete/cancel path recreates a valid store.
-        if !matches!(load_outcome, DebugStoreLoadOutcome::IsolatedCorrupt) {
-            if self.persist_debug_store().is_err() {
-                self.debug_records = previous_after_load;
-            }
+        if !matches!(load_outcome, DebugStoreLoadOutcome::IsolatedCorrupt)
+            && self.persist_debug_store().is_err()
+        {
+            self.debug_records = previous_after_load;
         }
     }
 
     /// Whether a durable store path is configured (tests / diagnostics).
+    #[allow(dead_code)]
     pub fn debug_store_configured(&self) -> bool {
         self.debug_store_path.is_some()
     }
@@ -278,15 +279,15 @@ impl AiJobManager {
     }
 
     pub fn cancel(&mut self, id: &str) -> Result<AiJob, String> {
-        let state = self
+        let current = self
             .jobs
             .get(id)
-            .map(|job| job.state)
+            .cloned()
             .ok_or_else(|| "job not found".to_string())?;
-        if state.is_terminal() {
-            return Ok(self.jobs.get(id).cloned().unwrap());
+        if current.state.is_terminal() {
+            return Ok(current);
         }
-        let was_running = state == AiJobState::Running;
+        let was_running = current.state == AiJobState::Running;
         if let Some(job) = self.jobs.get_mut(id) {
             job.state = AiJobState::Cancelled;
             job.error_code = Some("CANCELLED".to_string());
@@ -298,8 +299,11 @@ impl AiJobManager {
         } else {
             self.queue.retain(|queued| queued != id);
         }
-        self.finish_debug(id, AiJobState::Cancelled, "job cancelled".to_string(), None);
-        Ok(self.jobs.get(id).cloned().unwrap())
+        self.finish_debug(id, AiJobState::Cancelled, "job cancelled", None);
+        self.jobs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "job not found".to_string())
     }
 
     pub fn complete(
@@ -335,7 +339,10 @@ impl AiJobManager {
         }
         self.finish_debug(id, state, summary.into(), usage);
         self.promote_next();
-        Ok(self.jobs.get(id).cloned().unwrap())
+        self.jobs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "job not found".to_string())
     }
 
     pub fn mark_stale(&mut self, id: &str, reason: impl Into<String>) -> Result<AiJob, String> {
@@ -358,7 +365,10 @@ impl AiJobManager {
         }
         self.finish_debug(id, AiJobState::Stale, reason.into(), None);
         self.promote_next();
-        Ok(self.jobs.get(id).cloned().unwrap())
+        self.jobs
+            .get(id)
+            .cloned()
+            .ok_or_else(|| "job not found".to_string())
     }
 
     pub fn cancel_unfinished(&mut self) {
@@ -373,6 +383,7 @@ impl AiJobManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn debug_records(&self) -> &[DebugRecord] {
         &self.debug_records
     }
@@ -406,6 +417,7 @@ impl AiJobManager {
     ///
     /// On durable write failure, restores the pre-prune in-memory set so memory
     /// and disk stay consistent and returns `Err` for the caller to observe.
+    #[allow(dead_code)]
     pub fn retain_debug_records(
         &mut self,
         now: u64,
@@ -494,9 +506,10 @@ impl AiJobManager {
         &mut self,
         id: &str,
         state: AiJobState,
-        summary: String,
+        summary: impl Into<String>,
         usage: Option<crate::ai::provider::ProviderUsage>,
     ) {
+        let summary = summary.into();
         let Some(job_snapshot) = self.jobs.get(id).cloned() else {
             return;
         };
@@ -654,7 +667,7 @@ fn sanitize_debug_summary(summary: &str) -> String {
 /// `debug-…` ids, or a fixed redaction placeholder). Rejects path, URL, and
 /// credential-like material that would fail the canary scan.
 fn is_safe_debug_identifier(value: &str) -> bool {
-    if value == "[REDACTED_ID]" || value == "[REDACTED_JOB_ID]" {
+    if ["[REDACTED_ID]", "[REDACTED_JOB_ID]"].contains(&value) {
         return true;
     }
     if value.is_empty() || value.len() > 200 {
@@ -1180,7 +1193,7 @@ mod tests {
         let mut manager = AiJobManager::default();
         let id = manager.start(JobKind::Vision, 1, "snap", None);
         manager
-            .complete(&id, true, None, "vision ok".to_string(), None)
+            .complete(&id, true, None, "vision ok", None)
             .unwrap();
         let listed = manager.list_debug_records();
         assert_eq!(listed.len(), 1);
@@ -1703,7 +1716,7 @@ mod tests {
         for (index, summary) in secrets.iter().enumerate() {
             let id = manager.start(JobKind::Vision, index as u64, format!("snap-{index}"), None);
             manager
-                .complete(&id, false, Some("X".into()), (*summary).to_string(), None)
+                .complete(&id, false, Some("X".into()), *summary, None)
                 .unwrap();
         }
 
@@ -1828,9 +1841,11 @@ mod tests {
         let blocker = dir.join("not-a-dir");
         std::fs::write(&blocker, b"file").expect("blocker file");
 
-        let mut manager = AiJobManager::default();
         // Force a store path under a file path → persist will fail.
-        manager.debug_store_path = Some(blocker.join(DEBUG_STORE_FILE_NAME));
+        let mut manager = AiJobManager {
+            debug_store_path: Some(blocker.join(DEBUG_STORE_FILE_NAME)),
+            ..AiJobManager::default()
+        };
 
         let id = manager.start(JobKind::Audit, 1, "sha256:nonfatal", None);
         let result = manager.complete(&id, true, None, "ok despite store fail", None);

@@ -10,20 +10,11 @@ pub mod credentials;
 pub mod jobs;
 pub mod media;
 pub mod provider;
+/// Offline provider/mock contract surface (fixtures + localhost mock helpers).
+/// Test-only: never linked into production; never calls live/paid providers.
+#[cfg(test)]
+mod provider_contract;
 pub mod recognition;
 pub mod redaction;
 pub mod template_seed;
 pub mod vision;
-
-pub use audit::{compute_decision, Acknowledgements, AuditDecision, Finding, FindingSeverity};
-pub use context::{ContextError, ContextProjection, ContextProjectionInput};
-pub use credentials::{AuthMode, CredentialRef, SecretStore};
-pub use jobs::{AiJob, AiJobManager, AiJobState, JobKind};
-pub use provider::{CapabilityIdentity, CapabilityState, ProviderKind, ProviderMode};
-pub use recognition::{
-    parse_recognition, RecognitionCandidate, RecognitionOutput, RecognitionResult,
-};
-pub use template_seed::{
-    build_eligible_catalog, parse_template_selection, EligibleTemplateCatalogEntry, TemplateSeed,
-    TemplateSeedRegistry,
-};

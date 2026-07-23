@@ -83,6 +83,7 @@ pub async fn set_plan_acknowledgements(
 
 /// Compatibility path for the existing AI-disabled publisher.
 /// New preflight flows must use `publish_prepared_plan` instead.
+#[allow(dead_code)]
 pub async fn publish_legacy(app: tauri::AppHandle, request: PublishRequest) -> Result<(), String> {
     let app_handle = app.clone();
     let request_payload = request.clone();
@@ -133,9 +134,7 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
         guard.inspect_plan(&token).cloned()
     };
     if let Some(plan) = early_plan {
-        if let Err(error) = publish_evidence_gate(&plan) {
-            return Err(error);
-        }
+        publish_evidence_gate(&plan)?;
         if plan.has_blockers() || !plan.can_publish_now() {
             return Err(publish_gate_error(&plan));
         }
@@ -166,9 +165,7 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
             .inspect_plan(&token)
             .cloned()
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
-        if let Err(error) = publish_evidence_gate(&plan) {
-            return Err(error);
-        }
+        publish_evidence_gate(&plan)?;
         if plan.has_blockers() || !plan.can_publish_now() {
             return Err(publish_gate_error(&plan));
         }

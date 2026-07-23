@@ -799,36 +799,33 @@ pub fn classify_probe_response(
     let parsed = serde_json::from_str::<Value>(body).ok();
     let failure = if !(200..300).contains(&status) {
         Some(classify_http_failure(status, body))
-    } else if parsed.as_ref().is_some_and(|value| {
-        has_provider_error(value) || has_refusal(provider, resolved_mode, value)
-    }) {
-        Some(ProviderFailure {
-            kind: if parsed
-                .as_ref()
-                .is_some_and(|value| has_refusal(provider, resolved_mode, value))
-            {
-                ProviderFailureKind::Refusal
-            } else {
-                ProviderFailureKind::Schema
-            },
-            status: Some(status),
-            message: "provider did not return a valid strict-schema result".to_string(),
-        })
-    } else if parsed.is_none() {
+    } else if let Some(value) = parsed.as_ref() {
+        if has_provider_error(value) || has_refusal(provider, resolved_mode, value) {
+            Some(ProviderFailure {
+                kind: if has_refusal(provider, resolved_mode, value) {
+                    ProviderFailureKind::Refusal
+                } else {
+                    ProviderFailureKind::Schema
+                },
+                status: Some(status),
+                message: "provider did not return a valid strict-schema result".to_string(),
+            })
+        } else if !has_structured_success(provider, resolved_mode, value) {
+            Some(ProviderFailure {
+                kind: ProviderFailureKind::Schema,
+                status: Some(status),
+                message: "provider returned JSON mode or an incompatible shape, not strict schema"
+                    .to_string(),
+            })
+        } else {
+            None
+        }
+    } else {
         Some(ProviderFailure {
             kind: ProviderFailureKind::Malformed,
             status: Some(status),
             message: "provider returned malformed JSON".to_string(),
         })
-    } else if !has_structured_success(provider, resolved_mode, parsed.as_ref().unwrap()) {
-        Some(ProviderFailure {
-            kind: ProviderFailureKind::Schema,
-            status: Some(status),
-            message: "provider returned JSON mode or an incompatible shape, not strict schema"
-                .to_string(),
-        })
-    } else {
-        None
     };
 
     match failure {

@@ -157,7 +157,7 @@ pub(crate) fn browser_path_candidates(path_env: Option<&OsStr>) -> Vec<PathBuf> 
 pub(crate) fn collect_browser_executable_candidates(
     path_env: Option<&OsStr>,
     _home_dir: Option<&Path>,
-    local_app_data: Option<&Path>,
+    _local_app_data: Option<&Path>,
 ) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
@@ -350,7 +350,7 @@ impl BrowserProcess {
                     return Ok(ws_url);
                 }
                 Ok(None) => {
-                    if attempt <= 3 || attempt % 10 == 0 {
+                    if attempt <= 3 || attempt.is_multiple_of(10) {
                         println!(
                             "[cookies] Waiting for DevToolsActivePort attempt #{} in {}",
                             attempt,
@@ -360,7 +360,7 @@ impl BrowserProcess {
                     last_error = Some("尚未生成 DevToolsActivePort 文件".to_string());
                 }
                 Err(err) => {
-                    if attempt <= 3 || attempt % 10 == 0 {
+                    if attempt <= 3 || attempt.is_multiple_of(10) {
                         println!(
                             "[cookies] Waiting for DevToolsActivePort attempt #{} failed: {}",
                             attempt, err
@@ -463,7 +463,7 @@ impl CdpClient {
         });
 
         self.socket
-            .send(WsMessage::Text(request.to_string().into()))
+            .send(WsMessage::Text(request.to_string()))
             .map_err(|e| format!("发送 CDP 命令 {} 失败: {}", method, e))?;
 
         loop {
@@ -611,7 +611,7 @@ impl CookieCaptureSession {
             match self.snapshot_cookies() {
                 Ok(cookies) => {
                     consecutive_poll_failures = 0;
-                    if poll_count <= 3 || poll_count % 10 == 0 {
+                    if poll_count <= 3 || poll_count.is_multiple_of(10) {
                         println!(
                             "[cookies] Poll #{}: found {} relevant cookies for {}",
                             poll_count,

@@ -11,6 +11,7 @@ use crate::publish::{
 /// Legacy / non-prepared publish path: resolve OKP from the live app config.
 /// Prepared-plan callers must use [`run_publish_with_resolved_okp`] with the
 /// already-revalidated bound executable so config drift cannot switch binaries.
+#[allow(dead_code)]
 pub fn run_publish(app: &AppHandle, request: &PublishRequest) -> Result<String, String> {
     let okp_core = find_okp_executable(app)?;
     run_publish_with_resolved_okp(app, request, okp_core)

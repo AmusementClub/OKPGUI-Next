@@ -66,6 +66,7 @@ impl Default for TemplateSeedRegistry {
 }
 
 impl TemplateSeedRegistry {
+    #[allow(dead_code)]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             seeds: HashMap::new(),
@@ -123,9 +124,7 @@ impl TemplateSeedRegistry {
         catalog: &[EligibleTemplateCatalogEntry],
     ) -> Option<TemplateSeed> {
         self.remove_expired();
-        let Some(stored) = self.seeds.get(token).cloned() else {
-            return None;
-        };
+        let stored = self.seeds.get(token).cloned()?;
         if validate_seed_against_current_state(&stored, catalog).is_err() {
             self.seeds.remove(token);
             return None;
@@ -134,6 +133,7 @@ impl TemplateSeedRegistry {
     }
 
     /// Legacy inspect (TTL only). Prefer `inspect_validated`.
+    #[allow(dead_code)]
     pub fn inspect(&mut self, token: &str) -> Option<&TemplateSeed> {
         self.remove_expired();
         self.seeds.get(token).map(|seed| &seed.public)

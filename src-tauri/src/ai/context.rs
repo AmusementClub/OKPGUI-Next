@@ -282,8 +282,8 @@ fn deduplicate_values(values: Vec<Value>, policy: &RedactionPolicy) -> Vec<Value
     for value in values {
         let redacted = policy.redact_value(&value);
         let key = serde_json::to_string(&redacted).unwrap_or_default();
-        if !seen.contains_key(&key) {
-            seen.insert(key, result.len());
+        if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
+            e.insert(result.len());
             result.push(redacted);
         }
     }
@@ -307,13 +307,15 @@ fn is_safe_relative_path(path: &str) -> bool {
         return false;
     }
     for component in path.split(['/', '\\']) {
-        if component.is_empty() || component == "." || component == ".." {
+        if component.is_empty() || matches!(component, "." | "..") {
             return false;
         }
     }
     path.chars().count() <= 1024
 }
 
+/// Build a JSON object from explicit allowlisted entries (compatibility helper).
+#[allow(dead_code)] // compatibility helper for allowlisted context builders
 pub fn safe_object(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
     let mut object = Map::new();
     for (key, value) in entries {
@@ -486,12 +488,14 @@ mod tests {
     }
 
     fn sample_request(torrent_path: PathBuf, secret_in_template: Option<&str>) -> PublishRequest {
-        let mut template = Template::default();
-        template.title = "Demo Title".into();
-        template.description = secret_in_template
-            .map(|secret| format!("description with {secret}"))
-            .unwrap_or_else(|| "description".into());
-        template.ep_pattern = r"(?P<ep>\d+)".into();
+        let template = Template {
+            title: "Demo Title".into(),
+            description: secret_in_template
+                .map(|secret| format!("description with {secret}"))
+                .unwrap_or_else(|| "description".into()),
+            ep_pattern: r"(?P<ep>\d+)".into(),
+            ..Template::default()
+        };
         PublishRequest {
             publish_id: "publish".into(),
             torrent_path: torrent_path.display().to_string(),
