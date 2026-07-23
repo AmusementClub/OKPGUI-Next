@@ -60,8 +60,11 @@ impl std::fmt::Display for VisionError {
             Self::TooManyImages(count) => {
                 write!(formatter, "VISION_IMAGE_LIMIT: {count} images requested")
             }
-            Self::UnsafeUrl(url) => write!(formatter, "unsafe image URL: {url}"),
-            Self::Fetch(error) => write!(formatter, "image fetch failed: {error}"),
+            // These errors can be returned as plan-bound warnings before the general
+            // redaction layer runs. Never echo a userinfo-bearing URL or transport
+            // error text that may contain the request URL.
+            Self::UnsafeUrl(_) => formatter.write_str("unsafe image URL"),
+            Self::Fetch(_) => formatter.write_str("image fetch failed"),
             Self::InvalidImage(error) => write!(formatter, "invalid image: {error}"),
             Self::TooLarge(error) => write!(formatter, "image too large: {error}"),
             Self::Cancelled => formatter.write_str("image fetch cancelled"),
@@ -367,14 +370,20 @@ pub fn normalize_image(
             "MIME and magic bytes do not identify an image".to_string(),
         ));
     }
-    let decoded = image::load_from_memory(bytes)
+    // Read dimensions before decoding pixels so a valid-header image bomb cannot
+    // allocate its full raster before the 40MP policy is enforced.
+    let (width, height) = image::ImageReader::new(Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| VisionError::InvalidImage(error.to_string()))?
+        .into_dimensions()
         .map_err(|error| VisionError::InvalidImage(error.to_string()))?;
-    let (width, height) = (decoded.width(), decoded.height());
     if u64::from(width).saturating_mul(u64::from(height)) > MAX_PIXELS {
         return Err(VisionError::TooLarge(
             "decoded pixel count exceeds limit".to_string(),
         ));
     }
+    let decoded = image::load_from_memory(bytes)
+        .map_err(|error| VisionError::InvalidImage(error.to_string()))?;
     let mut output = Vec::new();
     decoded
         .write_to(&mut Cursor::new(&mut output), image::ImageFormat::Jpeg)
@@ -710,7 +719,9 @@ mod tests {
     #[test]
     fn rejects_local_and_credentialed_urls() {
         assert!(validate_public_image_url("http://127.0.0.1/image.png").is_err());
-        assert!(validate_public_image_url("http://user:pass@example.test/image.png").is_err());
+        let credentialed = validate_public_image_url("http://user:pass@example.test/image.png")
+            .expect_err("credentialed image URL must be rejected");
+        assert!(!credentialed.to_string().contains("user:pass"));
         assert!(validate_public_image_url("http://localhost/image.png").is_err());
     }
 
@@ -724,6 +735,22 @@ mod tests {
         let (normalized, width, height) = normalize_image("image/png", &bytes).unwrap();
         assert!(!normalized.is_empty());
         assert_eq!((width, height), (2, 3));
+    }
+
+    #[test]
+    fn rejects_oversized_dimensions_before_pixel_decode() {
+        // Use a real encoded image so the dimension reader sees a valid header
+        // and the test does not depend on decoder behavior for corrupt CRCs.
+        let image = image::DynamicImage::new_luma8(10_001, 4_000);
+        let mut header = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut header), image::ImageFormat::Png)
+            .expect("encode oversized PNG fixture");
+
+        assert!(matches!(
+            normalize_image("image/png", &header),
+            Err(VisionError::TooLarge(_))
+        ));
     }
 
     #[test]
