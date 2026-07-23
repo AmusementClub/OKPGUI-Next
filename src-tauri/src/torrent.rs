@@ -144,7 +144,10 @@ fn skip_bencode_value(input: &[u8], cursor: &mut usize, depth: usize) -> Option<
     match input.get(*cursor).copied() {
         Some(b'i') => {
             *cursor += 1;
-            let encoded_length = input.get(*cursor..)?.iter().position(|byte| *byte == b'e')?;
+            let encoded_length = input
+                .get(*cursor..)?
+                .iter()
+                .position(|byte| *byte == b'e')?;
             *cursor += encoded_length + 1;
         }
         Some(b'l') => {
@@ -183,8 +186,9 @@ fn read_torrent_compat(path: &str) -> Result<(Torrent, Option<String>), String> 
         Ok(torrent) => Ok((torrent, None)),
         Err(strict_error) => {
             let original_error = format!("解析种子文件失败: {}", strict_error);
-            let bytes = std::fs::read(path)
-                .map_err(|read_error| format!("{}；读取文件失败: {}", original_error, read_error))?;
+            let bytes = std::fs::read(path).map_err(|read_error| {
+                format!("{}；读取文件失败: {}", original_error, read_error)
+            })?;
 
             let Some(normalized) = sort_top_level_bencode_dictionary(&bytes) else {
                 return Err(original_error);
@@ -291,9 +295,8 @@ pub struct SafeTorrentProjection {
 pub fn project_safe_torrent_context(path: &str) -> Result<SafeTorrentProjection, String> {
     validate_torrent_path_for_context(path)?;
     let (torrent, _compat_notice) = read_torrent_compat_path_free(path)?;
-    let info = torrent_to_info(torrent, None).map_err(|_| {
-        "无法解析种子文件内容，请重新执行发布前检查。".to_string()
-    })?;
+    let info = torrent_to_info(torrent, None)
+        .map_err(|_| "无法解析种子文件内容，请重新执行发布前检查。".to_string())?;
     safe_projection_from_torrent_info(&info)
 }
 
@@ -332,9 +335,8 @@ fn read_torrent_compat_path_free(path: &str) -> Result<(Torrent, Option<String>)
             let Some(normalized) = sort_top_level_bencode_dictionary(&bytes) else {
                 return Err("无法解析种子文件内容，请重新执行发布前检查。".to_string());
             };
-            let torrent = Torrent::read_from_bytes(normalized).map_err(|_| {
-                "无法解析种子文件内容，请重新执行发布前检查。".to_string()
-            })?;
+            let torrent = Torrent::read_from_bytes(normalized)
+                .map_err(|_| "无法解析种子文件内容，请重新执行发布前检查。".to_string())?;
             Ok((
                 torrent,
                 Some(
@@ -531,8 +533,7 @@ mod tests {
 
     #[test]
     fn normalized_torrent_is_accepted_by_lava_torrent() {
-        let mut malformed =
-            b"d4:infod6:lengthi1e4:name1:x12:piece lengthi1e6:pieces20:".to_vec();
+        let mut malformed = b"d4:infod6:lengthi1e4:name1:x12:piece lengthi1e6:pieces20:".to_vec();
         malformed.extend_from_slice(&[0xff; 20]);
         malformed.extend_from_slice(b"e4:hash1:xe");
 
@@ -646,10 +647,8 @@ mod tests {
         let mut bytes = b"d4:infod5:filesld6:lengthi1e4:pathl2:..4:evileee4:name4:root12:piece lengthi1e6:pieces20:".to_vec();
         bytes.extend_from_slice(&[0xff; 20]);
         bytes.extend_from_slice(b"ee");
-        let path = std::env::temp_dir().join(format!(
-            "okpgui-unsafe-rel-{}-.torrent",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("okpgui-unsafe-rel-{}-.torrent", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
         let result = project_safe_torrent_context(&path.to_string_lossy());
         let _ = std::fs::remove_file(&path);
@@ -658,6 +657,9 @@ mod tests {
             err.contains("不安全") || err.contains("无法解析"),
             "unexpected: {err}"
         );
-        assert!(!err.contains(".."), "should not echo raw path in public error");
+        assert!(
+            !err.contains(".."),
+            "should not echo raw path in public error"
+        );
     }
 }

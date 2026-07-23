@@ -830,8 +830,7 @@ mod tests {
     #[test]
     fn formal_audit_prompt_uses_delimited_projection_not_client_fields() {
         let projection = sample_projection();
-        let prompt =
-            build_formal_audit_prompt("sha256:snap", &projection).expect("prompt builds");
+        let prompt = build_formal_audit_prompt("sha256:snap", &projection).expect("prompt builds");
 
         assert!(
             prompt.contains(UNTRUSTED_CONTEXT_BEGIN) && prompt.contains(UNTRUSTED_CONTEXT_END),
@@ -1005,9 +1004,9 @@ mod tests {
             "IMAGE_FETCH_FAILED: invalid image: decode failed (markdown)".into(),
         ]);
         assert_eq!(findings.len(), 2);
-        assert!(findings.iter().all(|f| {
-            f.code == "VISION_WARNING" && f.severity == FindingSeverity::Warning
-        }));
+        assert!(findings
+            .iter()
+            .all(|f| { f.code == "VISION_WARNING" && f.severity == FindingSeverity::Warning }));
         assert!(KNOWN_CODES.contains(&"VISION_WARNING"));
 
         // Soft Vision warnings alone yield WARNING (never GO) and need warning ack.

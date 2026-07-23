@@ -451,9 +451,8 @@ pub fn prepare_images_soft(
             continue;
         }
         match fetch_image(&input.url, timeout).and_then(|(content_type, bytes)| {
-            normalize_image(&content_type, &bytes).map(|(normalized, width, height)| {
-                (normalized, width, height)
-            })
+            normalize_image(&content_type, &bytes)
+                .map(|(normalized, width, height)| (normalized, width, height))
         }) {
             Ok((normalized, width, height)) => {
                 let next_total = total_bytes.saturating_add(normalized.len());
@@ -479,10 +478,9 @@ pub fn prepare_images_soft(
                 });
             }
             Err(error) => {
-                result.warnings.push(format!(
-                    "IMAGE_FETCH_FAILED: {error} ({})",
-                    input.source
-                ));
+                result
+                    .warnings
+                    .push(format!("IMAGE_FETCH_FAILED: {error} ({})", input.source));
             }
         }
     }
@@ -687,11 +685,13 @@ mod tests {
     #[test]
     fn html_img_src_survives_quoted_greater_than_in_alt() {
         // A `>` inside a quoted attribute must not truncate the tag before real `src`.
-        let html = r#"<img alt="a > b and also c > d" class="x" src="https://example.test/after-gt.png">"#;
+        let html =
+            r#"<img alt="a > b and also c > d" class="x" src="https://example.test/after-gt.png">"#;
         let urls = extract_html_img_srcs(html);
         assert_eq!(urls, vec!["https://example.test/after-gt.png".to_string()]);
 
-        let html_mixed = r#"<img title='ratio 16>9' alt="score 10 > 9" src='https://example.test/mixed.png'>"#;
+        let html_mixed =
+            r#"<img title='ratio 16>9' alt="score 10 > 9" src='https://example.test/mixed.png'>"#;
         assert_eq!(
             extract_html_img_srcs(html_mixed),
             vec!["https://example.test/mixed.png".to_string()]

@@ -174,7 +174,10 @@ pub fn redacted_plan_media_summaries(
         .collect()
 }
 
-pub fn discover_media_files(torrent_path: &str, manual_paths: &[String]) -> Result<Vec<MediaCandidate>, String> {
+pub fn discover_media_files(
+    torrent_path: &str,
+    manual_paths: &[String],
+) -> Result<Vec<MediaCandidate>, String> {
     let torrent = Path::new(torrent_path);
     let torrent_parent = torrent
         .parent()
@@ -204,12 +207,22 @@ pub fn discover_media_files(torrent_path: &str, manual_paths: &[String]) -> Resu
         }
     }
     for root in roots {
-        collect_video_files(&root, 0, &display_root, &mut paths, &mut seen, &mut used_names);
+        collect_video_files(
+            &root,
+            0,
+            &display_root,
+            &mut paths,
+            &mut seen,
+            &mut used_names,
+        );
     }
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(paths
         .into_iter()
-        .map(|(relative_name, size, _)| MediaCandidate { relative_name, size })
+        .map(|(relative_name, size, _)| MediaCandidate {
+            relative_name,
+            size,
+        })
         .collect())
 }
 
@@ -224,7 +237,9 @@ fn collect_video_files(
     if depth > MAX_DISCOVERY_DEPTH || output.len() >= MAX_DISCOVERY_FILES {
         return;
     }
-    let Ok(entries) = std::fs::read_dir(root) else { return };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
     for entry in entries.flatten() {
         if output.len() >= MAX_DISCOVERY_FILES {
             return;
@@ -245,13 +260,17 @@ fn add_candidate(
     seen: &mut HashSet<PathBuf>,
     used_names: &mut HashSet<String>,
 ) {
-    let Ok(canonical) = path.canonicalize() else { return };
+    let Ok(canonical) = path.canonicalize() else {
+        return;
+    };
     if !seen.insert(canonical.clone()) {
         return;
     }
     // Keep the canonical PathBuf for internal probing; only a safe relative label is exposed.
     let relative_name = relative_label_for_candidate(&canonical, display_root, used_names);
-    let size = std::fs::metadata(&canonical).map(|metadata| metadata.len()).unwrap_or_default();
+    let size = std::fs::metadata(&canonical)
+        .map(|metadata| metadata.len())
+        .unwrap_or_default();
     output.push((relative_name, size, canonical));
 }
 
@@ -316,7 +335,9 @@ fn manual_relative_label(path: &Path, used_names: &mut HashSet<String>) -> Strin
 fn is_video_file(path: &Path) -> bool {
     path.extension()
         .and_then(|extension| extension.to_str())
-        .is_some_and(|extension| VIDEO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str()))
+        .is_some_and(|extension| {
+            VIDEO_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
 }
 
 /// Build the allowlisted content roots for MediaInfo path resolution.
@@ -357,7 +378,10 @@ pub fn allowed_media_content_roots(
             push_canonical_dir(grandparent, &mut roots);
         }
     }
-    if let Some(manual) = content_root.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(manual) = content_root
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         let manual_path = PathBuf::from(manual);
         if !manual_path.is_dir() {
             return Err("content root is not a directory".to_string());
@@ -365,7 +389,8 @@ pub fn allowed_media_content_roots(
         let canonical_manual = manual_path
             .canonicalize()
             .unwrap_or_else(|_| manual_path.clone());
-        if is_filesystem_or_drive_root(&manual_path) || is_filesystem_or_drive_root(&canonical_manual)
+        if is_filesystem_or_drive_root(&manual_path)
+            || is_filesystem_or_drive_root(&canonical_manual)
         {
             return Err("content root must not be a filesystem or drive root".to_string());
         }
@@ -499,7 +524,9 @@ pub fn resolve_media_relative_entries(
                     relative_name: label,
                     state: MediaProbeState::MissingFile,
                     summary: None,
-                    message: Some("Media file was not found under allowed content roots".to_string()),
+                    message: Some(
+                        "Media file was not found under allowed content roots".to_string(),
+                    ),
                 });
             }
             [only] => {
@@ -597,7 +624,14 @@ pub fn discover_media_probe_requests(
     let mut seen = HashSet::new();
     let mut used_names = HashSet::new();
     for root in &roots {
-        collect_video_files(root, 0, &display_root, &mut paths, &mut seen, &mut used_names);
+        collect_video_files(
+            root,
+            0,
+            &display_root,
+            &mut paths,
+            &mut seen,
+            &mut used_names,
+        );
     }
     paths.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(paths
@@ -671,19 +705,11 @@ fn packaged_mediainfo_file_names() -> &'static [&'static str] {
     }
     #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
     {
-        &[
-            "mediainfo-x86_64-apple-darwin",
-            "mediainfo",
-            "MediaInfo",
-        ]
+        &["mediainfo-x86_64-apple-darwin", "mediainfo", "MediaInfo"]
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
-        &[
-            "mediainfo-aarch64-apple-darwin",
-            "mediainfo",
-            "MediaInfo",
-        ]
+        &["mediainfo-aarch64-apple-darwin", "mediainfo", "MediaInfo"]
     }
     #[cfg(all(target_os = "windows", not(target_arch = "x86_64")))]
     {
@@ -801,7 +827,9 @@ pub fn probe_media_files_with_progress(
         thread::scope(|scope| {
             let handles = chunk
                 .iter()
-                .map(|request| scope.spawn(move || probe_one(request, sidecar, cancellation, timeout)))
+                .map(|request| {
+                    scope.spawn(move || probe_one(request, sidecar, cancellation, timeout))
+                })
                 .collect::<Vec<_>>();
             for handle in handles {
                 if let Ok(result) = handle.join() {
@@ -894,12 +922,9 @@ fn probe_one(
             None,
             Some("MediaInfo probe timed out".to_string()),
         ),
-        WaitOutcome::WaitError(error) => result(
-            request,
-            MediaProbeState::StartFailed,
-            None,
-            Some(error),
-        ),
+        WaitOutcome::WaitError(error) => {
+            result(request, MediaProbeState::StartFailed, None, Some(error))
+        }
         WaitOutcome::Exited(status) => {
             if stdout.truncated || stderr.truncated {
                 return result(
@@ -1108,7 +1133,10 @@ fn is_absolute_path_start(chars: &[char], index: usize) -> bool {
 
 fn is_path_boundary(character: char) -> bool {
     character.is_whitespace()
-        || matches!(character, '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|')
+        || matches!(
+            character,
+            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|'
+        )
 }
 
 fn consume_path(chars: &[char], start: usize) -> usize {
@@ -1116,7 +1144,10 @@ fn consume_path(chars: &[char], start: usize) -> usize {
     while index < chars.len() {
         let character = chars[index];
         if character.is_whitespace()
-            || matches!(character, '"' | '\'' | '`' | ')' | ']' | '}' | '>' | '<' | ',' | ';' | '|')
+            || matches!(
+                character,
+                '"' | '\'' | '`' | ')' | ']' | '}' | '>' | '<' | ',' | ';' | '|'
+            )
         {
             break;
         }
@@ -1127,8 +1158,12 @@ fn consume_path(chars: &[char], start: usize) -> usize {
 
 fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
     let tracks = value.get("media")?.get("track")?.as_array()?;
-    let general = tracks.iter().find(|track| track.get("@type").and_then(Value::as_str) == Some("General"));
-    let video = tracks.iter().find(|track| track.get("@type").and_then(Value::as_str) == Some("Video"));
+    let general = tracks
+        .iter()
+        .find(|track| track.get("@type").and_then(Value::as_str) == Some("General"));
+    let video = tracks
+        .iter()
+        .find(|track| track.get("@type").and_then(Value::as_str) == Some("Video"));
     let duration_ms = general
         .and_then(|track| track.get("Duration"))
         .and_then(parse_duration_ms);
@@ -1148,8 +1183,12 @@ fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
         .collect();
     Some(MediaInfoSummary {
         duration_ms,
-        width: video.and_then(|track| track.get("Width")).and_then(parse_u32),
-        height: video.and_then(|track| track.get("Height")).and_then(parse_u32),
+        width: video
+            .and_then(|track| track.get("Width"))
+            .and_then(parse_u32),
+        height: video
+            .and_then(|track| track.get("Height"))
+            .and_then(parse_u32),
         video_codec: video
             .and_then(|track| track.get("CodecID").or_else(|| track.get("Format")))
             .and_then(Value::as_str)
@@ -1211,7 +1250,9 @@ mod tests {
         // MediaInfo Duration is seconds; 1234.5s → 1_234_500 ms.
         assert_eq!(normalized.duration_ms, Some(1_234_500));
         assert_eq!(normalized.width, Some(1920));
-        assert!(!serde_json::to_string(&normalized).unwrap().contains("/private"));
+        assert!(!serde_json::to_string(&normalized)
+            .unwrap()
+            .contains("/private"));
     }
 
     #[test]
@@ -1306,10 +1347,8 @@ mod tests {
 
     #[test]
     fn discover_media_files_manual_paths_respect_max_discovery_files() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_manual_cap_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_manual_cap_{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!(
             "okpgui_media_manual_cap_outside_{}",
             std::process::id()
@@ -1332,11 +1371,9 @@ mod tests {
             manual_paths.push(path.to_string_lossy().into_owned());
         }
 
-        let candidates = discover_media_files(
-            torrent_path.to_string_lossy().as_ref(),
-            &manual_paths,
-        )
-        .expect("discover");
+        let candidates =
+            discover_media_files(torrent_path.to_string_lossy().as_ref(), &manual_paths)
+                .expect("discover");
 
         assert!(
             candidates.len() <= MAX_DISCOVERY_FILES,
@@ -1358,7 +1395,11 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(names, sorted, "candidates must remain sorted");
         names.dedup();
-        assert_eq!(names.len(), candidates.len(), "candidates must remain unique");
+        assert_eq!(
+            names.len(),
+            candidates.len(),
+            "candidates must remain unique"
+        );
         for candidate in &candidates {
             assert!(is_safe_relative_name(&candidate.relative_name));
             assert!(
@@ -1391,10 +1432,8 @@ mod tests {
 
     #[test]
     fn packaged_mediainfo_resolution_only_accepts_resource_candidates() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_mediainfo_resource_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_mediainfo_resource_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("sidecars")).unwrap();
 
@@ -1410,7 +1449,10 @@ mod tests {
         let resolved = resolve_packaged_mediainfo(&root).expect("packaged sidecar");
         // macOS's default case-insensitive filesystem may resolve the lower-case
         // candidate spelling to the same file as the fixture's `MediaInfo` name.
-        assert_eq!(resolved.canonicalize().unwrap(), sidecar.canonicalize().unwrap());
+        assert_eq!(
+            resolved.canonicalize().unwrap(),
+            sidecar.canonicalize().unwrap()
+        );
 
         // Arbitrary paths outside the fixed candidate set must not resolve.
         let outsider = root.join("evil-bin");
@@ -1442,7 +1484,10 @@ mod tests {
             mediainfo_staged_name_for_target("aarch64-apple-darwin"),
             Some("mediainfo-aarch64-apple-darwin")
         );
-        assert_eq!(mediainfo_staged_name_for_target("wasm32-unknown-unknown"), None);
+        assert_eq!(
+            mediainfo_staged_name_for_target("wasm32-unknown-unknown"),
+            None
+        );
         assert_eq!(mediainfo_staged_name_for_target(""), None);
     }
 
@@ -1459,7 +1504,9 @@ mod tests {
         if let Some(triple) = packaged_mediainfo_host_target_triple() {
             let staged = mediainfo_staged_name_for_target(triple).expect("host triple staged name");
             assert!(
-                rendered.iter().any(|p| p.ends_with(&format!("/binaries/{staged}"))),
+                rendered
+                    .iter()
+                    .any(|p| p.ends_with(&format!("/binaries/{staged}"))),
                 "expected binaries/{staged} candidate, got {rendered:?}"
             );
         }
@@ -1467,11 +1514,15 @@ mod tests {
         // Runtime bare name under resource root remains accepted.
         #[cfg(target_os = "windows")]
         {
-            assert!(rendered.iter().any(|p| p.ends_with("/mediainfo.exe") || p.ends_with("/MediaInfo.exe")));
+            assert!(rendered
+                .iter()
+                .any(|p| p.ends_with("/mediainfo.exe") || p.ends_with("/MediaInfo.exe")));
         }
         #[cfg(not(target_os = "windows"))]
         {
-            assert!(rendered.iter().any(|p| p.ends_with("/mediainfo") || p.ends_with("/MediaInfo")));
+            assert!(rendered
+                .iter()
+                .any(|p| p.ends_with("/mediainfo") || p.ends_with("/MediaInfo")));
         }
 
         // Tauri places externalBin beside Resources / in Contents/MacOS.
@@ -1533,10 +1584,8 @@ mod tests {
 
     #[test]
     fn packaged_mediainfo_prefers_staged_triple_name_when_present() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_mediainfo_triple_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_mediainfo_triple_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("binaries")).unwrap();
 
@@ -1620,10 +1669,8 @@ mod tests {
 
     #[test]
     fn discover_media_files_labels_are_safe_and_include_parent_root() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_discover_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_discover_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let torrent_dir = root.join("release");
         std::fs::create_dir_all(&torrent_dir).unwrap();
@@ -1636,11 +1683,8 @@ mod tests {
         let torrent_path = torrent_dir.join("release.torrent");
         std::fs::write(&torrent_path, b"d4:infod4:name7:releaseee").unwrap();
 
-        let candidates = discover_media_files(
-            torrent_path.to_string_lossy().as_ref(),
-            &[],
-        )
-        .expect("discover");
+        let candidates =
+            discover_media_files(torrent_path.to_string_lossy().as_ref(), &[]).expect("discover");
 
         assert!(
             !candidates.is_empty(),
@@ -1680,10 +1724,7 @@ mod tests {
 
     #[test]
     fn discover_media_files_manual_outside_root_uses_manual_namespace() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_manual_{}",
-            std::process::id()
-        ));
+        let root = std::env::temp_dir().join(format!("okpgui_media_manual_{}", std::process::id()));
         let outside = std::env::temp_dir().join(format!(
             "okpgui_media_manual_outside_{}",
             std::process::id()
@@ -1711,7 +1752,9 @@ mod tests {
             .expect("manual candidate");
         assert_eq!(manual.relative_name, "manual/outside.mkv");
         assert!(is_safe_relative_name(&manual.relative_name));
-        assert!(!manual.relative_name.contains(outside.to_string_lossy().as_ref()));
+        assert!(!manual
+            .relative_name
+            .contains(outside.to_string_lossy().as_ref()));
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
@@ -1720,10 +1763,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_media_files_symlink_expanded_paths_strip_via_canonical_display_root() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_symlink_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_symlink_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let real = root.join("real");
         let link = root.join("link");
@@ -1736,11 +1777,8 @@ mod tests {
         let torrent_path = link.join("release").join("release.torrent");
         std::fs::write(&torrent_path, b"d4:infod4:name7:releaseee").unwrap();
 
-        let candidates = discover_media_files(
-            torrent_path.to_string_lossy().as_ref(),
-            &[],
-        )
-        .expect("discover");
+        let candidates =
+            discover_media_files(torrent_path.to_string_lossy().as_ref(), &[]).expect("discover");
 
         for candidate in &candidates {
             assert!(
@@ -1818,10 +1856,8 @@ mod tests {
 
     #[test]
     fn resolve_media_relative_entries_caps_explicit_batch_size() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_batch_cap_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_batch_cap_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let torrent_dir = root.join("release");
         std::fs::create_dir_all(&torrent_dir).unwrap();
@@ -1834,12 +1870,9 @@ mod tests {
                 expected_size: None,
             })
             .collect();
-        let error = resolve_media_relative_entries(
-            torrent_path.to_string_lossy().as_ref(),
-            &entries,
-            None,
-        )
-        .expect_err("over-cap batch must fail");
+        let error =
+            resolve_media_relative_entries(torrent_path.to_string_lossy().as_ref(), &entries, None)
+                .expect_err("over-cap batch must fail");
         assert!(
             error.contains(&MAX_MEDIA_RELATIVE_ENTRIES.to_string()),
             "expected cap in error, got {error}"
@@ -1851,10 +1884,8 @@ mod tests {
 
     #[test]
     fn resolve_media_relative_entries_rejects_absolute_probe_authority() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_resolve_abs_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_resolve_abs_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let torrent_dir = root.join("release");
         std::fs::create_dir_all(&torrent_dir).unwrap();
@@ -1884,10 +1915,8 @@ mod tests {
 
     #[test]
     fn resolve_media_relative_entries_maps_under_torrent_parent() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_resolve_ok_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_resolve_ok_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let torrent_dir = root.join("release");
         std::fs::create_dir_all(&torrent_dir).unwrap();
@@ -1942,10 +1971,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn allowed_media_content_roots_rejects_unix_filesystem_root() {
-        let root = std::env::temp_dir().join(format!(
-            "okpgui_media_root_reject_{}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_root_reject_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         let torrent_dir = root.join("release");
         std::fs::create_dir_all(&torrent_dir).unwrap();
@@ -2041,11 +2068,7 @@ mod tests {
             let mut file = std::fs::File::create(&script).expect("create oversize sidecar script");
             // Emit more than MAX_PIPE_BYTES on stdout; stderr discarded.
             writeln!(file, "#!/bin/sh").unwrap();
-            writeln!(
-                file,
-                "dd if=/dev/zero bs=1024 count=512 2>/dev/null"
-            )
-            .unwrap();
+            writeln!(file, "dd if=/dev/zero bs=1024 count=512 2>/dev/null").unwrap();
         }
         let mut permissions = std::fs::metadata(&script).unwrap().permissions();
         permissions.set_mode(0o755);
@@ -2056,12 +2079,7 @@ mod tests {
             path: PathBuf::from("/private/video.mkv"),
         };
         let cancelled = AtomicBool::new(false);
-        let results = probe_media_files(
-            vec![request],
-            &script,
-            &cancelled,
-            Duration::from_secs(5),
-        );
+        let results = probe_media_files(vec![request], &script, &cancelled, Duration::from_secs(5));
         let _ = std::fs::remove_file(&script);
 
         assert_eq!(results[0].state, MediaProbeState::OversizedOutput);

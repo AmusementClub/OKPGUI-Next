@@ -605,13 +605,11 @@ pub fn apply_public_credential_session_flag(
     connection: &mut PublicConnectionConfig,
     store: &OsCredentialStore,
 ) {
-    connection.credential_session_only = match (
-        connection.auth_mode,
-        connection.credential_ref.as_ref(),
-    ) {
-        (AuthMode::None, _) | (_, None) => false,
-        (_, Some(reference)) => store.credential_is_session_only(reference),
-    };
+    connection.credential_session_only =
+        match (connection.auth_mode, connection.credential_ref.as_ref()) {
+            (AuthMode::None, _) | (_, None) => false,
+            (_, Some(reference)) => store.credential_is_session_only(reference),
+        };
 }
 
 /// Managed auth/transport names plus RFC hop-by-hop headers that must not be
@@ -795,8 +793,10 @@ pub fn plan_credential_secret_write(
     }
 
     let next_ref_id = connection_ref_id.or(old_ref_id.clone());
-    let delete_after_success_id =
-        previous_secret_to_delete_after_successful_switch(old_ref_id.as_deref(), next_ref_id.as_deref());
+    let delete_after_success_id = previous_secret_to_delete_after_successful_switch(
+        old_ref_id.as_deref(),
+        next_ref_id.as_deref(),
+    );
     Ok(CredentialSecretWritePlan {
         next_ref_id,
         rollback_candidate_id: None,
@@ -1045,9 +1045,7 @@ pub fn credential_journal_path(app_data_dir: &Path) -> PathBuf {
 }
 
 /// Load a journal from disk. Missing file → `Ok(None)`. Corrupt JSON → error (fail closed).
-pub fn load_credential_journal(
-    path: &Path,
-) -> Result<Option<CredentialRotationJournal>, String> {
+pub fn load_credential_journal(path: &Path) -> Result<Option<CredentialRotationJournal>, String> {
     if !path.exists() {
         return Ok(None);
     }
@@ -1121,9 +1119,7 @@ pub fn apply_credential_journal_recovery(
                 // Never delete the live active secret if it still equals old (should not
                 // happen when config_points_to_journal_next, but guard anyway).
                 if active_ref != Some(old_id.as_str()) {
-                    if let Err(error) = store.delete(&CredentialRef {
-                        id: old_id.clone(),
-                    }) {
+                    if let Err(error) = store.delete(&CredentialRef { id: old_id.clone() }) {
                         // Keep journal so the next startup can retry old cleanup.
                         return Err(error);
                     }
@@ -1159,8 +1155,7 @@ pub fn reconcile_existing_credential_journal_before_new(
     let Some(existing) = load_credential_journal(path)? else {
         return Ok(None);
     };
-    let action =
-        apply_credential_journal_recovery(store, path, &existing, active_ref, now_unix)?;
+    let action = apply_credential_journal_recovery(store, path, &existing, active_ref, now_unix)?;
     Ok(Some(action))
 }
 
@@ -1278,9 +1273,7 @@ mod tests {
             mode: ProviderMode::Chat,
             auth_mode: AuthMode::Bearer,
             custom_header_name: None,
-            credential_ref: Some(CredentialRef {
-                id: "c1".into(),
-            }),
+            credential_ref: Some(CredentialRef { id: "c1".into() }),
             enabled: true,
             capability: None,
             discovered_models: Vec::new(),
@@ -1667,9 +1660,8 @@ mod tests {
         assert_eq!(tombstoned, LinuxLocalOverlay::Tombstone);
 
         // Successful durable OS write recovers: clear local, OS becomes source of truth.
-        let after_write = linux_overlay_after_set(linux_reconcile_set(
-            LinuxOsWriteObservation::Success,
-        ));
+        let after_write =
+            linux_overlay_after_set(linux_reconcile_set(LinuxOsWriteObservation::Success));
         assert_eq!(after_write, LinuxLocalOverlay::None);
         assert_eq!(
             linux_reconcile_get(after_write, LinuxOsGetObservation::Present),
@@ -2022,7 +2014,10 @@ mod tests {
             journal.created_at_unix,
         )
         .unwrap();
-        assert_eq!(first, CredentialJournalRecoveryAction::FinishCommittedCleanup);
+        assert_eq!(
+            first,
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
 
         // Second pass: no journal left → load None; re-applying decision with no file is no-op.
         assert!(load_credential_journal(&path).unwrap().is_none());
@@ -2057,7 +2052,11 @@ mod tests {
 
         // Expired + config still old → rollback (not leave orphan forever).
         assert_eq!(
-            decide_credential_journal_recovery(&expired, Some("old-ref"), expired.created_at_unix + 1),
+            decide_credential_journal_recovery(
+                &expired,
+                Some("old-ref"),
+                expired.created_at_unix + 1
+            ),
             CredentialJournalRecoveryAction::RollbackCandidate
         );
 
@@ -2093,7 +2092,9 @@ mod tests {
         let loaded = load_credential_journal(&path).unwrap().unwrap();
         assert_eq!(loaded.phase, CredentialJournalPhase::Prepared);
 
-        let second = first.clone().with_phase(CredentialJournalPhase::CandidateStored);
+        let second = first
+            .clone()
+            .with_phase(CredentialJournalPhase::CandidateStored);
         write_credential_journal(&path, &second).unwrap();
         let loaded = load_credential_journal(&path).unwrap().unwrap();
         assert_eq!(loaded.phase, CredentialJournalPhase::CandidateStored);
@@ -2259,7 +2260,9 @@ mod tests {
             .expect_err("unconfirmed rollback must not clear journal");
         assert!(err.contains("rollback unconfirmed"));
         // Journal retained and advanced to a recovery-processable phase.
-        let retained = load_credential_journal(&path).unwrap().expect("journal retained");
+        let retained = load_credential_journal(&path)
+            .unwrap()
+            .expect("journal retained");
         assert_eq!(retained.phase, CredentialJournalPhase::CandidateStored);
         assert_eq!(retained.candidate_ref.as_deref(), Some("candidate-ref"));
         // Non-secret journal body only.
@@ -2341,7 +2344,9 @@ mod tests {
         )
         .expect_err("incomplete recovery must fail closed");
         assert!(err.contains("simulated operational delete failure"));
-        let retained = load_credential_journal(&path).unwrap().expect("journal retained");
+        let retained = load_credential_journal(&path)
+            .unwrap()
+            .expect("journal retained");
         assert_eq!(retained.phase, CredentialJournalPhase::ConfigCommitted);
         let _ = std::fs::remove_dir_all(&dir);
     }

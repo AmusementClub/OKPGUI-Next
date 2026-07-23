@@ -11,17 +11,18 @@ use crate::ai::credentials::{
     apply_credential_journal_recovery, apply_public_credential_session_flag,
     apply_public_identity_matches, capability_identity, capability_identity_matches,
     cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
-    credential_write_plan_needs_journal, load_credential_journal, may_read_credential_store_for_settings,
-    plan_credential_secret_write, reconcile_existing_credential_journal_before_new,
-    rollback_candidate_or_retain_journal, rollback_credential_candidate, validate_custom_header_name,
-    write_credential_journal, AuthMode, CREDENTIAL_JOURNAL_TTL_SECS, CredentialJournalPhase,
-    CredentialJournalSettingsMetadata, CredentialMutationGate, CredentialRef, CredentialRotationJournal,
-    OsCredentialStore, PublicCapabilityStatus, PublicConnectionConfig, SecretStore, SecretValue,
+    credential_write_plan_needs_journal, load_credential_journal,
+    may_read_credential_store_for_settings, plan_credential_secret_write,
+    reconcile_existing_credential_journal_before_new, rollback_candidate_or_retain_journal,
+    rollback_credential_candidate, validate_custom_header_name, write_credential_journal, AuthMode,
+    CredentialJournalPhase, CredentialJournalSettingsMetadata, CredentialMutationGate,
+    CredentialRef, CredentialRotationJournal, OsCredentialStore, PublicCapabilityStatus,
+    PublicConnectionConfig, SecretStore, SecretValue, CREDENTIAL_JOURNAL_TTL_SECS,
 };
 use crate::ai::jobs::{
     formal_audit_may_bind_terminal_evidence, media_info_may_bind_plan_evidence,
     media_info_may_report_success, recognition_may_return_result, AiJob, AiJobManager, AiJobState,
-    DEBUG_EXPORT_RELATIVE_DIR, DEBUG_STORE_RELATIVE_DIR, DebugExportMetadata, DebugRecord, JobKind,
+    DebugExportMetadata, DebugRecord, JobKind, DEBUG_EXPORT_RELATIVE_DIR, DEBUG_STORE_RELATIVE_DIR,
 };
 use crate::ai::media::{
     build_plan_media_evidence, clamp_media_probe_timeout_ms, discover_media_files,
@@ -30,8 +31,8 @@ use crate::ai::media::{
     MediaProbeState, MediaRelativeEntry, MAX_MEDIA_RELATIVE_ENTRIES,
 };
 use crate::ai::provider::{
-    auto_fallback_allowed, build_models_list_request, build_no_redirect_client, build_probe_request,
-    build_structured_request, build_structured_request_with_vision,
+    auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
+    build_probe_request, build_structured_request, build_structured_request_with_vision,
     classify_and_validate_probe_response, classify_http_failure, extract_structured_json,
     formal_attempt_modes, formal_attempt_modes_for_ready_capability, minimal_probe_schema,
     parse_models_list_response, send_managed_provider_request, CapabilityIdentity,
@@ -79,9 +80,7 @@ pub fn init_ai_debug_store(app: &AppHandle) {
         return;
     };
     let store_dir = local_dir.join(DEBUG_STORE_RELATIVE_DIR);
-    let mut manager = jobs()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
     manager.init_debug_store(store_dir);
 }
 
@@ -147,16 +146,18 @@ fn credential_mutation_gate() -> &'static CredentialMutationGate {
 
 /// App-local path for the non-secret credential rotation journal.
 fn ai_credential_journal_path(app: &AppHandle) -> Result<PathBuf, String> {
-    let data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|error| format!("failed to resolve app data dir for credential journal: {error}"))?;
-    std::fs::create_dir_all(&data_dir)
-        .map_err(|error| format!("failed to create app data dir for credential journal: {error}"))?;
+    let data_dir = app.path().app_data_dir().map_err(|error| {
+        format!("failed to resolve app data dir for credential journal: {error}")
+    })?;
+    std::fs::create_dir_all(&data_dir).map_err(|error| {
+        format!("failed to create app data dir for credential journal: {error}")
+    })?;
     Ok(credential_journal_path(&data_dir))
 }
 
-fn journal_settings_metadata(connection: &PublicConnectionConfig) -> CredentialJournalSettingsMetadata {
+fn journal_settings_metadata(
+    connection: &PublicConnectionConfig,
+) -> CredentialJournalSettingsMetadata {
     CredentialJournalSettingsMetadata {
         provider: match connection.provider {
             ProviderKind::OpenAi => "openai".to_string(),
@@ -485,9 +486,7 @@ pub fn ai_save_settings(
             }
             return Err(error);
         }
-        if let (Some(path), Some(current_journal)) =
-            (journal_path.as_ref(), journal.as_mut())
-        {
+        if let (Some(path), Some(current_journal)) = (journal_path.as_ref(), journal.as_mut()) {
             *current_journal = current_journal
                 .clone()
                 .with_phase(CredentialJournalPhase::CandidateStored);
@@ -744,11 +743,8 @@ pub fn ai_start_media_info(
             Vec::new(),
         )
     } else {
-        let batch = resolve_media_relative_entries(
-            torrent_path.as_str(),
-            &request.relative_entries,
-            None,
-        )?;
+        let batch =
+            resolve_media_relative_entries(torrent_path.as_str(), &request.relative_entries, None)?;
         (batch.requests, batch.pre_results)
     };
 
@@ -1235,10 +1231,7 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
                 .clone()
                 .or_else(|| Some("CANCELLED".to_string()));
         } else if job.state == AiJobState::Stale {
-            view.error_code = job
-                .error_code
-                .clone()
-                .or_else(|| Some("STALE".to_string()));
+            view.error_code = job.error_code.clone().or_else(|| Some("STALE".to_string()));
         }
     }
     // Drop absolute paths if any leaked into messages (defense in depth).
@@ -1261,22 +1254,24 @@ fn finish_media_info_job(
     results: Vec<MediaProbeResult>,
 ) -> MediaInfoJobView {
     let summary = summary.into();
-    let job = complete_job_backend(job_id, success, error_code.clone(), summary)
-        .unwrap_or_else(|_| AiJob {
-            id: job_id.to_string(),
-            kind: JobKind::MediaInfo,
-            state: if success {
-                AiJobState::Succeeded
-            } else {
-                AiJobState::Failed
-            },
-            request_generation,
-            snapshot_hash: snapshot_hash.to_string(),
-            provider_identity: None,
-            progress: 100,
-            error_code: error_code.clone(),
-            debug_record_id: None,
-            created_at_unix: now_unix(),
+    let job =
+        complete_job_backend(job_id, success, error_code.clone(), summary).unwrap_or_else(|_| {
+            AiJob {
+                id: job_id.to_string(),
+                kind: JobKind::MediaInfo,
+                state: if success {
+                    AiJobState::Succeeded
+                } else {
+                    AiJobState::Failed
+                },
+                request_generation,
+                snapshot_hash: snapshot_hash.to_string(),
+                provider_identity: None,
+                progress: 100,
+                error_code: error_code.clone(),
+                debug_record_id: None,
+                created_at_unix: now_unix(),
+            }
         });
 
     let mut results = results;
@@ -1393,9 +1388,7 @@ fn retain_media_global_state(
         if store.len() > MEDIA_STATE_MAX_RECORDS {
             let mut terminal: Vec<String> = store
                 .iter()
-                .filter(|(id, view)| {
-                    !active_ids.contains(*id) && view.state.is_terminal()
-                })
+                .filter(|(id, view)| !active_ids.contains(*id) && view.state.is_terminal())
                 .map(|(id, _)| id.clone())
                 .collect();
             // Deterministic prune order for stable retention under pressure.
@@ -1434,7 +1427,8 @@ fn sanitize_media_results_for_non_success(results: Vec<MediaProbeResult>) -> Vec
             if item.state == MediaProbeState::Measured {
                 item.state = MediaProbeState::Cancelled;
                 item.summary = None;
-                item.message = Some("MediaInfo result discarded after cancel or failure".to_string());
+                item.message =
+                    Some("MediaInfo result discarded after cancel or failure".to_string());
             } else if item.summary.is_some() && item.state != MediaProbeState::Measured {
                 item.summary = None;
             }
@@ -2043,10 +2037,7 @@ fn template_selection_terminal_view(job: &AiJob) -> TemplateSelectionJobView {
                 view.message = Some("template selection cancelled".to_string());
             }
         } else if job.state == AiJobState::Stale {
-            view.error_code = job
-                .error_code
-                .clone()
-                .or_else(|| Some("STALE".to_string()));
+            view.error_code = job.error_code.clone().or_else(|| Some("STALE".to_string()));
             if view.message.is_none() {
                 view.message = Some("template selection is stale".to_string());
             }
@@ -2123,24 +2114,19 @@ fn finish_template_selection_failure(
     message: impl Into<String>,
 ) -> TemplateSelectionJobView {
     let message = message.into();
-    let job = complete_job_backend(
-        job_id,
-        false,
-        error_code.clone(),
-        message.clone(),
-    )
-    .unwrap_or_else(|_| AiJob {
-        id: job_id.to_string(),
-        kind: JobKind::TemplateSelection,
-        state: AiJobState::Failed,
-        request_generation,
-        snapshot_hash: snapshot_hash.to_string(),
-        provider_identity: None,
-        progress: 100,
-        error_code: error_code.clone(),
-        debug_record_id: None,
-        created_at_unix: now_unix(),
-    });
+    let job = complete_job_backend(job_id, false, error_code.clone(), message.clone())
+        .unwrap_or_else(|_| AiJob {
+            id: job_id.to_string(),
+            kind: JobKind::TemplateSelection,
+            state: AiJobState::Failed,
+            request_generation,
+            snapshot_hash: snapshot_hash.to_string(),
+            provider_identity: None,
+            progress: 100,
+            error_code: error_code.clone(),
+            debug_record_id: None,
+            created_at_unix: now_unix(),
+        });
     // If cancel/stale won the race, honor that terminal state without a seed.
     store_template_selection_view(TemplateSelectionJobView {
         job_id: job_id.to_string(),
@@ -2198,9 +2184,8 @@ fn finish_template_selection_success(
         }
     };
 
-    let summary = format!(
-        "template selection matched id={selected_id} revision={selected_revision}"
-    );
+    let summary =
+        format!("template selection matched id={selected_id} revision={selected_revision}");
     let job = complete_job_backend(job_id, true, None, summary).unwrap_or_else(|_| AiJob {
         id: job_id.to_string(),
         kind: JobKind::TemplateSelection,
@@ -2259,20 +2244,18 @@ fn finish_template_selection_cancelled(
     // Ensure Cancelled (idempotent if ai_cancel_job already ran).
     let job = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
-        manager
-            .cancel(job_id)
-            .unwrap_or_else(|_| AiJob {
-                id: job_id.to_string(),
-                kind: JobKind::TemplateSelection,
-                state: AiJobState::Cancelled,
-                request_generation,
-                snapshot_hash: snapshot_hash.to_string(),
-                provider_identity: None,
-                progress: 100,
-                error_code: Some("CANCELLED".to_string()),
-                debug_record_id: None,
-                created_at_unix: now_unix(),
-            })
+        manager.cancel(job_id).unwrap_or_else(|_| AiJob {
+            id: job_id.to_string(),
+            kind: JobKind::TemplateSelection,
+            state: AiJobState::Cancelled,
+            request_generation,
+            snapshot_hash: snapshot_hash.to_string(),
+            provider_identity: None,
+            progress: 100,
+            error_code: Some("CANCELLED".to_string()),
+            debug_record_id: None,
+            created_at_unix: now_unix(),
+        })
     };
     store_template_selection_view(TemplateSelectionJobView {
         job_id: job_id.to_string(),
@@ -2771,10 +2754,7 @@ fn recognition_terminal_view(job: &AiJob) -> RecognitionJobView {
                 view.message = Some("recognition cancelled".to_string());
             }
         } else if job.state == AiJobState::Stale {
-            view.error_code = job
-                .error_code
-                .clone()
-                .or_else(|| Some("STALE".to_string()));
+            view.error_code = job.error_code.clone().or_else(|| Some("STALE".to_string()));
             if view.message.is_none() {
                 view.message = Some("recognition is stale".to_string());
             }
@@ -2850,24 +2830,19 @@ fn finish_recognition_failure(
     message: impl Into<String>,
 ) -> RecognitionJobView {
     let message = message.into();
-    let job = complete_job_backend(
-        job_id,
-        false,
-        error_code.clone(),
-        message.clone(),
-    )
-    .unwrap_or_else(|_| AiJob {
-        id: job_id.to_string(),
-        kind: JobKind::Recognition,
-        state: AiJobState::Failed,
-        request_generation,
-        snapshot_hash: snapshot_hash.to_string(),
-        provider_identity: None,
-        progress: 100,
-        error_code: error_code.clone(),
-        debug_record_id: None,
-        created_at_unix: now_unix(),
-    });
+    let job = complete_job_backend(job_id, false, error_code.clone(), message.clone())
+        .unwrap_or_else(|_| AiJob {
+            id: job_id.to_string(),
+            kind: JobKind::Recognition,
+            state: AiJobState::Failed,
+            request_generation,
+            snapshot_hash: snapshot_hash.to_string(),
+            provider_identity: None,
+            progress: 100,
+            error_code: error_code.clone(),
+            debug_record_id: None,
+            created_at_unix: now_unix(),
+        });
     // If cancel/stale won the race, honor that terminal state without a result.
     store_recognition_view(RecognitionJobView {
         job_id: job_id.to_string(),
@@ -3052,7 +3027,12 @@ async fn run_recognition_worker(
 
     update_recognition_job_progress(&job_id, 10, "preparing recognition");
 
-    let prompt = build_recognition_prompt(&torrent_name, &ep_pattern, &resolution_pattern, &title_pattern);
+    let prompt = build_recognition_prompt(
+        &torrent_name,
+        &ep_pattern,
+        &resolution_pattern,
+        &title_pattern,
+    );
     let schema = recognition_schema();
 
     if recognition_is_cancelled(&job_id, &cancel_flag) {
@@ -3332,9 +3312,7 @@ pub struct AiProjectContextRequest {
 /// Absolute paths, raw bencode, trackers, credentials, generic PublishPlan
 /// serialization, and client-supplied names/files never enter the projection.
 #[tauri::command]
-pub fn ai_project_context(
-    request: AiProjectContextRequest,
-) -> Result<ContextProjection, String> {
+pub fn ai_project_context(request: AiProjectContextRequest) -> Result<ContextProjection, String> {
     let plan_token = request.plan_token.trim();
     if plan_token.is_empty() {
         return Err("prepared plan token is required".to_string());
@@ -3348,8 +3326,12 @@ pub fn ai_project_context(
     };
 
     // Credentials never enter ContextProjection; default policy still path-redacts scalars.
-    project_context_from_binding(&binding, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING)
-        .map_err(context_error_to_public)
+    project_context_from_binding(
+        &binding,
+        &RedactionPolicy::default(),
+        DEFAULT_CONTEXT_CEILING,
+    )
+    .map_err(context_error_to_public)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -4616,9 +4598,7 @@ pub fn ai_export_debug_records(app: AppHandle) -> Result<DebugExportMetadata, St
     let export_dir = local_dir
         .join(DEBUG_STORE_RELATIVE_DIR)
         .join(DEBUG_EXPORT_RELATIVE_DIR);
-    let manager = jobs()
-        .lock()
-        .unwrap_or_else(|error| error.into_inner());
+    let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
     manager.export_debug_bundle(export_dir)
 }
 
@@ -4776,31 +4756,32 @@ pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, St
 
     let fetched_at_unix = now_unix();
     match send_result {
-        Ok((status, body)) => match parse_models_list_response(connection.provider, status, &body)
-        {
-            Ok(models) => {
-                let _ = crate::config::save_ai_discovered_models(
-                    &app,
-                    models.clone(),
-                    Some(fetched_at_unix),
-                );
-                Ok(AiModelDiscoveryResult {
-                    models,
-                    fetched_at_unix,
-                    manual_fallback: false,
-                    message: "models refreshed".to_string(),
-                })
+        Ok((status, body)) => {
+            match parse_models_list_response(connection.provider, status, &body) {
+                Ok(models) => {
+                    let _ = crate::config::save_ai_discovered_models(
+                        &app,
+                        models.clone(),
+                        Some(fetched_at_unix),
+                    );
+                    Ok(AiModelDiscoveryResult {
+                        models,
+                        fetched_at_unix,
+                        manual_fallback: false,
+                        message: "models refreshed".to_string(),
+                    })
+                }
+                Err(failure) => {
+                    // Keep any previous cached list; UI keeps manual model entry.
+                    Ok(AiModelDiscoveryResult {
+                        models: connection.discovered_models,
+                        fetched_at_unix,
+                        manual_fallback: true,
+                        message: failure.message,
+                    })
+                }
             }
-            Err(failure) => {
-                // Keep any previous cached list; UI keeps manual model entry.
-                Ok(AiModelDiscoveryResult {
-                    models: connection.discovered_models,
-                    fetched_at_unix,
-                    manual_fallback: true,
-                    message: failure.message,
-                })
-            }
-        },
+        }
         Err(error) => Ok(AiModelDiscoveryResult {
             models: connection.discovered_models,
             fetched_at_unix,
@@ -4872,12 +4853,8 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
                 connection.mode,
                 message.clone(),
             );
-            let _ = complete_job_backend(
-                &job_id,
-                false,
-                Some("PROVIDER_CLIENT".to_string()),
-                message,
-            );
+            let _ =
+                complete_job_backend(&job_id, false, Some("PROVIDER_CLIENT".to_string()), message);
             return Ok(status);
         }
     };
@@ -5119,14 +5096,8 @@ mod debug_record_and_exit_tests {
         let running = start_job_backend(JobKind::Vision, 1, "sha256:exit-run", None);
         let queued = start_job_backend(JobKind::Vision, 1, "sha256:exit-queue", None);
         cancel_unfinished_ai_jobs_on_exit();
-        assert_eq!(
-            ai_get_job(running).unwrap().state,
-            AiJobState::Cancelled
-        );
-        assert_eq!(
-            ai_get_job(queued).unwrap().state,
-            AiJobState::Cancelled
-        );
+        assert_eq!(ai_get_job(running).unwrap().state, AiJobState::Cancelled);
+        assert_eq!(ai_get_job(queued).unwrap().state, AiJobState::Cancelled);
     }
 }
 
@@ -5407,7 +5378,10 @@ mod formal_audit_lifecycle_tests {
             Some("job-context".to_string()),
             &RedactionPolicy::default(),
         );
-        assert!(!result.formal_ran, "context failure must not claim provider ran");
+        assert!(
+            !result.formal_ran,
+            "context failure must not claim provider ran"
+        );
         assert_eq!(result.decision, AuditDecision::Warning);
         assert_eq!(result.findings[0].code, "PAYLOAD_TOO_LARGE");
     }
@@ -5434,7 +5408,10 @@ mod formal_audit_lifecycle_tests {
             Some("client-title-must-not-drive-prompt")
         );
         assert_eq!(request.local_blockers, vec!["client-blocker".to_string()]);
-        assert_eq!(request.snapshot_hash.as_deref(), Some("sha256:client-forged"));
+        assert_eq!(
+            request.snapshot_hash.as_deref(),
+            Some("sha256:client-forged")
+        );
     }
 }
 
@@ -5490,10 +5467,7 @@ mod candidate_id_tests {
     fn candidate_ids_are_unique_and_restart_resistant_by_construction() {
         let first = unique_connection_candidate_id();
         let second = unique_connection_candidate_id();
-        assert_ne!(
-            first, second,
-            "concurrent saves must not share an id"
-        );
+        assert_ne!(first, second, "concurrent saves must not share an id");
         assert!(
             first.starts_with("connection-") && second.starts_with("connection-"),
             "ids must keep the connection- prefix without embedding secrets"
@@ -5502,9 +5476,7 @@ mod candidate_id_tests {
         // Format: connection-{pid}-{nanos}-{seq} — process identity + high-res time + counter.
         let pid = std::process::id().to_string();
         for id in [&first, &second] {
-            let rest = id
-                .strip_prefix("connection-")
-                .expect("connection- prefix");
+            let rest = id.strip_prefix("connection-").expect("connection- prefix");
             let mut parts = rest.splitn(3, '-');
             let id_pid = parts.next().expect("pid component");
             let id_nanos = parts.next().expect("nanos component");
@@ -5695,12 +5667,12 @@ mod capability_gate_tests {
 #[cfg(test)]
 mod recognition_command_tests {
     use super::*;
+    use crate::ai::credentials::PublicCapabilityStatus;
+    use crate::ai::provider::CapabilityState;
     use crate::ai::recognition::{
         bind_recognition_result, recognition_from_provider_outcome, sanitize_recognition_context,
         RECOGNITION_SCHEMA_VERSION,
     };
-    use crate::ai::credentials::PublicCapabilityStatus;
-    use crate::ai::provider::CapabilityState;
     use serde_json::json;
 
     fn configured_connection() -> PublicConnectionConfig {
@@ -5727,7 +5699,10 @@ mod recognition_command_tests {
         let secret = SecretValue::new("sk-recog-test");
         let mut connection = configured_connection();
         let err = require_ready_capability_identity(&connection, Some(&secret)).unwrap_err();
-        assert!(err.contains("capability probe") || err.contains("AI settings"), "{err}");
+        assert!(
+            err.contains("capability probe") || err.contains("AI settings"),
+            "{err}"
+        );
 
         let identity = capability_identity(&connection, Some(&secret));
         connection.capability = Some(PublicCapabilityStatus {
@@ -5788,7 +5763,10 @@ mod recognition_command_tests {
             &policy,
         )
         .expect_err("absolute torrent name must fail");
-        assert!(err.contains("torrent_name") || err.contains("path"), "{err}");
+        assert!(
+            err.contains("torrent_name") || err.contains("path"),
+            "{err}"
+        );
     }
 
     fn sample_recognition_result(job_id: &str) -> RecognitionResult {
@@ -6299,8 +6277,7 @@ mod media_info_job_tests {
         // Force a real Queued MediaInfo job under full concurrency.
         let blocker = start_job_backend(JobKind::Audit, 1, "sha256:bound-blocker", None);
         let blocker2 = start_job_backend(JobKind::Audit, 1, "sha256:bound-blocker2", None);
-        let media_id =
-            start_job_backend(JobKind::MediaInfo, 9, "sha256:bound-media", None);
+        let media_id = start_job_backend(JobKind::MediaInfo, 9, "sha256:bound-media", None);
         assert_eq!(
             ai_get_job(media_id.clone()).map(|job| job.state),
             Some(AiJobState::Queued)
@@ -6383,8 +6360,7 @@ mod media_info_job_tests {
         // Fill concurrency so MediaInfo starts Queued (stale snapshot would say Queued).
         let blocker = start_job_backend(JobKind::Audit, 1, "sha256:toctou-b1", None);
         let blocker2 = start_job_backend(JobKind::Audit, 1, "sha256:toctou-b2", None);
-        let media_id =
-            start_job_backend(JobKind::MediaInfo, 7, "sha256:toctou-live-handoff", None);
+        let media_id = start_job_backend(JobKind::MediaInfo, 7, "sha256:toctou-live-handoff", None);
         assert_eq!(
             ai_get_job(media_id.clone()).map(|job| job.state),
             Some(AiJobState::Queued)
@@ -6532,11 +6508,9 @@ mod media_info_job_tests {
         reset_media_job_globals();
 
         // Running target that will fail to park + second Running filler so media_q is Queued.
-        let media_reject =
-            start_job_backend(JobKind::MediaInfo, 1, "sha256:overflow-reject", None);
+        let media_reject = start_job_backend(JobKind::MediaInfo, 1, "sha256:overflow-reject", None);
         let filler = start_job_backend(JobKind::Audit, 1, "sha256:overflow-filler", None);
-        let media_q =
-            start_job_backend(JobKind::MediaInfo, 2, "sha256:overflow-queued", None);
+        let media_q = start_job_backend(JobKind::MediaInfo, 2, "sha256:overflow-queued", None);
         assert_eq!(
             ai_get_job(media_reject.clone()).map(|job| job.state),
             Some(AiJobState::Running)
@@ -6646,9 +6620,18 @@ mod media_info_job_tests {
             ai_get_job(media_reject.clone()).map(|job| job.state),
             Some(AiJobState::Cancelled)
         );
-        assert!(!media_pending_work().lock().unwrap().contains_key(&media_reject));
-        assert!(!media_job_results().lock().unwrap().contains_key(&media_reject));
-        assert!(!media_cancel_flags().lock().unwrap().contains_key(&media_reject));
+        assert!(!media_pending_work()
+            .lock()
+            .unwrap()
+            .contains_key(&media_reject));
+        assert!(!media_job_results()
+            .lock()
+            .unwrap()
+            .contains_key(&media_reject));
+        assert!(!media_cancel_flags()
+            .lock()
+            .unwrap()
+            .contains_key(&media_reject));
 
         // Cancel of Running media_reject promotes media_q; reject's drain must start it
         // without a manual try_start in the test.
@@ -6730,7 +6713,10 @@ mod media_info_job_tests {
             );
             // Bound overall map: active + at most MEDIA_STATE_MAX_RECORDS is not required
             // when active pushes over, but terminal-only surplus must shrink toward the cap.
-            let terminal_count = store.values().filter(|view| view.state.is_terminal()).count();
+            let terminal_count = store
+                .values()
+                .filter(|view| view.state.is_terminal())
+                .count();
             assert!(
                 terminal_count <= MEDIA_STATE_MAX_RECORDS,
                 "terminal MediaInfo results unbounded: {terminal_count}"
@@ -6806,11 +6792,9 @@ mod media_info_job_tests {
         let candidates = crate::ai::media::packaged_mediainfo_candidates(&fallback);
         let exe_dir = exe_parent.to_string_lossy().replace('\\', "/");
         assert!(
-            candidates.iter().any(|c| {
-                c.to_string_lossy()
-                    .replace('\\', "/")
-                    .starts_with(&exe_dir)
-            }),
+            candidates
+                .iter()
+                .any(|c| { c.to_string_lossy().replace('\\', "/").starts_with(&exe_dir) }),
             "fallback resource base must include current_exe parent candidates"
         );
     }
@@ -7056,7 +7040,10 @@ mod media_info_plan_bind_tests {
             }],
         )
         .expect_err("forged snapshot");
-        assert!(err.contains("identity") || err.contains("snapshot"), "{err}");
+        assert!(
+            err.contains("identity") || err.contains("snapshot"),
+            "{err}"
+        );
 
         // Identity drift: mutate torrent after start, bind must fail closed.
         std::fs::write(&torrent_path, b"d4:infod4:name7:changedee").expect("mutate");
@@ -7217,7 +7204,9 @@ mod template_selection_job_tests {
         let late = complete_job_backend(&job_id, true, None, "late success").unwrap();
         assert_eq!(late.state, AiJobState::Cancelled);
 
-        let terminal = ai_poll_template_selection(job_id).unwrap().expect("terminal");
+        let terminal = ai_poll_template_selection(job_id)
+            .unwrap()
+            .expect("terminal");
         assert_eq!(terminal.state, AiJobState::Cancelled);
         assert!(terminal.seed.is_none(), "cancelled must not hand off seed");
         assert_eq!(
@@ -7243,7 +7232,9 @@ mod template_selection_job_tests {
         assert!(view.seed.is_none());
         assert_eq!(view.error_code.as_deref(), Some("SELECTION_INVALID"));
 
-        let polled = ai_poll_template_selection(job_id).unwrap().expect("terminal");
+        let polled = ai_poll_template_selection(job_id)
+            .unwrap()
+            .expect("terminal");
         assert_eq!(polled.state, AiJobState::Failed);
         assert!(polled.seed.is_none());
         assert!(
@@ -7335,7 +7326,12 @@ mod plan_vision_command_tests {
         path.to_string_lossy().to_string()
     }
 
-    fn sample_request(torrent_path: String, poster: &str, markdown: &str, html: &str) -> PublishRequest {
+    fn sample_request(
+        torrent_path: String,
+        poster: &str,
+        markdown: &str,
+        html: &str,
+    ) -> PublishRequest {
         let mut template = Template::default();
         template.poster = poster.into();
         template.description = markdown.into();

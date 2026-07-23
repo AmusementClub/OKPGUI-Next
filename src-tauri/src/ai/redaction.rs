@@ -294,8 +294,7 @@ fn absolute_path_start(value: &str) -> Option<usize> {
             // host redaction stays intact. Still treat glued forms like "error:/tmp/secret"
             // (single colon, not "://") as an absolute path start.
             if bytes[index - 1] == b':' {
-                let is_scheme_slash =
-                    index + 1 < bytes.len() && bytes[index + 1] == b'/';
+                let is_scheme_slash = index + 1 < bytes.len() && bytes[index + 1] == b'/';
                 if is_scheme_slash {
                     continue;
                 }

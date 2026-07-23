@@ -42,7 +42,10 @@ pub struct ContextProjection {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContextError {
-    PayloadTooLarge { bytes: usize, ceiling: usize },
+    PayloadTooLarge {
+        bytes: usize,
+        ceiling: usize,
+    },
     InvalidRelativePath(String),
     Serialization(String),
     /// Path-free torrent parse / tree safety failure.
@@ -103,15 +106,15 @@ pub fn project_context_from_binding(
     ceiling: usize,
 ) -> Result<ContextProjection, ContextError> {
     let torrent_path = binding.request().torrent_path.as_str();
-    let safe_torrent = project_safe_torrent_context(torrent_path)
-        .map_err(ContextError::Torrent)?;
+    let safe_torrent = project_safe_torrent_context(torrent_path).map_err(ContextError::Torrent)?;
 
     // Revalidate AFTER parse so a same-path replacement cannot return stale/wrong context.
     if let Err(failures) = binding.revalidate() {
         return Err(ContextError::IdentityDrift(failures.join("；")));
     }
 
-    let input = build_projection_input_from_bound_sources(&safe_torrent, &binding.request().template);
+    let input =
+        build_projection_input_from_bound_sources(&safe_torrent, &binding.request().template);
     project_context(input, policy, ceiling)
 }
 
@@ -252,9 +255,7 @@ fn redact_torrent_metadata_value(value: &Value, policy: &RedactionPolicy) -> Val
 
 /// Fixed-point size of the projection once `bytes` embeds its own serialization length.
 /// Ensures PAYLOAD_TOO_LARGE accounts for the final form, not a `bytes: 0` placeholder.
-fn measure_final_projection_bytes(
-    projection: &ContextProjection,
-) -> Result<usize, ContextError> {
+fn measure_final_projection_bytes(projection: &ContextProjection) -> Result<usize, ContextError> {
     let mut working = projection.clone();
     working.bytes = 0;
     let mut bytes = serde_json::to_vec(&working)
@@ -364,7 +365,11 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            project_context(bad_path, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING),
+            project_context(
+                bad_path,
+                &RedactionPolicy::default(),
+                DEFAULT_CONTEXT_CEILING
+            ),
             Err(ContextError::InvalidRelativePath(_))
         ));
 
@@ -499,12 +504,16 @@ mod tests {
     fn project_from_binding_allowlists_relative_metadata_and_hides_absolute_paths() {
         let torrent_path = write_valid_torrent("show.mkv", b"v1-identity-marker");
         let abs = torrent_path.display().to_string();
-        let plan = PublishPlan::from_publish_request(1, sample_request(torrent_path.clone(), None), None)
-            .expect("plan");
+        let plan =
+            PublishPlan::from_publish_request(1, sample_request(torrent_path.clone(), None), None)
+                .expect("plan");
         let binding = plan.get_local_binding().expect("binding");
-        let projection =
-            project_context_from_binding(binding, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING)
-                .expect("project");
+        let projection = project_context_from_binding(
+            binding,
+            &RedactionPolicy::default(),
+            DEFAULT_CONTEXT_CEILING,
+        )
+        .expect("project");
 
         assert_eq!(projection.torrent_name, "show.mkv");
         assert_eq!(projection.files.len(), 1);
@@ -570,9 +579,7 @@ mod tests {
         // Missing
         let missing = registry.resolve_binding_for_context("plan_does_not_exist");
         assert!(missing.is_err());
-        assert!(missing
-            .unwrap_err()
-            .contains("missing or expired"));
+        assert!(missing.unwrap_err().contains("missing or expired"));
 
         // Unbound (lightweight prepare has no LocalExecutionBinding)
         let unbound_token = registry

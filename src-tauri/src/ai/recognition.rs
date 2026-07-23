@@ -293,8 +293,12 @@ pub fn sanitize_recognition_context(
     let torrent_name =
         sanitize_context_field(torrent_name, "torrent_name", MAX_TORRENT_NAME_CHARS, true)?;
     let ep_pattern = sanitize_context_field(ep_pattern, "ep_pattern", MAX_PATTERN_CHARS, false)?;
-    let resolution_pattern =
-        sanitize_context_field(resolution_pattern, "resolution_pattern", MAX_PATTERN_CHARS, false)?;
+    let resolution_pattern = sanitize_context_field(
+        resolution_pattern,
+        "resolution_pattern",
+        MAX_PATTERN_CHARS,
+        false,
+    )?;
     let title_pattern =
         sanitize_context_field(title_pattern, "title_pattern", MAX_PATTERN_CHARS, false)?;
     // Secret-only redaction: generic path heuristics would mangle safe relative
@@ -323,10 +327,14 @@ fn sanitize_context_field(
         return Ok(String::new());
     }
     if trimmed.chars().count() > max_chars {
-        return Err(format!("recognition {field} exceeds {max_chars} characters"));
+        return Err(format!(
+            "recognition {field} exceeds {max_chars} characters"
+        ));
     }
     if trimmed.chars().any(|character| character.is_control()) {
-        return Err(format!("recognition {field} must not contain control characters"));
+        return Err(format!(
+            "recognition {field} must not contain control characters"
+        ));
     }
     // Patterns are regex-like and may include safe relative `/`; still reject the same
     // absolute/UNC/drive/URL/traversal/embedded-drive forms as candidate text.
@@ -436,13 +444,7 @@ mod tests {
 
     #[test]
     fn rejects_publish_decision_and_final_title_fields() {
-        for field in [
-            "decision",
-            "publish",
-            "final_title",
-            "can_publish",
-            "GO",
-        ] {
+        for field in ["decision", "publish", "final_title", "can_publish", "GO"] {
             // GO is case-sensitive key; use lowercase wire names we explicitly block.
             let key = if field == "GO" { "go" } else { field };
             let mut object = serde_json::Map::new();
@@ -544,7 +546,9 @@ mod tests {
     #[test]
     fn sanitize_context_rejects_empty_and_path_like_torrent_name() {
         let policy = RedactionPolicy::default();
-        assert!(sanitize_recognition_context("", r"(?P<ep>\d+)", "1080p", "<ep>", &policy).is_err());
+        assert!(
+            sanitize_recognition_context("", r"(?P<ep>\d+)", "1080p", "<ep>", &policy).is_err()
+        );
         assert!(sanitize_recognition_context(
             "/abs/path.torrent",
             r"(?P<ep>\d+)",

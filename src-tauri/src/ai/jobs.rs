@@ -858,7 +858,8 @@ fn raw_text_fails_canary_scan(text: &str) -> bool {
     // Unredacted path markers should be the only path form remaining.
     // Reject raw POSIX absolute tokens that are not the redaction placeholder.
     for token in text.split_whitespace() {
-        let trimmed = token.trim_matches(|ch: char| matches!(ch, '"' | ',' | '{' | '}' | '[' | ']'));
+        let trimmed =
+            token.trim_matches(|ch: char| matches!(ch, '"' | ',' | '{' | '}' | '[' | ']'));
         if trimmed.starts_with('/')
             && !trimmed.contains("[PATH_REDACTED]")
             && trimmed.len() > 1
@@ -880,9 +881,7 @@ fn raw_text_fails_canary_scan(text: &str) -> bool {
         // scheme://user:pass@host residue (userinfo not fully redacted).
         if let Some(scheme_end) = trimmed.find("://") {
             let authority = &trimmed[scheme_end + 3..];
-            let authority_end = authority
-                .find(['/', '?', '#'])
-                .unwrap_or(authority.len());
+            let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
             let authority = &authority[..authority_end];
             if let Some((userinfo, _)) = authority.rsplit_once('@') {
                 if !userinfo.is_empty() && userinfo != "[REDACTED]" {
@@ -926,8 +925,9 @@ fn raw_text_fails_canary_scan(text: &str) -> bool {
     }
 
     // Long base64-looking blobs (image/bytes) that escaped structural redaction.
-    for token in text.split(|ch: char| ch.is_whitespace() || matches!(ch, '"' | ',' | ':' | '{' | '}' | '[' | ']'))
-    {
+    for token in text.split(|ch: char| {
+        ch.is_whitespace() || matches!(ch, '"' | ',' | ':' | '{' | '}' | '[' | ']')
+    }) {
         if token.len() >= 96
             && token.len() % 4 == 0
             && token
@@ -1120,11 +1120,19 @@ mod tests {
         let job = manager.get(&id).unwrap();
         assert_eq!(job.kind, JobKind::CapabilityProbe);
         assert_eq!(
-            job.provider_identity.as_ref().map(|item| item.digest.as_str()),
+            job.provider_identity
+                .as_ref()
+                .map(|item| item.digest.as_str()),
             Some("sha256:probe")
         );
         manager
-            .complete(&id, true, None, "strict structured output is available", None)
+            .complete(
+                &id,
+                true,
+                None,
+                "strict structured output is available",
+                None,
+            )
             .unwrap();
         assert_eq!(manager.get(&id).unwrap().state, AiJobState::Succeeded);
         assert!(manager
@@ -1259,12 +1267,7 @@ mod tests {
         let isolated = std::fs::read_dir(&dir)
             .expect("read dir")
             .filter_map(|entry| entry.ok())
-            .any(|entry| {
-                entry
-                    .file_name()
-                    .to_string_lossy()
-                    .contains("corrupt-")
-            });
+            .any(|entry| entry.file_name().to_string_lossy().contains("corrupt-"));
         assert!(isolated, "corrupt file must be isolated via rename");
 
         // Subsequent terminal writes recreate a valid store at the active path.
@@ -1273,7 +1276,10 @@ mod tests {
             .complete(&job_id, true, None, "recovered", None)
             .unwrap();
         assert_eq!(manager.debug_records().len(), 1);
-        assert!(store_path.exists(), "later complete must recreate active store");
+        assert!(
+            store_path.exists(),
+            "later complete must recreate active store"
+        );
 
         let mut reader = AiJobManager::default();
         reader.init_debug_store(&dir);
@@ -1542,9 +1548,7 @@ mod tests {
         ));
         // Windows root-relative (JSON wire `\\Users\\...` → decoded `\Users\...`) fails closed.
         assert!(
-            debug_bundle_fails_canary_scan(
-                r#"{"summary":"leak \\Users\\owen\\secret"}"#
-            ),
+            debug_bundle_fails_canary_scan(r#"{"summary":"leak \\Users\\owen\\secret"}"#),
             "decoded Windows root-relative path must fail canary"
         );
         assert!(
@@ -1606,7 +1610,10 @@ mod tests {
 
         // Durable store must not retain the residual path material.
         let store_path = dir.join(DEBUG_STORE_FILE_NAME);
-        assert!(store_path.exists(), "records.json must exist after complete");
+        assert!(
+            store_path.exists(),
+            "records.json must exist after complete"
+        );
         let stored = std::fs::read_to_string(&store_path).expect("read store");
         assert!(
             !stored.contains(r"\Users\owen") && !stored.contains(r"\\Users\\owen"),
@@ -1751,9 +1758,7 @@ mod tests {
         // without tripping the canary on JSON escaping.
         let summary = "provider diag: status \\x1b[0m reset path-safe";
         let id = manager.start(JobKind::Audit, 1, "sha256:backslash", None);
-        manager
-            .complete(&id, true, None, summary, None)
-            .unwrap();
+        manager.complete(&id, true, None, summary, None).unwrap();
 
         let store_path = dir.join(DEBUG_STORE_FILE_NAME);
         assert!(
@@ -1829,7 +1834,10 @@ mod tests {
 
         let id = manager.start(JobKind::Audit, 1, "sha256:nonfatal", None);
         let result = manager.complete(&id, true, None, "ok despite store fail", None);
-        assert!(result.is_ok(), "job complete must succeed even if persist fails");
+        assert!(
+            result.is_ok(),
+            "job complete must succeed even if persist fails"
+        );
         let completed = result.unwrap();
         assert_eq!(completed.state, AiJobState::Succeeded);
         // Fail closed: durable persist failure restores debug memory + linkage.
@@ -1884,7 +1892,9 @@ mod tests {
         );
         // Prior successful linkage is untouched.
         assert_eq!(
-            manager.get(&prior_id).and_then(|job| job.debug_record_id.clone()),
+            manager
+                .get(&prior_id)
+                .and_then(|job| job.debug_record_id.clone()),
             prior_link
         );
 

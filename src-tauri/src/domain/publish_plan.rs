@@ -332,9 +332,7 @@ impl PublishPlan {
     /// revalidating the private local execution binding.
     pub fn bind_media_evidence(&mut self, evidence: PlanMediaEvidence) -> Result<(), String> {
         if evidence.snapshot_hash != self.snapshot_hash {
-            return Err(
-                "media evidence snapshot_hash does not match prepared plan".to_string(),
-            );
+            return Err("media evidence snapshot_hash does not match prepared plan".to_string());
         }
         if evidence.request_generation != self.request_generation {
             return Err(
@@ -393,7 +391,9 @@ impl PublishPlan {
                 || image.width == 0
                 || image.height == 0
             {
-                return Err("vision evidence contains invalid normalized image metadata".to_string());
+                return Err(
+                    "vision evidence contains invalid normalized image metadata".to_string()
+                );
             }
             // When payload is present (live bind path), size and content_hash must match
             // the Rust SHA-256 of those bytes. Empty payload is allowed for hash-only
@@ -405,7 +405,7 @@ impl PublishPlan {
                 let digest = content_hash_of_bytes(&image.payload);
                 if digest != image.content_hash {
                     return Err(
-                        "vision evidence content_hash does not match payload bytes".to_string(),
+                        "vision evidence content_hash does not match payload bytes".to_string()
                     );
                 }
             }
@@ -484,9 +484,11 @@ impl PublishPlan {
     /// Never trusts client-supplied warning strings. Empty / mismatched vision
     /// evidence yields no findings (existing no-image/no-warning path unchanged).
     pub fn vision_audit_findings(&self) -> Vec<Finding> {
-        let Some(evidence) = self.vision_evidence.as_ref().filter(|evidence| {
-            evidence.matches_plan(&self.snapshot_hash, self.request_generation)
-        }) else {
+        let Some(evidence) = self
+            .vision_evidence
+            .as_ref()
+            .filter(|evidence| evidence.matches_plan(&self.snapshot_hash, self.request_generation))
+        else {
             return Vec::new();
         };
         crate::ai::audit::vision_findings_from_plan_warnings(&evidence.warnings)
@@ -507,9 +509,7 @@ impl PublishPlan {
         let state = self
             .media_evidence
             .as_ref()
-            .filter(|evidence| {
-                evidence.matches_plan(&self.snapshot_hash, self.request_generation)
-            })
+            .filter(|evidence| evidence.matches_plan(&self.snapshot_hash, self.request_generation))
             .map(PlanMediaEvidence::audit_state)
             .unwrap_or(MediaEvidenceAuditState::NotTested);
         media_findings_from_plan_evidence(state)
@@ -896,7 +896,10 @@ fn bound_vision_warnings(warnings: Vec<String>) -> Vec<String> {
             if trimmed.is_empty() {
                 return None;
             }
-            let mut bounded: String = trimmed.chars().take(MAX_PLAN_VISION_WARNING_CHARS).collect();
+            let mut bounded: String = trimmed
+                .chars()
+                .take(MAX_PLAN_VISION_WARNING_CHARS)
+                .collect();
             if trimmed.chars().count() > MAX_PLAN_VISION_WARNING_CHARS {
                 bounded.push('…');
             }
@@ -1117,9 +1120,8 @@ impl PlanRegistry {
         let plan = self
             .inspect_plan(token)
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
-        plan.get_local_binding_owned().ok_or_else(|| {
-            "prepared plan has no local execution binding".to_string()
-        })
+        plan.get_local_binding_owned()
+            .ok_or_else(|| "prepared plan has no local execution binding".to_string())
     }
 
     pub fn invalidate_plan(&mut self, token: &str) -> bool {
@@ -1176,9 +1178,7 @@ impl PlanRegistry {
         if evidence.snapshot_hash != plan.snapshot_hash
             || evidence.request_generation != plan.request_generation
         {
-            return Err(
-                "media evidence identity does not match prepared plan".to_string(),
-            );
+            return Err("media evidence identity does not match prepared plan".to_string());
         }
         // Revalidate private binding so same-path replacements fail closed without bind.
         if let Some(binding) = plan.get_local_binding() {
@@ -1353,9 +1353,9 @@ impl PlanRegistry {
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
         let snapshot_hash = plan.snapshot_hash.clone();
         let request_generation = plan.request_generation;
-        let binding = plan.get_local_binding_owned().ok_or_else(|| {
-            "prepared plan has no local execution binding".to_string()
-        })?;
+        let binding = plan
+            .get_local_binding_owned()
+            .ok_or_else(|| "prepared plan has no local execution binding".to_string())?;
         if let Err(failures) = binding.revalidate() {
             return Err(failures.join("；"));
         }
@@ -2136,7 +2136,7 @@ mod tests {
                         height: 360,
                     }],
                     warnings: vec![
-                        "IMAGE_FETCH_FAILED: image fetch failed: timeout (markdown)".into(),
+                        "IMAGE_FETCH_FAILED: image fetch failed: timeout (markdown)".into()
                     ],
                 },
             )
@@ -2358,14 +2358,16 @@ mod tests {
             .expect("record warnings");
 
         let plan = registry.inspect_plan(&token).expect("plan remains live");
-        assert_eq!(plan.snapshot_hash, old_hash, "warning-only must not roll hash");
+        assert_eq!(
+            plan.snapshot_hash, old_hash,
+            "warning-only must not roll hash"
+        );
         assert_eq!(plan.audit_evidence.as_ref(), Some(&audit_before));
         assert!(plan.has_authoritative_vision_evidence());
         let findings = plan.vision_audit_findings();
         assert_eq!(findings.len(), 2);
         assert!(findings.iter().all(|f| {
-            f.code == "VISION_WARNING"
-                && f.severity == crate::ai::audit::FindingSeverity::Warning
+            f.code == "VISION_WARNING" && f.severity == crate::ai::audit::FindingSeverity::Warning
         }));
         // Decision with warnings alone is WARNING and needs acknowledgement.
         let decision = crate::ai::audit::compute_decision(&crate::ai::audit::AuditInput {
@@ -2506,8 +2508,7 @@ mod tests {
                 None,
             )
             .expect("prepare hash-only");
-        let hash_only =
-            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        let hash_only = "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
         registry
             .bind_vision_evidence(
                 &prepared2.token,
@@ -2611,10 +2612,7 @@ mod tests {
                 },
             )
             .expect_err("unknown token");
-        assert!(
-            err.contains("missing") || err.contains("expired"),
-            "{err}"
-        );
+        assert!(err.contains("missing") || err.contains("expired"), "{err}");
 
         // Snapshot mismatch must leave media_evidence unset.
         let err = registry
@@ -2632,7 +2630,10 @@ mod tests {
                 },
             )
             .expect_err("forged snapshot");
-        assert!(err.contains("identity") || err.contains("snapshot"), "{err}");
+        assert!(
+            err.contains("identity") || err.contains("snapshot"),
+            "{err}"
+        );
         assert!(
             registry
                 .inspect_plan(&token)
@@ -2658,12 +2659,10 @@ mod tests {
             err.contains("identity") || err.contains("generation"),
             "{err}"
         );
-        assert!(
-            registry
-                .inspect_plan(&token)
-                .and_then(|plan| plan.media_evidence.as_ref())
-                .is_none()
-        );
+        assert!(registry
+            .inspect_plan(&token)
+            .and_then(|plan| plan.media_evidence.as_ref())
+            .is_none());
         let _ = std::fs::remove_file(&torrent_path);
     }
 

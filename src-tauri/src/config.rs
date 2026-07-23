@@ -667,18 +667,14 @@ fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
         return Ok(AppConfig::default());
     }
 
-    let data = std::fs::read_to_string(path)
-        .map_err(|error| format!("无法读取配置文件: {}", error))?;
+    let data =
+        std::fs::read_to_string(path).map_err(|error| format!("无法读取配置文件: {}", error))?;
     if data.trim().is_empty() {
         return Ok(AppConfig::default());
     }
 
-    let mut config: AppConfig = serde_json::from_str(&data).map_err(|error| {
-        format!(
-            "配置文件解析失败（已拒绝用默认配置覆盖）: {}",
-            error
-        )
-    })?;
+    let mut config: AppConfig = serde_json::from_str(&data)
+        .map_err(|error| format!("配置文件解析失败（已拒绝用默认配置覆盖）: {}", error))?;
     migrate_config(&mut config);
     Ok(config)
 }
@@ -872,9 +868,7 @@ fn apply_upsert_quick_publish_template(
     template_id: String,
     template: QuickPublishTemplate,
 ) {
-    config
-        .quick_publish_templates
-        .insert(template_id, template);
+    config.quick_publish_templates.insert(template_id, template);
 }
 
 fn migrate_config(config: &mut AppConfig) {
@@ -1056,10 +1050,7 @@ pub fn get_proxy(app: AppHandle) -> ProxyConfig {
 }
 
 #[tauri::command]
-pub fn save_okp_executable_path(
-    app: AppHandle,
-    okp_executable_path: String,
-) -> Result<(), String> {
+pub fn save_okp_executable_path(app: AppHandle, okp_executable_path: String) -> Result<(), String> {
     mutate_config(&app, |config| {
         config.okp_executable_path = okp_executable_path;
         Ok(((), true))
@@ -1237,8 +1228,9 @@ pub fn import_quick_publish_template_from_file(
     let file_content = std::fs::read_to_string(&import_path)
         .map_err(|error| format!("无法读取快速发布模板文件: {}", error))?;
 
-    let import_file: EntityImportFileFormat<QuickPublishTemplate> = serde_json::from_str(&file_content)
-        .map_err(|error| format!("快速发布模板文件格式无效: {}", error))?;
+    let import_file: EntityImportFileFormat<QuickPublishTemplate> =
+        serde_json::from_str(&file_content)
+            .map_err(|error| format!("快速发布模板文件格式无效: {}", error))?;
 
     let fallback_id = import_path
         .file_stem()
@@ -1343,11 +1335,8 @@ pub fn import_content_template_from_file(
     let normalized_id = normalize_required_value(&id, "正文模板 ID", ENTITY_ID_MAX_CHARS)?;
 
     mutate_config(&app, |config| {
-        let final_id = resolve_import_id_conflict(
-            normalized_id.clone(),
-            &config.content_templates,
-            strategy,
-        )?;
+        let final_id =
+            resolve_import_id_conflict(normalized_id.clone(), &config.content_templates, strategy)?;
 
         template.id = final_id.clone();
         template.name = normalize_optional_name(
@@ -1553,7 +1542,10 @@ mod tests {
 
         assert_eq!(apply_set_last_used_template(&mut config, "alpha"), Ok(true));
         assert_eq!(config.last_used_template.as_deref(), Some("alpha"));
-        assert_eq!(apply_set_last_used_template(&mut config, "alpha"), Ok(false));
+        assert_eq!(
+            apply_set_last_used_template(&mut config, "alpha"),
+            Ok(false)
+        );
         assert_eq!(apply_set_last_used_template(&mut config, "beta"), Ok(true));
         assert_eq!(config.last_used_template.as_deref(), Some("beta"));
     }
@@ -1633,13 +1625,8 @@ mod tests {
         assert_eq!(config.last_used_template.as_deref(), Some("new"));
 
         // Saving another template must not stamp last_used.
-        apply_upsert_template(
-            &mut config,
-            "other".to_string(),
-            sample_template(),
-            None,
-        )
-        .expect("create upsert");
+        apply_upsert_template(&mut config, "other".to_string(), sample_template(), None)
+            .expect("create upsert");
         assert_eq!(config.last_used_template.as_deref(), Some("new"));
     }
 
@@ -1799,7 +1786,10 @@ mod tests {
         assert!(error.contains("已存在同名模板"));
 
         // Existing template must remain untouched.
-        assert_eq!(config.templates["alpha"].title_pattern, original.title_pattern);
+        assert_eq!(
+            config.templates["alpha"].title_pattern,
+            original.title_pattern
+        );
 
         // Same-name update WITH previous name (normal autosave) still works.
         apply_save_template(
@@ -1840,10 +1830,7 @@ mod tests {
     #[test]
     fn test_config_load_error_slot_set_and_cleared() {
         set_config_load_error(Some("配置文件解析失败".to_string()));
-        assert_eq!(
-            get_config_load_error().as_deref(),
-            Some("配置文件解析失败")
-        );
+        assert_eq!(get_config_load_error().as_deref(), Some("配置文件解析失败"));
 
         set_config_load_error(None);
         assert_eq!(get_config_load_error(), None);

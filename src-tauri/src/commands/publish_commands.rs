@@ -336,12 +336,17 @@ mod tests {
         assert!(pending.can_publish_now());
 
         let mut no_go = plan_with_decision(AuditDecision::NoGo);
-        no_go.audit_evidence.as_mut().unwrap().findings.push(Finding {
-            code: "TEST_CRITICAL".to_string(),
-            severity: FindingSeverity::Critical,
-            message: "blocked".to_string(),
-            evidence_path: None,
-        });
+        no_go
+            .audit_evidence
+            .as_mut()
+            .unwrap()
+            .findings
+            .push(Finding {
+                code: "TEST_CRITICAL".to_string(),
+                severity: FindingSeverity::Critical,
+                message: "blocked".to_string(),
+                evidence_path: None,
+            });
         assert!(!no_go.can_publish_now());
         assert!(publish_gate_error(&no_go).contains("critical acknowledgement"));
         no_go.set_acknowledgements(Acknowledgements {
@@ -365,9 +370,14 @@ mod tests {
         assert!(!plan_before.can_publish_now());
         assert!(publish_gate_error(&plan_before).contains("pending acknowledgement"));
 
-        let plan_after = registry.inspect_plan(&token).expect("failed gate preserves plan");
+        let plan_after = registry
+            .inspect_plan(&token)
+            .expect("failed gate preserves plan");
         assert_eq!(plan_after.snapshot_hash, plan_before.snapshot_hash);
-        assert_eq!(plan_after.request_generation, plan_before.request_generation);
+        assert_eq!(
+            plan_after.request_generation,
+            plan_before.request_generation
+        );
         assert!(registry.publish_plan(&token).is_some());
     }
 

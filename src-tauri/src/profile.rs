@@ -631,12 +631,8 @@ fn read_profile_file(path: &std::path::Path) -> Result<ProfileStore, String> {
         return Ok(ProfileStore::default());
     }
 
-    let mut store: ProfileStore = serde_json::from_str(&data).map_err(|error| {
-        format!(
-            "身份配置文件解析失败（已拒绝用默认配置覆盖）: {}",
-            error
-        )
-    })?;
+    let mut store: ProfileStore = serde_json::from_str(&data)
+        .map_err(|error| format!("身份配置文件解析失败（已拒绝用默认配置覆盖）: {}", error))?;
     normalize_store(&mut store);
     Ok(store)
 }
@@ -925,7 +921,9 @@ mod tests {
     fn test_apply_upsert_profile_rename_moves_entry_and_rejects_collision() {
         let mut store = ProfileStore::default();
         store.profiles.insert("old".to_string(), Profile::default());
-        store.profiles.insert("taken".to_string(), Profile::default());
+        store
+            .profiles
+            .insert("taken".to_string(), Profile::default());
 
         let error = apply_upsert_profile(
             &mut store,
@@ -937,8 +935,13 @@ mod tests {
         assert!(error.contains("已存在同名身份配置"));
         assert!(store.profiles.contains_key("old"));
 
-        apply_upsert_profile(&mut store, "new".to_string(), Profile::default(), Some("old"))
-            .expect("rename upsert");
+        apply_upsert_profile(
+            &mut store,
+            "new".to_string(),
+            Profile::default(),
+            Some("old"),
+        )
+        .expect("rename upsert");
         assert!(!store.profiles.contains_key("old"));
         assert!(store.profiles.contains_key("new"));
     }
