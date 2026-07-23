@@ -94,12 +94,13 @@ impl PlanMediaEvidence {
 /// The URL and normalized payload are retained only inside the Rust plan registry
 /// for provider assembly; both are intentionally omitted from public plan serialization.
 /// Payload bytes never leave the process (no DTO/export/log/debug persistence).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanVisionImage {
     #[serde(skip)]
     pub url: String,
     /// In-memory normalized JPEG bytes for one formal-audit assembly only.
-    /// Never serialized; never logged; cleared when the plan is dropped/invalidated.
+    /// Never serialized; never logged; cleared when the plan is dropped/invalidated
+    /// or after an explicit consume/take for provider request assembly.
     #[serde(skip)]
     pub payload: Vec<u8>,
     pub source: String,
@@ -108,6 +109,29 @@ pub struct PlanVisionImage {
     pub normalized_bytes: usize,
     pub width: u32,
     pub height: u32,
+}
+
+impl PlanVisionImage {
+    /// Move normalized payload bytes out for ephemeral provider assembly.
+    /// Metadata (hash/size/source) remains; `payload` is empty immediately afterward.
+    pub fn take_payload(&mut self) -> Vec<u8> {
+        std::mem::take(&mut self.payload)
+    }
+}
+
+impl std::fmt::Debug for PlanVisionImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Never debug-export URL or normalized payload bytes.
+        f.debug_struct("PlanVisionImage")
+            .field("source", &self.source)
+            .field("content_hash", &self.content_hash)
+            .field("mime_type", &self.mime_type)
+            .field("normalized_bytes", &self.normalized_bytes)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("payload_len", &self.payload.len())
+            .finish()
+    }
 }
 
 /// Normalized Vision assets bound to a prepared plan before formal audit.
@@ -119,9 +143,15 @@ pub struct PlanVisionEvidence {
     pub batch_hash: String,
     #[serde(default)]
     pub images: Vec<PlanVisionImage>,
+    /// Rust-owned soft fetch/normalization warnings (never client-authoritative).
+    /// Surfaced as `VISION_WARNING` findings during formal/local audit.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 const MAX_PLAN_VISION_IMAGES: usize = 5;
+const MAX_PLAN_VISION_WARNINGS: usize = 8;
+const MAX_PLAN_VISION_WARNING_CHARS: usize = 300;
 
 impl PlanVisionEvidence {
     pub fn matches_plan(&self, snapshot_hash: &str, request_generation: u64) -> bool {
@@ -326,6 +356,7 @@ impl PublishPlan {
     /// Vision must be bound before a formal audit starts. Rebinding changes the
     /// snapshot identity, clears prior audit/acknowledgement state, and returns the
     /// new hash so callers can start exactly one audit for the new plan.
+    /// Soft warnings on the evidence are retained for formal audit as `VISION_WARNING`.
     pub fn bind_vision_evidence(&mut self, evidence: PlanVisionEvidence) -> Result<String, String> {
         if evidence.snapshot_hash != self.snapshot_hash {
             return Err("vision evidence snapshot_hash does not match prepared plan".to_string());
@@ -364,10 +395,19 @@ impl PublishPlan {
             {
                 return Err("vision evidence contains invalid normalized image metadata".to_string());
             }
-            // When payload is present (live bind path), size must match declared metadata.
-            // Empty payload is allowed for hash-only unit fixtures that never assemble Vision.
-            if !image.payload.is_empty() && image.payload.len() != image.normalized_bytes {
-                return Err("vision evidence payload size does not match metadata".to_string());
+            // When payload is present (live bind path), size and content_hash must match
+            // the Rust SHA-256 of those bytes. Empty payload is allowed for hash-only
+            // unit fixtures that never assemble Vision.
+            if !image.payload.is_empty() {
+                if image.payload.len() != image.normalized_bytes {
+                    return Err("vision evidence payload size does not match metadata".to_string());
+                }
+                let digest = content_hash_of_bytes(&image.payload);
+                if digest != image.content_hash {
+                    return Err(
+                        "vision evidence content_hash does not match payload bytes".to_string(),
+                    );
+                }
             }
         }
         let snapshot = self
@@ -387,6 +427,7 @@ impl PublishPlan {
         self.snapshot_hash = next_hash.clone();
         let mut evidence = evidence;
         evidence.snapshot_hash = next_hash.clone();
+        evidence.warnings = bound_vision_warnings(evidence.warnings);
         self.vision_evidence = Some(evidence);
         // The old evidence is tied to the previous snapshot and is no longer valid.
         self.audit_evidence = None;
@@ -394,10 +435,61 @@ impl PublishPlan {
         Ok(next_hash)
     }
 
+    /// Persist soft Vision fetch/normalization warnings without rolling plan identity.
+    ///
+    /// Used when every selected image fails soft-fetch: the text formal-audit path
+    /// continues under the current snapshot, but warning evidence must still reach
+    /// the subsequent audit as Rust-owned `VISION_WARNING` findings.
+    /// Empty input is a no-op (preserves no-image/no-warning behavior).
+    pub fn record_vision_soft_warnings(&mut self, warnings: Vec<String>) -> Result<(), String> {
+        if warnings.is_empty() {
+            return Ok(());
+        }
+        if self
+            .audit_evidence
+            .as_ref()
+            .is_some_and(|audit| audit.job_id.is_some())
+        {
+            return Err("vision evidence must be bound before formal audit starts".to_string());
+        }
+        let warnings = bound_vision_warnings(warnings);
+        if warnings.is_empty() {
+            return Ok(());
+        }
+        if let Some(evidence) = self.vision_evidence.as_mut() {
+            if evidence.matches_plan(&self.snapshot_hash, self.request_generation) {
+                evidence.warnings = warnings;
+                return Ok(());
+            }
+        }
+        // Warning-only shell: no images, no batch/hash rollover, audit evidence retained.
+        self.vision_evidence = Some(PlanVisionEvidence {
+            snapshot_hash: self.snapshot_hash.clone(),
+            request_generation: self.request_generation,
+            batch_hash: String::new(),
+            images: Vec::new(),
+            warnings,
+        });
+        Ok(())
+    }
+
     pub fn has_authoritative_vision_evidence(&self) -> bool {
         self.vision_evidence.as_ref().is_some_and(|evidence| {
             evidence.matches_plan(&self.snapshot_hash, self.request_generation)
         })
+    }
+
+    /// Derive `VISION_WARNING` findings from identity-matched plan-owned soft warnings.
+    ///
+    /// Never trusts client-supplied warning strings. Empty / mismatched vision
+    /// evidence yields no findings (existing no-image/no-warning path unchanged).
+    pub fn vision_audit_findings(&self) -> Vec<Finding> {
+        let Some(evidence) = self.vision_evidence.as_ref().filter(|evidence| {
+            evidence.matches_plan(&self.snapshot_hash, self.request_generation)
+        }) else {
+            return Vec::new();
+        };
+        crate::ai::audit::vision_findings_from_plan_warnings(&evidence.warnings)
     }
 
     /// True when this plan has identity-matched backend-owned MediaInfo evidence.
@@ -789,6 +881,30 @@ fn compute_vision_batch_hash(image_hashes: &[&str]) -> String {
     format!("sha256:{}", hex::encode(hasher.finalize()))
 }
 
+fn content_hash_of_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("sha256:{}", hex::encode(hasher.finalize()))
+}
+
+fn bound_vision_warnings(warnings: Vec<String>) -> Vec<String> {
+    warnings
+        .into_iter()
+        .take(MAX_PLAN_VISION_WARNINGS)
+        .filter_map(|warning| {
+            let trimmed = warning.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let mut bounded: String = trimmed.chars().take(MAX_PLAN_VISION_WARNING_CHARS).collect();
+            if trimmed.chars().count() > MAX_PLAN_VISION_WARNING_CHARS {
+                bounded.push('…');
+            }
+            Some(bounded)
+        })
+        .collect()
+}
+
 fn is_sha256_digest(value: &str) -> bool {
     let Some(hex) = value.strip_prefix("sha256:") else {
         return false;
@@ -1107,6 +1223,34 @@ impl PlanRegistry {
         plan.bind_vision_evidence(evidence)
     }
 
+    /// Persist soft Vision warnings without rolling plan identity (all-images-failed path).
+    pub fn record_vision_soft_warnings(
+        &mut self,
+        token: &str,
+        warnings: Vec<String>,
+    ) -> Result<(), String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        if self.is_expired(token) {
+            self.remove(token);
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        let plan = self
+            .plans
+            .get_mut(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        if let Some(binding) = plan.get_local_binding() {
+            if let Err(failures) = binding.revalidate() {
+                return Err(failures.join("；"));
+            }
+        } else {
+            return Err("prepared plan has no local execution binding".to_string());
+        }
+        plan.record_vision_soft_warnings(warnings)
+    }
+
     /// Derive Vision image candidates only from the bound final poster/Markdown/HTML.
     ///
     /// Returns plan identity + candidates. Does not fetch images, mutate the plan,
@@ -1147,9 +1291,11 @@ impl PlanRegistry {
         ))
     }
 
-    /// Load in-memory Vision payloads for formal-audit provider assembly.
+    /// Consume in-memory Vision payloads for formal-audit provider assembly.
     ///
-    /// Returns only identity-matched bound images with non-empty payloads.
+    /// Moves identity-matched bound JPEG payloads out of the plan registry via an
+    /// explicit take. Plan metadata (hash/size/source) remains, but every extracted
+    /// image's `payload` is empty immediately afterward and is never re-exported.
     /// Never exposes URLs or bytes over public IPC — caller uses this only to
     /// build an ephemeral provider request body.
     pub fn take_vision_request_images(
@@ -1166,20 +1312,24 @@ impl PlanRegistry {
         }
         let plan = self
             .plans
-            .get(token)
+            .get_mut(token)
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
-        let Some(evidence) = plan.vision_evidence.as_ref() else {
+        let snapshot_hash = plan.snapshot_hash.clone();
+        let request_generation = plan.request_generation;
+        let Some(evidence) = plan.vision_evidence.as_mut() else {
             return Ok(Vec::new());
         };
-        if !evidence.matches_plan(&plan.snapshot_hash, plan.request_generation) {
+        if !evidence.matches_plan(&snapshot_hash, request_generation) {
             return Ok(Vec::new());
         }
-        Ok(evidence
-            .images
-            .iter()
-            .filter(|image| !image.payload.is_empty() && image.mime_type == "image/jpeg")
-            .map(|image| (image.mime_type.clone(), image.payload.clone()))
-            .collect())
+        let mut out = Vec::new();
+        for image in &mut evidence.images {
+            if image.mime_type == "image/jpeg" && !image.payload.is_empty() {
+                let bytes = image.take_payload();
+                out.push((image.mime_type.clone(), bytes));
+            }
+        }
+        Ok(out)
     }
 
     /// Resolve plan identity + private binding for MediaInfo start.
@@ -1964,8 +2114,9 @@ mod tests {
             .expect("prepare");
         let token = prepared.token.clone();
         let old_hash = prepared.snapshot_hash.clone();
-        let content_hash = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let batch_hash = compute_vision_batch_hash(&[content_hash]);
+        let payload = vec![0_u8; 1024];
+        let content_hash = content_hash_of_bytes(&payload);
+        let batch_hash = compute_vision_batch_hash(&[content_hash.as_str()]);
 
         let next_hash = registry
             .bind_vision_evidence(
@@ -1976,14 +2127,17 @@ mod tests {
                     batch_hash: batch_hash.clone(),
                     images: vec![PlanVisionImage {
                         url: "https://cdn.example.test/poster.jpg?token=redacted".into(),
-                        payload: vec![0_u8; 1024],
+                        payload: payload.clone(),
                         source: "poster".into(),
-                        content_hash: content_hash.into(),
+                        content_hash: content_hash.clone(),
                         mime_type: "image/jpeg".into(),
                         normalized_bytes: 1024,
                         width: 640,
                         height: 360,
                     }],
+                    warnings: vec![
+                        "IMAGE_FETCH_FAILED: image fetch failed: timeout (markdown)".into(),
+                    ],
                 },
             )
             .expect("bind vision");
@@ -2009,6 +2163,15 @@ mod tests {
                 .map(|image| image.payload.len()),
             Some(1024)
         );
+        // Soft warnings survive bind for formal audit.
+        let findings = plan.vision_audit_findings();
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].code, "VISION_WARNING");
+        assert_eq!(
+            findings[0].severity,
+            crate::ai::audit::FindingSeverity::Warning
+        );
+        assert!(findings[0].message.contains("IMAGE_FETCH_FAILED"));
         let public = serde_json::to_string(plan).expect("serialize public plan");
         assert!(!public.contains("cdn.example.test"));
         assert!(!public.contains("token=redacted"));
@@ -2036,12 +2199,13 @@ mod tests {
         let old_hash = prepared.snapshot_hash.clone();
 
         // More than five images is fail-closed.
+        // Hash-only fixtures (empty payload) keep intentional non-live digests.
         let six = (0..6)
             .map(|index| {
                 let digest = format!("sha256:{:064x}", index + 1);
                 PlanVisionImage {
                     url: format!("https://cdn.example.test/{index}.jpg"),
-                    payload: vec![1_u8; 64],
+                    payload: Vec::new(),
                     source: "poster".into(),
                     content_hash: digest,
                     mime_type: "image/jpeg".into(),
@@ -2064,6 +2228,7 @@ mod tests {
                     request_generation: 13,
                     batch_hash,
                     images: six,
+                    warnings: Vec::new(),
                 },
             )
             .expect_err("six images must fail");
@@ -2081,7 +2246,7 @@ mod tests {
                     batch_hash: compute_vision_batch_hash(&[content_hash]),
                     images: vec![PlanVisionImage {
                         url: "https://cdn.example.test/poster.jpg".into(),
-                        payload: vec![2_u8; 32],
+                        payload: Vec::new(),
                         source: "poster".into(),
                         content_hash: content_hash.into(),
                         mime_type: "image/jpeg".into(),
@@ -2089,6 +2254,7 @@ mod tests {
                         width: 4,
                         height: 4,
                     }],
+                    warnings: Vec::new(),
                 },
             )
             .expect_err("stale snapshot must fail");
@@ -2126,7 +2292,8 @@ mod tests {
                     batch_hash: "sha256:forged".into(),
                     images: vec![PlanVisionImage {
                         url: "https://cdn.example.test/poster.jpg".into(),
-                        payload: vec![0_u8; 1024],
+                        // Hash-only fixture: batch check fails before live payload verify.
+                        payload: Vec::new(),
                         source: "poster".into(),
                         content_hash:
                             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
@@ -2136,6 +2303,7 @@ mod tests {
                         width: 640,
                         height: 360,
                     }],
+                    warnings: Vec::new(),
                 },
             )
             .expect_err("forged batch must fail");
@@ -2146,6 +2314,224 @@ mod tests {
         assert!(plan.has_authoritative_audit_evidence());
 
         let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn vision_soft_warnings_only_bind_retains_evidence_without_hash_rollover() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(
+                21,
+                sample_request(torrent_path.clone()),
+                Vec::new(),
+                true,
+                None,
+            )
+            .expect("prepare");
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+        let audit_before = registry
+            .inspect_plan(&token)
+            .and_then(|plan| plan.audit_evidence.clone())
+            .expect("initial audit");
+
+        // Empty warnings are a no-op (no-image / no-warning path).
+        registry
+            .record_vision_soft_warnings(&token, Vec::new())
+            .expect("empty warnings");
+        {
+            let plan = registry.inspect_plan(&token).expect("plan");
+            assert_eq!(plan.snapshot_hash, old_hash);
+            assert!(plan.vision_evidence.is_none());
+            assert!(plan.vision_audit_findings().is_empty());
+        }
+
+        registry
+            .record_vision_soft_warnings(
+                &token,
+                vec![
+                    "IMAGE_FETCH_FAILED: image fetch failed: 404 (poster)".into(),
+                    "IMAGE_FETCH_FAILED: invalid image: decode failed (markdown)".into(),
+                ],
+            )
+            .expect("record warnings");
+
+        let plan = registry.inspect_plan(&token).expect("plan remains live");
+        assert_eq!(plan.snapshot_hash, old_hash, "warning-only must not roll hash");
+        assert_eq!(plan.audit_evidence.as_ref(), Some(&audit_before));
+        assert!(plan.has_authoritative_vision_evidence());
+        let findings = plan.vision_audit_findings();
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| {
+            f.code == "VISION_WARNING"
+                && f.severity == crate::ai::audit::FindingSeverity::Warning
+        }));
+        // Decision with warnings alone is WARNING and needs acknowledgement.
+        let decision = crate::ai::audit::compute_decision(&crate::ai::audit::AuditInput {
+            local_blockers: vec![],
+            findings: findings.clone(),
+            checking: false,
+        });
+        assert_eq!(decision.decision, AuditDecision::Warning);
+        assert!(!crate::ai::audit::can_publish(
+            decision.decision,
+            Acknowledgements::default()
+        ));
+        assert!(crate::ai::audit::can_publish(
+            decision.decision,
+            Acknowledgements {
+                warning: true,
+                critical: false,
+                pending: false,
+            }
+        ));
+
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn vision_payload_take_consumes_bytes_and_rejects_forged_content_hash() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(
+                22,
+                sample_request(torrent_path.clone()),
+                Vec::new(),
+                false,
+                None,
+            )
+            .expect("prepare");
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+
+        // Live payload with forged content_hash is rejected without mutating the plan.
+        let forged_payload = vec![7_u8; 48];
+        let forged = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: old_hash.clone(),
+                    request_generation: 22,
+                    batch_hash: compute_vision_batch_hash(&[
+                        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                    ]),
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/forged.jpg".into(),
+                        payload: forged_payload,
+                        source: "poster".into(),
+                        content_hash:
+                            "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                                .into(),
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 48,
+                        width: 8,
+                        height: 8,
+                    }],
+                    warnings: Vec::new(),
+                },
+            )
+            .expect_err("forged content_hash must fail");
+        assert!(
+            forged.contains("content_hash") || forged.contains("payload"),
+            "{forged}"
+        );
+        {
+            let plan = registry.inspect_plan(&token).expect("plan");
+            assert_eq!(plan.snapshot_hash, old_hash);
+            assert!(plan.vision_evidence.is_none());
+            assert!(plan.has_authoritative_audit_evidence());
+        }
+
+        // Valid live binding then consume/take empties plan payloads.
+        let payload = vec![9_u8; 64];
+        let content_hash = content_hash_of_bytes(&payload);
+        let batch_hash = compute_vision_batch_hash(&[content_hash.as_str()]);
+        let next_hash = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: old_hash.clone(),
+                    request_generation: 22,
+                    batch_hash,
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/ok.jpg".into(),
+                        payload: payload.clone(),
+                        source: "poster".into(),
+                        content_hash,
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 64,
+                        width: 16,
+                        height: 16,
+                    }],
+                    warnings: Vec::new(),
+                },
+            )
+            .expect("valid live bind");
+        assert_ne!(next_hash, old_hash);
+
+        let taken = registry
+            .take_vision_request_images(&token)
+            .expect("take payloads");
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0, "image/jpeg");
+        assert_eq!(taken[0].1, payload);
+
+        let plan = registry.inspect_plan(&token).expect("plan");
+        let image = plan
+            .vision_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.images.first())
+            .expect("image metadata remains");
+        assert!(
+            image.payload.is_empty(),
+            "payload must be empty after consume/take"
+        );
+        assert_eq!(image.normalized_bytes, 64);
+        // Second take yields nothing (bytes already moved out).
+        let again = registry
+            .take_vision_request_images(&token)
+            .expect("second take");
+        assert!(again.is_empty());
+
+        // Hash-only fixtures (empty payload) still bind without live digest verify.
+        let torrent_path2 = write_temp_torrent(b"d4:infod4:name4:hashonlyee");
+        let prepared2 = registry
+            .prepare_plan_with_request_and_blockers(
+                23,
+                sample_request(torrent_path2.clone()),
+                Vec::new(),
+                false,
+                None,
+            )
+            .expect("prepare hash-only");
+        let hash_only =
+            "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
+        registry
+            .bind_vision_evidence(
+                &prepared2.token,
+                PlanVisionEvidence {
+                    snapshot_hash: prepared2.snapshot_hash.clone(),
+                    request_generation: 23,
+                    batch_hash: compute_vision_batch_hash(&[hash_only]),
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/hash-only.jpg".into(),
+                        payload: Vec::new(),
+                        source: "poster".into(),
+                        content_hash: hash_only.into(),
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 128,
+                        width: 32,
+                        height: 32,
+                    }],
+                    warnings: Vec::new(),
+                },
+            )
+            .expect("hash-only fixture binds");
+
+        let _ = std::fs::remove_file(&torrent_path);
+        let _ = std::fs::remove_file(&torrent_path2);
     }
 
     #[test]

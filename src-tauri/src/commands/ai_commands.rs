@@ -1675,14 +1675,28 @@ pub fn ai_bind_plan_vision(
         .map_err(|error| error.to_string())?;
 
     if batch.images.is_empty() {
-        // All fetches failed: continue text audit path without mutating plan identity.
+        // All fetches failed: continue text audit path without rolling plan identity,
+        // but retain Rust-owned soft warnings so formal audit can surface VISION_WARNING.
+        let warnings = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard.record_vision_soft_warnings(&plan_token, batch.warnings.clone())?;
+            guard
+                .inspect_plan(&plan_token)
+                .map(|plan| plan.vision_audit_findings())
+                .unwrap_or_default()
+                .into_iter()
+                .map(|finding| finding.message)
+                .collect()
+        };
         return Ok(PlanVisionBindResponse {
             plan_token,
             snapshot_hash,
             request_generation,
             batch_hash: String::new(),
             images: Vec::new(),
-            warnings: batch.warnings,
+            warnings,
         });
     }
 
@@ -1704,6 +1718,8 @@ pub fn ai_bind_plan_vision(
                 height: image.height,
             })
             .collect(),
+        // Soft per-image failures stay Rust-owned on the plan for formal audit.
+        warnings: batch.warnings.clone(),
     };
 
     let next_hash = {
@@ -1713,7 +1729,7 @@ pub fn ai_bind_plan_vision(
         guard.bind_vision_evidence(&plan_token, evidence)?
     };
 
-    let public_images = {
+    let (public_images, warnings) = {
         let mut guard = get_or_create_registry()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
@@ -1721,7 +1737,7 @@ pub fn ai_bind_plan_vision(
             .inspect_plan(&plan_token)
             .and_then(|plan| plan.vision_evidence.as_ref())
             .map(|evidence| {
-                evidence
+                let public_images = evidence
                     .images
                     .iter()
                     .map(|image| PublicPlanVisionImage {
@@ -1732,9 +1748,10 @@ pub fn ai_bind_plan_vision(
                         width: image.width,
                         height: image.height,
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                (public_images, evidence.warnings.clone())
             })
-            .unwrap_or_default()
+            .unwrap_or_else(|| (Vec::new(), Vec::new()))
     };
 
     Ok(PlanVisionBindResponse {
@@ -1743,7 +1760,7 @@ pub fn ai_bind_plan_vision(
         request_generation,
         batch_hash: batch.batch_hash,
         images: public_images,
-        warnings: batch.warnings,
+        warnings,
     })
 }
 
@@ -3407,6 +3424,8 @@ pub fn ai_connection_is_configured_for_app(app: &AppHandle) -> bool {
 ///
 /// Plan-owned MediaInfo state contributes `MEDIA_NOT_TESTED` / `MEDIA_CHECK_FAILED`
 /// via [`media_findings_from_plan_evidence`] — never client probe values.
+/// Plan-owned soft Vision warnings contribute `VISION_WARNING` findings — never from
+/// a frontend round trip. Warning merge does not introduce a second provider request.
 fn local_audit_result(
     plan_token: String,
     snapshot_hash: String,
@@ -3435,6 +3454,9 @@ fn local_audit_result(
     if formal_ran || job_id.is_some() || !findings.is_empty() {
         findings.extend(load_plan_media_findings(&plan_token));
     }
+    // Rust-owned Vision soft warnings always merge when present on the plan token.
+    // Bind requires AI enabled, so the AI-disabled zero-side-effect path never invents them.
+    findings.extend(load_plan_vision_findings(&plan_token));
     let input = sanitize_audit_input(
         AuditInput {
             local_blockers: local_blockers.clone(),
@@ -3474,6 +3496,24 @@ fn load_plan_media_findings(plan_token: &str) -> Vec<Finding> {
         return Vec::new();
     };
     plan.media_audit_findings()
+}
+
+/// Load plan-owned soft Vision warnings as `VISION_WARNING` findings.
+///
+/// Missing / expired tokens yield no findings. Live plans derive findings only from
+/// identity-matched Rust-owned warning strings retained at Vision bind time.
+fn load_plan_vision_findings(plan_token: &str) -> Vec<Finding> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Vec::new();
+    }
+    let mut guard = get_or_create_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let Some(plan) = guard.inspect_plan(plan_token) else {
+        return Vec::new();
+    };
+    plan.vision_audit_findings()
 }
 
 fn bind_audit_to_plan(result: &AiFormalAuditResult) -> Result<(), String> {
@@ -7436,5 +7476,143 @@ mod plan_vision_command_tests {
         assert!(!public.contains("\"url\""));
         assert!(public.contains("content_hash"));
         assert!(public.contains("IMAGE_FETCH_FAILED"));
+    }
+
+    #[test]
+    fn vision_soft_warnings_surface_in_formal_audit_without_second_provider() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(
+            torrent_path.clone(),
+            "https://cdn.example.test/poster.jpg",
+            "",
+            "",
+        );
+        let prepared = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .prepare_plan_with_request_and_blockers(9, request, Vec::new(), true, None)
+                .expect("prepare")
+        };
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+
+        // Warning-only bind path (all images failed): retain evidence, no hash rollover.
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .record_vision_soft_warnings(
+                    &token,
+                    vec!["IMAGE_FETCH_FAILED: image fetch failed: 404 (poster)".into()],
+                )
+                .expect("record soft warnings");
+        }
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let plan = guard.inspect_plan(&token).expect("plan");
+            assert_eq!(plan.snapshot_hash, old_hash);
+            assert_eq!(plan.vision_audit_findings().len(), 1);
+        }
+
+        // Formal/local audit merge includes VISION_WARNING; still a single decision path
+        // (no extra provider call introduced by warning propagation).
+        let result = local_audit_result(
+            token.clone(),
+            old_hash.clone(),
+            9,
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some("job-vision-warn".into()),
+            &RedactionPolicy::default(),
+        );
+        assert_eq!(result.decision, AuditDecision::Warning);
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.code == "VISION_WARNING" && f.severity == FindingSeverity::Warning),
+            "expected VISION_WARNING in {:?}",
+            result
+                .findings
+                .iter()
+                .map(|f| f.code.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result
+                .findings
+                .iter()
+                .any(|f| f.message.contains("IMAGE_FETCH_FAILED")),
+            "warning message should survive sanitize: {:?}",
+            result.findings
+        );
+
+        // Plan payload take moves bytes out (metadata remains empty after consume).
+        let payload = vec![3_u8; 32];
+        let content_hash = content_digest(&payload);
+        let batch_hash = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(content_hash.as_bytes());
+            hasher.update(b"\n");
+            format!("sha256:{}", hex::encode(hasher.finalize()))
+        };
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            // Replace warning-only shell with a live payload bind for take regression.
+            let (snapshot, gen) = {
+                let plan = guard.inspect_plan(&token).expect("plan");
+                (plan.snapshot_hash.clone(), plan.request_generation)
+            };
+            let evidence = PlanVisionEvidence {
+                snapshot_hash: snapshot,
+                request_generation: gen,
+                batch_hash,
+                images: vec![PlanVisionImage {
+                    url: "https://cdn.example.test/poster.jpg".into(),
+                    payload: payload.clone(),
+                    source: "poster".into(),
+                    content_hash,
+                    mime_type: "image/jpeg".into(),
+                    normalized_bytes: 32,
+                    width: 4,
+                    height: 4,
+                }],
+                warnings: vec!["IMAGE_FETCH_FAILED: partial (markdown)".into()],
+            };
+            guard
+                .bind_vision_evidence(&token, evidence)
+                .expect("bind live");
+        }
+        let taken = load_plan_vision_request_images(&token);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].bytes, payload);
+        // Registry payloads must be empty after consume.
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let plan = guard.inspect_plan(&token).expect("plan");
+            let empty = plan
+                .vision_evidence
+                .as_ref()
+                .and_then(|e| e.images.first())
+                .map(|i| i.payload.is_empty())
+                .unwrap_or(false);
+            assert!(empty, "payload must be consumed from plan registry");
+        }
+        // Second load is empty (one-shot consume).
+        assert!(load_plan_vision_request_images(&token).is_empty());
+
+        let _ = std::fs::remove_file(&torrent_path);
     }
 }

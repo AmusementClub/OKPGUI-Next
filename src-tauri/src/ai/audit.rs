@@ -190,6 +190,30 @@ pub fn media_findings_from_plan_evidence(state: MediaEvidenceAuditState) -> Vec<
     }
 }
 
+/// Map Rust-owned soft Vision fetch/normalization warnings to formal audit findings.
+///
+/// Each non-empty warning becomes a `VISION_WARNING` finding with `WARNING` severity.
+/// Callers must pass plan-owned strings only — never client-supplied authority.
+/// Messages are expected to already be bounded at bind time; `sanitize_audit_input`
+/// still redacts them before IPC/decision bind.
+pub fn vision_findings_from_plan_warnings(warnings: &[String]) -> Vec<Finding> {
+    warnings
+        .iter()
+        .filter_map(|warning| {
+            let message = warning.trim();
+            if message.is_empty() {
+                return None;
+            }
+            Some(Finding {
+                code: "VISION_WARNING".to_string(),
+                severity: FindingSeverity::Warning,
+                message: message.to_string(),
+                evidence_path: None,
+            })
+        })
+        .collect()
+}
+
 /// Strict JSON schema for formal AI audit structured output.
 pub fn formal_audit_schema() -> Value {
     json!({
@@ -966,5 +990,50 @@ mod tests {
         });
         assert_eq!(decision.decision, AuditDecision::Warning);
         assert_ne!(decision.decision, AuditDecision::Go);
+    }
+
+    #[test]
+    fn vision_warnings_become_warning_findings_and_require_acknowledgement() {
+        let empty = vision_findings_from_plan_warnings(&[]);
+        assert!(empty.is_empty());
+
+        let blank = vision_findings_from_plan_warnings(&[String::new(), "   ".into()]);
+        assert!(blank.is_empty());
+
+        let findings = vision_findings_from_plan_warnings(&[
+            "IMAGE_FETCH_FAILED: image fetch failed: 404 (poster)".into(),
+            "IMAGE_FETCH_FAILED: invalid image: decode failed (markdown)".into(),
+        ]);
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| {
+            f.code == "VISION_WARNING" && f.severity == FindingSeverity::Warning
+        }));
+        assert!(KNOWN_CODES.contains(&"VISION_WARNING"));
+
+        // Soft Vision warnings alone yield WARNING (never GO) and need warning ack.
+        let decision = compute_decision(&AuditInput {
+            local_blockers: vec![],
+            findings: findings.clone(),
+            checking: false,
+        });
+        assert_eq!(decision.decision, AuditDecision::Warning);
+        assert!(decision.unknown_codes.is_empty());
+        assert!(!can_publish(decision.decision, Acknowledgements::default()));
+        assert!(can_publish(
+            decision.decision,
+            Acknowledgements {
+                warning: true,
+                critical: false,
+                pending: false,
+            }
+        ));
+
+        // Formal provider returning no issues still stays WARNING when plan warnings exist.
+        let provider_go_plus_vision = compute_decision(&AuditInput {
+            local_blockers: vec![],
+            findings,
+            checking: false,
+        });
+        assert_eq!(provider_go_plus_vision.decision, AuditDecision::Warning);
     }
 }
