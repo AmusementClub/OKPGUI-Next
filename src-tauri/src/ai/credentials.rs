@@ -1,6 +1,8 @@
 use crate::ai::provider::{CapabilityIdentity, ProviderKind, ProviderMode};
+use crate::atomic_file::write_text_file_atomically;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -441,10 +443,13 @@ impl SecretStore for OsCredentialStore {
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            return self
-                .entry(reference)?
-                .delete_credential()
-                .map_err(|error| format!("credential store delete failed: {error}"));
+            // Missing-entry delete is idempotent success (matches Linux/session), so
+            // ConfigCommitted cleanup retries and rollback of already-gone candidates succeed.
+            return match self.entry(reference)?.delete_credential() {
+                Ok(()) => Ok(()),
+                Err(error) if is_missing_credential_error(&error.to_string()) => Ok(()),
+                Err(error) => Err(format!("credential store delete failed: {error}")),
+            };
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
@@ -752,6 +757,8 @@ pub struct CredentialSecretWritePlan {
 /// - `AuthMode::None` clears the pointer, never writes a secret, and schedules old-secret cleanup
 ///   only after a successful config persist (never on pre-switch failure).
 /// - When a new secret is provided, always allocate `unique_candidate_id` (never in-place replace).
+/// - When a caller-supplied candidate equals the active `old_ref_id`, reject with an error so
+///   rollback/cleanup cannot overwrite or delete the live secret under the same id.
 /// - When no secret is provided, keep the explicit connection ref or the previous active ref.
 pub fn plan_credential_secret_write(
     auth_mode: AuthMode,
@@ -759,34 +766,42 @@ pub fn plan_credential_secret_write(
     connection_ref_id: Option<String>,
     secret_provided: bool,
     unique_candidate_id: impl Into<String>,
-) -> CredentialSecretWritePlan {
+) -> Result<CredentialSecretWritePlan, String> {
     if auth_mode == AuthMode::None {
-        return CredentialSecretWritePlan {
+        return Ok(CredentialSecretWritePlan {
             next_ref_id: None,
             rollback_candidate_id: None,
             // Clear orphan only after successful switch; pre-switch failure keeps old secret.
             delete_after_success_id: old_ref_id,
-        };
+        });
     }
 
     if secret_provided {
         let candidate = unique_candidate_id.into();
-        let delete_after_success_id = old_ref_id.filter(|old| old != &candidate);
-        return CredentialSecretWritePlan {
+        // Plan-level defense: never treat the active ref as a disposable candidate.
+        // (Caller-supplied collisions used to set rollback_candidate_id == old_ref, so pre-switch
+        // rollback deleted the live secret and delete_after_success_id was cleared.)
+        if old_ref_id.as_ref() == Some(&candidate) {
+            return Err(format!(
+                "credential candidate id collides with active ref; refusing overwrite/rollback of active secret ({candidate})"
+            ));
+        }
+        return Ok(CredentialSecretWritePlan {
             next_ref_id: Some(candidate.clone()),
             rollback_candidate_id: Some(candidate),
-            delete_after_success_id,
-        };
+            // Candidate is distinct from old when present; schedule old cleanup after switch.
+            delete_after_success_id: old_ref_id,
+        });
     }
 
     let next_ref_id = connection_ref_id.or(old_ref_id.clone());
     let delete_after_success_id =
         previous_secret_to_delete_after_successful_switch(old_ref_id.as_deref(), next_ref_id.as_deref());
-    CredentialSecretWritePlan {
+    Ok(CredentialSecretWritePlan {
         next_ref_id,
         rollback_candidate_id: None,
         delete_after_success_id,
-    }
+    })
 }
 
 /// Pure helper: which previous secret id (if any) should be deleted after config switch succeeds.
@@ -816,17 +831,337 @@ pub fn rollback_credential_candidate(
     Ok(())
 }
 
-/// After successful config persist, best-effort delete the previous active secret when planned.
+/// Pre-switch failure after a candidate may exist: clear the journal only when candidate
+/// rollback is confirmed. If delete cannot be confirmed, retain a recoverable
+/// `CandidateStored` journal for startup recovery and return `Err`.
+///
+/// Never discards a rollback error and then clears the journal (that would orphan the candidate).
+pub fn rollback_candidate_or_retain_journal(
+    store: &impl SecretStore,
+    plan: &CredentialSecretWritePlan,
+    journal_path: &Path,
+    journal: &CredentialRotationJournal,
+) -> Result<(), String> {
+    match rollback_credential_candidate(store, plan) {
+        Ok(()) => {
+            // Candidate confirmed gone (or none planned). Safe to drop the journal.
+            clear_credential_journal(journal_path)?;
+            Ok(())
+        }
+        Err(error) => {
+            // Candidate may still exist. Keep a phase startup recovery can process.
+            let retain = journal
+                .clone()
+                .with_phase(CredentialJournalPhase::CandidateStored);
+            // Best-effort phase write; even a Prepared journal with candidate_ref recovers.
+            let _ = write_credential_journal(journal_path, &retain);
+            Err(format!(
+                "credential candidate rollback unconfirmed; journal retained for recovery: {error}"
+            ))
+        }
+    }
+}
+
+/// After successful config persist, delete the previous active secret when planned.
 /// Never called on pre-switch failure (rollback keeps the old secret).
+/// Missing-entry deletes are success; operational store failures propagate so the
+/// durable rotation journal can retain ConfigCommitted for startup retry.
 pub fn cleanup_previous_secret_after_success(
     store: &impl SecretStore,
     plan: &CredentialSecretWritePlan,
 ) -> Result<(), String> {
     if let Some(id) = plan.delete_after_success_id.as_ref() {
-        // Best-effort: missing entry is fine after a successful pointer switch.
-        let _ = store.delete(&CredentialRef { id: id.clone() });
+        store.delete(&CredentialRef { id: id.clone() })?;
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Crash-consistent credential rotation journal (non-secret, app-local, atomic)
+// ---------------------------------------------------------------------------
+
+/// On-disk schema version for [`CredentialRotationJournal`].
+pub const CREDENTIAL_JOURNAL_VERSION: u32 = 1;
+
+/// Default TTL for an in-flight rotation journal (7 days).
+pub const CREDENTIAL_JOURNAL_TTL_SECS: u64 = 7 * 24 * 60 * 60;
+
+/// Filename under the app data directory (never stores secret material).
+pub const CREDENTIAL_JOURNAL_FILE_NAME: &str = "ai_credential_rotation_journal.json";
+
+/// Durable phases of a credential rotation transaction.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialJournalPhase {
+    /// Journal written before any candidate secret is stored.
+    Prepared,
+    /// Candidate secret is in the store; config pointer not yet switched.
+    CandidateStored,
+    /// AIConfig pointer switched to next generation; old cleanup may still be pending.
+    ConfigCommitted,
+}
+
+/// Redacted, non-secret settings snapshot for audit / recovery correlation.
+/// Never includes `SecretValue`, raw keys, or keyring payloads.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CredentialJournalSettingsMetadata {
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub auth_mode: String,
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub mode: String,
+}
+
+/// App-local durable journal for one in-flight credential rotation.
+///
+/// Bytes on disk are intentionally non-secret: only credential *refs* (ids),
+/// phase, TTL, and redacted connection metadata. Never serialize `SecretValue`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CredentialRotationJournal {
+    pub version: u32,
+    pub phase: CredentialJournalPhase,
+    /// New secret id created by this rotation (if any).
+    #[serde(default)]
+    pub candidate_ref: Option<String>,
+    /// Previously active credential id (cleanup target after commit).
+    #[serde(default)]
+    pub old_ref: Option<String>,
+    /// Credential id the config pointer should hold after a successful switch.
+    #[serde(default)]
+    pub next_ref: Option<String>,
+    pub created_at_unix: u64,
+    pub expires_at_unix: u64,
+    #[serde(default)]
+    pub settings_metadata: CredentialJournalSettingsMetadata,
+}
+
+impl CredentialRotationJournal {
+    /// Build a `Prepared` journal from a write plan and redacted metadata.
+    pub fn prepare(
+        plan: &CredentialSecretWritePlan,
+        metadata: CredentialJournalSettingsMetadata,
+        now_unix: u64,
+        ttl_secs: u64,
+    ) -> Self {
+        Self {
+            version: CREDENTIAL_JOURNAL_VERSION,
+            phase: CredentialJournalPhase::Prepared,
+            candidate_ref: plan.rollback_candidate_id.clone(),
+            old_ref: plan.delete_after_success_id.clone(),
+            next_ref: plan.next_ref_id.clone(),
+            created_at_unix: now_unix,
+            expires_at_unix: now_unix.saturating_add(ttl_secs),
+            settings_metadata: metadata,
+        }
+    }
+
+    pub fn is_expired(&self, now_unix: u64) -> bool {
+        now_unix > self.expires_at_unix
+    }
+
+    pub fn with_phase(mut self, phase: CredentialJournalPhase) -> Self {
+        self.phase = phase;
+        self
+    }
+}
+
+/// Recovery decision derived from journal + current config pointer (fail closed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialJournalRecoveryAction {
+    /// Config still on old / not on next: delete only this journal's candidate, clear journal.
+    RollbackCandidate,
+    /// Config points at next/candidate: keep candidate, finish old cleanup, clear journal.
+    FinishCommittedCleanup,
+    /// Config generation is unrelated: clear journal without deleting active secrets.
+    ClearJournalOnly,
+}
+
+/// True when the live config credential pointer matches the journal's next generation.
+///
+/// `AuthMode::None` commits with `next_ref = None`; that matches only when the live
+/// config also has no credential ref (and the journal recorded an old ref or commit).
+pub fn config_points_to_journal_next(
+    active_ref: Option<&str>,
+    journal: &CredentialRotationJournal,
+) -> bool {
+    match journal.next_ref.as_deref() {
+        Some(next) => active_ref == Some(next),
+        None => {
+            // Clearing credentials: treat as committed next-gen when config has no ref
+            // and this journal intended a clear (old present) or already marked committed.
+            active_ref.is_none()
+                && (journal.old_ref.is_some()
+                    || matches!(journal.phase, CredentialJournalPhase::ConfigCommitted))
+        }
+    }
+}
+
+/// Decide idempotent recovery for a durable rotation journal.
+///
+/// Config pointer is authoritative over phase. Expired journals still reconcile
+/// against the live pointer (TTL does not orphan a committed next secret).
+pub fn decide_credential_journal_recovery(
+    journal: &CredentialRotationJournal,
+    active_ref: Option<&str>,
+    _now_unix: u64,
+) -> CredentialJournalRecoveryAction {
+    // Successful pointer switch (or None-mode clear): finish old cleanup.
+    if config_points_to_journal_next(active_ref, journal) {
+        return CredentialJournalRecoveryAction::FinishCommittedCleanup;
+    }
+
+    // Live config holds this journal's candidate even if phase lagged (crash after
+    // config save but before ConfigCommitted phase write).
+    if let (Some(active), Some(candidate)) = (active_ref, journal.candidate_ref.as_deref()) {
+        if active == candidate {
+            return CredentialJournalRecoveryAction::FinishCommittedCleanup;
+        }
+    }
+
+    // Unrelated generation: active is neither old, next, nor candidate.
+    if let Some(active) = active_ref {
+        let is_old = journal.old_ref.as_deref() == Some(active);
+        let is_next = journal.next_ref.as_deref() == Some(active);
+        let is_candidate = journal.candidate_ref.as_deref() == Some(active);
+        if !is_old && !is_next && !is_candidate {
+            return CredentialJournalRecoveryAction::ClearJournalOnly;
+        }
+    }
+
+    // Config still on old (or missing next): remove only this rotation's candidate.
+    CredentialJournalRecoveryAction::RollbackCandidate
+}
+
+/// Resolve the journal path under an app-local data directory.
+pub fn credential_journal_path(app_data_dir: &Path) -> PathBuf {
+    app_data_dir.join(CREDENTIAL_JOURNAL_FILE_NAME)
+}
+
+/// Load a journal from disk. Missing file → `Ok(None)`. Corrupt JSON → error (fail closed).
+pub fn load_credential_journal(
+    path: &Path,
+) -> Result<Option<CredentialRotationJournal>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let data = std::fs::read_to_string(path)
+        .map_err(|error| format!("credential journal read failed: {error}"))?;
+    if data.trim().is_empty() {
+        return Ok(None);
+    }
+    let journal: CredentialRotationJournal = serde_json::from_str(&data)
+        .map_err(|error| format!("credential journal parse failed: {error}"))?;
+    if journal.version != CREDENTIAL_JOURNAL_VERSION {
+        return Err(format!(
+            "credential journal version unsupported: {}",
+            journal.version
+        ));
+    }
+    Ok(Some(journal))
+}
+
+/// Atomically persist a non-secret journal (temp write + replace).
+pub fn write_credential_journal(
+    path: &Path,
+    journal: &CredentialRotationJournal,
+) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("credential journal dir create failed: {error}"))?;
+    }
+    let data = serde_json::to_string_pretty(journal)
+        .map_err(|error| format!("credential journal serialize failed: {error}"))?;
+    // Atomic replace so a crash cannot leave a truncated journal as the only copy.
+    write_text_file_atomically(path, &data)
+}
+
+/// Remove the journal file (idempotent).
+pub fn clear_credential_journal(path: &Path) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("credential journal clear failed: {error}")),
+    }
+}
+
+/// Apply a recovery decision against the secret store and journal file.
+///
+/// Idempotent and fail closed: never deletes the live active secret; never rewrites config.
+/// Returns whether the journal was cleared (cleanup may leave it for retry).
+pub fn apply_credential_journal_recovery(
+    store: &impl SecretStore,
+    path: &Path,
+    journal: &CredentialRotationJournal,
+    active_ref: Option<&str>,
+    now_unix: u64,
+) -> Result<CredentialJournalRecoveryAction, String> {
+    let action = decide_credential_journal_recovery(journal, active_ref, now_unix);
+    match action {
+        CredentialJournalRecoveryAction::RollbackCandidate => {
+            if let Some(candidate_id) = journal.candidate_ref.as_ref() {
+                // Never delete the currently active ref (fail closed).
+                if active_ref != Some(candidate_id.as_str()) {
+                    // Propagate operational delete failures so the journal is retained for retry.
+                    store.delete(&CredentialRef {
+                        id: candidate_id.clone(),
+                    })?;
+                }
+            }
+            clear_credential_journal(path)?;
+        }
+        CredentialJournalRecoveryAction::FinishCommittedCleanup => {
+            if let Some(old_id) = journal.old_ref.as_ref() {
+                // Never delete the live active secret if it still equals old (should not
+                // happen when config_points_to_journal_next, but guard anyway).
+                if active_ref != Some(old_id.as_str()) {
+                    if let Err(error) = store.delete(&CredentialRef {
+                        id: old_id.clone(),
+                    }) {
+                        // Keep journal so the next startup can retry old cleanup.
+                        return Err(error);
+                    }
+                }
+            }
+            clear_credential_journal(path)?;
+        }
+        CredentialJournalRecoveryAction::ClearJournalOnly => {
+            clear_credential_journal(path)?;
+        }
+    }
+    Ok(action)
+}
+
+/// True when a write plan needs a durable rotation journal.
+pub fn credential_write_plan_needs_journal(plan: &CredentialSecretWritePlan) -> bool {
+    plan.rollback_candidate_id.is_some() || plan.delete_after_success_id.is_some()
+}
+
+/// Before writing a new rotation journal, reconcile any existing journal against the
+/// live config pointer (fail closed). Prevents overwriting a prior `ConfigCommitted`
+/// cleanup record with a new `Prepared` journal.
+///
+/// Returns `Ok(None)` when no journal exists, `Ok(Some(action))` after successful
+/// recovery, and `Err` when existing recovery cannot complete (caller must not start
+/// a new rotation).
+pub fn reconcile_existing_credential_journal_before_new(
+    store: &impl SecretStore,
+    path: &Path,
+    active_ref: Option<&str>,
+    now_unix: u64,
+) -> Result<Option<CredentialJournalRecoveryAction>, String> {
+    let Some(existing) = load_credential_journal(path)? else {
+        return Ok(None);
+    };
+    let action =
+        apply_credential_journal_recovery(store, path, &existing, active_ref, now_unix)?;
+    Ok(Some(action))
 }
 
 #[cfg(test)]
@@ -1044,7 +1379,8 @@ mod tests {
             Some(old_ref.id.clone()),
             true,
             "candidate-connection",
-        );
+        )
+        .expect("distinct candidate must plan");
         assert_eq!(plan.next_ref_id.as_deref(), Some("candidate-connection"));
         assert_eq!(
             plan.rollback_candidate_id.as_deref(),
@@ -1087,7 +1423,8 @@ mod tests {
             None,
             false,
             "unused-candidate",
-        );
+        )
+        .expect("no-secret plan must succeed");
         assert_eq!(keep.next_ref_id.as_deref(), Some("active-connection"));
         assert!(keep.rollback_candidate_id.is_none());
         assert!(keep.delete_after_success_id.is_none());
@@ -1096,6 +1433,57 @@ mod tests {
             store.get(&old_ref).unwrap().unwrap().expose(),
             "old-active-secret"
         );
+    }
+
+    #[test]
+    fn plan_rejects_candidate_equal_to_old_ref() {
+        // High-severity defense: candidate == old_ref must not produce a plan that would
+        // overwrite the active secret or schedule it as a disposable rollback candidate.
+        let err = plan_credential_secret_write(
+            AuthMode::Bearer,
+            Some("active-connection".into()),
+            Some("active-connection".into()),
+            true,
+            "active-connection",
+        )
+        .expect_err("candidate colliding with old_ref must be rejected");
+        assert!(
+            err.contains("collides with active ref"),
+            "error should name the collision clearly: {err}"
+        );
+        assert!(
+            err.contains("active-connection"),
+            "error should mention the colliding id without embedding secret material: {err}"
+        );
+
+        // AuthMode::None still ignores the candidate id entirely (even when equal to old_ref).
+        let none_plan = plan_credential_secret_write(
+            AuthMode::None,
+            Some("active-connection".into()),
+            Some("active-connection".into()),
+            true,
+            "active-connection",
+        )
+        .expect("AuthMode::None must ignore candidate collision");
+        assert!(none_plan.next_ref_id.is_none());
+        assert!(none_plan.rollback_candidate_id.is_none());
+        assert_eq!(
+            none_plan.delete_after_success_id.as_deref(),
+            Some("active-connection")
+        );
+
+        // No-secret path keeps previous semantics and does not consume the candidate id.
+        let keep = plan_credential_secret_write(
+            AuthMode::Bearer,
+            Some("active-connection".into()),
+            None,
+            false,
+            "active-connection",
+        )
+        .expect("no-secret plan ignores candidate id");
+        assert_eq!(keep.next_ref_id.as_deref(), Some("active-connection"));
+        assert!(keep.rollback_candidate_id.is_none());
+        assert!(keep.delete_after_success_id.is_none());
     }
 
     #[test]
@@ -1114,7 +1502,8 @@ mod tests {
             Some(old_ref.id.clone()),
             true, // even if a secret string is present, None mode ignores it
             "must-not-be-used",
-        );
+        )
+        .expect("AuthMode::None plan must succeed");
         assert!(plan.next_ref_id.is_none());
         assert!(plan.rollback_candidate_id.is_none());
         assert_eq!(plan.delete_after_success_id.as_deref(), Some("was-active"));
@@ -1436,5 +1825,536 @@ mod tests {
         assert!(encoded.contains("credential_session_only"));
         assert!(!encoded.contains("must-not-leak"));
         assert!(!encoded.contains("sk-"));
+    }
+
+    fn sample_plan_rotation() -> CredentialSecretWritePlan {
+        plan_credential_secret_write(
+            AuthMode::Bearer,
+            Some("old-ref".into()),
+            Some("old-ref".into()),
+            true,
+            "candidate-ref",
+        )
+        .expect("sample rotation plan uses distinct candidate")
+    }
+
+    fn sample_journal(phase: CredentialJournalPhase) -> CredentialRotationJournal {
+        CredentialRotationJournal::prepare(
+            &sample_plan_rotation(),
+            CredentialJournalSettingsMetadata {
+                provider: "openai".into(),
+                endpoint: "https://example.test/v1".into(),
+                model: "gpt-test".into(),
+                auth_mode: "bearer".into(),
+                enabled: true,
+                mode: "auto".into(),
+            },
+            1_700_000_000,
+            CREDENTIAL_JOURNAL_TTL_SECS,
+        )
+        .with_phase(phase)
+    }
+
+    fn temp_journal_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-cred-journal-{}-{}-{}",
+            label,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp journal dir");
+        dir
+    }
+
+    #[test]
+    fn credential_journal_phase_serializes_snake_case() {
+        for (phase, expected) in [
+            (CredentialJournalPhase::Prepared, "prepared"),
+            (CredentialJournalPhase::CandidateStored, "candidate_stored"),
+            (CredentialJournalPhase::ConfigCommitted, "config_committed"),
+        ] {
+            let encoded = to_string(&phase).unwrap();
+            assert_eq!(encoded, format!("\"{expected}\""));
+            let decoded: CredentialJournalPhase = serde_json::from_str(&encoded).unwrap();
+            assert_eq!(decoded, phase);
+        }
+
+        let journal = sample_journal(CredentialJournalPhase::CandidateStored);
+        let body = to_string(&journal).unwrap();
+        assert!(body.contains("candidate_stored"));
+        assert!(body.contains("\"version\":1"));
+        let roundtrip: CredentialRotationJournal = serde_json::from_str(&body).unwrap();
+        assert_eq!(roundtrip, journal);
+    }
+
+    #[test]
+    fn credential_journal_contains_no_secret_bytes() {
+        let secret_canary = "sk-live-super-secret-value-do-not-persist";
+        // Even if a caller tried to stuff a canary into free-form metadata, the journal
+        // type has no secret fields; sample metadata is non-secret by construction.
+        let journal = sample_journal(CredentialJournalPhase::Prepared);
+        let body = serde_json::to_string_pretty(&journal).unwrap();
+        assert!(!body.contains(secret_canary));
+        assert!(!body.contains("SecretValue"));
+        assert!(!body.contains("password"));
+        assert!(!body.contains("api_key"));
+        assert!(!body.contains("\"secret\""));
+        assert!(!body.contains("sk-"));
+        // Refs and redacted connection metadata only.
+        assert!(body.contains("candidate-ref"));
+        assert!(body.contains("old-ref"));
+        assert!(body.contains("openai"));
+        assert!(body.contains("settings_metadata"));
+    }
+
+    #[test]
+    fn credential_journal_old_config_rollback_deletes_only_candidate() {
+        let store = SessionSecretStore::new();
+        let old = CredentialRef {
+            id: "old-ref".into(),
+        };
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        store
+            .set(&old, SecretValue::new("old-active-secret"))
+            .unwrap();
+        store
+            .set(&candidate, SecretValue::new("new-candidate-secret"))
+            .unwrap();
+
+        let dir = temp_journal_dir("rollback");
+        let path = credential_journal_path(&dir);
+        let journal = sample_journal(CredentialJournalPhase::CandidateStored);
+        write_credential_journal(&path, &journal).unwrap();
+
+        // Config still points at old → rollback candidate only.
+        let action = apply_credential_journal_recovery(
+            &store,
+            &path,
+            &journal,
+            Some("old-ref"),
+            journal.created_at_unix,
+        )
+        .unwrap();
+        assert_eq!(action, CredentialJournalRecoveryAction::RollbackCandidate);
+        assert!(store.get(&candidate).unwrap().is_none());
+        assert_eq!(
+            store.get(&old).unwrap().unwrap().expose(),
+            "old-active-secret"
+        );
+        assert!(load_credential_journal(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_journal_committed_config_finishes_old_cleanup() {
+        let store = SessionSecretStore::new();
+        let old = CredentialRef {
+            id: "old-ref".into(),
+        };
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        store
+            .set(&old, SecretValue::new("old-active-secret"))
+            .unwrap();
+        store
+            .set(&candidate, SecretValue::new("new-candidate-secret"))
+            .unwrap();
+
+        let dir = temp_journal_dir("committed");
+        let path = credential_journal_path(&dir);
+        let journal = sample_journal(CredentialJournalPhase::ConfigCommitted);
+        write_credential_journal(&path, &journal).unwrap();
+
+        // Config already switched to candidate/next.
+        let action = apply_credential_journal_recovery(
+            &store,
+            &path,
+            &journal,
+            Some("candidate-ref"),
+            journal.created_at_unix,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
+        assert_eq!(
+            store.get(&candidate).unwrap().unwrap().expose(),
+            "new-candidate-secret"
+        );
+        assert!(store.get(&old).unwrap().is_none());
+        assert!(load_credential_journal(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_journal_recovery_is_idempotent() {
+        let store = SessionSecretStore::new();
+        let old = CredentialRef {
+            id: "old-ref".into(),
+        };
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        store
+            .set(&old, SecretValue::new("old-active-secret"))
+            .unwrap();
+        store
+            .set(&candidate, SecretValue::new("new-candidate-secret"))
+            .unwrap();
+
+        let dir = temp_journal_dir("idempotent");
+        let path = credential_journal_path(&dir);
+        let journal = sample_journal(CredentialJournalPhase::ConfigCommitted);
+        write_credential_journal(&path, &journal).unwrap();
+
+        let first = apply_credential_journal_recovery(
+            &store,
+            &path,
+            &journal,
+            Some("candidate-ref"),
+            journal.created_at_unix,
+        )
+        .unwrap();
+        assert_eq!(first, CredentialJournalRecoveryAction::FinishCommittedCleanup);
+
+        // Second pass: no journal left → load None; re-applying decision with no file is no-op.
+        assert!(load_credential_journal(&path).unwrap().is_none());
+        // Re-run pure decision + apply against already-clean state (simulate double recovery).
+        write_credential_journal(&path, &journal).unwrap();
+        let second = apply_credential_journal_recovery(
+            &store,
+            &path,
+            &journal,
+            Some("candidate-ref"),
+            journal.created_at_unix + 10,
+        )
+        .unwrap();
+        assert_eq!(
+            second,
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
+        assert_eq!(
+            store.get(&candidate).unwrap().unwrap().expose(),
+            "new-candidate-secret"
+        );
+        assert!(store.get(&old).unwrap().is_none());
+        assert!(load_credential_journal(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_journal_stale_expired_still_reconciles_by_config_pointer() {
+        let mut expired = sample_journal(CredentialJournalPhase::CandidateStored);
+        expired.expires_at_unix = expired.created_at_unix; // already expired at created+1
+        assert!(expired.is_expired(expired.created_at_unix + 1));
+
+        // Expired + config still old → rollback (not leave orphan forever).
+        assert_eq!(
+            decide_credential_journal_recovery(&expired, Some("old-ref"), expired.created_at_unix + 1),
+            CredentialJournalRecoveryAction::RollbackCandidate
+        );
+
+        // Expired + config already on next → still finish cleanup.
+        let mut committed = expired.clone();
+        committed.phase = CredentialJournalPhase::ConfigCommitted;
+        assert_eq!(
+            decide_credential_journal_recovery(
+                &committed,
+                Some("candidate-ref"),
+                committed.created_at_unix + CREDENTIAL_JOURNAL_TTL_SECS + 100
+            ),
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
+
+        // Unrelated live ref → clear journal only (do not touch that generation).
+        assert_eq!(
+            decide_credential_journal_recovery(
+                &committed,
+                Some("totally-other-ref"),
+                committed.created_at_unix + 1
+            ),
+            CredentialJournalRecoveryAction::ClearJournalOnly
+        );
+    }
+
+    #[test]
+    fn credential_journal_atomic_file_writes_replace_destination() {
+        let dir = temp_journal_dir("atomic");
+        let path = credential_journal_path(&dir);
+        let first = sample_journal(CredentialJournalPhase::Prepared);
+        write_credential_journal(&path, &first).unwrap();
+        let loaded = load_credential_journal(&path).unwrap().unwrap();
+        assert_eq!(loaded.phase, CredentialJournalPhase::Prepared);
+
+        let second = first.clone().with_phase(CredentialJournalPhase::CandidateStored);
+        write_credential_journal(&path, &second).unwrap();
+        let loaded = load_credential_journal(&path).unwrap().unwrap();
+        assert_eq!(loaded.phase, CredentialJournalPhase::CandidateStored);
+        // No leftover temp beside the journal after atomic replace.
+        let tmp = path.with_extension("json.tmp");
+        assert!(!tmp.exists(), "atomic write must not leave .json.tmp");
+        // Destination remains a single valid journal file.
+        assert!(path.exists());
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.contains("candidate_stored"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn credential_journal_candidate_stored_with_switched_config_finishes_cleanup() {
+        // Crash after config save but before phase advanced to ConfigCommitted.
+        let journal = sample_journal(CredentialJournalPhase::CandidateStored);
+        assert_eq!(
+            decide_credential_journal_recovery(
+                &journal,
+                Some("candidate-ref"),
+                journal.created_at_unix
+            ),
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
+    }
+
+    #[test]
+    fn credential_journal_auth_mode_none_clear_recovery() {
+        let plan = plan_credential_secret_write(
+            AuthMode::None,
+            Some("was-active".into()),
+            None,
+            false,
+            "unused",
+        )
+        .expect("AuthMode::None clear plan");
+        let journal = CredentialRotationJournal::prepare(
+            &plan,
+            CredentialJournalSettingsMetadata {
+                auth_mode: "none".into(),
+                enabled: false,
+                ..Default::default()
+            },
+            100,
+            1000,
+        )
+        .with_phase(CredentialJournalPhase::ConfigCommitted);
+        assert!(journal.candidate_ref.is_none());
+        assert_eq!(journal.next_ref, None);
+        assert_eq!(
+            decide_credential_journal_recovery(&journal, None, 100),
+            CredentialJournalRecoveryAction::FinishCommittedCleanup
+        );
+        // Pre-switch: config still has old.
+        let prepared = journal.clone().with_phase(CredentialJournalPhase::Prepared);
+        assert_eq!(
+            decide_credential_journal_recovery(&prepared, Some("was-active"), 100),
+            CredentialJournalRecoveryAction::RollbackCandidate
+        );
+    }
+
+    /// Store that fails delete for selected ids (models OS operational delete failure).
+    struct FailDeleteStore {
+        inner: SessionSecretStore,
+        fail_ids: HashSet<String>,
+    }
+
+    impl SecretStore for FailDeleteStore {
+        fn set(&self, reference: &CredentialRef, value: SecretValue) -> Result<(), String> {
+            self.inner.set(reference, value)
+        }
+
+        fn get(&self, reference: &CredentialRef) -> Result<Option<SecretValue>, String> {
+            self.inner.get(reference)
+        }
+
+        fn delete(&self, reference: &CredentialRef) -> Result<(), String> {
+            if self.fail_ids.contains(&reference.id) {
+                return Err("simulated operational delete failure".to_string());
+            }
+            self.inner.delete(reference)
+        }
+    }
+
+    #[test]
+    fn missing_credential_delete_errors_are_idempotent_success_policy() {
+        // Shared policy used by macOS/Windows/Linux OS delete paths and session store.
+        // Retrying committed cleanup against an already-absent old ref must succeed.
+        for message in [
+            "No matching entry found in secure storage",
+            "credential not found",
+            "No entry for service",
+            "Password not found",
+        ] {
+            assert_eq!(
+                classify_keyring_error(message),
+                KeyringErrorClass::MissingEntry,
+                "missing-style error must be success for delete: {message}"
+            );
+            assert!(
+                is_missing_credential_error(message),
+                "is_missing_credential_error must accept: {message}"
+            );
+        }
+        // Operational failures remain failures (not treated as missing).
+        assert_eq!(
+            classify_keyring_error("keychain access denied"),
+            KeyringErrorClass::OperationalFailure
+        );
+        // Session store delete of absent id is already Ok (Linux/session baseline).
+        let session = SessionSecretStore::new();
+        let missing = CredentialRef {
+            id: "never-written".into(),
+        };
+        session.delete(&missing).unwrap();
+        session.delete(&missing).unwrap();
+    }
+
+    #[test]
+    fn pre_switch_rollback_clears_journal_only_after_confirmed_candidate_delete() {
+        let store = SessionSecretStore::new();
+        let plan = sample_plan_rotation();
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        store
+            .set(&candidate, SecretValue::new("candidate-secret"))
+            .unwrap();
+
+        let dir = temp_journal_dir("pre-switch-ok");
+        let path = credential_journal_path(&dir);
+        let journal = sample_journal(CredentialJournalPhase::CandidateStored);
+        write_credential_journal(&path, &journal).unwrap();
+
+        rollback_candidate_or_retain_journal(&store, &plan, &path, &journal).unwrap();
+        assert!(store.get(&candidate).unwrap().is_none());
+        assert!(load_credential_journal(&path).unwrap().is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pre_switch_rollback_retains_journal_when_candidate_delete_unconfirmed() {
+        let inner = SessionSecretStore::new();
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        inner
+            .set(&candidate, SecretValue::new("candidate-secret"))
+            .unwrap();
+        let store = FailDeleteStore {
+            inner,
+            fail_ids: HashSet::from(["candidate-ref".to_string()]),
+        };
+        let plan = sample_plan_rotation();
+        let dir = temp_journal_dir("pre-switch-retain");
+        let path = credential_journal_path(&dir);
+        // Disk may still be Prepared if CandidateStored phase write failed.
+        let journal = sample_journal(CredentialJournalPhase::Prepared);
+        write_credential_journal(&path, &journal).unwrap();
+
+        let err = rollback_candidate_or_retain_journal(&store, &plan, &path, &journal)
+            .expect_err("unconfirmed rollback must not clear journal");
+        assert!(err.contains("rollback unconfirmed"));
+        // Journal retained and advanced to a recovery-processable phase.
+        let retained = load_credential_journal(&path).unwrap().expect("journal retained");
+        assert_eq!(retained.phase, CredentialJournalPhase::CandidateStored);
+        assert_eq!(retained.candidate_ref.as_deref(), Some("candidate-ref"));
+        // Non-secret journal body only.
+        let body = serde_json::to_string(&retained).unwrap();
+        assert!(!body.contains("candidate-secret"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_existing_journal_before_new_finishes_committed_cleanup() {
+        let store = SessionSecretStore::new();
+        let old = CredentialRef {
+            id: "old-ref".into(),
+        };
+        let candidate = CredentialRef {
+            id: "candidate-ref".into(),
+        };
+        store
+            .set(&old, SecretValue::new("old-active-secret"))
+            .unwrap();
+        store
+            .set(&candidate, SecretValue::new("new-candidate-secret"))
+            .unwrap();
+
+        let dir = temp_journal_dir("reconcile-before-new");
+        let path = credential_journal_path(&dir);
+        let existing = sample_journal(CredentialJournalPhase::ConfigCommitted);
+        write_credential_journal(&path, &existing).unwrap();
+
+        // Config already on next; prior cleanup must finish before a new journal is written.
+        let action = reconcile_existing_credential_journal_before_new(
+            &store,
+            &path,
+            Some("candidate-ref"),
+            existing.created_at_unix,
+        )
+        .unwrap();
+        assert_eq!(
+            action,
+            Some(CredentialJournalRecoveryAction::FinishCommittedCleanup)
+        );
+        assert!(store.get(&old).unwrap().is_none());
+        assert!(load_credential_journal(&path).unwrap().is_none());
+
+        // A new Prepared journal can now be written without clobbering pending cleanup.
+        let new_journal = sample_journal(CredentialJournalPhase::Prepared);
+        write_credential_journal(&path, &new_journal).unwrap();
+        assert_eq!(
+            load_credential_journal(&path).unwrap().unwrap().phase,
+            CredentialJournalPhase::Prepared
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_existing_journal_before_new_fail_closed_on_incomplete_recovery() {
+        let inner = SessionSecretStore::new();
+        let old = CredentialRef {
+            id: "old-ref".into(),
+        };
+        inner
+            .set(&old, SecretValue::new("old-active-secret"))
+            .unwrap();
+        let store = FailDeleteStore {
+            inner,
+            fail_ids: HashSet::from(["old-ref".to_string()]),
+        };
+        let dir = temp_journal_dir("reconcile-fail-closed");
+        let path = credential_journal_path(&dir);
+        let existing = sample_journal(CredentialJournalPhase::ConfigCommitted);
+        write_credential_journal(&path, &existing).unwrap();
+
+        // Cannot finish old cleanup → must not start a new rotation (journal retained).
+        let err = reconcile_existing_credential_journal_before_new(
+            &store,
+            &path,
+            Some("candidate-ref"),
+            existing.created_at_unix,
+        )
+        .expect_err("incomplete recovery must fail closed");
+        assert!(err.contains("simulated operational delete failure"));
+        let retained = load_credential_journal(&path).unwrap().expect("journal retained");
+        assert_eq!(retained.phase, CredentialJournalPhase::ConfigCommitted);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reconcile_existing_journal_before_new_noop_when_absent() {
+        let store = SessionSecretStore::new();
+        let dir = temp_journal_dir("reconcile-absent");
+        let path = credential_journal_path(&dir);
+        let action =
+            reconcile_existing_credential_journal_before_new(&store, &path, Some("any"), 1)
+                .unwrap();
+        assert!(action.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

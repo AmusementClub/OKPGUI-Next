@@ -16,6 +16,12 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .setup(|app| {
+            // Reconcile any in-flight credential rotation journal before normal AI use.
+            // Idempotent / fail closed; never exposes secrets over IPC.
+            commands::ai_commands::init_ai_credential_journal_recovery(app.handle().clone());
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             config::get_config,
             config::get_config_load_error,

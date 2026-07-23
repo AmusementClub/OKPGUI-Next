@@ -8,12 +8,15 @@ use crate::ai::context::{
     DEFAULT_CONTEXT_CEILING,
 };
 use crate::ai::credentials::{
-    apply_public_credential_session_flag, apply_public_identity_matches, capability_identity,
-    capability_identity_matches, cleanup_previous_secret_after_success,
-    may_read_credential_store_for_settings, plan_credential_secret_write,
-    rollback_credential_candidate, validate_custom_header_name, AuthMode, CredentialMutationGate,
-    CredentialRef, OsCredentialStore, PublicCapabilityStatus, PublicConnectionConfig, SecretStore,
-    SecretValue,
+    apply_credential_journal_recovery, apply_public_credential_session_flag,
+    apply_public_identity_matches, capability_identity, capability_identity_matches,
+    cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
+    credential_write_plan_needs_journal, load_credential_journal, may_read_credential_store_for_settings,
+    plan_credential_secret_write, reconcile_existing_credential_journal_before_new,
+    rollback_candidate_or_retain_journal, rollback_credential_candidate, validate_custom_header_name,
+    write_credential_journal, AuthMode, CREDENTIAL_JOURNAL_TTL_SECS, CredentialJournalPhase,
+    CredentialJournalSettingsMetadata, CredentialMutationGate, CredentialRef, CredentialRotationJournal,
+    OsCredentialStore, PublicCapabilityStatus, PublicConnectionConfig, SecretStore, SecretValue,
 };
 use crate::ai::jobs::{
     formal_audit_may_bind_terminal_evidence, media_info_may_report_success,
@@ -118,6 +121,75 @@ fn credential_store() -> &'static OsCredentialStore {
 fn credential_mutation_gate() -> &'static CredentialMutationGate {
     static GATE: OnceLock<CredentialMutationGate> = OnceLock::new();
     GATE.get_or_init(CredentialMutationGate::new)
+}
+
+/// App-local path for the non-secret credential rotation journal.
+fn ai_credential_journal_path(app: &AppHandle) -> Result<PathBuf, String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("failed to resolve app data dir for credential journal: {error}"))?;
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|error| format!("failed to create app data dir for credential journal: {error}"))?;
+    Ok(credential_journal_path(&data_dir))
+}
+
+fn journal_settings_metadata(connection: &PublicConnectionConfig) -> CredentialJournalSettingsMetadata {
+    CredentialJournalSettingsMetadata {
+        provider: match connection.provider {
+            ProviderKind::OpenAi => "openai".to_string(),
+            ProviderKind::Anthropic => "anthropic".to_string(),
+        },
+        endpoint: connection.endpoint.clone(),
+        model: connection.model.clone(),
+        auth_mode: match connection.auth_mode {
+            AuthMode::Bearer => "bearer".to_string(),
+            AuthMode::AnthropicApiKey => "anthropic_api_key".to_string(),
+            AuthMode::CustomHeader => "custom_header".to_string(),
+            AuthMode::None => "none".to_string(),
+        },
+        enabled: connection.enabled,
+        mode: match connection.mode {
+            ProviderMode::Auto => "auto".to_string(),
+            ProviderMode::Responses => "responses".to_string(),
+            ProviderMode::Chat => "chat".to_string(),
+            ProviderMode::AnthropicMessages => "anthropic_messages".to_string(),
+        },
+    }
+}
+
+/// Startup hook: reconcile any in-flight credential rotation journal before normal AI use.
+///
+/// Idempotent and fail closed. Never exposes secrets over IPC. Host-only gap: Linux
+/// session-only secrets do not survive process restart, so recovery can only clean
+/// durable OS keyring entries + the journal file after a cold start on that path.
+pub fn init_ai_credential_journal_recovery(app: AppHandle) {
+    if let Err(error) = recover_ai_credential_journal(&app) {
+        // Best-effort startup reconciliation; do not abort app launch.
+        eprintln!("ai credential journal recovery: {error}");
+    }
+}
+
+fn recover_ai_credential_journal(app: &AppHandle) -> Result<(), String> {
+    let _mutation_guard = credential_mutation_gate().lock()?;
+    let path = ai_credential_journal_path(app)?;
+    let Some(journal) = load_credential_journal(&path)? else {
+        return Ok(());
+    };
+    let config = crate::config::load_config(app);
+    let active_ref = config
+        .ai
+        .credential_ref
+        .as_ref()
+        .and_then(|reference| reference.key_ref.clone());
+    let _ = apply_credential_journal_recovery(
+        credential_store(),
+        &path,
+        &journal,
+        active_ref.as_deref(),
+        now_unix(),
+    )?;
+    Ok(())
 }
 
 fn template_seeds() -> &'static Mutex<TemplateSeedRegistry> {
@@ -330,6 +402,7 @@ pub fn ai_save_settings(
         .and_then(|reference| reference.key_ref.clone());
     // New secrets always write to a unique candidate; never overwrite the active secret in place.
     // AuthMode::None never creates a candidate and schedules old-secret cleanup only after success.
+    // Plan rejects candidate == old_ref so rollback cannot delete the live secret.
     let write_plan = plan_credential_secret_write(
         connection.auth_mode,
         old_ref.clone(),
@@ -339,18 +412,77 @@ pub fn ai_save_settings(
             .map(|reference| reference.id.clone()),
         secret.is_some(),
         unique_connection_candidate_id(),
-    );
+    )?;
     let next_ref = write_plan.next_ref_id.clone();
+
+    // Durable non-secret journal around candidate write → config pointer → old cleanup.
+    // Journal failures before the pointer switch abort without destroying the old active secret.
+    let needs_journal = credential_write_plan_needs_journal(&write_plan);
+    let journal_path = if needs_journal {
+        Some(ai_credential_journal_path(&app)?)
+    } else {
+        None
+    };
+
+    // Under the mutation gate: finish or fail any prior journal before writing a new one so a
+    // ConfigCommitted cleanup record cannot be overwritten by a later save (fail closed).
+    if let Some(path) = journal_path.as_ref() {
+        reconcile_existing_credential_journal_before_new(
+            credential_store(),
+            path,
+            old_ref.as_deref(),
+            now_unix(),
+        )?;
+    }
+
+    let mut journal = if let Some(path) = journal_path.as_ref() {
+        let prepared = CredentialRotationJournal::prepare(
+            &write_plan,
+            journal_settings_metadata(&connection),
+            now_unix(),
+            CREDENTIAL_JOURNAL_TTL_SECS,
+        );
+        write_credential_journal(path, &prepared)?;
+        Some(prepared)
+    } else {
+        None
+    };
 
     if let (Some(candidate_id), Some(value)) =
         (write_plan.rollback_candidate_id.as_ref(), secret.as_deref())
     {
-        credential_store().set(
+        if let Err(error) = credential_store().set(
             &CredentialRef {
                 id: candidate_id.clone(),
             },
             SecretValue::new(value),
-        )?;
+        ) {
+            // Candidate never stored; drop journal and keep old active secret.
+            if let Some(path) = journal_path.as_ref() {
+                let _ = clear_credential_journal(path);
+            }
+            return Err(error);
+        }
+        if let (Some(path), Some(current_journal)) =
+            (journal_path.as_ref(), journal.as_mut())
+        {
+            *current_journal = current_journal
+                .clone()
+                .with_phase(CredentialJournalPhase::CandidateStored);
+            if let Err(error) = write_credential_journal(path, current_journal) {
+                // Phase advance failed after candidate write: roll back candidate only.
+                // Clear journal only after confirmed delete; otherwise retain for recovery.
+                if let Err(rollback_error) = rollback_candidate_or_retain_journal(
+                    credential_store(),
+                    &write_plan,
+                    path,
+                    current_journal,
+                ) {
+                    return Err(format!("{error}; {rollback_error}"));
+                }
+                return Err(error);
+            }
+        }
     }
 
     let mut ai = crate::config::AIConfig {
@@ -409,13 +541,44 @@ pub fn ai_save_settings(
 
     if let Err(error) = crate::config::save_ai_config(app.clone(), ai) {
         // Pre-switch failure: delete only the candidate created by this call; keep old active secret.
-        let _ = rollback_credential_candidate(credential_store(), &write_plan);
+        // Clear journal only after confirmed candidate rollback; otherwise retain for recovery.
+        if let (Some(path), Some(current_journal)) = (journal_path.as_ref(), journal.as_ref()) {
+            if let Err(rollback_error) = rollback_candidate_or_retain_journal(
+                credential_store(),
+                &write_plan,
+                path,
+                current_journal,
+            ) {
+                return Err(format!("{error}; {rollback_error}"));
+            }
+        } else {
+            // No journal path (no rotation journal planned): still attempt candidate rollback.
+            let _ = rollback_credential_candidate(credential_store(), &write_plan);
+        }
         return Err(error);
     }
 
-    // Successful switch: best-effort delete previous active secret (None transition + rotation).
-    // Never runs on pre-switch failure, so rollback still preserves the old active secret.
-    let _ = cleanup_previous_secret_after_success(credential_store(), &write_plan);
+    // Pointer switched: mark committed so startup recovery finishes old cleanup if we crash.
+    if let (Some(path), Some(current_journal)) = (journal_path.as_ref(), journal.as_mut()) {
+        *current_journal = current_journal
+            .clone()
+            .with_phase(CredentialJournalPhase::ConfigCommitted);
+        // Best-effort phase write; config pointer is authoritative if this fails.
+        let _ = write_credential_journal(path, current_journal);
+    }
+
+    // Successful switch: delete previous active secret (None transition + rotation).
+    // On failure keep ConfigCommitted journal so the next startup retries cleanup.
+    match cleanup_previous_secret_after_success(credential_store(), &write_plan) {
+        Ok(()) => {
+            if let Some(path) = journal_path.as_ref() {
+                let _ = clear_credential_journal(path);
+            }
+        }
+        Err(_error) => {
+            // Leave journal for init_ai_credential_journal_recovery on next launch.
+        }
+    }
 
     connection.credential_ref = next_ref.map(|id| CredentialRef { id });
     Ok(ai_get_settings(app))
@@ -4787,12 +4950,20 @@ fn now_unix() -> u64 {
         .unwrap_or_default()
 }
 
-/// Process-unique credential candidate id: wall-clock seconds plus a monotonic counter.
-/// Concurrent saves within the same second must not collide on the keyring entry name.
+/// Restart-safe credential candidate id.
+///
+/// Combines process identity, high-resolution wall time, and a process-local monotonic counter
+/// so IDs remain distinct across concurrent saves and process restarts (unix-second + reset
+/// counter alone could reuse an active ref after restart). Keeps the `connection-` prefix.
 fn unique_connection_candidate_id() -> String {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let seq = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("connection-{}-{}", now_unix(), seq)
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let pid = std::process::id();
+    format!("connection-{pid}-{nanos}-{seq}")
 }
 
 #[cfg(test)]
@@ -4800,21 +4971,51 @@ mod candidate_id_tests {
     use super::unique_connection_candidate_id;
 
     #[test]
-    fn candidate_ids_are_unique_within_the_same_second() {
+    fn candidate_ids_are_unique_and_restart_resistant_by_construction() {
         let first = unique_connection_candidate_id();
         let second = unique_connection_candidate_id();
         assert_ne!(
             first, second,
-            "same-second concurrent saves must not share an id"
+            "concurrent saves must not share an id"
         );
         assert!(
             first.starts_with("connection-") && second.starts_with("connection-"),
             "ids must keep the connection- prefix without embedding secrets"
         );
-        // Counter suffix differs even when the unix-second prefix matches.
+
+        // Format: connection-{pid}-{nanos}-{seq} — process identity + high-res time + counter.
+        let pid = std::process::id().to_string();
+        for id in [&first, &second] {
+            let rest = id
+                .strip_prefix("connection-")
+                .expect("connection- prefix");
+            let mut parts = rest.splitn(3, '-');
+            let id_pid = parts.next().expect("pid component");
+            let id_nanos = parts.next().expect("nanos component");
+            let id_seq = parts.next().expect("seq component");
+            assert_eq!(id_pid, pid, "candidate must embed process identity");
+            assert!(
+                !id_nanos.is_empty() && id_nanos.chars().all(|c| c.is_ascii_digit()),
+                "high-resolution time component must be numeric nanos: {id}"
+            );
+            assert!(
+                !id_seq.is_empty() && id_seq.chars().all(|c| c.is_ascii_digit()),
+                "counter component must be numeric: {id}"
+            );
+            // Nanos alone is restart-resistant vs second-granularity ids; pid further
+            // separates concurrent processes that might share a counter restart epoch.
+            assert!(
+                id_nanos.len() >= 10,
+                "nanos component should be high-resolution (not unix seconds only): {id}"
+            );
+        }
+
         let first_seq = first.rsplit('-').next().unwrap_or_default();
         let second_seq = second.rsplit('-').next().unwrap_or_default();
-        assert_ne!(first_seq, second_seq);
+        assert_ne!(
+            first_seq, second_seq,
+            "monotonic counter must differ even if nanos matched"
+        );
     }
 }
 
