@@ -31,6 +31,8 @@ interface PublishConfirmModalProps {
     profile: string;
     okpPath: string;
     selectedSites: PublishConfirmSiteSummary[];
+    preflight?: React.ReactNode;
+    confirmDisabled?: boolean;
 }
 
 function dotBgFromTone(toneClass: string): string {
@@ -129,6 +131,8 @@ export default function PublishConfirmModal({
     profile,
     okpPath,
     selectedSites,
+    preflight,
+    confirmDisabled = false,
 }: PublishConfirmModalProps) {
     const [autoOpenConsole, setAutoOpenConsole] = useState<boolean>(() => {
         const stored = localStorage.getItem('okpgui:autoOpenPublishConsole');
@@ -335,6 +339,7 @@ export default function PublishConfirmModal({
                                             </span>
                                         </span>
                                     </div>
+                                    {preflight}
                                 </div>
 
                                 {/* Action bar */}
@@ -377,7 +382,8 @@ export default function PublishConfirmModal({
                                             );
                                             onConfirm({ autoOpenConsole });
                                         }}
-                                        className="inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500 px-[18px] py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-600"
+                                        disabled={confirmDisabled}
+                                        className="inline-flex items-center gap-2 rounded-lg border border-emerald-400/40 bg-emerald-500 px-[18px] py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                                     >
                                         <Send size={14} />
                                         确认发布
