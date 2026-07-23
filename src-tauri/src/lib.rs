@@ -78,6 +78,10 @@ pub fn run() {
             commands::ai_commands::ai_get_media_info_result,
             commands::ai_commands::ai_extract_vision_images,
             commands::ai_commands::ai_normalize_vision_image,
+            // Plan-token Vision: list candidates from bound final content, bind after
+            // explicit over-cap selection, then formal audit attaches provider image parts.
+            commands::ai_commands::ai_list_plan_vision_candidates,
+            commands::ai_commands::ai_bind_plan_vision,
             // TemplateSelection is a backend-owned AiJob: start / poll; cancel via ai_cancel_job.
             // Seed mint only on Succeeded; cancel/stale/late completion never hand off a seed.
             commands::ai_commands::ai_start_template_selection,

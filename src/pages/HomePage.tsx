@@ -2067,6 +2067,8 @@ export default function HomePage() {
                         configured={preflight.isConfigured}
                         canConfirm={preflight.canConfirm}
                         onAcknowledgementChange={preflight.setAcknowledgement}
+                        onToggleVisionSelection={preflight.toggleVisionSelection}
+                        onConfirmVisionSelection={() => { void preflight.confirmVisionSelection(); }}
                     />
                 )}
                 confirmDisabled={isPublishing || isPreparingPublish || !preflight.canConfirm}

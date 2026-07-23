@@ -2976,4 +2976,174 @@ describe('HomePage publish content pipeline', () => {
             await rendered.unmount();
         }
     });
+
+    it('AI-disabled prepare never lists or binds Vision images', async () => {
+        // Default mountWithTemplate uses enabled: false — zero image side effects.
+        mountWithTemplate({}, { acgnx_asia_token: 'token-abc' });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
+            expect(findInvokeArgs('ai_start_formal_audit')).toHaveLength(1);
+            expect(findInvokeArgs('ai_list_plan_vision_candidates')).toHaveLength(0);
+            expect(findInvokeArgs('ai_bind_plan_vision')).toHaveLength(0);
+            expect(findInvokeArgs('ai_extract_vision_images')).toHaveLength(0);
+            expect(findInvokeArgs('ai_normalize_vision_image')).toHaveLength(0);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('requires explicit selection when more than five Vision candidates exist', async () => {
+        const candidates = Array.from({ length: 6 }, (_, index) => ({
+            url: `https://cdn.example.test/${index}.jpg`,
+            source: 'markdown',
+        }));
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_config':
+                    return Promise.resolve({
+                        last_used_template: 'default',
+                        okp_executable_path: '/okp',
+                        templates: {
+                            default: {
+                                profile: 'p1',
+                                description: '**markdown 简介**',
+                                description_html: '',
+                                title: '发布标题',
+                            },
+                        },
+                    });
+                case 'get_profile_list':
+                    return Promise.resolve(['p1']);
+                case 'get_profiles':
+                    return Promise.resolve({
+                        profiles: { p1: { ...buildProfile(), acgnx_asia_token: 'token-abc' } },
+                    });
+                case 'save_template':
+                    return Promise.resolve({ name: typedArgs?.name, template: typedArgs?.template });
+                case 'parse_torrent':
+                    return Promise.resolve({
+                        name: 'release.mkv',
+                        total_size: 1,
+                        file_tree: { name: 'release.mkv', size: 1, children: [], is_file: true },
+                    });
+                case 'parse_title_details':
+                    return Promise.resolve({ title: '发布标题', episode: '01', resolution: '1080p' });
+                case 'ai_get_settings':
+                    return Promise.resolve({
+                        provider: 'open_ai',
+                        endpoint: 'https://api.openai.com/v1',
+                        model: 'gpt-test',
+                        mode: 'auto',
+                        auth_mode: 'bearer',
+                        custom_header_name: null,
+                        credential_ref: { id: 'cred-1' },
+                        enabled: true,
+                    });
+                case 'prepare_plan':
+                    return Promise.resolve({
+                        token: 'prepared-token',
+                        snapshot_hash: 'sha256:pre-vision',
+                        request_generation: 1,
+                        local_blockers: [],
+                        has_blockers: false,
+                    });
+                case 'ai_list_plan_vision_candidates':
+                    return Promise.resolve({
+                        plan_token: 'prepared-token',
+                        snapshot_hash: 'sha256:pre-vision',
+                        request_generation: 1,
+                        candidates,
+                        requires_selection: true,
+                        max_images: 5,
+                    });
+                case 'ai_bind_plan_vision':
+                    return Promise.resolve({
+                        plan_token: 'prepared-token',
+                        snapshot_hash: 'sha256:post-vision',
+                        request_generation: 1,
+                        batch_hash: 'sha256:batch',
+                        images: (typedArgs?.request as { selected_urls?: string[] } | undefined)
+                            ?.selected_urls
+                            ?.slice(0, 5)
+                            .map((url) => ({
+                                source: 'markdown',
+                                content_hash: `sha256:${url.length}`,
+                                mime_type: 'image/jpeg',
+                                normalized_bytes: 100,
+                                width: 10,
+                                height: 10,
+                            })) ?? [],
+                        warnings: [],
+                    });
+                case 'ai_start_formal_audit':
+                    return Promise.resolve({
+                        decision: 'GO',
+                        findings: [],
+                        unknown_codes: [],
+                        local_blockers: [],
+                        formal_ran: true,
+                        job_id: null,
+                        plan_token: 'prepared-token',
+                        snapshot_hash: 'sha256:post-vision',
+                        request_generation: 1,
+                    });
+                case 'set_plan_acknowledgements':
+                case 'invalidate_plan':
+                    return Promise.resolve(null);
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            // Formal audit must wait for explicit Vision selection.
+            expect(findInvokeArgs('ai_list_plan_vision_candidates')).toHaveLength(1);
+            expect(findInvokeArgs('ai_bind_plan_vision')).toHaveLength(0);
+            expect(findInvokeArgs('ai_start_formal_audit')).toHaveLength(0);
+            expect(document.body.querySelector('[data-testid="ai-vision-selection"]')).not.toBeNull();
+
+            const checkboxes = Array.from(
+                document.body.querySelectorAll<HTMLInputElement>('[data-testid="ai-vision-candidate"]'),
+            );
+            expect(checkboxes).toHaveLength(6);
+
+            // Select five explicitly (never silent first-five).
+            for (let index = 0; index < 5; index += 1) {
+                await act(async () => {
+                    checkboxes[index].dispatchEvent(new MouseEvent('click', { bubbles: true }));
+                });
+            }
+            await flushAsync();
+
+            const confirmVision = document.body.querySelector<HTMLButtonElement>(
+                '[data-testid="ai-vision-confirm-selection"]',
+            );
+            expect(confirmVision).not.toBeNull();
+            await act(async () => {
+                confirmVision!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync(10);
+
+            expect(findInvokeArgs('ai_bind_plan_vision')).toHaveLength(1);
+            const bindArgs = findInvokeArgs('ai_bind_plan_vision')[0] as {
+                request: { plan_token?: string; selected_urls?: string[] };
+            };
+            expect(bindArgs.request.plan_token).toBe('prepared-token');
+            expect(bindArgs.request.selected_urls).toHaveLength(5);
+            expect(findInvokeArgs('ai_start_formal_audit')).toHaveLength(1);
+            expect(document.body.querySelector('[data-testid="ai-vision-bound-count"]')).not.toBeNull();
+        } finally {
+            await rendered.unmount();
+        }
+    });
 });

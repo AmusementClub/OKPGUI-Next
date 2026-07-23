@@ -3443,3 +3443,394 @@ describe('AutoTemplate selection and seed hydration', () => {
         await rendered.unmount();
     });
 });
+
+describe('QuickPublish Vision + preflight identity', () => {
+    beforeEach(() => {
+        invokeMock.mockReset();
+    });
+
+    it('useAiPreflight skips Vision and formal side effects when AI is disabled', async () => {
+        const { useAiPreflight } = await import('../hooks/useAiPreflight');
+        const { createElement } = await import('react');
+
+        invokeMock.mockImplementation((command: string) => {
+            if (command === 'ai_get_settings') {
+                return Promise.resolve({
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: '',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: null,
+                    enabled: false,
+                });
+            }
+            if (command === 'prepare_plan') {
+                return Promise.resolve({
+                    token: 'plan-disabled',
+                    snapshot_hash: 'sha256:local',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            }
+            if (command === 'ai_start_formal_audit') {
+                return Promise.resolve({
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    local_blockers: [],
+                    formal_ran: false,
+                    job_id: null,
+                    plan_token: 'plan-disabled',
+                    snapshot_hash: 'sha256:local',
+                    request_generation: 1,
+                });
+            }
+            if (command === 'invalidate_plan') {
+                return Promise.resolve(true);
+            }
+            return Promise.resolve(null);
+        });
+
+        let api: ReturnType<typeof useAiPreflight> | null = null;
+        function Probe() {
+            api = useAiPreflight();
+            return null;
+        }
+        const rendered = await renderElement(createElement(Probe));
+        await flushAsync();
+
+        const template = createDefaultQuickPublishTemplate();
+        await act(async () => {
+            await api!.prepare({
+                publish_id: 'p1',
+                torrent_path: '/tmp/a.torrent',
+                profile_name: 'profile',
+                template: {
+                    ep_pattern: template.ep_pattern,
+                    resolution_pattern: template.resolution_pattern,
+                    title_pattern: template.title_pattern,
+                    poster: template.poster,
+                    about: template.about,
+                    tags: template.tags,
+                    description: template.body_markdown,
+                    description_html: template.body_html,
+                    profile: template.default_profile,
+                    title: 't',
+                    publish_history: template.publish_history,
+                    sites: {
+                        dmhy: false,
+                        nyaa: true,
+                        acgrip: false,
+                        bangumi: false,
+                        acgnx_asia: false,
+                        acgnx_global: false,
+                    },
+                },
+            });
+        });
+        await flushAsync();
+
+        expect(api!.state.decision).toBe('GO');
+        expect(api!.state.vision.status).toBe('skipped');
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_list_plan_vision_candidates')).toBe(false);
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_bind_plan_vision')).toBe(false);
+        expect(api!.canConfirm).toBe(true);
+
+        await rendered.unmount();
+    });
+
+    it('useAiPreflight blocks confirm until over-cap Vision selection is bound', async () => {
+        const { useAiPreflight } = await import('../hooks/useAiPreflight');
+        const { createElement } = await import('react');
+
+        const candidates = Array.from({ length: 6 }, (_, index) => ({
+            url: `https://cdn.example.test/${index}.jpg`,
+            source: index === 0 ? 'poster' : 'markdown',
+        }));
+
+        invokeMock.mockImplementation((command: string, args) => {
+            if (command === 'ai_get_settings') {
+                return Promise.resolve({
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                });
+            }
+            if (command === 'prepare_plan') {
+                return Promise.resolve({
+                    token: 'plan-vision',
+                    snapshot_hash: 'sha256:pre',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            }
+            if (command === 'ai_list_plan_vision_candidates') {
+                return Promise.resolve({
+                    plan_token: 'plan-vision',
+                    snapshot_hash: 'sha256:pre',
+                    request_generation: 1,
+                    candidates,
+                    requires_selection: true,
+                    max_images: 5,
+                });
+            }
+            if (command === 'ai_bind_plan_vision') {
+                const selected = (args as { request?: { selected_urls?: string[] } })?.request
+                    ?.selected_urls ?? [];
+                return Promise.resolve({
+                    plan_token: 'plan-vision',
+                    snapshot_hash: 'sha256:rolled',
+                    request_generation: 1,
+                    batch_hash: 'sha256:batch',
+                    images: selected.map((url) => ({
+                        source: 'markdown',
+                        content_hash: `sha256:${url.length}`,
+                        mime_type: 'image/jpeg',
+                        normalized_bytes: 64,
+                        width: 8,
+                        height: 8,
+                    })),
+                    warnings: [],
+                });
+            }
+            if (command === 'ai_start_formal_audit') {
+                return Promise.resolve({
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    local_blockers: [],
+                    formal_ran: true,
+                    job_id: null,
+                    plan_token: 'plan-vision',
+                    snapshot_hash: 'sha256:rolled',
+                    request_generation: 1,
+                });
+            }
+            if (command === 'invalidate_plan') {
+                return Promise.resolve(true);
+            }
+            return Promise.resolve(null);
+        });
+
+        let api: ReturnType<typeof useAiPreflight> | null = null;
+        function Probe() {
+            api = useAiPreflight();
+            return null;
+        }
+        const rendered = await renderElement(createElement(Probe));
+        await flushAsync();
+
+        const template = createDefaultQuickPublishTemplate();
+        await act(async () => {
+            await api!.prepare({
+                publish_id: 'p1',
+                torrent_path: '/tmp/a.torrent',
+                profile_name: 'profile',
+                template: {
+                    ep_pattern: template.ep_pattern,
+                    resolution_pattern: template.resolution_pattern,
+                    title_pattern: template.title_pattern,
+                    poster: 'https://cdn.example.test/0.jpg',
+                    about: template.about,
+                    tags: template.tags,
+                    description: candidates.slice(1).map((c) => `![](${c.url})`).join(' '),
+                    description_html: template.body_html,
+                    profile: template.default_profile,
+                    title: 't',
+                    publish_history: template.publish_history,
+                    sites: {
+                        dmhy: false,
+                        nyaa: true,
+                        acgrip: false,
+                        bangumi: false,
+                        acgnx_asia: false,
+                        acgnx_global: false,
+                    },
+                },
+            });
+        });
+        await flushAsync();
+
+        expect(api!.state.vision.status).toBe('needs_selection');
+        expect(api!.state.vision.candidates).toHaveLength(6);
+        expect(api!.canConfirm).toBe(false);
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_start_formal_audit')).toBe(false);
+
+        // Selecting a 6th beyond cap is a no-op once five are chosen.
+        for (const candidate of candidates.slice(0, 5)) {
+            await act(async () => {
+                api!.toggleVisionSelection(candidate.url);
+            });
+        }
+        await act(async () => {
+            api!.toggleVisionSelection(candidates[5].url);
+        });
+        expect(api!.state.vision.selectedUrls).toHaveLength(5);
+        expect(api!.state.vision.selectedUrls).not.toContain(candidates[5].url);
+
+        await act(async () => {
+            await api!.confirmVisionSelection();
+        });
+        await flushAsync();
+
+        expect(api!.state.vision.status).toBe('bound');
+        expect(api!.state.snapshot_hash).toBe('sha256:rolled');
+        expect(api!.state.decision).toBe('GO');
+        expect(api!.canConfirm).toBe(true);
+        const bindCall = invokeMock.mock.calls.find(([command]) => command === 'ai_bind_plan_vision');
+        expect(bindCall).toBeTruthy();
+        expect((bindCall![1] as { request: { selected_urls: string[] } }).request.selected_urls).toHaveLength(5);
+
+        await rendered.unmount();
+    });
+
+    it('useAiPreflight rejects stale generation after Vision selection drift', async () => {
+        const { useAiPreflight, isPrepareSupersededError } = await import('../hooks/useAiPreflight');
+        const { createElement } = await import('react');
+
+        const candidates = Array.from({ length: 6 }, (_, index) => ({
+            url: `https://cdn.example.test/stale-${index}.jpg`,
+            source: 'markdown',
+        }));
+        const pendingBind = deferred<{
+            plan_token: string;
+            snapshot_hash: string;
+            request_generation: number;
+            batch_hash: string;
+            images: Array<{
+                source: string;
+                content_hash: string;
+                mime_type: string;
+                normalized_bytes: number;
+                width: number;
+                height: number;
+            }>;
+            warnings: string[];
+        }>();
+
+        invokeMock.mockImplementation((command: string) => {
+            if (command === 'ai_get_settings') {
+                return Promise.resolve({
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                });
+            }
+            if (command === 'prepare_plan') {
+                return Promise.resolve({
+                    token: 'plan-stale',
+                    snapshot_hash: 'sha256:pre',
+                    request_generation: 1,
+                    local_blockers: [],
+                    has_blockers: false,
+                });
+            }
+            if (command === 'ai_list_plan_vision_candidates') {
+                return Promise.resolve({
+                    plan_token: 'plan-stale',
+                    snapshot_hash: 'sha256:pre',
+                    request_generation: 1,
+                    candidates,
+                    requires_selection: true,
+                    max_images: 5,
+                });
+            }
+            if (command === 'ai_bind_plan_vision') {
+                return pendingBind.promise;
+            }
+            if (command === 'invalidate_plan') {
+                return Promise.resolve(true);
+            }
+            return Promise.resolve(null);
+        });
+
+        let api: ReturnType<typeof useAiPreflight> | null = null;
+        function Probe() {
+            api = useAiPreflight();
+            return null;
+        }
+        const rendered = await renderElement(createElement(Probe));
+        await flushAsync();
+
+        const template = createDefaultQuickPublishTemplate();
+        await act(async () => {
+            await api!.prepare({
+                publish_id: 'p1',
+                torrent_path: '/tmp/a.torrent',
+                profile_name: 'profile',
+                template: {
+                    ep_pattern: template.ep_pattern,
+                    resolution_pattern: template.resolution_pattern,
+                    title_pattern: template.title_pattern,
+                    poster: template.poster,
+                    about: template.about,
+                    tags: template.tags,
+                    description: candidates.map((c) => `![](${c.url})`).join(' '),
+                    description_html: template.body_html,
+                    profile: template.default_profile,
+                    title: 't',
+                    publish_history: template.publish_history,
+                    sites: {
+                        dmhy: false,
+                        nyaa: true,
+                        acgrip: false,
+                        bangumi: false,
+                        acgnx_asia: false,
+                        acgnx_global: false,
+                    },
+                },
+            });
+        });
+        await flushAsync();
+
+        for (const candidate of candidates.slice(0, 5)) {
+            await act(async () => {
+                api!.toggleVisionSelection(candidate.url);
+            });
+        }
+
+        let confirmPromise!: Promise<void>;
+        await act(async () => {
+            confirmPromise = api!.confirmVisionSelection();
+        });
+
+        // Invalidate (covered edit) while bind is in flight — late bind must not commit.
+        await act(async () => {
+            api!.invalidate();
+        });
+        await act(async () => {
+            pendingBind.resolve({
+                plan_token: 'plan-stale',
+                snapshot_hash: 'sha256:should-not-apply',
+                request_generation: 1,
+                batch_hash: 'sha256:batch',
+                images: [],
+                warnings: [],
+            });
+        });
+        await expect(confirmPromise).resolves.toBeUndefined();
+        await flushAsync();
+
+        expect(api!.state.token).toBeNull();
+        expect(api!.state.decision).toBe('IDLE');
+        expect(api!.state.snapshot_hash).toBeNull();
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_start_formal_audit')).toBe(false);
+        expect(isPrepareSupersededError).toEqual(expect.any(Function));
+
+        await rendered.unmount();
+    });
+});

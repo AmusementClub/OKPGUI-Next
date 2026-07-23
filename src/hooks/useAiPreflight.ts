@@ -5,20 +5,33 @@ import type {
     AiDecision,
     AiSettings,
     PublishRequestPayload,
+    VisionPreflightState,
 } from '../types/ai';
 import {
+    bindPlanVision,
     canPublishAudit,
     cancelAiJob,
     disabledAiSettings,
     getAiSettings,
     invalidatePublishPlan,
     isAiConfigured,
+    listPlanVisionCandidates,
     pollFormalAudit,
     preparePublishPlan,
     readFriendlyError,
     setPlanAcknowledgements,
     startFormalAudit,
 } from '../services/ai';
+
+const idleVisionState: VisionPreflightState = {
+    status: 'idle',
+    candidates: [],
+    selectedUrls: [],
+    maxImages: 5,
+    boundImages: [],
+    warnings: [],
+    error: null,
+};
 
 export interface AiPreflightState {
     settings: AiSettings;
@@ -38,6 +51,8 @@ export interface AiPreflightState {
     /** Backend formal-audit job id while PENDING; null for local/terminal decisions. */
     job_id: string | null;
     error: string | null;
+    /** Shared plan-token Vision disclosure state (HomePage + QuickPublish). */
+    vision: VisionPreflightState;
 }
 
 export interface AiPreflightPrepareResult {
@@ -79,6 +94,7 @@ const initialState: AiPreflightState = {
     snapshot_hash: null,
     job_id: null,
     error: null,
+    vision: { ...idleVisionState },
 };
 
 const FORMAL_POLL_INTERVAL_MS = 400;
@@ -262,8 +278,85 @@ export function useAiPreflight() {
             snapshot_hash: null,
             job_id: null,
             error: null,
+            vision: { ...idleVisionState },
         }));
     }, [stopPolling]);
+
+    const commitFormalAudit = useCallback((
+        token: string,
+        requestGeneration: number,
+        auditBase: AiAuditResult,
+        fallbackSnapshotHash: string,
+        localBlockers: string[],
+        vision: VisionPreflightState,
+    ): AiPreflightPrepareResult => {
+        const audit: AiAuditResult = {
+            ...auditBase,
+            local_blockers: auditBase.local_blockers ?? localBlockers,
+            plan_token: auditBase.plan_token ?? token,
+            snapshot_hash: auditBase.snapshot_hash ?? fallbackSnapshotHash,
+        };
+
+        tokenRef.current = token;
+        const jobId = audit.job_id?.trim() ? audit.job_id : null;
+        jobIdRef.current = audit.decision === 'PENDING' ? jobId : null;
+
+        setState((current) => ({
+            ...current,
+            checking: false,
+            error: null,
+            audit,
+            decision: audit.decision,
+            token,
+            snapshot_hash: audit.snapshot_hash ?? fallbackSnapshotHash,
+            job_id: jobIdRef.current,
+            acknowledgements: { ...idleAcknowledgements },
+            acknowledgementsBound: audit.decision === 'GO',
+            vision,
+        }));
+
+        if (audit.decision === 'PENDING' && jobIdRef.current) {
+            startFormalPolling(
+                token,
+                jobIdRef.current,
+                requestGeneration,
+                audit.snapshot_hash ?? fallbackSnapshotHash,
+            );
+        }
+
+        return {
+            token,
+            snapshotHash: audit.snapshot_hash ?? fallbackSnapshotHash,
+            audit,
+            requestGeneration,
+        };
+    }, [startFormalPolling]);
+
+    const runFormalAfterVision = useCallback(async (
+        token: string,
+        requestGeneration: number,
+        snapshotHash: string,
+        localBlockers: string[],
+        vision: VisionPreflightState,
+    ): Promise<AiPreflightPrepareResult> => {
+        const auditBase = await startFormalAudit({
+            plan_token: token,
+        });
+        if (requestGeneration !== generationRef.current) {
+            if (auditBase.job_id) {
+                void cancelAiJob(auditBase.job_id).catch(() => undefined);
+            }
+            throw createSupersededError();
+        }
+        return commitFormalAudit(
+            token,
+            requestGeneration,
+            auditBase,
+            auditBase.snapshot_hash ?? snapshotHash,
+            localBlockers,
+            vision,
+        );
+    }, [commitFormalAudit]);
 
     const prepare = useCallback(async (
         request: PublishRequestPayload,
@@ -293,6 +386,7 @@ export function useAiPreflight() {
             job_id: null,
             acknowledgements: { ...idleAcknowledgements },
             acknowledgementsBound: true,
+            vision: { ...idleVisionState, status: 'listing' },
         }));
 
         // Track the prepared token so any failure / non-commit path can invalidate it.
@@ -308,7 +402,7 @@ export function useAiPreflight() {
 
             const token = prepared.token;
             // Backend-authoritative snapshot hash — never computed on the client.
-            const nextSnapshotHash = prepared.snapshot_hash;
+            let nextSnapshotHash = prepared.snapshot_hash;
             if (!nextSnapshotHash?.trim()) {
                 clearTokenSideEffects(token);
                 preparedToken = null;
@@ -319,65 +413,148 @@ export function useAiPreflight() {
             // returns local_blockers (plan-token blockers are authoritative).
             void localBlockers;
 
-            // Start formal audit with plan_token only: provider prompt is projected from
-            // the plan binding server-side (never client title/torrent_name/sites/blockers).
-            // Local/disabled paths return terminal immediately; configured AI returns
-            // PENDING+job_id so the confirm modal can open now.
-            const auditBase = await startFormalAudit({
-                plan_token: token,
-            });
+            // AI-disabled / unconfigured: skip Vision entirely (zero image/network side effects).
+            const settings = await getAiSettings();
             if (requestGeneration !== generationRef.current) {
-                if (auditBase.job_id) {
-                    void cancelAiJob(auditBase.job_id).catch(() => undefined);
-                }
                 clearTokenSideEffects(token);
                 preparedToken = null;
                 throw createSupersededError();
             }
 
-            const audit: AiAuditResult = {
-                ...auditBase,
-                // Prefer backend plan blockers when present (including empty array).
-                local_blockers: auditBase.local_blockers ?? prepared.local_blockers,
-                plan_token: auditBase.plan_token ?? token,
-                snapshot_hash: auditBase.snapshot_hash ?? nextSnapshotHash,
+            let vision: VisionPreflightState = {
+                ...idleVisionState,
+                status: 'skipped',
             };
 
-            // Commit token after a successful, generation-matched start (PENDING or terminal).
-            preparedToken = null;
-            tokenRef.current = token;
-            const jobId = audit.job_id?.trim() ? audit.job_id : null;
-            jobIdRef.current = audit.decision === 'PENDING' ? jobId : null;
+            if (isAiConfigured(settings)) {
+                // Plan-token Vision: list candidates from bound final content only.
+                let listed;
+                try {
+                    listed = await listPlanVisionCandidates(token);
+                } catch {
+                    // Listing failure must not invent images; continue text-only formal audit.
+                    listed = null;
+                }
+                if (requestGeneration !== generationRef.current) {
+                    clearTokenSideEffects(token);
+                    preparedToken = null;
+                    throw createSupersededError();
+                }
 
-            setState((current) => ({
-                ...current,
-                checking: false,
-                error: null,
-                audit,
-                decision: audit.decision,
-                token,
-                snapshot_hash: audit.snapshot_hash ?? nextSnapshotHash,
-                job_id: jobIdRef.current,
-                acknowledgements: { ...idleAcknowledgements },
-                // GO needs no acks; other decisions start unbound until the user checks boxes.
-                acknowledgementsBound: audit.decision === 'GO',
-            }));
+                if (listed && listed.requires_selection) {
+                    // Explicit selection required — do not silently choose the first five.
+                    preparedToken = null;
+                    tokenRef.current = token;
+                    vision = {
+                        status: 'needs_selection',
+                        candidates: listed.candidates,
+                        selectedUrls: [],
+                        maxImages: listed.max_images ?? 5,
+                        boundImages: [],
+                        warnings: [],
+                        error: null,
+                    };
+                    setState((current) => ({
+                        ...current,
+                        checking: false,
+                        error: null,
+                        audit: null,
+                        decision: 'PENDING',
+                        token,
+                        snapshot_hash: listed.snapshot_hash || nextSnapshotHash,
+                        job_id: null,
+                        acknowledgements: { ...idleAcknowledgements },
+                        acknowledgementsBound: false,
+                        vision,
+                    }));
+                    return {
+                        token,
+                        snapshotHash: listed.snapshot_hash || nextSnapshotHash,
+                        audit: {
+                            decision: 'PENDING',
+                            findings: [],
+                            unknown_codes: [],
+                            local_blockers: prepared.local_blockers,
+                            formal_ran: false,
+                            job_id: null,
+                            plan_token: token,
+                            snapshot_hash: listed.snapshot_hash || nextSnapshotHash,
+                            request_generation: requestGeneration,
+                        },
+                        requestGeneration,
+                    };
+                }
 
-            if (audit.decision === 'PENDING' && jobIdRef.current) {
-                startFormalPolling(
-                    token,
-                    jobIdRef.current,
-                    requestGeneration,
-                    audit.snapshot_hash ?? nextSnapshotHash,
-                );
+                const candidateUrls = (listed?.candidates ?? []).map((item) => item.url);
+                if (candidateUrls.length > 0) {
+                    setState((current) => ({
+                        ...current,
+                        vision: {
+                            ...idleVisionState,
+                            status: 'binding',
+                            candidates: listed?.candidates ?? [],
+                            selectedUrls: candidateUrls,
+                            maxImages: listed?.max_images ?? 5,
+                        },
+                    }));
+                    try {
+                        const bound = await bindPlanVision({
+                            plan_token: token,
+                            selected_urls: candidateUrls,
+                        });
+                        if (requestGeneration !== generationRef.current) {
+                            clearTokenSideEffects(token);
+                            preparedToken = null;
+                            throw createSupersededError();
+                        }
+                        if (bound.snapshot_hash?.trim()) {
+                            nextSnapshotHash = bound.snapshot_hash;
+                        }
+                        vision = {
+                            status: 'bound',
+                            candidates: listed?.candidates ?? [],
+                            selectedUrls: candidateUrls,
+                            maxImages: listed?.max_images ?? 5,
+                            boundImages: bound.images ?? [],
+                            warnings: bound.warnings ?? [],
+                            error: null,
+                        };
+                    } catch (visionError) {
+                        if (requestGeneration !== generationRef.current) {
+                            clearTokenSideEffects(token);
+                            preparedToken = null;
+                            throw createSupersededError();
+                        }
+                        // Soft-fail Vision: continue text formal audit without mutating UI to error.
+                        vision = {
+                            status: 'failed',
+                            candidates: listed?.candidates ?? [],
+                            selectedUrls: candidateUrls,
+                            maxImages: listed?.max_images ?? 5,
+                            boundImages: [],
+                            warnings: [],
+                            error: readFriendlyError(visionError, '图片检查未能完成，将继续文本审核。'),
+                        };
+                    }
+                } else {
+                    vision = {
+                        ...idleVisionState,
+                        status: 'bound',
+                        candidates: listed?.candidates ?? [],
+                        maxImages: listed?.max_images ?? 5,
+                    };
+                }
             }
 
-            return {
+            // Start formal audit with plan_token only after Vision bind (or skip).
+            preparedToken = null;
+            return await runFormalAfterVision(
                 token,
-                snapshotHash: audit.snapshot_hash ?? nextSnapshotHash,
-                audit,
                 requestGeneration,
-            };
+                nextSnapshotHash,
+                prepared.local_blockers,
+                vision,
+            );
         } catch (error) {
             // Failed or uncommitted preflight must not leave a publishable orphan token.
             if (preparedToken) {
@@ -400,11 +577,155 @@ export function useAiPreflight() {
                     acknowledgements: { ...idleAcknowledgements },
                     acknowledgementsBound: true,
                     error: readFriendlyError(error, '无法准备发布前检查。'),
+                    vision: { ...idleVisionState },
                 }));
             }
             throw error;
         }
-    }, [startFormalPolling, stopPolling]);
+    }, [runFormalAfterVision, stopPolling]);
+
+    /**
+     * Toggle a Vision candidate URL for explicit over-cap selection.
+     * Never auto-fills beyond maxImages; user must choose up to the cap.
+     */
+    const toggleVisionSelection = useCallback((url: string) => {
+        setState((current) => {
+            if (current.vision.status !== 'needs_selection') {
+                return current;
+            }
+            const exists = current.vision.selectedUrls.includes(url);
+            let selectedUrls: string[];
+            if (exists) {
+                selectedUrls = current.vision.selectedUrls.filter((item) => item !== url);
+            } else if (current.vision.selectedUrls.length >= current.vision.maxImages) {
+                // Do not silently replace or exceed the cap.
+                return current;
+            } else {
+                selectedUrls = [...current.vision.selectedUrls, url];
+            }
+            return {
+                ...current,
+                vision: {
+                    ...current.vision,
+                    selectedUrls,
+                    error: null,
+                },
+            };
+        });
+    }, []);
+
+    /**
+     * After the user picks ≤5 images, bind them to the plan token and start formal audit.
+     * Generation-guarded so stale selections cannot publish a drifted plan.
+     */
+    const confirmVisionSelection = useCallback(async (): Promise<void> => {
+        const requestGeneration = generationRef.current;
+        const token = tokenRef.current;
+
+        // Capture current selection from React state through a synchronous updater read.
+        let selection: {
+            urls: string[];
+            maxImages: number;
+            candidates: VisionPreflightState['candidates'];
+            fallbackHash: string;
+        } | null = null;
+        setState((current) => {
+            if (
+                current.vision.status !== 'needs_selection'
+                || !current.token
+                || current.token !== token
+            ) {
+                return current;
+            }
+            selection = {
+                urls: [...current.vision.selectedUrls],
+                maxImages: current.vision.maxImages,
+                candidates: current.vision.candidates,
+                fallbackHash: current.snapshot_hash ?? '',
+            };
+            return {
+                ...current,
+                checking: true,
+                vision: {
+                    ...current.vision,
+                    status: 'binding',
+                    error: null,
+                },
+            };
+        });
+
+        if (!token || !selection) {
+            return;
+        }
+        const { urls, maxImages, candidates, fallbackHash } = selection;
+
+        if (urls.length === 0 || urls.length > maxImages) {
+            setState((current) => (
+                current.token === token
+                    ? {
+                        ...current,
+                        checking: false,
+                        vision: {
+                            ...current.vision,
+                            status: 'needs_selection',
+                            error: `请明确选择 1–${maxImages} 张图片后再继续。`,
+                        },
+                    }
+                    : current
+            ));
+            return;
+        }
+
+        try {
+            const bound = await bindPlanVision({
+                plan_token: token,
+                selected_urls: urls,
+            });
+            if (
+                requestGeneration !== generationRef.current
+                || tokenRef.current !== token
+            ) {
+                clearTokenSideEffects(token);
+                throw createSupersededError();
+            }
+            const vision: VisionPreflightState = {
+                status: 'bound',
+                candidates,
+                selectedUrls: urls,
+                maxImages,
+                boundImages: bound.images ?? [],
+                warnings: bound.warnings ?? [],
+                error: null,
+            };
+            await runFormalAfterVision(
+                token,
+                requestGeneration,
+                bound.snapshot_hash || fallbackHash,
+                [],
+                vision,
+            );
+        } catch (error) {
+            if (isPrepareSupersededError(error)) {
+                return;
+            }
+            if (requestGeneration !== generationRef.current || tokenRef.current !== token) {
+                return;
+            }
+            setState((current) => (
+                current.token === token
+                    ? {
+                        ...current,
+                        checking: false,
+                        vision: {
+                            ...current.vision,
+                            status: 'needs_selection',
+                            error: readFriendlyError(error, '无法绑定所选图片，请重试。'),
+                        },
+                    }
+                    : current
+            ));
+        }
+    }, [runFormalAfterVision]);
 
     /**
      * When confirm is clicked while formal audit is still PENDING and pending ack is bound,
@@ -480,9 +801,14 @@ export function useAiPreflight() {
     const needsBoundAcks = decision === 'WARNING'
         || decision === 'NO_GO'
         || decision === 'PENDING';
+    const visionBlocksConfirm = state.vision.status === 'needs_selection'
+        || state.vision.status === 'binding'
+        || state.vision.status === 'listing';
     // checking is only true during prepare/start — PENDING background audit still allows confirm.
+    // Vision over-cap selection must complete before confirm (no silent first-five).
     const canConfirm = !state.checking
         && !state.error
+        && !visionBlocksConfirm
         && Boolean(state.token)
         && Boolean(state.snapshot_hash)
         && decision !== 'IDLE'
@@ -497,6 +823,8 @@ export function useAiPreflight() {
         invalidate,
         setAcknowledgement,
         cancelPendingAuditForPublish,
+        toggleVisionSelection,
+        confirmVisionSelection,
         canConfirm,
     };
 }

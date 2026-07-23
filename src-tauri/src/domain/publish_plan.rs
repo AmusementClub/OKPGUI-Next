@@ -91,12 +91,17 @@ impl PlanMediaEvidence {
 }
 
 /// One backend-fetched, normalized Vision asset bound to a prepared plan.
-/// The URL is retained only inside the Rust plan registry for provider assembly;
-/// it is intentionally omitted from public plan serialization.
+/// The URL and normalized payload are retained only inside the Rust plan registry
+/// for provider assembly; both are intentionally omitted from public plan serialization.
+/// Payload bytes never leave the process (no DTO/export/log/debug persistence).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanVisionImage {
     #[serde(skip)]
     pub url: String,
+    /// In-memory normalized JPEG bytes for one formal-audit assembly only.
+    /// Never serialized; never logged; cleared when the plan is dropped/invalidated.
+    #[serde(skip)]
+    pub payload: Vec<u8>,
     pub source: String,
     pub content_hash: String,
     pub mime_type: String,
@@ -358,6 +363,11 @@ impl PublishPlan {
                 || image.height == 0
             {
                 return Err("vision evidence contains invalid normalized image metadata".to_string());
+            }
+            // When payload is present (live bind path), size must match declared metadata.
+            // Empty payload is allowed for hash-only unit fixtures that never assemble Vision.
+            if !image.payload.is_empty() && image.payload.len() != image.normalized_bytes {
+                return Err("vision evidence payload size does not match metadata".to_string());
             }
         }
         let snapshot = self
@@ -1095,6 +1105,81 @@ impl PlanRegistry {
             return Err("prepared plan has no local execution binding".to_string());
         }
         plan.bind_vision_evidence(evidence)
+    }
+
+    /// Derive Vision image candidates only from the bound final poster/Markdown/HTML.
+    ///
+    /// Returns plan identity + candidates. Does not fetch images, mutate the plan,
+    /// or accept client-supplied snapshot hashes. Stale/missing tokens fail closed.
+    pub fn list_vision_candidates(
+        &mut self,
+        token: &str,
+    ) -> Result<(String, u64, String, String, String), String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        if self.is_expired(token) {
+            self.remove(token);
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        let plan = self
+            .plans
+            .get(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        if let Some(binding) = plan.get_local_binding() {
+            if let Err(failures) = binding.revalidate() {
+                return Err(failures.join("；"));
+            }
+        } else {
+            return Err("prepared plan has no local execution binding".to_string());
+        }
+        let binding = plan
+            .get_local_binding()
+            .ok_or_else(|| "prepared plan has no local execution binding".to_string())?;
+        let template = &binding.request().template;
+        Ok((
+            plan.snapshot_hash.clone(),
+            plan.request_generation,
+            template.poster.clone(),
+            template.description.clone(),
+            template.description_html.clone(),
+        ))
+    }
+
+    /// Load in-memory Vision payloads for formal-audit provider assembly.
+    ///
+    /// Returns only identity-matched bound images with non-empty payloads.
+    /// Never exposes URLs or bytes over public IPC — caller uses this only to
+    /// build an ephemeral provider request body.
+    pub fn take_vision_request_images(
+        &mut self,
+        token: &str,
+    ) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("prepared plan token is required".to_string());
+        }
+        if self.is_expired(token) {
+            self.remove(token);
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        let plan = self
+            .plans
+            .get(token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        let Some(evidence) = plan.vision_evidence.as_ref() else {
+            return Ok(Vec::new());
+        };
+        if !evidence.matches_plan(&plan.snapshot_hash, plan.request_generation) {
+            return Ok(Vec::new());
+        }
+        Ok(evidence
+            .images
+            .iter()
+            .filter(|image| !image.payload.is_empty() && image.mime_type == "image/jpeg")
+            .map(|image| (image.mime_type.clone(), image.payload.clone()))
+            .collect())
     }
 
     /// Resolve plan identity + private binding for MediaInfo start.
@@ -1891,6 +1976,7 @@ mod tests {
                     batch_hash: batch_hash.clone(),
                     images: vec![PlanVisionImage {
                         url: "https://cdn.example.test/poster.jpg?token=redacted".into(),
+                        payload: vec![0_u8; 1024],
                         source: "poster".into(),
                         content_hash: content_hash.into(),
                         mime_type: "image/jpeg".into(),
@@ -1915,9 +2001,103 @@ mod tests {
                 .vision_batch_hash,
             batch_hash
         );
+        // Payload exists only in-memory on the live plan, never in public serialization.
+        assert_eq!(
+            plan.vision_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.images.first())
+                .map(|image| image.payload.len()),
+            Some(1024)
+        );
         let public = serde_json::to_string(plan).expect("serialize public plan");
         assert!(!public.contains("cdn.example.test"));
         assert!(!public.contains("token=redacted"));
+        assert!(!public.contains("payload"));
+        // Raw image bytes must never appear in the public plan JSON.
+        assert!(!public.contains(&"\u{0000}".repeat(8)));
+
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn vision_evidence_rejects_over_limit_and_stale_identity_without_mutating() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut registry = PlanRegistry::default();
+        let prepared = registry
+            .prepare_plan_with_request_and_blockers(
+                13,
+                sample_request(torrent_path.clone()),
+                Vec::new(),
+                true,
+                None,
+            )
+            .expect("prepare");
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+
+        // More than five images is fail-closed.
+        let six = (0..6)
+            .map(|index| {
+                let digest = format!("sha256:{:064x}", index + 1);
+                PlanVisionImage {
+                    url: format!("https://cdn.example.test/{index}.jpg"),
+                    payload: vec![1_u8; 64],
+                    source: "poster".into(),
+                    content_hash: digest,
+                    mime_type: "image/jpeg".into(),
+                    normalized_bytes: 64,
+                    width: 8,
+                    height: 8,
+                }
+            })
+            .collect::<Vec<_>>();
+        let hashes = six
+            .iter()
+            .map(|image| image.content_hash.as_str())
+            .collect::<Vec<_>>();
+        let batch_hash = compute_vision_batch_hash(&hashes);
+        let over_limit = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: old_hash.clone(),
+                    request_generation: 13,
+                    batch_hash,
+                    images: six,
+                },
+            )
+            .expect_err("six images must fail");
+        assert!(over_limit.contains("five-image") || over_limit.contains("limit"));
+
+        // Stale snapshot hash is fail-closed.
+        let content_hash =
+            "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let stale = registry
+            .bind_vision_evidence(
+                &token,
+                PlanVisionEvidence {
+                    snapshot_hash: "sha256:stale".into(),
+                    request_generation: 13,
+                    batch_hash: compute_vision_batch_hash(&[content_hash]),
+                    images: vec![PlanVisionImage {
+                        url: "https://cdn.example.test/poster.jpg".into(),
+                        payload: vec![2_u8; 32],
+                        source: "poster".into(),
+                        content_hash: content_hash.into(),
+                        mime_type: "image/jpeg".into(),
+                        normalized_bytes: 32,
+                        width: 4,
+                        height: 4,
+                    }],
+                },
+            )
+            .expect_err("stale snapshot must fail");
+        assert!(stale.contains("snapshot_hash") || stale.contains("does not match"));
+
+        let plan = registry.inspect_plan(&token).expect("plan remains live");
+        assert_eq!(plan.snapshot_hash, old_hash);
+        assert!(plan.vision_evidence.is_none());
+        assert!(plan.has_authoritative_audit_evidence());
 
         let _ = std::fs::remove_file(&torrent_path);
     }
@@ -1946,6 +2126,7 @@ mod tests {
                     batch_hash: "sha256:forged".into(),
                     images: vec![PlanVisionImage {
                         url: "https://cdn.example.test/poster.jpg".into(),
+                        payload: vec![0_u8; 1024],
                         source: "poster".into(),
                         content_hash:
                             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"

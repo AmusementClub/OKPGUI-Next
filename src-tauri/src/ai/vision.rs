@@ -31,6 +31,9 @@ pub struct VisionImageResult {
     pub normalized_bytes: usize,
     pub width: u32,
     pub height: u32,
+    /// In-memory normalized JPEG only. Never serialized over IPC/debug/export.
+    #[serde(skip)]
+    pub payload: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -402,7 +405,7 @@ pub fn prepare_images(
         }
         let (content_type, bytes) = fetch_image(&input.url, timeout)?;
         let (normalized, width, height) = normalize_image(&content_type, &bytes)?;
-        // Digest normalized bytes before drop; never retain or serialize image bytes.
+        // Digest normalized bytes; keep payload only in-memory for plan bind / request assembly.
         image_digests.push(content_digest(&normalized));
         total_bytes = total_bytes.saturating_add(normalized.len());
         enforce_aggregate_limit(total_bytes)?;
@@ -414,11 +417,117 @@ pub fn prepare_images(
             normalized_bytes: normalized.len(),
             width,
             height,
+            payload: normalized,
         });
-        // normalized drops here without base64/path persistence.
     }
     result.batch_hash = batch_content_digest(&image_digests);
     Ok(result)
+}
+
+/// Soft-failing per-image preparation: unsafe/oversized/invalid images become warnings
+/// and are omitted so the text formal audit can still proceed without a second provider call.
+pub fn prepare_images_soft(
+    inputs: Vec<VisionImageInput>,
+    timeout: Duration,
+) -> Result<VisionBatchResult, VisionError> {
+    if inputs.len() > MAX_IMAGES {
+        return Err(VisionError::TooManyImages(inputs.len()));
+    }
+    let mut seen = HashSet::new();
+    let mut result = VisionBatchResult::default();
+    let mut total_bytes = 0usize;
+    let mut image_digests = Vec::new();
+    for input in inputs {
+        if !seen.insert(input.url.clone()) {
+            continue;
+        }
+        match fetch_image(&input.url, timeout).and_then(|(content_type, bytes)| {
+            normalize_image(&content_type, &bytes).map(|(normalized, width, height)| {
+                (normalized, width, height)
+            })
+        }) {
+            Ok((normalized, width, height)) => {
+                let next_total = total_bytes.saturating_add(normalized.len());
+                if next_total > MAX_TOTAL_BYTES {
+                    result.warnings.push(format!(
+                        "IMAGE_FETCH_FAILED: aggregate normalized image bytes exceed 7.5 MiB ({})",
+                        input.source
+                    ));
+                    continue;
+                }
+                total_bytes = next_total;
+                let digest = content_digest(&normalized);
+                image_digests.push(digest.clone());
+                result.images.push(VisionImageResult {
+                    url: input.url,
+                    source: input.source,
+                    content_hash: digest,
+                    mime_type: "image/jpeg".to_string(),
+                    normalized_bytes: normalized.len(),
+                    width,
+                    height,
+                    payload: normalized,
+                });
+            }
+            Err(error) => {
+                result.warnings.push(format!(
+                    "IMAGE_FETCH_FAILED: {error} ({})",
+                    input.source
+                ));
+            }
+        }
+    }
+    result.batch_hash = batch_content_digest(&image_digests);
+    Ok(result)
+}
+
+/// Resolve which candidate URLs may be fetched for a prepared plan.
+///
+/// - `selected_urls` empty and candidates ≤ `MAX_IMAGES` → use all candidates.
+/// - `selected_urls` empty and candidates > `MAX_IMAGES` → `TooManyImages` (explicit selection required).
+/// - Non-empty selection must be a subset of candidates, de-duplicated, and ≤ `MAX_IMAGES`.
+pub fn resolve_selected_vision_inputs(
+    candidates: &[VisionImageInput],
+    selected_urls: &[String],
+) -> Result<Vec<VisionImageInput>, VisionError> {
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let candidate_by_url = candidates
+        .iter()
+        .map(|image| (image.url.as_str(), image))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    if selected_urls.is_empty() {
+        if candidates.len() > MAX_IMAGES {
+            return Err(VisionError::TooManyImages(candidates.len()));
+        }
+        return Ok(candidates.to_vec());
+    }
+
+    let mut seen = HashSet::new();
+    let mut resolved = Vec::new();
+    for url in selected_urls {
+        let url = url.trim();
+        if url.is_empty() || !seen.insert(url.to_string()) {
+            continue;
+        }
+        let Some(candidate) = candidate_by_url.get(url) else {
+            return Err(VisionError::UnsafeUrl(format!(
+                "selection is not derived from the prepared plan: {url}"
+            )));
+        };
+        resolved.push((*candidate).clone());
+    }
+    if resolved.is_empty() {
+        return Err(VisionError::InvalidImage(
+            "vision selection is empty".to_string(),
+        ));
+    }
+    if resolved.len() > MAX_IMAGES {
+        return Err(VisionError::TooManyImages(resolved.len()));
+    }
+    Ok(resolved)
 }
 
 fn enforce_aggregate_limit(total_bytes: usize) -> Result<(), VisionError> {
@@ -713,5 +822,48 @@ mod tests {
             !is_private_or_local(public_mapped),
             "public IPv4-mapped addresses remain allowed"
         );
+    }
+
+    #[test]
+    fn resolve_selected_requires_explicit_choice_above_cap() {
+        let candidates = (0..6)
+            .map(|index| VisionImageInput {
+                url: format!("https://example.test/{index}.jpg"),
+                source: "poster".into(),
+            })
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            resolve_selected_vision_inputs(&candidates, &[]),
+            Err(VisionError::TooManyImages(6))
+        ));
+        let selected = candidates
+            .iter()
+            .take(5)
+            .map(|image| image.url.clone())
+            .collect::<Vec<_>>();
+        let resolved = resolve_selected_vision_inputs(&candidates, &selected).unwrap();
+        assert_eq!(resolved.len(), 5);
+        // Foreign URL (not in candidates) is rejected.
+        assert!(matches!(
+            resolve_selected_vision_inputs(
+                &candidates,
+                &["https://evil.example.test/x.jpg".into()]
+            ),
+            Err(VisionError::UnsafeUrl(_))
+        ));
+        // Silent first-five is not allowed: empty selection with 6 candidates fails.
+        assert!(resolve_selected_vision_inputs(&candidates, &[]).is_err());
+    }
+
+    #[test]
+    fn resolve_selected_auto_accepts_at_or_below_cap() {
+        let candidates = (0..3)
+            .map(|index| VisionImageInput {
+                url: format!("https://example.test/{index}.jpg"),
+                source: "markdown".into(),
+            })
+            .collect::<Vec<_>>();
+        let resolved = resolve_selected_vision_inputs(&candidates, &[]).unwrap();
+        assert_eq!(resolved.len(), 3);
     }
 }

@@ -31,11 +31,12 @@ use crate::ai::media::{
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client, build_probe_request,
-    build_structured_request, classify_and_validate_probe_response, classify_http_failure,
-    extract_structured_json, formal_attempt_modes, formal_attempt_modes_for_ready_capability,
-    minimal_probe_schema, parse_models_list_response, send_managed_provider_request,
-    CapabilityIdentity, CapabilityProbeResult, CapabilityState, ProviderFailure, ProviderKind,
-    ProviderMode,
+    build_structured_request, build_structured_request_with_vision,
+    classify_and_validate_probe_response, classify_http_failure, extract_structured_json,
+    formal_attempt_modes, formal_attempt_modes_for_ready_capability, minimal_probe_schema,
+    parse_models_list_response, send_managed_provider_request, CapabilityIdentity,
+    CapabilityProbeResult, CapabilityState, ProviderFailure, ProviderKind, ProviderMode,
+    VisionRequestImage,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_prompt, recognition_from_provider_outcome,
@@ -48,10 +49,13 @@ use crate::ai::template_seed::{
     parse_template_selection, template_selection_schema, TemplateSeed, TemplateSeedRegistry,
 };
 use crate::ai::vision::{
-    content_digest, extract_final_image_urls, normalize_image, VisionImageInput, VisionImageResult,
-    MAX_DOWNLOAD_BYTES,
+    content_digest, extract_final_image_urls, normalize_image, prepare_images_soft,
+    resolve_selected_vision_inputs, VisionImageInput, VisionImageResult, MAX_DOWNLOAD_BYTES,
+    MAX_IMAGES,
 };
-use crate::domain::publish_plan::{get_or_create_registry, PlanAuditEvidence};
+use crate::domain::publish_plan::{
+    get_or_create_registry, PlanAuditEvidence, PlanVisionEvidence, PlanVisionImage,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -1520,7 +1524,245 @@ pub fn ai_normalize_vision_image(
         normalized_bytes: normalized.len(),
         width,
         height,
+        // Payload is never returned over IPC (serde skip); hash/size only.
+        payload: Vec::new(),
     })
+}
+
+/// Public Vision candidate (URL + source only). Never includes bytes or hashes as authority.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVisionCandidate {
+    pub url: String,
+    pub source: String,
+}
+
+/// Public bound Vision image metadata (no URL, no bytes).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicPlanVisionImage {
+    pub source: String,
+    pub content_hash: String,
+    pub mime_type: String,
+    pub normalized_bytes: usize,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// List plan-bound Vision candidates derived only from the prepared plan's final content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVisionCandidatesResponse {
+    pub plan_token: String,
+    pub snapshot_hash: String,
+    pub request_generation: u64,
+    pub candidates: Vec<PlanVisionCandidate>,
+    /// True when more than five unique candidates exist; client must not auto-pick.
+    pub requires_selection: bool,
+    pub max_images: usize,
+}
+
+/// Bind request: plan token + optional explicit selection (subset of candidates).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVisionBindRequest {
+    pub plan_token: String,
+    /// Empty means "all candidates" only when `candidates.len() <= 5`.
+    #[serde(default)]
+    pub selected_urls: Vec<String>,
+}
+
+/// Public bind result after hash rollover. Never includes image bytes or raw URLs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlanVisionBindResponse {
+    pub plan_token: String,
+    pub snapshot_hash: String,
+    pub request_generation: u64,
+    pub batch_hash: String,
+    pub images: Vec<PublicPlanVisionImage>,
+    pub warnings: Vec<String>,
+}
+
+/// List Vision image candidates for a prepared plan token.
+///
+/// Candidates come only from the bound final poster/Markdown/HTML. No network I/O.
+/// Stale/missing tokens and identity drift fail closed without mutating the plan.
+/// Disabled AI still may list (zero network); the shared frontend skips this path.
+#[tauri::command]
+pub fn ai_list_plan_vision_candidates(
+    plan_token: String,
+) -> Result<PlanVisionCandidatesResponse, String> {
+    let plan_token = plan_token.trim().to_string();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required".to_string());
+    }
+    let (snapshot_hash, request_generation, poster, markdown, html) = {
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.list_vision_candidates(&plan_token)?
+    };
+    let candidates = extract_final_image_urls(&poster, &markdown, &html)
+        .into_iter()
+        .map(|image| PlanVisionCandidate {
+            url: image.url,
+            source: image.source,
+        })
+        .collect::<Vec<_>>();
+    let requires_selection = candidates.len() > MAX_IMAGES;
+    Ok(PlanVisionCandidatesResponse {
+        plan_token,
+        snapshot_hash,
+        request_generation,
+        candidates,
+        requires_selection,
+        max_images: MAX_IMAGES,
+    })
+}
+
+/// Fetch/normalize selected Vision images through Rust and bind them to the plan.
+///
+/// - Resolves only the prepared plan token (client hashes/decisions are ignored).
+/// - Candidates are re-derived from bound final content; foreign URLs are rejected.
+/// - More than five unique candidates requires an explicit selection (no silent first-five).
+/// - Soft image failures become warnings; successful images roll the plan hash and
+///   invalidate prior audit evidence. Raw bytes never leave the process.
+/// - Disabled AI is zero-impact: no image fetch.
+#[tauri::command]
+pub fn ai_bind_plan_vision(
+    app: AppHandle,
+    request: PlanVisionBindRequest,
+) -> Result<PlanVisionBindResponse, String> {
+    let plan_token = request.plan_token.trim().to_string();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required".to_string());
+    }
+
+    let connection = ai_get_settings(app);
+    if !connection.enabled {
+        return Err("AI is disabled; Vision is not available".to_string());
+    }
+
+    let (snapshot_hash, request_generation, poster, markdown, html) = {
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.list_vision_candidates(&plan_token)?
+    };
+
+    let candidates = extract_final_image_urls(&poster, &markdown, &html);
+    let selected = resolve_selected_vision_inputs(&candidates, &request.selected_urls).map_err(
+        |error| match error {
+            crate::ai::vision::VisionError::TooManyImages(count) => {
+                format!(
+                    "VISION_SELECTION_REQUIRED: {count} images require explicit selection (max {MAX_IMAGES})"
+                )
+            }
+            other => other.to_string(),
+        },
+    )?;
+
+    if selected.is_empty() {
+        // No images: leave plan unchanged (no hash rollover, no network).
+        return Ok(PlanVisionBindResponse {
+            plan_token,
+            snapshot_hash,
+            request_generation,
+            batch_hash: String::new(),
+            images: Vec::new(),
+            warnings: Vec::new(),
+        });
+    }
+
+    // Fetch/normalize only selected public candidates. Soft-fail individual images.
+    let batch = prepare_images_soft(selected, Duration::from_secs(15))
+        .map_err(|error| error.to_string())?;
+
+    if batch.images.is_empty() {
+        // All fetches failed: continue text audit path without mutating plan identity.
+        return Ok(PlanVisionBindResponse {
+            plan_token,
+            snapshot_hash,
+            request_generation,
+            batch_hash: String::new(),
+            images: Vec::new(),
+            warnings: batch.warnings,
+        });
+    }
+
+    let evidence = PlanVisionEvidence {
+        snapshot_hash: snapshot_hash.clone(),
+        request_generation,
+        batch_hash: batch.batch_hash.clone(),
+        images: batch
+            .images
+            .into_iter()
+            .map(|image| PlanVisionImage {
+                url: image.url,
+                payload: image.payload,
+                source: image.source,
+                content_hash: image.content_hash,
+                mime_type: image.mime_type,
+                normalized_bytes: image.normalized_bytes,
+                width: image.width,
+                height: image.height,
+            })
+            .collect(),
+    };
+
+    let next_hash = {
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard.bind_vision_evidence(&plan_token, evidence)?
+    };
+
+    let public_images = {
+        let mut guard = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        guard
+            .inspect_plan(&plan_token)
+            .and_then(|plan| plan.vision_evidence.as_ref())
+            .map(|evidence| {
+                evidence
+                    .images
+                    .iter()
+                    .map(|image| PublicPlanVisionImage {
+                        source: image.source.clone(),
+                        content_hash: image.content_hash.clone(),
+                        mime_type: image.mime_type.clone(),
+                        normalized_bytes: image.normalized_bytes,
+                        width: image.width,
+                        height: image.height,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+
+    Ok(PlanVisionBindResponse {
+        plan_token,
+        snapshot_hash: next_hash,
+        request_generation,
+        batch_hash: batch.batch_hash,
+        images: public_images,
+        warnings: batch.warnings,
+    })
+}
+
+/// Load identity-matched in-memory Vision payloads for formal provider assembly only.
+fn load_plan_vision_request_images(plan_token: &str) -> Vec<VisionRequestImage> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Vec::new();
+    }
+    let mut guard = get_or_create_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    match guard.take_vision_request_images(plan_token) {
+        Ok(images) => images
+            .into_iter()
+            .map(|(mime_type, bytes)| VisionRequestImage { mime_type, bytes })
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3719,13 +3961,17 @@ async fn run_provider_formal_audit(
         }
     };
 
+    // Bound normalized Vision payloads only — never client-supplied image bytes.
+    // Base64 exists solely inside the ephemeral provider request body.
+    let vision_images = load_plan_vision_request_images(&plan_token);
+
     let attempt_modes = formal_modes_for_connection(&connection);
     let mut last_failure: Option<ProviderFailure> = None;
     let mut formal_ran = false;
     let mut structured: Option<Value> = None;
 
     for attempted_mode in attempt_modes {
-        let provider_request = match build_structured_request(
+        let provider_request = match build_structured_request_with_vision(
             connection.provider,
             attempted_mode,
             &connection.endpoint,
@@ -3735,6 +3981,7 @@ async fn run_provider_formal_audit(
             "okpgui_audit",
             &prompt,
             1024,
+            &vision_images,
         ) {
             Ok(value) => value,
             Err(error) => {
@@ -7028,5 +7275,166 @@ mod template_selection_job_tests {
             err.contains("invalid or stale") || err.contains("stale"),
             "{err}"
         );
+    }
+}
+
+#[cfg(test)]
+mod plan_vision_command_tests {
+    use super::*;
+    use crate::config::{SiteSelection, Template};
+    use crate::publish::PublishRequest;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn write_temp_torrent(bytes: &[u8]) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("okpgui-vision-{nanos}.torrent"));
+        std::fs::write(&path, bytes).expect("write torrent");
+        path.to_string_lossy().to_string()
+    }
+
+    fn sample_request(torrent_path: String, poster: &str, markdown: &str, html: &str) -> PublishRequest {
+        let mut template = Template::default();
+        template.poster = poster.into();
+        template.description = markdown.into();
+        template.description_html = html.into();
+        template.title = "Title".into();
+        template.profile = "profile".into();
+        template.sites = SiteSelection {
+            dmhy: false,
+            nyaa: true,
+            acgrip: false,
+            bangumi: false,
+            acgnx_asia: false,
+            acgnx_global: false,
+        };
+        PublishRequest {
+            publish_id: "vision-test".into(),
+            torrent_path,
+            profile_name: "profile".into(),
+            template,
+        }
+    }
+
+    #[test]
+    fn list_vision_candidates_is_identity_bound_and_public() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(
+            torrent_path.clone(),
+            "https://cdn.example.test/poster.jpg",
+            "![a](https://cdn.example.test/a.png) ![b](https://cdn.example.test/b.png)",
+            r#"<img src="https://cdn.example.test/c.jpg">"#,
+        );
+        let token = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .prepare_plan_with_request_and_blockers(7, request, Vec::new(), true, None)
+                .expect("prepare")
+                .token
+        };
+
+        let listed = ai_list_plan_vision_candidates(token.clone()).expect("list");
+        assert_eq!(listed.plan_token, token);
+        assert!(!listed.snapshot_hash.is_empty());
+        assert_eq!(listed.request_generation, 7);
+        assert_eq!(listed.candidates.len(), 4);
+        assert!(!listed.requires_selection);
+        assert_eq!(listed.max_images, 5);
+        // Public response must not invent client-trusted hashes or bytes.
+        let public = serde_json::to_string(&listed).expect("serialize");
+        assert!(!public.contains("payload"));
+        assert!(!public.contains("content_hash"));
+
+        // Stale token fails closed.
+        let err = ai_list_plan_vision_candidates("missing-token".into()).expect_err("stale");
+        assert!(err.contains("missing") || err.contains("expired"), "{err}");
+
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn bind_vision_requires_explicit_selection_above_cap() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let mut markdown = String::new();
+        for index in 0..6 {
+            markdown.push_str(&format!("![x](https://cdn.example.test/{index}.png) "));
+        }
+        let request = sample_request(torrent_path.clone(), "", &markdown, "");
+        let prepared = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .prepare_plan_with_request_and_blockers(8, request, Vec::new(), true, None)
+                .expect("prepare")
+        };
+        let token = prepared.token.clone();
+        let old_hash = prepared.snapshot_hash.clone();
+
+        let listed = ai_list_plan_vision_candidates(token.clone()).expect("list");
+        assert!(listed.requires_selection);
+        assert_eq!(listed.candidates.len(), 6);
+
+        // Empty selection with 6 candidates must not silently take the first five.
+        // Note: bind also requires AI enabled; we only assert selection gate message when
+        // the disabled gate is not the first failure. Exercise the pure resolver here.
+        let candidates = listed
+            .candidates
+            .iter()
+            .map(|c| VisionImageInput {
+                url: c.url.clone(),
+                source: c.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let err = resolve_selected_vision_inputs(&candidates, &[]).expect_err("need selection");
+        assert!(matches!(
+            err,
+            crate::ai::vision::VisionError::TooManyImages(6)
+        ));
+
+        // Plan identity must remain unchanged without a successful bind.
+        let plan_hash = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .inspect_plan(&token)
+                .map(|plan| plan.snapshot_hash.clone())
+                .expect("plan")
+        };
+        assert_eq!(plan_hash, old_hash);
+
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn public_vision_bind_response_has_no_image_bytes_or_urls() {
+        // Structural canary: public DTO serialization never embeds payload/url fields.
+        let response = PlanVisionBindResponse {
+            plan_token: "tok".into(),
+            snapshot_hash: "sha256:abc".into(),
+            request_generation: 1,
+            batch_hash: "sha256:batch".into(),
+            images: vec![PublicPlanVisionImage {
+                source: "poster".into(),
+                content_hash: "sha256:deadbeef".into(),
+                mime_type: "image/jpeg".into(),
+                normalized_bytes: 12,
+                width: 2,
+                height: 2,
+            }],
+            warnings: vec!["IMAGE_FETCH_FAILED: test".into()],
+        };
+        let public = serde_json::to_string(&response).expect("serialize");
+        assert!(!public.contains("payload"));
+        assert!(!public.contains("\"url\""));
+        assert!(public.contains("content_hash"));
+        assert!(public.contains("IMAGE_FETCH_FAILED"));
     }
 }

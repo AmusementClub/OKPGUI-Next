@@ -11,6 +11,9 @@ import type {
     AutoTemplateSeedHandoff,
     ConsumedTemplateSeed,
     PlanPrepareResponse,
+    PlanVisionBindRequest,
+    PlanVisionBindResponse,
+    PlanVisionCandidatesResponse,
     PublishPlan,
     PublishRequestPayload,
     RecognitionJobView,
@@ -194,6 +197,29 @@ export async function recognizeWithAi(request: AiRecognizeRequest): Promise<Reco
  */
 export async function startFormalAudit(request: AiFormalAuditRequest): Promise<AiAuditResult> {
     return invoke<AiAuditResult>('ai_start_formal_audit', { request });
+}
+
+/**
+ * List Vision image candidates derived only from the prepared plan's final content.
+ * Zero network; does not mutate the plan. Callers must not invent snapshot hashes.
+ */
+export async function listPlanVisionCandidates(
+    planToken: string,
+): Promise<PlanVisionCandidatesResponse> {
+    return invoke<PlanVisionCandidatesResponse>('ai_list_plan_vision_candidates', {
+        planToken,
+    });
+}
+
+/**
+ * Bind selected Vision images to a prepared plan token.
+ * Backend fetches/normalizes, rolls the plan hash, and invalidates prior audit evidence.
+ * Never accepts client-supplied image bytes, hashes, or decisions as authority.
+ */
+export async function bindPlanVision(
+    request: PlanVisionBindRequest,
+): Promise<PlanVisionBindResponse> {
+    return invoke<PlanVisionBindResponse>('ai_bind_plan_vision', { request });
 }
 
 /**

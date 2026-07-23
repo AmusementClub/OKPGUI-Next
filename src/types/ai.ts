@@ -84,6 +84,70 @@ export interface AiFormalAuditRequest {
     local_blockers?: string[];
 }
 
+/** One plan-derived Vision candidate (URL + source only; never trusted as hash authority). */
+export interface PlanVisionCandidate {
+    url: string;
+    source: string;
+}
+
+/** Public list of Vision candidates for a prepared plan token. */
+export interface PlanVisionCandidatesResponse {
+    plan_token: string;
+    snapshot_hash: string;
+    request_generation: number;
+    candidates: PlanVisionCandidate[];
+    /** True when more than five unique candidates exist; UI must not auto-pick. */
+    requires_selection: boolean;
+    max_images: number;
+}
+
+/** Request to bind selected Vision images to a prepared plan (backend fetches/normalizes). */
+export interface PlanVisionBindRequest {
+    plan_token: string;
+    /** Empty means all candidates only when count ≤ max_images. */
+    selected_urls?: string[];
+}
+
+/** Public bound Vision image metadata (no URL, no bytes). */
+export interface PublicPlanVisionImage {
+    source: string;
+    content_hash: string;
+    mime_type: string;
+    normalized_bytes: number;
+    width: number;
+    height: number;
+}
+
+/** Public result after Vision bind + plan hash rollover. */
+export interface PlanVisionBindResponse {
+    plan_token: string;
+    snapshot_hash: string;
+    request_generation: number;
+    batch_hash: string;
+    images: PublicPlanVisionImage[];
+    warnings: string[];
+}
+
+/** Frontend disclosure state for the shared plan-token Vision flow. */
+export type VisionPreflightStatus =
+    | 'idle'
+    | 'skipped'
+    | 'listing'
+    | 'needs_selection'
+    | 'binding'
+    | 'bound'
+    | 'failed';
+
+export interface VisionPreflightState {
+    status: VisionPreflightStatus;
+    candidates: PlanVisionCandidate[];
+    selectedUrls: string[];
+    maxImages: number;
+    boundImages: PublicPlanVisionImage[];
+    warnings: string[];
+    error: string | null;
+}
+
 export interface AiAuditResult {
     decision: AiDecision;
     findings: AiFinding[];
