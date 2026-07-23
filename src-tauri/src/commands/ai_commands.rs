@@ -62,6 +62,14 @@ fn jobs() -> &'static Mutex<AiJobManager> {
     JOBS.get_or_init(|| Mutex::new(AiJobManager::default()))
 }
 
+#[cfg(test)]
+fn command_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 /// Cooperative cancel flags for in-flight MediaInfo child probes (job_id → flag).
 fn media_cancel_flags() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
     static FLAGS: OnceLock<Mutex<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
@@ -4420,6 +4428,7 @@ mod debug_record_and_exit_tests {
 
     #[test]
     fn debug_record_ipc_lists_and_clears_non_secret_metadata() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Audit, 9, "sha256:debug-ipc", None);
         complete_job_backend(&job_id, true, None, "debug summary only").unwrap();
 
@@ -4442,6 +4451,7 @@ mod debug_record_and_exit_tests {
 
     #[test]
     fn app_exit_hook_cancels_unfinished_jobs() {
+        let _guard = command_test_guard();
         let running = start_job_backend(JobKind::Vision, 1, "sha256:exit-run", None);
         let queued = start_job_backend(JobKind::Vision, 1, "sha256:exit-queue", None);
         cancel_unfinished_ai_jobs_on_exit();
@@ -4475,6 +4485,7 @@ mod formal_audit_lifecycle_tests {
 
     #[test]
     fn late_success_after_cancel_does_not_bind_terminal_evidence() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Audit, 1, "sha256:test", None);
         ai_cancel_job(job_id.clone()).unwrap();
 
@@ -4495,6 +4506,7 @@ mod formal_audit_lifecycle_tests {
 
     #[test]
     fn poll_rejects_cancelled_job_without_forging_terminal_evidence() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Audit, 3, "sha256:poll", None);
         let token = {
             let mut guard = get_or_create_registry()
@@ -4525,6 +4537,7 @@ mod formal_audit_lifecycle_tests {
 
     #[test]
     fn poll_returns_none_while_job_still_running() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Audit, 4, "sha256:running", None);
         let token = {
             let mut guard = get_or_create_registry()
@@ -4544,15 +4557,17 @@ mod formal_audit_lifecycle_tests {
         );
         bind_audit_to_plan(&pending).expect("bind pending");
 
-        let polled = ai_poll_formal_audit(token, job_id).expect("running poll");
+        let polled = ai_poll_formal_audit(token, job_id.clone()).expect("running poll");
         assert!(
             polled.is_none(),
             "running job must not surface terminal evidence"
         );
+        let _ = ai_cancel_job(job_id);
     }
 
     #[test]
     fn late_provider_failure_after_stale_does_not_bind_terminal_evidence() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Audit, 2, "sha256:stale", None);
         mark_job_stale_backend(&job_id, "app exit").unwrap();
 
@@ -5018,6 +5033,7 @@ mod recognition_command_tests {
 
     #[test]
     fn recognition_job_kind_and_schema_version_are_stable() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Recognition, 11, "sha256:recog", None);
         let job = ai_get_job(job_id.clone()).expect("job");
         assert_eq!(job.kind, JobKind::Recognition);
@@ -5060,6 +5076,7 @@ mod recognition_command_tests {
 
     #[test]
     fn poll_recognition_returns_none_until_terminal() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Recognition, 3, "sha256:recog-poll", None);
         store_recognition_view(RecognitionJobView {
             job_id: job_id.clone(),
@@ -5099,6 +5116,7 @@ mod recognition_command_tests {
 
     #[test]
     fn cancel_recognition_strips_result_and_blocks_late_success() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Recognition, 5, "sha256:recog-cancel", None);
         let flag = Arc::new(AtomicBool::new(false));
         recognition_cancel_flags()
@@ -5141,6 +5159,7 @@ mod recognition_command_tests {
 
     #[test]
     fn failed_recognition_never_returns_result() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::Recognition, 2, "sha256:recog-fail", None);
         let view = finish_recognition_failure(
             &job_id,
@@ -5176,6 +5195,7 @@ mod media_info_job_tests {
 
     #[test]
     fn sanitize_media_results_strips_measured_summaries() {
+        let _guard = command_test_guard();
         let results = vec![MediaProbeResult {
             relative_name: "video.mkv".into(),
             state: MediaProbeState::Measured,
@@ -5202,6 +5222,8 @@ mod media_info_job_tests {
 
     #[test]
     fn cancel_media_info_job_signals_flag_and_discards_success() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
         let job_id = start_job_backend(JobKind::MediaInfo, 7, "sha256:media", None);
         let flag = Arc::new(AtomicBool::new(false));
         media_cancel_flags()
@@ -5257,6 +5279,8 @@ mod media_info_job_tests {
 
     #[test]
     fn cancel_after_media_info_success_preserves_measured_results() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
         let job_id = start_job_backend(JobKind::MediaInfo, 11, "sha256:media-ok", None);
         complete_job_backend(&job_id, true, None, "measured ok").unwrap();
         media_job_results().lock().unwrap().insert(
@@ -5396,6 +5420,13 @@ mod media_info_job_tests {
     }
 
     fn reset_media_job_globals() {
+        // Signal any child probe before cancelling jobs so a worker cannot keep probing
+        // while the process-global test state is being reset.
+        if let Ok(flags) = media_cancel_flags().lock() {
+            for flag in flags.values() {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
         {
             let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
             manager.cancel_unfinished();
@@ -5404,10 +5435,19 @@ mod media_info_job_tests {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .clear();
+        media_job_results()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
+        media_cancel_flags()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clear();
     }
 
     #[test]
     fn queued_media_info_work_does_not_spawn_until_promoted() {
+        let _guard = command_test_guard();
         // Best-effort isolation against process-global leftover jobs from other tests.
         reset_media_job_globals();
 
@@ -5458,6 +5498,7 @@ mod media_info_job_tests {
 
     #[test]
     fn non_media_cancel_promotes_and_starts_deferred_media_info() {
+        let _guard = command_test_guard();
         reset_media_job_globals();
 
         let (blocker, blocker2, media_id, _flag) =
@@ -5489,6 +5530,7 @@ mod media_info_job_tests {
 
     #[test]
     fn pending_media_info_work_is_bounded_and_rejects_without_zombie() {
+        let _guard = command_test_guard();
         reset_media_job_globals();
 
         // Fill deferred map to the documented finite bound with placeholder entries.
@@ -5594,6 +5636,7 @@ mod media_info_job_tests {
     /// spawn when work is parked via the production start-path coordinator (no manual drain).
     #[test]
     fn park_and_drain_starts_running_job_after_stale_queued_snapshot() {
+        let _guard = command_test_guard();
         reset_media_job_globals();
 
         // Fill concurrency so MediaInfo starts Queued (stale snapshot would say Queued).
@@ -5672,6 +5715,7 @@ mod media_info_job_tests {
     /// resurrect a cancelled job when the start path parks then drains.
     #[test]
     fn park_and_drain_discards_terminal_pending_without_resurrection() {
+        let _guard = command_test_guard();
         reset_media_job_globals();
 
         let media_id =
@@ -5739,6 +5783,7 @@ mod media_info_job_tests {
     /// Queued MediaInfo promoted by that cancel (capacity freed by rejecting the Running job).
     #[test]
     fn park_overflow_rejects_running_and_drains_promoted_queued() {
+        let _guard = command_test_guard();
         reset_media_job_globals();
 
         // Running target that will fail to park + second Running filler so media_q is Queued.
@@ -5879,6 +5924,8 @@ mod media_info_job_tests {
 
     #[test]
     fn media_global_state_retention_keeps_active_jobs() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
         let active = start_job_backend(JobKind::MediaInfo, 1, "sha256:active-retain", None);
         media_job_results().lock().unwrap().insert(
             active.clone(),
@@ -5943,6 +5990,8 @@ mod media_info_job_tests {
 
     #[test]
     fn poll_media_info_returns_none_until_terminal() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
         let job_id = start_job_backend(JobKind::MediaInfo, 1, "sha256:poll-media", None);
         media_job_results().lock().unwrap().insert(
             job_id.clone(),
@@ -6005,6 +6054,7 @@ mod template_selection_job_tests {
 
     #[test]
     fn poll_template_selection_returns_none_until_terminal() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:catalog", None);
         store_template_selection_view(TemplateSelectionJobView {
             job_id: job_id.clone(),
@@ -6050,6 +6100,7 @@ mod template_selection_job_tests {
 
     #[test]
     fn cancel_template_selection_strips_seed_and_blocks_late_success() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:cancel", None);
         let flag = Arc::new(AtomicBool::new(false));
         template_cancel_flags()
@@ -6089,6 +6140,7 @@ mod template_selection_job_tests {
 
     #[test]
     fn failed_selection_never_returns_seed() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:fail", None);
         let view = finish_template_selection_failure(
             &job_id,
@@ -6117,6 +6169,7 @@ mod template_selection_job_tests {
 
     #[test]
     fn stale_or_cancelled_finish_success_discards_seed() {
+        let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:stale", None);
         ai_cancel_job(job_id.clone()).unwrap();
 
