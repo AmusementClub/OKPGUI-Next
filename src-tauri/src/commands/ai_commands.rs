@@ -65,6 +65,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
+use tauri_plugin_opener::OpenerExt;
 
 fn jobs() -> &'static Mutex<AiJobManager> {
     static JOBS: OnceLock<Mutex<AiJobManager>> = OnceLock::new();
@@ -4600,6 +4601,23 @@ pub fn ai_export_debug_records(app: AppHandle) -> Result<DebugExportMetadata, St
         .join(DEBUG_EXPORT_RELATIVE_DIR);
     let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
     manager.export_debug_bundle(export_dir)
+}
+
+/// Reveal the backend-owned debug directory in the system file manager.
+///
+/// The directory is derived from the app-local data root; callers cannot supply
+/// an arbitrary path to the opener.
+#[tauri::command]
+pub fn ai_open_debug_directory(app: AppHandle) -> Result<(), String> {
+    let local_dir = app
+        .path()
+        .app_local_data_dir()
+        .map_err(|_| "debug directory unavailable".to_string())?;
+    let debug_dir = local_dir.join(DEBUG_STORE_RELATIVE_DIR);
+    std::fs::create_dir_all(&debug_dir).map_err(|_| "debug directory unavailable".to_string())?;
+    app.opener()
+        .reveal_item_in_dir(&debug_dir)
+        .map_err(|_| "debug directory could not be opened".to_string())
 }
 
 /// App-exit hook: cancel queued/running AI jobs so late completions cannot bind.

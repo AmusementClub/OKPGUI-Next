@@ -112,6 +112,7 @@ pub fn run() {
             commands::ai_commands::ai_list_debug_records,
             commands::ai_commands::ai_clear_debug_records,
             commands::ai_commands::ai_export_debug_records,
+            commands::ai_commands::ai_open_debug_directory,
             commands::ai_commands::ai_build_capability_probe,
             commands::ai_commands::ai_classify_capability_probe,
             commands::ai_commands::ai_list_models,
