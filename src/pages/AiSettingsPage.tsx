@@ -148,6 +148,19 @@ export default function AiSettingsPage() {
                     </p>
                 </header>
 
+                {settings.credential_session_only ? (
+                    <div
+                        role="status"
+                        data-testid="credential-session-only-warning"
+                        className="rounded-xl border border-amber-600/50 bg-amber-500/10 px-4 py-3 text-sm text-amber-100"
+                    >
+                        <p className="font-medium text-amber-200">密钥仅保存在本会话中</p>
+                        <p className="mt-1 text-xs text-amber-100/90">
+                            当前平台无法将密钥写入系统密钥环，密钥不会在应用重启后恢复。退出应用后需重新输入密钥；重启不会自动恢复密钥，也不会以明文写入磁盘。
+                        </p>
+                    </div>
+                ) : null}
+
                 <section className="space-y-4 rounded-xl border border-slate-700 bg-slate-800/50 p-5">
                     <label className="flex items-center gap-3 text-sm text-slate-200">
                         <input
@@ -328,7 +341,7 @@ export default function AiSettingsPage() {
                                     className="text-xs text-amber-300"
                                     data-testid="credential-session-only"
                                 >
-                                    密钥已配置（仅本会话，未持久化）
+                                    密钥已配置（仅本会话，重启后丢失）
                                 </span>
                             ) : (
                                 <span className="text-xs text-emerald-300">密钥已配置</span>

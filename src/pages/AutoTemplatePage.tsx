@@ -9,10 +9,11 @@ import {
     isSuccessfulTemplateSelection,
     pollTemplateSelection,
     readFriendlyError,
+    reviewTemplateRecommendation,
     startTemplateSelection,
     writeAutoTemplateSeedHandoff,
 } from '../services/ai';
-import type { AiSettings, TemplateSelectionJobView } from '../types/ai';
+import type { AiSettings, TemplateRecommendation, TemplateSelectionJobView } from '../types/ai';
 import type { QuickPublishConfigPayload, QuickPublishTemplate } from '../utils/quickPublish';
 
 const POLL_INTERVAL_MS = 400;
@@ -28,6 +29,9 @@ export default function AutoTemplatePage() {
     const [working, setWorking] = useState(false);
     const [progress, setProgress] = useState(0);
     const [jobId, setJobId] = useState<string | null>(null);
+    /** Backend-owned recommendation shown until explicit Review / Stay / manual. */
+    const [recommendation, setRecommendation] = useState<TemplateRecommendation | null>(null);
+    const [reviewing, setReviewing] = useState(false);
 
     const disposedRef = useRef(false);
     const jobIdRef = useRef<string | null>(null);
@@ -47,8 +51,6 @@ export default function AutoTemplatePage() {
             clearTimeout(timeoutTimerRef.current);
             timeoutTimerRef.current = null;
         }
-        // Do not clear pollInFlightRef here: an already-awaiting tick must keep the latch
-        // until its finally runs (or a new startPolling/invalidateClaim resets it).
     }, []);
 
     const clearActiveJob = useCallback(() => {
@@ -115,17 +117,19 @@ export default function AutoTemplatePage() {
         setProgress(100);
         setWorking(false);
 
-        if (isSuccessfulTemplateSelection(view) && view.seed) {
-            // Opaque handoff only after validated succeeded result — token + public template id.
-            writeAutoTemplateSeedHandoff(view.seed);
-            window.dispatchEvent(new CustomEvent('okpgui:navigate', { detail: 'quick_publish' }));
-            const label = catalog[view.seed.template_id]?.name || view.seed.template_id;
-            setStatus(`已选择模板“${label}”，正在进入模板发布。`);
+        if (isSuccessfulTemplateSelection(view) && view.recommendation) {
+            // Stay on result view with backend recommendation — never mint/write/navigate here.
+            setRecommendation(view.recommendation);
+            const label = catalog[view.recommendation.template_id]?.name
+                || view.recommendation.template_name
+                || view.recommendation.template_id;
+            setStatus(`已推荐模板“${label}”。请确认后在模板发布中审阅，或手动选择。`);
             setError('');
             return;
         }
 
         // Fail closed: stay on this page; never write handoff for cancel/stale/failed.
+        setRecommendation(null);
         if (view.state === 'cancelled') {
             setError(view.message || '自动选择已取消。');
             setStatus('');
@@ -245,6 +249,7 @@ export default function AutoTemplatePage() {
         setWorking(false);
         setProgress(0);
         setStatus('');
+        setRecommendation(null);
         if (!active) {
             setError('自动选择已取消。');
             return;
@@ -294,6 +299,7 @@ export default function AutoTemplatePage() {
         setError('');
         setStatus('');
         setProgress(0);
+        setRecommendation(null);
         if (!torrentPath.trim()) {
             setError('请先输入种子路径。');
             return;
@@ -364,6 +370,64 @@ export default function AutoTemplatePage() {
         }
     };
 
+    /** Explicit Review: atomic revalidate + mint seed, then write handoff and navigate. */
+    const handleReviewInQuickPublish = useCallback(async () => {
+        if (!recommendation?.recommendation_id || reviewing) {
+            return;
+        }
+        setReviewing(true);
+        setError('');
+        try {
+            const result = await reviewTemplateRecommendation(recommendation.recommendation_id);
+            if (disposedRef.current) {
+                return;
+            }
+            if (
+                (result.status === 'minted' || result.status === 'already_minted')
+                && result.seed?.token
+                && result.seed.template_id
+            ) {
+                writeAutoTemplateSeedHandoff(result.seed);
+                window.dispatchEvent(new CustomEvent('okpgui:navigate', { detail: 'quick_publish' }));
+                setStatus('正在进入模板发布…');
+                return;
+            }
+            if (result.status === 'already_consumed') {
+                setError(result.message || '该推荐生成的种子已被模板发布消费，请重新自动选择模板。');
+                setRecommendation(null);
+                setStatus('');
+                return;
+            }
+            setError(result.message || '无法生成发布种子，请重试或手动选择模板。');
+        } catch (reviewError) {
+            if (!disposedRef.current) {
+                setError(readFriendlyError(reviewError, '审阅并进入发布失败，请重试。'));
+            }
+        } finally {
+            if (!disposedRef.current) {
+                setReviewing(false);
+            }
+        }
+    }, [recommendation, reviewing]);
+
+    const handleStayOnResult = useCallback(() => {
+        setStatus('已保留推荐结果。需要时再点击“在模板发布中审阅”。');
+    }, []);
+
+    const handleChooseManually = useCallback(() => {
+        // Never mint: discard local recommendation UI and navigate to Quick Publish empty.
+        setRecommendation(null);
+        setStatus('');
+        setError('');
+        window.dispatchEvent(new CustomEvent('okpgui:navigate', { detail: 'quick_publish' }));
+    }, []);
+
+    const clearRecommendation = useCallback(() => {
+        setRecommendation(null);
+        setStatus('');
+        setError('');
+    }, []);
+
     return (
         <div className="h-full overflow-y-auto">
             <div className="mx-auto max-w-3xl space-y-5 p-6">
@@ -374,7 +438,7 @@ export default function AutoTemplatePage() {
                     </div>
                     <h2 className="mt-2 text-xl font-semibold text-slate-100">自动选择模板</h2>
                     <p className="mt-1 text-sm text-slate-500">
-                        由已配置的 AI 从现有模板目录中选择；失败时停留本页，不会修改模板内容。
+                        由已配置的 AI 从现有模板目录中选择；成功后需你确认再进入模板发布，失败时停留本页，不会修改模板内容。
                     </p>
                 </header>
                 <section className="space-y-4 rounded-xl border border-slate-700 bg-slate-800/50 p-5">
@@ -384,7 +448,7 @@ export default function AutoTemplatePage() {
                             value={torrentPath}
                             onChange={(event) => setTorrentPath(event.target.value)}
                             placeholder="/path/to/file.torrent"
-                            disabled={working}
+                            disabled={working || reviewing}
                             className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200 disabled:opacity-60"
                         />
                     </label>
@@ -392,11 +456,11 @@ export default function AutoTemplatePage() {
                         <button
                             type="button"
                             onClick={() => void selectTemplate()}
-                            disabled={working}
+                            disabled={working || reviewing}
                             className="inline-flex items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600 disabled:opacity-50"
                         >
                             {working ? <Loader2 size={15} className="animate-spin" /> : <Send size={15} />}
-                            选择并进入发布
+                            开始自动选择
                         </button>
                         {working ? (
                             <button
@@ -426,9 +490,97 @@ export default function AutoTemplatePage() {
                             ) : null}
                         </div>
                     ) : null}
-                    {status ? <p className="text-xs text-emerald-300">{status}</p> : null}
-                    {error ? <p className="text-xs text-rose-300">{error}</p> : null}
+                    {status ? <p className="text-xs text-emerald-300" data-testid="auto-template-status">{status}</p> : null}
+                    {error ? <p className="text-xs text-rose-300" data-testid="auto-template-error">{error}</p> : null}
                 </section>
+
+                {recommendation ? (
+                    <section
+                        className="space-y-4 rounded-xl border border-cyan-500/30 bg-cyan-500/5 p-5"
+                        data-testid="auto-template-recommendation"
+                    >
+                        <div>
+                            <p className="font-mono text-[11px] uppercase tracking-[0.16em] text-cyan-400/80">
+                                推荐结果
+                            </p>
+                            <h3 className="mt-2 text-base font-semibold text-slate-100">
+                                {templates[recommendation.template_id]?.name
+                                    || recommendation.template_name
+                                    || recommendation.template_id}
+                            </h3>
+                            <p className="mt-1 font-mono text-[11px] text-slate-500">
+                                id {recommendation.template_id} · revision {recommendation.template_revision}
+                            </p>
+                            {recommendation.summary ? (
+                                <p className="mt-2 text-sm text-slate-300" data-testid="auto-template-recommendation-summary">
+                                    {recommendation.summary}
+                                </p>
+                            ) : null}
+                        </div>
+                        {recommendation.alternatives.length > 0 ? (
+                            <div data-testid="auto-template-alternatives">
+                                <p className="text-xs text-slate-500">其他可选模板</p>
+                                <ul className="mt-2 space-y-1.5">
+                                    {recommendation.alternatives.map((alt) => (
+                                        <li
+                                            key={`${alt.template_id}:${alt.template_revision}`}
+                                            className="rounded-lg border border-slate-700/80 bg-slate-900/50 px-3 py-2 text-xs text-slate-300"
+                                        >
+                                            <span className="font-medium text-slate-200">
+                                                {templates[alt.template_id]?.name || alt.name || alt.template_id}
+                                            </span>
+                                            <span className="text-slate-500">
+                                                {' '}· rev {alt.template_revision}
+                                            </span>
+                                            {alt.summary ? (
+                                                <p className="mt-0.5 text-slate-500">{alt.summary}</p>
+                                            ) : null}
+                                        </li>
+                                    ))}
+                                </ul>
+                            </div>
+                        ) : null}
+                        <div className="flex flex-wrap items-center gap-2">
+                            <button
+                                type="button"
+                                data-testid="auto-template-review"
+                                onClick={() => void handleReviewInQuickPublish()}
+                                disabled={reviewing}
+                                className="inline-flex items-center gap-2 rounded-lg bg-cyan-500 px-4 py-2 text-sm font-medium text-white hover:bg-cyan-600 disabled:opacity-50"
+                            >
+                                {reviewing ? <Loader2 size={15} className="animate-spin" /> : null}
+                                在模板发布中审阅
+                            </button>
+                            <button
+                                type="button"
+                                data-testid="auto-template-stay"
+                                onClick={handleStayOnResult}
+                                disabled={reviewing}
+                                className="inline-flex items-center gap-2 rounded-lg border border-slate-600 px-3 py-2 text-sm text-slate-300 hover:bg-slate-700/60 disabled:opacity-50"
+                            >
+                                留在此页
+                            </button>
+                            <button
+                                type="button"
+                                data-testid="auto-template-choose-manual"
+                                onClick={handleChooseManually}
+                                disabled={reviewing}
+                                className="inline-flex items-center gap-2 rounded-lg border border-slate-600 px-3 py-2 text-sm text-slate-300 hover:bg-slate-700/60 disabled:opacity-50"
+                            >
+                                手动选择
+                            </button>
+                            <button
+                                type="button"
+                                data-testid="auto-template-dismiss-recommendation"
+                                onClick={clearRecommendation}
+                                disabled={reviewing}
+                                className="inline-flex items-center gap-2 rounded-lg border border-transparent px-2 py-2 text-sm text-slate-500 hover:text-slate-300 disabled:opacity-50"
+                            >
+                                关闭结果
+                            </button>
+                        </div>
+                    </section>
+                ) : null}
             </div>
         </div>
     );

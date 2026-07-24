@@ -1115,6 +1115,12 @@ describe('HomePage publish content pipeline', () => {
                         snapshot_hash: 'sha256:backend-authoritative',
                         progress: 100,
                     });
+                case 'ai_cancel_preflight_session':
+                    return Promise.resolve({
+                        job_state: 'cancelled',
+                        token_state: 'invalidated',
+                        reconciled: true,
+                    });
                 case 'invalidate_plan':
                     return Promise.resolve(true);
                 case 'publish_prepared_plan':
@@ -1129,6 +1135,15 @@ describe('HomePage publish content pipeline', () => {
         return invokeMock.mock.calls
             .filter(([called]) => called === command)
             .map(([, args]) => args as Record<string, unknown>);
+    }
+
+    /** True when the prepared token was cancelled via atomic session cancel or legacy invalidate. */
+    function preparedTokenWasInvalidated(token = 'prepared-token'): boolean {
+        const sessionCancels = findInvokeArgs('ai_cancel_preflight_session');
+        if (sessionCancels.some((args) => args.planToken === token || args.plan_token === token)) {
+            return true;
+        }
+        return findInvokeArgs('invalidate_plan').some((args) => args.token === token);
     }
 
     async function selectTorrentAndOpenConfirm(container: HTMLElement, siteLabel: string) {
@@ -1234,8 +1249,7 @@ describe('HomePage publish content pipeline', () => {
 
             // Security invariants remain valid during the modal leave transition;
             // do not assert ai-preflight-panel unmount (Headless UI leave keeps DOM briefly).
-            const invalidateCalls = findInvokeArgs('invalidate_plan');
-            expect(invalidateCalls.some((args) => args.token === 'prepared-token')).toBe(true);
+            expect(preparedTokenWasInvalidated('prepared-token')).toBe(true);
             expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
         } finally {
             await rendered.unmount();
@@ -1260,7 +1274,7 @@ describe('HomePage publish content pipeline', () => {
             });
             await flushAsync();
 
-            expect(findInvokeArgs('invalidate_plan').some((args) => args.token === 'prepared-token')).toBe(true);
+            expect(preparedTokenWasInvalidated('prepared-token')).toBe(true);
             expect(findInvokeArgs('publish_prepared_plan')).toHaveLength(0);
         } finally {
             await rendered.unmount();
@@ -2317,13 +2331,7 @@ describe('HomePage publish content pipeline', () => {
     });
 
     it('runs recognition pre-confirm with draft identity and explicit episode adopt (no plan token)', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: 'E(\\d+)',
-            resolutionPattern: '(\\d{3,4}p)',
-            titlePattern: '{title} - {ep}',
-        });
+                const draftIdentity = 'sha256:backend-recognition-context';
 
         mountWithTemplate(
             {
@@ -2357,12 +2365,11 @@ describe('HomePage publish content pipeline', () => {
         const baseImpl = invokeMock.getMockImplementation();
         invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
             if (command === 'ai_start_recognition') {
-                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                const reqGen = request?.request_generation ?? 1;
+                // Backend allocates identity; ignore any client-supplied identity fields.
                 return Promise.resolve({
                     job_id: 'job-rec-home',
                     state: 'succeeded',
-                    request_generation: reqGen,
+                    request_generation: 7,
                     snapshot_hash: draftIdentity,
                     progress: 100,
                     error_code: null,
@@ -2372,7 +2379,7 @@ describe('HomePage publish content pipeline', () => {
                         episode: { value: '12', confidence: 0.95, evidence: 'E12' },
                         resolution: { value: '1080p', confidence: 0.9, evidence: '1080p' },
                         suggested_title: { value: 'AI TITLE MUST NOT APPLY', confidence: 1, evidence: 'x' },
-                        request_generation: reqGen,
+                        request_generation: 7,
                         snapshot_hash: draftIdentity,
                         job_id: 'job-rec-home',
                     },
@@ -2423,10 +2430,16 @@ describe('HomePage publish content pipeline', () => {
             const startCalls = invokeMock.mock.calls.filter(([command]) => command === 'ai_start_recognition');
             expect(startCalls.length).toBeGreaterThanOrEqual(1);
             const payload = startCalls[0][1] as {
-                request: { torrent_name: string; snapshot_hash: string; plan_token?: string };
+                request: {
+                    torrent_name: string;
+                    snapshot_hash?: string;
+                    request_generation?: number;
+                    plan_token?: string;
+                };
             };
             expect(payload.request.torrent_name).toBe('release.mkv');
-            expect(payload.request.snapshot_hash).toBe(draftIdentity);
+            expect(payload.request.snapshot_hash).toBeUndefined();
+            expect(payload.request.request_generation).toBeUndefined();
             expect(payload.request.plan_token).toBeUndefined();
             expect(findInvokeArgs('prepare_plan')).toHaveLength(0);
 
@@ -2621,13 +2634,7 @@ describe('HomePage publish content pipeline', () => {
     });
 
     it('clears page-side adopted history on re-recognize and preserves it across title covered edits into confirm', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: 'E(\\d+)',
-            resolutionPattern: '(\\d{3,4}p)',
-            titlePattern: '{title} - {ep}',
-        });
+                const draftIdentity = 'sha256:backend-recognition-context';
 
         let recognitionGeneration = 0;
         mountWithTemplate(
@@ -2663,8 +2670,8 @@ describe('HomePage publish content pipeline', () => {
             if (command === 'ai_start_recognition') {
                 recognitionGeneration += 1;
                 const gen = recognitionGeneration;
-                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                const reqGen = request?.request_generation ?? gen;
+                // Backend owns generation; client content only.
+                const reqGen = gen;
                 return Promise.resolve({
                     job_id: `job-rec-home-${gen}`,
                     state: 'succeeded',
@@ -2814,13 +2821,7 @@ describe('HomePage publish content pipeline', () => {
     });
 
     it('reads latest adopted history via ref when adopt lands during held prepare', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: 'E(\\d+)',
-            resolutionPattern: '(\\d{3,4}p)',
-            titlePattern: '{title} - {ep}',
-        });
+                const draftIdentity = 'sha256:backend-recognition-context';
 
         const pendingPrepare = deferred<{
             token: string;
@@ -2861,8 +2862,8 @@ describe('HomePage publish content pipeline', () => {
         const baseImpl = invokeMock.getMockImplementation();
         invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
             if (command === 'ai_start_recognition') {
-                const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                const reqGen = request?.request_generation ?? 1;
+                // Backend owns generation; client content only.
+                const reqGen = 1;
                 return Promise.resolve({
                     job_id: 'job-rec-during-prepare',
                     state: 'succeeded',
@@ -3126,7 +3127,7 @@ describe('HomePage publish content pipeline', () => {
             await flushAsync();
 
             const confirmVision = document.body.querySelector<HTMLButtonElement>(
-                '[data-testid="ai-vision-confirm-selection"]',
+                '[data-testid="ai-preflight-vision-use-selected"]',
             );
             expect(confirmVision).not.toBeNull();
             await act(async () => {

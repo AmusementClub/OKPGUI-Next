@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import {
   buildDefaultBridgeState,
   defaultReadySettings,
+  ensureTauriMockOnPage,
   installTauriMock,
   navigateToPage,
   readBridgeState,
@@ -20,6 +21,7 @@ test.describe('UI integration · settings/capability', () => {
     });
     await installTauriMock(page, state);
     await page.goto('/');
+    await ensureTauriMockOnPage(page, state);
 
     await navigateToPage(page, 'ai_settings');
     await expect(page.getByText('BYOK AI 连接')).toBeVisible();
@@ -56,6 +58,7 @@ test.describe('UI integration · settings/capability', () => {
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: {           ...defaultReadySettings(),           model: 'manual-model',           discovered_models: [],           models_fetched_at_unix: null,         },       }));
     await navigateToPage(page, 'ai_settings');
     await page.getByRole('button', { name: '刷新模型' }).click();
     await expect(page.getByText(/^已刷新 \d+ 个模型。$/)).toBeVisible({ timeout: 15_000 });

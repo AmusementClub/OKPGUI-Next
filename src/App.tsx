@@ -1,6 +1,7 @@
 import { Transition } from '@headlessui/react';
 import { ComponentType, useEffect, useRef, useState } from 'react';
 import Sidebar, { Page } from './components/Sidebar';
+import ActiveAiJobStatusStrip from './components/ActiveAiJobStatusStrip';
 import { getStartupPagePreference } from './utils/appPreferences';
 import HomePage from './pages/HomePage';
 import QuickPublishPage from './pages/QuickPublishPage';
@@ -85,7 +86,8 @@ export default function App() {
                 onPageChange={setActivePage}
                 onToggleCollapse={() => setIsSidebarCollapsed((collapsed) => !collapsed)}
             />
-            <main className="min-w-0 flex-1 overflow-hidden">
+            <main className="min-w-0 flex-1 overflow-hidden flex flex-col">
+                <ActiveAiJobStatusStrip />
                 <Transition
                     appear
                     show={isPageVisible}
@@ -97,7 +99,7 @@ export default function App() {
                     leave={`transform-gpu transition duration-100 ${PAGE_LEAVE_TIMING}`}
                     leaveFrom="opacity-100 translate-y-0 scale-100 blur-0"
                     leaveTo="pointer-events-none opacity-0 -translate-y-1 scale-[0.996] blur-[3px]"
-                    className="h-full"
+                    className="min-h-0 flex-1"
                 >
                     <ActivePage />
                 </Transition>

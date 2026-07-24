@@ -861,8 +861,6 @@ describe('AI recognition advisory contracts', () => {
             ep_pattern: 'E(\\d+)',
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title}',
-            request_generation: 3,
-            snapshot_hash: 'sha256:rec',
         });
 
         expect(invokeMock).toHaveBeenCalledWith('ai_recognize', {
@@ -871,8 +869,6 @@ describe('AI recognition advisory contracts', () => {
                 ep_pattern: 'E(\\d+)',
                 resolution_pattern: '(\\d{3,4}p)',
                 title_pattern: '{title}',
-                request_generation: 3,
-                snapshot_hash: 'sha256:rec',
             },
         });
         expect(result.suggested_title?.value).toBe('Suggested');
@@ -880,7 +876,6 @@ describe('AI recognition advisory contracts', () => {
     });
 
     it('recognition is runnable pre-confirm when Ready + torrent + patterns; adopt is explicit', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -908,14 +903,9 @@ describe('AI recognition advisory contracts', () => {
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title} - {ep}',
         };
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: template.ep_pattern,
-            resolutionPattern: template.resolution_pattern,
-            titlePattern: template.title_pattern,
-        });
+        const draftIdentity = 'sha256:backend-recognition-context';
 
-        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        invokeMock.mockImplementation((command: string, _args?: Record<string, unknown>) => {
             switch (command) {
                 case 'get_config':
                     return Promise.resolve({
@@ -955,8 +945,8 @@ describe('AI recognition advisory contracts', () => {
                     });
                 case 'ai_start_recognition': {
                     // Echo client request_generation so clear-before-recognize gen bumps still apply.
-                    const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                    const reqGen = request?.request_generation ?? 1;
+                    // Backend owns generation; client content only.
+                    const reqGen = 1;
                     return Promise.resolve({
                         job_id: 'job-rec-1',
                         state: 'succeeded',
@@ -1030,12 +1020,14 @@ describe('AI recognition advisory contracts', () => {
             const request = startCalls[0][1] as {
                 request: {
                     torrent_name: string;
-                    snapshot_hash: string;
+                    snapshot_hash?: string;
+                    request_generation?: number;
                     plan_token?: string;
                 };
             };
             expect(request.request.torrent_name).toBe('release.mkv');
-            expect(request.request.snapshot_hash).toBe(draftIdentity);
+            expect(request.request.snapshot_hash).toBeUndefined();
+            expect((request.request as { request_generation?: number }).request_generation).toBeUndefined();
             expect(request.request.plan_token).toBeUndefined();
             expect(invokeMock.mock.calls.filter(([command]) => command === 'prepare_plan')).toHaveLength(0);
 
@@ -1063,7 +1055,6 @@ describe('AI recognition advisory contracts', () => {
     });
 
     it('preserves explicit episode adopt through title override into confirm (no reparse clobber)', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -1091,14 +1082,9 @@ describe('AI recognition advisory contracts', () => {
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title} - {ep}',
         };
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: template.ep_pattern,
-            resolutionPattern: template.resolution_pattern,
-            titlePattern: template.title_pattern,
-        });
+        const draftIdentity = 'sha256:backend-recognition-context';
 
-        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        invokeMock.mockImplementation((command: string, _args?: Record<string, unknown>) => {
             switch (command) {
                 case 'get_config':
                     return Promise.resolve({
@@ -1138,8 +1124,8 @@ describe('AI recognition advisory contracts', () => {
                         },
                     });
                 case 'ai_start_recognition': {
-                    const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                    const reqGen = request?.request_generation ?? 1;
+                    // Backend owns generation; client content only.
+                    const reqGen = 1;
                     return Promise.resolve({
                         job_id: 'job-rec-adopt-title',
                         state: 'succeeded',
@@ -1290,7 +1276,6 @@ describe('AI recognition advisory contracts', () => {
     });
 
     it('re-recognize clears prior adopt so confirm does not reuse stale history values', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -1318,15 +1303,10 @@ describe('AI recognition advisory contracts', () => {
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title} - {ep}',
         };
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: template.ep_pattern,
-            resolutionPattern: template.resolution_pattern,
-            titlePattern: template.title_pattern,
-        });
+        const draftIdentity = 'sha256:backend-recognition-context';
 
         let recognitionGeneration = 0;
-        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        invokeMock.mockImplementation((command: string, _args?: Record<string, unknown>) => {
             switch (command) {
                 case 'get_config':
                     return Promise.resolve({
@@ -1367,8 +1347,8 @@ describe('AI recognition advisory contracts', () => {
                 case 'ai_start_recognition': {
                     recognitionGeneration += 1;
                     const gen = recognitionGeneration;
-                    const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                    const reqGen = request?.request_generation ?? gen;
+                    // Backend owns generation; client content only.
+                    const reqGen = gen;
                     return Promise.resolve({
                         job_id: `job-rec-rerun-${gen}`,
                         state: 'succeeded',
@@ -1513,7 +1493,6 @@ describe('AI recognition advisory contracts', () => {
     });
 
     it('does not re-seed mid-prepare re-recognize-cleared adopts into live draft chips', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -1541,19 +1520,14 @@ describe('AI recognition advisory contracts', () => {
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title} - {ep}',
         };
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: template.ep_pattern,
-            resolutionPattern: template.resolution_pattern,
-            titlePattern: template.title_pattern,
-        });
+        const draftIdentity = 'sha256:backend-recognition-context';
 
         let recognitionGeneration = 0;
         let holdPrepareParse = false;
         const heldParses: Array<{
             resolve: (value: { title: string; episode: string; resolution: string }) => void;
         }> = [];
-        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        invokeMock.mockImplementation((command: string, _args?: Record<string, unknown>) => {
             switch (command) {
                 case 'get_config':
                     return Promise.resolve({
@@ -1600,8 +1574,8 @@ describe('AI recognition advisory contracts', () => {
                 case 'ai_start_recognition': {
                     recognitionGeneration += 1;
                     const gen = recognitionGeneration;
-                    const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                    const reqGen = request?.request_generation ?? gen;
+                    // Backend owns generation; client content only.
+                    const reqGen = gen;
                     return Promise.resolve({
                         job_id: `job-rec-mid-prepare-${gen}`,
                         state: 'succeeded',
@@ -1767,7 +1741,6 @@ describe('AI recognition advisory contracts', () => {
     });
 
     it('re-recognize during held prepare_plan does not leave stale AI adopt chips after prepare', async () => {
-        const { buildRecognitionDraftIdentity } = await import('../types/ai');
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -1795,12 +1768,7 @@ describe('AI recognition advisory contracts', () => {
             resolution_pattern: '(\\d{3,4}p)',
             title_pattern: '{title} - {ep}',
         };
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'release.mkv',
-            epPattern: template.ep_pattern,
-            resolutionPattern: template.resolution_pattern,
-            titlePattern: template.title_pattern,
-        });
+        const draftIdentity = 'sha256:backend-recognition-context';
 
         let recognitionGeneration = 0;
         const pendingPrepare = deferred<{
@@ -1812,7 +1780,7 @@ describe('AI recognition advisory contracts', () => {
         }>();
         let prepareHeld = false;
 
-        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+        invokeMock.mockImplementation((command: string, _args?: Record<string, unknown>) => {
             switch (command) {
                 case 'get_config':
                     return Promise.resolve({
@@ -1854,8 +1822,8 @@ describe('AI recognition advisory contracts', () => {
                 case 'ai_start_recognition': {
                     recognitionGeneration += 1;
                     const gen = recognitionGeneration;
-                    const request = (args as { request?: { request_generation?: number } } | undefined)?.request;
-                    const reqGen = request?.request_generation ?? gen;
+                    // Backend owns generation; client content only.
+                    const reqGen = gen;
                     return Promise.resolve({
                         job_id: `job-rec-prepare-hold-${gen}`,
                         state: 'succeeded',
@@ -2208,7 +2176,16 @@ describe('AI preflight backend identity contracts', () => {
             if (command === 'ai_poll_formal_audit') {
                 return pendingPoll.promise;
             }
+            if (command === 'ai_cancel_pending_audit_for_publish') {
+                // Publish-safe path: cancel job, keep plan token live (must not use ai_cancel_job).
+                return Promise.resolve({
+                    job_state: 'cancelled',
+                    plan_token_live: true,
+                    decision: 'PENDING',
+                });
+            }
             if (command === 'ai_cancel_job') {
+                // Escalating cancel would invalidate the token — must not be used for publish.
                 return Promise.resolve({
                     id: 'job-audit-1',
                     kind: 'audit',
@@ -2289,8 +2266,18 @@ describe('AI preflight backend identity contracts', () => {
         });
         await flushAsync();
 
-        const cancelCalls = invokeMock.mock.calls.filter(([command]) => command === 'ai_cancel_job');
-        expect(cancelCalls.some(([, args]) => (args as { id?: string }).id === 'job-audit-1')).toBe(true);
+        const publishSafeCancel = invokeMock.mock.calls.filter(
+            ([command]) => command === 'ai_cancel_pending_audit_for_publish',
+        );
+        expect(publishSafeCancel).toHaveLength(1);
+        expect(publishSafeCancel[0][1]).toEqual({
+            planToken: 'plan-pending',
+            jobId: 'job-audit-1',
+        });
+        // Must not escalate via generic ai_cancel_job (that invalidates the frozen token).
+        expect(
+            invokeMock.mock.calls.filter(([command]) => command === 'ai_cancel_job'),
+        ).toHaveLength(0);
         // Late poll completion must not replace UI after cancel-for-publish.
         await act(async () => {
             pendingPoll.resolve(null);
@@ -2441,7 +2428,7 @@ describe('AutoTemplate selection and seed hydration', () => {
             input!.dispatchEvent(new Event('input', { bubbles: true }));
         });
         const button = Array.from(rendered.container.querySelectorAll('button')).find(
-            (node) => node.textContent?.includes('选择并进入发布'),
+            (node) => node.textContent?.includes('开始自动选择'),
         );
         expect(button).toBeTruthy();
         await act(async () => {
@@ -2449,6 +2436,21 @@ describe('AutoTemplate selection and seed hydration', () => {
         });
         await flushAsync();
     }
+
+    const zzzRecommendation = {
+        recommendation_id: 'rec_zzz_1',
+        template_id: 'zzz-last',
+        template_revision: 2,
+        template_digest: 'sha256:zzz',
+        template_name: 'Last',
+        summary: '推荐模板「Last」(revision 2)',
+        alternatives: [],
+        torrent_digest: 'sha256:torrent',
+        torrent_name: 'show.mkv',
+        catalog_hash: 'sha256:catalog',
+        generation: 1,
+        expires_at_unix: Math.floor(Date.now() / 1000) + 600,
+    };
 
     it('never selects the first catalog entry client-side; uses start/poll only', async () => {
         const { default: AutoTemplatePage } = await import('./AutoTemplatePage');
@@ -2496,6 +2498,13 @@ describe('AutoTemplate selection and seed hydration', () => {
                         progress: 100,
                         error_code: null,
                         message: 'selected template zzz-last revision 2',
+                        recommendation: zzzRecommendation,
+                        seed: null,
+                    });
+                case 'ai_review_template_recommendation':
+                    return Promise.resolve({
+                        status: 'minted',
+                        recommendation_id: 'rec_zzz_1',
                         seed: {
                             token: 'seed_opaque_1',
                             template_id: 'zzz-last',
@@ -2503,6 +2512,7 @@ describe('AutoTemplate selection and seed hydration', () => {
                             template_digest: 'sha256:zzz',
                             torrent_name: 'show.mkv',
                         },
+                        message: '已生成一次性发布种子。',
                     });
                 default:
                     return Promise.resolve(null);
@@ -2528,16 +2538,29 @@ describe('AutoTemplate selection and seed hydration', () => {
         expect(
             invokeMock.mock.calls.filter(([command]) => command === 'ai_prepare_template_seed'),
         ).toHaveLength(0);
-        // Handoff must wait for succeeded poll — not start alone.
+        // Handoff must wait for explicit Review — not start/poll alone.
         expect(window.localStorage.getItem(AUTO_TEMPLATE_SEED_STORAGE_KEY)).toBeNull();
 
-        // Drive poll interval (400ms) until terminal succeeded result.
+        // Drive poll interval (400ms) until terminal succeeded recommendation.
         await act(async () => {
             await new Promise((resolve) => setTimeout(resolve, 450));
         });
         await flushAsync();
         await act(async () => {
             await new Promise((resolve) => setTimeout(resolve, 450));
+        });
+        await flushAsync();
+
+        // Still no handoff until Review.
+        expect(window.localStorage.getItem(AUTO_TEMPLATE_SEED_STORAGE_KEY)).toBeNull();
+        expect(rendered.container.querySelector('[data-testid="auto-template-recommendation"]')).toBeTruthy();
+
+        const reviewButton = rendered.container.querySelector<HTMLButtonElement>(
+            '[data-testid="auto-template-review"]',
+        );
+        expect(reviewButton).toBeTruthy();
+        await act(async () => {
+            reviewButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
         });
         await flushAsync();
 

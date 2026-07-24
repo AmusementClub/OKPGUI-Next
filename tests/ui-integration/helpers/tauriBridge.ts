@@ -278,10 +278,10 @@ export function tauriMockInitScript(initial: BridgeState): string {
             progress: 10,
             error_code: null,
             message: 'selecting',
+            recommendation: null,
             seed: null,
           };
         case 'ai_poll_template_selection':
-          state.seedHandoff = { seed_id: 'seed-mock-1' };
           return {
             job_id: 'job-template-1',
             state: 'succeeded',
@@ -290,6 +290,27 @@ export function tauriMockInitScript(initial: BridgeState): string {
             progress: 100,
             error_code: null,
             message: 'matched',
+            recommendation: {
+              recommendation_id: 'rec-mock-1',
+              template_id: 'qp-default',
+              template_revision: 1,
+              template_digest: 'sha256:template',
+              template_name: 'Default QP',
+              summary: '推荐模板「Default QP」(revision 1)',
+              alternatives: [],
+              torrent_digest: 'sha256:torrent',
+              torrent_name: 'Mock.Torrent',
+              catalog_hash: 'sha256:catalog-mock',
+              generation: 1,
+              expires_at_unix: Math.floor(Date.now() / 1000) + 600,
+            },
+            seed: null,
+          };
+        case 'ai_review_template_recommendation':
+          state.seedHandoff = { seed_id: 'seed-mock-1' };
+          return {
+            status: 'minted',
+            recommendation_id: 'rec-mock-1',
             seed: {
               token: 'seed-mock-1',
               template_id: 'qp-default',
@@ -297,6 +318,7 @@ export function tauriMockInitScript(initial: BridgeState): string {
               template_digest: 'sha256:template',
               torrent_name: 'Mock.Torrent',
             },
+            message: '已生成一次性发布种子。',
           };
         case 'ai_prepare_template_seed':
           return {
@@ -324,6 +346,28 @@ export function tauriMockInitScript(initial: BridgeState): string {
           };
         case 'ai_list_jobs':
           return [];
+        case 'ai_list_active_jobs':
+          return [];
+        case 'ai_cancel_active_job':
+          return {
+            job_id: (args && args.jobId) || 'job-mock',
+            kind: 'audit',
+            job_state: 'cancelled',
+            used_preflight_session: true,
+            reconciled: true,
+          };
+        case 'ai_cancel_pending_audit_for_publish':
+          return {
+            job_state: 'cancelled',
+            plan_token_live: true,
+            decision: 'PENDING',
+          };
+        case 'ai_cancel_preflight_session':
+          return {
+            job_state: 'cancelled',
+            token_state: 'invalidated',
+            reconciled: true,
+          };
         case 'ai_get_job':
           return null;
         case 'ai_cancel_job':
@@ -343,6 +387,9 @@ export function tauriMockInitScript(initial: BridgeState): string {
     const callbacks = new Map();
     let nextCallbackId = 1;
 
+    // Tauri 2 core.invoke reads window.__TAURI_INTERNALS__.invoke.
+    // isTauri() checks window.isTauri — set both so app paths do not treat the page as browser-only.
+    window.isTauri = true;
     window.__TAURI_INTERNALS__ = {
       plugins: {},
       metadata: {
@@ -364,6 +411,7 @@ export function tauriMockInitScript(initial: BridgeState): string {
         entry.callback(data);
         if (entry.once) callbacks.delete(id);
       },
+      convertFileSrc: (filePath) => filePath,
     };
 
     // Minimal plugin stubs used by the app shell.
@@ -372,10 +420,55 @@ export function tauriMockInitScript(initial: BridgeState): string {
 }
 
 export async function installTauriMock(
-  page: { addInitScript: (script: string | (() => void)) => Promise<void> },
+  page: {
+    addInitScript: (script: string | (() => void)) => Promise<void>;
+    // Playwright Page.context()
+    context?: () => { addInitScript: (script: string | (() => void)) => Promise<void> };
+    evaluate?: (fn: (code: string) => void, arg: string) => Promise<void>;
+    url?: () => string;
+  },
   state: BridgeState = buildDefaultBridgeState(),
 ): Promise<void> {
-  await page.addInitScript(tauriMockInitScript(state));
+  const script = tauriMockInitScript(state);
+  // Prefer context so every subsequent navigation gets the mock.
+  if (typeof page.context === 'function') {
+    await page.context().addInitScript(script);
+  } else {
+    await page.addInitScript(script);
+  }
+}
+
+/**
+ * Ensure the mock is present on the current document after `page.goto`.
+ * Init scripts should already apply; this re-evaluates if a race left the page bare.
+ */
+export async function ensureTauriMockOnPage(
+  page: {
+    evaluate: (fn: ((code: string) => unknown) | (() => unknown), arg?: string) => Promise<unknown>;
+  },
+  state: BridgeState = buildDefaultBridgeState(),
+): Promise<void> {
+  // evaluate() serializes the function body to the browser — pure JS only (no TypeScript `as`).
+  const present = await page.evaluate(() => {
+    const w = window;
+    return !!(w.__TAURI_INTERNALS__ && w.__TAURI_INTERNALS__.invoke);
+  });
+  if (present) {
+    return;
+  }
+  const script = tauriMockInitScript(state);
+  await page.evaluate((code) => {
+    // Test-only re-injection when init script did not attach.
+    // eslint-disable-next-line no-eval, @typescript-eslint/no-implied-eval
+    (0, eval)(code);
+  }, script);
+  const ok = await page.evaluate(() => {
+    const w = window;
+    return !!(w.__TAURI_INTERNALS__ && w.__TAURI_INTERNALS__.invoke);
+  });
+  if (!ok) {
+    throw new Error('Failed to install __TAURI_INTERNALS__ mock on page');
+  }
 }
 
 export async function readBridgeState(

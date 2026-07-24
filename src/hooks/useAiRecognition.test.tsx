@@ -2,7 +2,6 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { AiRecognizeRequest, RecognitionJobView, RecognitionResult } from '../types/ai';
-import { buildRecognitionDraftIdentity } from '../types/ai';
 import { isSuccessfulRecognitionResult } from '../services/ai';
 import { useAiRecognition } from './useAiRecognition';
 
@@ -71,14 +70,17 @@ function renderHook() {
     };
 }
 
+const BACKEND_HASH = 'sha256:backend-context-abc';
+const BACKEND_GEN = 42;
+
 function sampleResult(overrides: Partial<RecognitionResult> = {}): RecognitionResult {
     return {
         schema_version: 'recognition_v1',
         episode: { value: '01', confidence: 0.9, evidence: 'E01 in name' },
         resolution: { value: '1080p', confidence: 0.8, evidence: '1080p tag' },
         suggested_title: { value: 'Show - 01 [1080p]', confidence: 0.7, evidence: 'pattern fill' },
-        request_generation: 1,
-        snapshot_hash: 'sha256:abc',
+        request_generation: BACKEND_GEN,
+        snapshot_hash: BACKEND_HASH,
         job_id: 'job-rec-1',
         ...overrides,
     };
@@ -87,16 +89,16 @@ function sampleResult(overrides: Partial<RecognitionResult> = {}): RecognitionRe
 function sampleView(overrides: Partial<RecognitionJobView> = {}): RecognitionJobView {
     const result = overrides.result === undefined
         ? sampleResult({
-            request_generation: overrides.request_generation ?? 1,
-            snapshot_hash: overrides.snapshot_hash ?? 'sha256:abc',
+            request_generation: overrides.request_generation ?? BACKEND_GEN,
+            snapshot_hash: overrides.snapshot_hash ?? BACKEND_HASH,
             job_id: overrides.job_id ?? 'job-rec-1',
         })
         : overrides.result;
     return {
         job_id: 'job-rec-1',
         state: 'succeeded',
-        request_generation: 1,
-        snapshot_hash: 'sha256:abc',
+        request_generation: BACKEND_GEN,
+        snapshot_hash: BACKEND_HASH,
         progress: 100,
         error_code: null,
         message: 'recognition completed',
@@ -115,16 +117,16 @@ describe('useAiRecognition', () => {
             id: 'job-rec-1',
             kind: 'recognition',
             state: 'cancelled',
-            request_generation: 1,
-            snapshot_hash: 'sha256:abc',
+            request_generation: BACKEND_GEN,
+            snapshot_hash: BACKEND_HASH,
             progress: 100,
         });
         getAiJobMock.mockResolvedValue({
             id: 'job-rec-1',
             kind: 'recognition',
             state: 'running',
-            request_generation: 1,
-            snapshot_hash: 'sha256:abc',
+            request_generation: BACKEND_GEN,
+            snapshot_hash: BACKEND_HASH,
             progress: 40,
         });
         vi.useFakeTimers();
@@ -138,21 +140,12 @@ describe('useAiRecognition', () => {
         cancelAiJobMock.mockReset();
     });
 
-    it('sends torrent name, patterns, draft identity, and request generation (no plan token)', async () => {
-        const draftIdentity = buildRecognitionDraftIdentity({
-            torrentName: 'Show.S01E01.1080p.mkv',
-            epPattern: 'E(\\d+)',
-            resolutionPattern: '(\\d{3,4}p)',
-            titlePattern: '{title} - {ep}',
-        });
+    it('sends content only (no client snapshot_hash or request_generation)', async () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'succeeded',
-            request_generation: 1,
-            snapshot_hash: draftIdentity,
-            result: sampleResult({
-                request_generation: 1,
-                snapshot_hash: draftIdentity,
-            }),
+            request_generation: BACKEND_GEN,
+            snapshot_hash: BACKEND_HASH,
+            result: sampleResult(),
         }));
         const rendered = renderHook();
         try {
@@ -171,20 +164,23 @@ describe('useAiRecognition', () => {
                 ep_pattern: 'E(\\d+)',
                 resolution_pattern: '(\\d{3,4}p)',
                 title_pattern: '{title} - {ep}',
-                request_generation: 1,
-                snapshot_hash: draftIdentity,
             } satisfies AiRecognizeRequest);
-            expect(draftIdentity.startsWith('rec:')).toBe(true);
+            const sent = startRecognitionMock.mock.calls[0][0] as Record<string, unknown>;
+            expect(sent).not.toHaveProperty('snapshot_hash');
+            expect(sent).not.toHaveProperty('request_generation');
             expect(rendered.result.busy).toBe(false);
             expect(rendered.result.error).toBeNull();
             expect(rendered.result.result?.suggested_title?.value).toBe('Show - 01 [1080p]');
             expect(rendered.result.result?.job_id).toBe('job-rec-1');
+            // Backend identity is tracked from start response.
+            expect(rendered.result.contextHash).toBe(BACKEND_HASH);
+            expect(rendered.result.contextGeneration).toBe(BACKEND_GEN);
         } finally {
             rendered.unmount();
         }
     });
 
-    it('ignores late results after clear bumps generation (stale generation)', async () => {
+    it('ignores late results after clear bumps local UI epoch', async () => {
         const pending = deferred<RecognitionJobView>();
         startRecognitionMock.mockReturnValueOnce(pending.promise);
         const rendered = renderHook();
@@ -196,7 +192,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'ep',
                     resolutionPattern: 'res',
                     titlePattern: 'title',
-                    draftIdentity: 'rec:live',
                 });
             });
             expect(rendered.result.busy).toBe(true);
@@ -210,11 +205,7 @@ describe('useAiRecognition', () => {
             await act(async () => {
                 pending.resolve(sampleView({
                     state: 'succeeded',
-                    request_generation: 1,
-                    snapshot_hash: 'rec:live',
                     result: sampleResult({
-                        request_generation: 1,
-                        snapshot_hash: 'rec:live',
                         suggested_title: { value: 'STALE TITLE', confidence: 1, evidence: 'late' },
                     }),
                 }));
@@ -224,14 +215,13 @@ describe('useAiRecognition', () => {
             expect(rendered.result.result).toBeNull();
             expect(rendered.result.error).toBeNull();
             expect(rendered.result.busy).toBe(false);
-            // clear should cancel any in-flight job once a job id is known; late start still cancels.
             expect(cancelAiJobMock).toHaveBeenCalled();
         } finally {
             rendered.unmount();
         }
     });
 
-    it('ignores late results when draft identity no longer matches', async () => {
+    it('ignores late results when local context key no longer matches', async () => {
         const pending = deferred<RecognitionJobView>();
         startRecognitionMock.mockReturnValueOnce(pending.promise);
         const rendered = renderHook();
@@ -243,12 +233,12 @@ describe('useAiRecognition', () => {
                     epPattern: 'ep',
                     resolutionPattern: 'res',
                     titlePattern: 'title',
-                    draftIdentity: 'rec:old',
                 });
             });
 
             act(() => {
-                rendered.result.invalidateIfDraftMismatch('rec:new');
+                // Drift local context key (page draft changed); not backend hash.
+                rendered.result.invalidateIfDraftMismatch('different\u0001context\u0001key\u0001here');
             });
             expect(rendered.result.result).toBeNull();
             expect(rendered.result.busy).toBe(false);
@@ -256,11 +246,7 @@ describe('useAiRecognition', () => {
             await act(async () => {
                 pending.resolve(sampleView({
                     state: 'succeeded',
-                    request_generation: 1,
-                    snapshot_hash: 'rec:old',
                     result: sampleResult({
-                        request_generation: 1,
-                        snapshot_hash: 'rec:old',
                         suggested_title: { value: 'STALE SNAPSHOT', confidence: 1, evidence: 'late' },
                     }),
                 }));
@@ -278,8 +264,6 @@ describe('useAiRecognition', () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'running',
             progress: 10,
-            request_generation: 1,
-            snapshot_hash: 'rec:u',
             result: null,
             message: 'recognition queued',
         }));
@@ -292,7 +276,6 @@ describe('useAiRecognition', () => {
                 epPattern: 'e',
                 resolutionPattern: 'r',
                 titlePattern: 't',
-                draftIdentity: 'rec:u',
             });
         });
         expect(rendered.result.busy).toBe(true);
@@ -302,12 +285,63 @@ describe('useAiRecognition', () => {
         expect(cancelAiJobMock).toHaveBeenCalledWith('job-rec-1');
     });
 
+    it('cancel() is idempotent and blocks late success from surfacing candidates', async () => {
+        startRecognitionMock.mockResolvedValue(sampleView({
+            state: 'running',
+            progress: 10,
+            result: null,
+            message: 'recognition queued',
+        }));
+        pollRecognitionMock.mockResolvedValue(null);
+
+        const rendered = renderHook();
+        try {
+            await act(async () => {
+                await rendered.result.recognize({
+                    torrentName: 'name.mkv',
+                    epPattern: 'e',
+                    resolutionPattern: 'r',
+                    titlePattern: 't',
+                });
+            });
+            expect(rendered.result.busy).toBe(true);
+
+            act(() => {
+                rendered.result.cancel();
+            });
+            expect(rendered.result.busy).toBe(false);
+            expect(rendered.result.result).toBeNull();
+            expect(rendered.result.error).toContain('取消');
+            expect(cancelAiJobMock).toHaveBeenCalledWith('job-rec-1');
+
+            // Idempotent second cancel.
+            act(() => {
+                rendered.result.cancel();
+            });
+            expect(rendered.result.busy).toBe(false);
+            expect(rendered.result.result).toBeNull();
+
+            // Late poll success must not apply.
+            pollRecognitionMock.mockResolvedValueOnce(sampleView({
+                state: 'succeeded',
+                result: sampleResult({
+                    episode: { value: '99', confidence: 1, evidence: 'late' },
+                }),
+            }));
+            await act(async () => {
+                await vi.advanceTimersByTimeAsync(400);
+            });
+            expect(rendered.result.result).toBeNull();
+            expect(rendered.result.adoptField('episode')).toBeNull();
+        } finally {
+            rendered.unmount();
+        }
+    });
+
     it('polls to a terminal validated result without holding start open', async () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'running',
             progress: 0,
-            request_generation: 1,
-            snapshot_hash: 'rec:poll',
             result: null,
             message: 'recognition queued',
         }));
@@ -315,12 +349,7 @@ describe('useAiRecognition', () => {
             .mockResolvedValueOnce(null)
             .mockResolvedValueOnce(sampleView({
                 state: 'succeeded',
-                request_generation: 1,
-                snapshot_hash: 'rec:poll',
-                result: sampleResult({
-                    request_generation: 1,
-                    snapshot_hash: 'rec:poll',
-                }),
+                result: sampleResult(),
             }));
 
         const rendered = renderHook();
@@ -331,7 +360,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:poll',
                 });
             });
             expect(rendered.result.busy).toBe(true);
@@ -340,7 +368,6 @@ describe('useAiRecognition', () => {
             await act(async () => {
                 await vi.advanceTimersByTimeAsync(400);
             });
-            // First poll still null.
             expect(rendered.result.busy).toBe(true);
 
             await act(async () => {
@@ -365,13 +392,10 @@ describe('useAiRecognition', () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'running',
             progress: 0,
-            request_generation: 1,
-            snapshot_hash: 'rec:poll-fail',
             result: null,
             message: 'recognition queued',
         }));
         pollRecognitionMock.mockRejectedValueOnce('poll transport failed');
-        // Cancellation failure must not replace the original poll UI error.
         cancelAiJobMock.mockRejectedValueOnce(new Error('cancel failed'));
 
         const rendered = renderHook();
@@ -382,7 +406,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:poll-fail',
                 });
             });
             expect(rendered.result.busy).toBe(true);
@@ -398,17 +421,11 @@ describe('useAiRecognition', () => {
             expect(rendered.result.error).toContain('poll transport failed');
             expect(rendered.result.error).not.toContain('cancel failed');
             expect(cancelAiJobMock).toHaveBeenCalledWith('job-rec-1');
-            // Generation bumped so a later recognize cannot orphan/reuse the failed job binding.
             expect(rendered.result.requestGeneration).toBeGreaterThan(1);
 
-            // Late terminal result for the failed generation must not apply (fail closed).
             pollRecognitionMock.mockResolvedValueOnce(sampleView({
                 state: 'succeeded',
-                request_generation: 1,
-                snapshot_hash: 'rec:poll-fail',
                 result: sampleResult({
-                    request_generation: 1,
-                    snapshot_hash: 'rec:poll-fail',
                     episode: { value: '99', confidence: 1, evidence: 'late' },
                 }),
             }));
@@ -418,15 +435,18 @@ describe('useAiRecognition', () => {
             expect(rendered.result.result).toBeNull();
             expect(rendered.result.error).toContain('poll transport failed');
 
-            // A subsequent recognize can start cleanly with a new generation/identity.
-            const nextIdentity = 'rec:poll-fail-retry';
+            // Subsequent recognize can start cleanly with new backend identity.
+            const nextHash = 'sha256:retry-context';
+            const nextGen = 99;
             startRecognitionMock.mockResolvedValue(sampleView({
                 state: 'succeeded',
-                request_generation: rendered.result.requestGeneration + 1,
-                snapshot_hash: nextIdentity,
+                request_generation: nextGen,
+                snapshot_hash: nextHash,
+                job_id: 'job-rec-2',
                 result: sampleResult({
-                    request_generation: rendered.result.requestGeneration + 1,
-                    snapshot_hash: nextIdentity,
+                    request_generation: nextGen,
+                    snapshot_hash: nextHash,
+                    job_id: 'job-rec-2',
                 }),
             }));
             await act(async () => {
@@ -435,12 +455,13 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: nextIdentity,
                 });
             });
             expect(rendered.result.busy).toBe(false);
             expect(rendered.result.error).toBeNull();
             expect(rendered.result.result?.episode?.value).toBe('01');
+            expect(rendered.result.contextHash).toBe(nextHash);
+            expect(rendered.result.contextGeneration).toBe(nextGen);
         } finally {
             rendered.unmount();
         }
@@ -450,8 +471,6 @@ describe('useAiRecognition', () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'running',
             progress: 0,
-            request_generation: 1,
-            snapshot_hash: 'rec:overlap',
             result: null,
             message: 'recognition queued',
         }));
@@ -473,17 +492,14 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:overlap',
                 });
             });
 
-            // First scheduled poll tick.
             await act(async () => {
                 await vi.advanceTimersByTimeAsync(400);
             });
             expect(pollStarts).toBe(1);
 
-            // While first poll is held open, advancing time must not start a second concurrent poll.
             await act(async () => {
                 await vi.advanceTimersByTimeAsync(800);
             });
@@ -492,7 +508,6 @@ describe('useAiRecognition', () => {
             await act(async () => {
                 resolvePoll(null);
             });
-            // After the in-flight tick settles null, the next recursive timeout may run.
             await act(async () => {
                 await vi.advanceTimersByTimeAsync(400);
             });
@@ -508,18 +523,11 @@ describe('useAiRecognition', () => {
     });
 
     it('never mutates an external draft title from suggested_title (no auto-fill contract)', async () => {
-        // Contract: the hook only stores advisory result; callers must not assign
-        // suggested_title into draft title. This test freezes a draft object and
-        // asserts the hook never touches it.
         const draft = { title: 'User Draft Title', episode: '', resolution: '' };
         const frozenTitle = draft.title;
 
         startRecognitionMock.mockResolvedValue(sampleView({
-            request_generation: 1,
-            snapshot_hash: 'rec:x',
             result: sampleResult({
-                request_generation: 1,
-                snapshot_hash: 'rec:x',
                 suggested_title: { value: 'AI Suggested', confidence: 0.99, evidence: 'model' },
             }),
         }));
@@ -531,17 +539,15 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:x',
                 });
             });
 
-            // Hook exposes advisory value but does not write into draft.
             expect(rendered.result.result?.suggested_title?.value).toBe('AI Suggested');
             expect(draft.title).toBe(frozenTitle);
             expect(draft.title).not.toBe(rendered.result.result?.suggested_title?.value);
             expect(draft.episode).toBe('');
             expect(draft.resolution).toBe('');
-            // No silent title adopt API.
+            // No silent title adopt API — only episode/resolution adoptable.
             expect(rendered.result.adoptField('episode')).toBe('01');
             expect(draft.episode).toBe('');
         } finally {
@@ -551,12 +557,7 @@ describe('useAiRecognition', () => {
 
     it('explicit per-field adopt is independent and leaves draft untouched until caller applies', async () => {
         startRecognitionMock.mockResolvedValue(sampleView({
-            request_generation: 1,
-            snapshot_hash: 'rec:adopt',
-            result: sampleResult({
-                request_generation: 1,
-                snapshot_hash: 'rec:adopt',
-            }),
+            result: sampleResult(),
         }));
         const draft = { episode: 'manual-ep', resolution: 'manual-res', title: 'manual-title' };
         const rendered = renderHook();
@@ -567,11 +568,9 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:adopt',
                 });
             });
 
-            // Success is advisory only — draft untouched until explicit adopt + caller apply.
             expect(draft.episode).toBe('manual-ep');
             expect(draft.resolution).toBe('manual-res');
             expect(draft.title).toBe('manual-title');
@@ -583,11 +582,9 @@ describe('useAiRecognition', () => {
             expect(episode).toBe('01');
             expect(rendered.result.adopted.episode).toBe(true);
             expect(rendered.result.fieldOrigins.episode.origin).toBe('adopted');
-            // Hook still does not write the draft; caller decides.
             expect(draft.episode).toBe('manual-ep');
             draft.episode = episode!;
 
-            // Resolution still adoptable independently; episode adopt did not touch it.
             let resolution: string | null = null;
             act(() => {
                 resolution = rendered.result.adoptField('resolution');
@@ -597,13 +594,11 @@ describe('useAiRecognition', () => {
             expect(draft.resolution).toBe('manual-res');
             draft.resolution = resolution!;
 
-            // Manual mark preserves provenance without clearing advisory result.
             act(() => {
                 rendered.result.markFieldManualEdit('episode');
             });
             expect(rendered.result.fieldOrigins.episode.origin).toBe('manual');
             expect(rendered.result.result?.episode?.value).toBe('01');
-            // Explicit re-adopt remains available (user intent); other field stays adopted.
             expect(rendered.result.adopted.resolution).toBe(true);
             let reAdopt: string | null = null;
             act(() => {
@@ -611,11 +606,10 @@ describe('useAiRecognition', () => {
             });
             expect(reAdopt).toBe('01');
 
-            // Failure/cancel path never yields adopt values.
             startRecognitionMock.mockResolvedValue(sampleView({
                 state: 'failed',
-                request_generation: 2,
-                snapshot_hash: 'rec:adopt',
+                request_generation: BACKEND_GEN + 1,
+                snapshot_hash: BACKEND_HASH,
                 error_code: 'PROVIDER',
                 message: 'boom',
                 result: null,
@@ -626,7 +620,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:adopt',
                 });
             });
             expect(rendered.result.adoptField('episode')).toBeNull();
@@ -646,7 +639,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:x',
                 });
             });
             expect(rendered.result.busy).toBe(false);
@@ -661,8 +653,6 @@ describe('useAiRecognition', () => {
     it('does not apply cancelled terminal views as success', async () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'cancelled',
-            request_generation: 1,
-            snapshot_hash: 'rec:c',
             error_code: 'CANCELLED',
             message: 'recognition cancelled',
             result: null,
@@ -675,7 +665,6 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:c',
                 });
             });
             expect(rendered.result.busy).toBe(false);
@@ -687,7 +676,7 @@ describe('useAiRecognition', () => {
         }
     });
 
-    it('rejects empty torrent name without invoking the backend; derives draft identity when ready', async () => {
+    it('rejects empty torrent name without invoking the backend', async () => {
         const rendered = renderHook();
         try {
             await act(async () => {
@@ -701,19 +690,8 @@ describe('useAiRecognition', () => {
             expect(startRecognitionMock).not.toHaveBeenCalled();
             expect(rendered.result.error).toContain('种子');
 
-            const draftIdentity = buildRecognitionDraftIdentity({
-                torrentName: 'ok.mkv',
-                epPattern: 'e',
-                resolutionPattern: 'r',
-                titlePattern: 't',
-            });
             startRecognitionMock.mockResolvedValue(sampleView({
-                request_generation: 1,
-                snapshot_hash: draftIdentity,
-                result: sampleResult({
-                    request_generation: 1,
-                    snapshot_hash: draftIdentity,
-                }),
+                result: sampleResult(),
             }));
             await act(async () => {
                 await rendered.result.recognize({
@@ -726,9 +704,11 @@ describe('useAiRecognition', () => {
             expect(startRecognitionMock).toHaveBeenCalledWith(
                 expect.objectContaining({
                     torrent_name: 'ok.mkv',
-                    snapshot_hash: draftIdentity,
                 }),
             );
+            const sent = startRecognitionMock.mock.calls[0][0] as Record<string, unknown>;
+            expect(sent).not.toHaveProperty('snapshot_hash');
+            expect(sent).not.toHaveProperty('request_generation');
             expect(rendered.result.error).toBeNull();
         } finally {
             rendered.unmount();
@@ -738,13 +718,13 @@ describe('useAiRecognition', () => {
     it('fails closed when succeeded view has nested result identity mismatch (does not stay busy)', async () => {
         startRecognitionMock.mockResolvedValue(sampleView({
             state: 'succeeded',
-            request_generation: 1,
-            snapshot_hash: 'rec:nested-ok',
+            request_generation: BACKEND_GEN,
+            snapshot_hash: BACKEND_HASH,
             job_id: 'job-nested-mismatch',
             result: sampleResult({
-                // Nested payload drifts from the outer view / request binding.
+                // Nested payload drifts from the outer view / backend binding.
                 request_generation: 99,
-                snapshot_hash: 'rec:nested-stale',
+                snapshot_hash: 'sha256:nested-stale',
                 job_id: 'job-nested-mismatch',
                 episode: { value: '77', confidence: 1, evidence: 'bad' },
             }),
@@ -757,11 +737,9 @@ describe('useAiRecognition', () => {
                     epPattern: 'e',
                     resolutionPattern: 'r',
                     titlePattern: 't',
-                    draftIdentity: 'rec:nested-ok',
                 });
             });
 
-            // Must not leave the hook permanently busy or apply the mismatched result.
             expect(rendered.result.busy).toBe(false);
             expect(rendered.result.result).toBeNull();
             expect(rendered.result.jobId).toBeNull();

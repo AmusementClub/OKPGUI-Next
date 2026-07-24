@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import {
   buildDefaultBridgeState,
   defaultReadySettings,
+  ensureTauriMockOnPage,
   installTauriMock,
   navigateToPage,
   readBridgeState,
@@ -22,6 +23,7 @@ test.describe('UI integration · auto-template handoff', () => {
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: defaultReadySettings(),       }));
     await navigateToPage(page, 'auto_template');
 
     // Page title / primary CTA from AutoTemplatePage.
@@ -31,7 +33,7 @@ test.describe('UI integration · auto-template handoff', () => {
 
     // Provide a mock path (no real filesystem access in browser UI integration).
     await page.getByPlaceholder('/path/to/file.torrent').fill('/mock/release.torrent');
-    await page.getByRole('button', { name: '选择并进入发布' }).click();
+    await page.getByRole('button', { name: '开始自动选择' }).click();
 
     // Poll bridge for selection IPC; success path may navigate or show status.
     await expect
@@ -55,6 +57,7 @@ test.describe('UI integration · auto-template handoff', () => {
   test('navigation shell exposes auto_template under AI section', async ({ page }) => {
     await installTauriMock(page, buildDefaultBridgeState());
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState());
     // Sidebar label from Sidebar.tsx
     await expect(page.getByText('自动选择模板')).toBeVisible();
     await page.getByText('自动选择模板').click();

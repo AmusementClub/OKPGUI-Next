@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import {
   buildDefaultBridgeState,
   defaultReadySettings,
+  ensureTauriMockOnPage,
   installTauriMock,
   navigateToPage,
   readBridgeState,
@@ -24,6 +25,7 @@ test.describe('UI integration · confirmation states and acknowledgement', () =>
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: defaultReadySettings(),         decision: 'WARNING',         acknowledgements: { warning: false, critical: false, pending: false },       }));
     await navigateToPage(page, 'home');
 
     // Best-effort: open publish path if controls are available with mock data.
@@ -40,6 +42,9 @@ test.describe('UI integration · confirmation states and acknowledgement', () =>
     await page.evaluate(async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const internals = (window as any).__TAURI_INTERNALS__;
+      if (!internals?.invoke) {
+        throw new Error('__TAURI_INTERNALS__.invoke missing — mock not installed before evaluate');
+      }
       await internals.invoke('set_plan_acknowledgements', {
         token: 'plan-mock-token',
         acknowledgements: { warning: true, critical: false, pending: false },
@@ -65,6 +70,7 @@ test.describe('UI integration · confirmation states and acknowledgement', () =>
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         decision: 'PENDING',         acknowledgements: { warning: false, critical: false, pending: false },       }));
 
     await page.evaluate(async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -102,6 +108,7 @@ test.describe('UI integration · confirmation states and acknowledgement', () =>
   }) => {
     await installTauriMock(page, buildDefaultBridgeState({ decision: 'GO' }));
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({ decision: 'GO' }));
     const prepared = await page.evaluate(async () => {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       const internals = (window as any).__TAURI_INTERNALS__;

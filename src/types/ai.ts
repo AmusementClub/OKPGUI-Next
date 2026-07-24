@@ -7,6 +7,23 @@ export type AiDecision = 'GO' | 'WARNING' | 'NO_GO' | 'PENDING' | 'LOCAL_BLOCKED
 export type FindingSeverity = 'WARNING' | 'CRITICAL';
 export type AiCapabilityState = 'unknown' | 'probing' | 'ready' | 'unsupported' | 'failed';
 
+/**
+ * Frontend audit lifecycle, separate from the authoritative audit decision.
+ * `reconciling` always has canConfirm=false until Rust returns reconciled=true.
+ */
+export type AiPreflightLifecycle =
+    | 'idle'
+    | 'preparing'
+    | 'awaiting_vision'
+    | 'auditing'
+    | 'reconciling'
+    | 'terminal'
+    | 'unavailable'
+    | 'cancelled';
+
+/** Token state after atomic preflight cancel/reconcile. */
+export type PreflightTokenState = 'invalidated' | 'already_missing';
+
 export interface CredentialRef {
     id: string;
 }
@@ -96,7 +113,10 @@ export interface PlanVisionCandidatesResponse {
     snapshot_hash: string;
     request_generation: number;
     candidates: PlanVisionCandidate[];
-    /** True when more than five unique candidates exist; UI must not auto-pick. */
+    /**
+     * True when more than max_images unique candidates exist.
+     * Frontend always requires explicit consent for any non-empty set (never auto-binds).
+     */
     requires_selection: boolean;
     max_images: number;
 }
@@ -225,12 +245,89 @@ export interface AiJob {
     debug_record_id?: string | null;
 }
 
+/** Result of `ai_cancel_preflight_session`. */
+export interface CancelPreflightSessionResult {
+    /** Final related job state (snake_case), or null when no job was bound. */
+    job_state: AiJob['state'] | string | null;
+    token_state: PreflightTokenState;
+    /** True only when job (if any) is terminal/absent and token is invalidated/missing. */
+    reconciled: boolean;
+}
+
+/**
+ * Result of `ai_cancel_pending_audit_for_publish`.
+ * Cancels the formal audit job without invalidating the frozen plan token.
+ */
+export interface CancelPendingAuditForPublishResult {
+    job_state: AiJob['state'] | string | null;
+    /** Must be true — publish_prepared_plan requires a live token. */
+    plan_token_live: boolean;
+    /** Authoritative decision still bound on the plan (typically PENDING). */
+    decision: string;
+}
+
+/**
+ * Sanitized cross-surface lifecycle event (`preflight-session-changed`).
+ * Never includes frozen request, paths, secrets, or provider bodies.
+ */
+export interface PreflightSessionChangedPayload {
+    plan_token?: string | null;
+    token_digest: string;
+    job_id?: string | null;
+    /** Authoritative lifecycle after reconciliation. */
+    lifecycle: AiPreflightLifecycle | string;
+    token_state: PreflightTokenState;
+    reconciled: boolean;
+}
+
 export interface TemplateSeed {
     token: string;
     template_id: string;
     template_revision: number;
     template_digest: string;
     torrent_name: string;
+}
+
+/** Bounded catalog-backed alternative on an auto-template recommendation. */
+export interface TemplateRecommendationAlternative {
+    template_id: string;
+    template_revision: number;
+    template_digest: string;
+    name: string;
+    summary: string;
+}
+
+/**
+ * Backend-owned validated recommendation (never a pre-minted handoff seed).
+ * Explicit Review revalidates and mints exactly one seed.
+ */
+export interface TemplateRecommendation {
+    recommendation_id: string;
+    template_id: string;
+    template_revision: number;
+    template_digest: string;
+    template_name: string;
+    /** Sanitized evidence/summary (never secrets, paths, or provider bodies). */
+    summary: string;
+    alternatives: TemplateRecommendationAlternative[];
+    torrent_digest: string;
+    torrent_name: string;
+    catalog_hash: string;
+    generation: number;
+    expires_at_unix: number;
+}
+
+export type ReviewTemplateRecommendationStatus =
+    | 'minted'
+    | 'already_minted'
+    | 'already_consumed';
+
+/** Result of explicit Review-in-Quick-Publish mint. */
+export interface ReviewTemplateRecommendationResult {
+    status: ReviewTemplateRecommendationStatus;
+    seed?: TemplateSeed | null;
+    recommendation_id: string;
+    message?: string | null;
 }
 
 /** Opaque browser handoff only — never includes torrent_path. */
@@ -255,7 +352,8 @@ export interface AiSelectTemplateRequest {
 
 /**
  * Public TemplateSelection job view from start/poll.
- * Seed is present only when state === 'succeeded'. Never includes torrent_path.
+ * Recommendation only when state === 'succeeded'. Never includes torrent_path.
+ * Seed is never auto-minted (explicit Review only).
  */
 export interface TemplateSelectionJobView {
     job_id: string;
@@ -266,8 +364,32 @@ export interface TemplateSelectionJobView {
     error_code?: string | null;
     /** Redacted status/error message (never secrets or raw provider bodies). */
     message?: string | null;
-    /** Opaque seed only when state is succeeded. */
+    /** Backend-owned validated recommendation when succeeded. */
+    recommendation?: TemplateRecommendation | null;
+    /** Deprecated: always absent after recommendation handoff. */
     seed?: TemplateSeed | null;
+}
+
+/**
+ * Sanitized active-job strip projection (never full AiJob).
+ * No secrets, paths, snapshot hashes, capability identity, or provider bodies.
+ */
+export interface ActiveAiJobSummary {
+    job_id: string;
+    kind: AiJob['kind'];
+    stage: string;
+    progress: number;
+    cancellable: boolean;
+    navigation_target?: string | null;
+    started_at_unix: number;
+}
+
+export interface ActiveAiJobCancelResult {
+    job_id: string;
+    kind: AiJob['kind'];
+    job_state: string;
+    used_preflight_session: boolean;
+    reconciled: boolean;
 }
 
 /** One optional recognition candidate with confidence and short evidence. */
@@ -312,37 +434,27 @@ export function markFieldAdopted(meta: FieldEditMeta): FieldEditMeta {
 }
 
 /**
- * Backend-safe recognition draft identity (not a publish-plan token or authority).
- * Derived only from recognition request context: torrent display name + template patterns.
- * Sent as `snapshot_hash` on the recognition wire for stale-result binding only.
+ * Local-only key for detecting torrent/template draft drift in the UI.
+ * Never serialized as wire identity — Rust owns context hash + generation.
  */
-export function buildRecognitionDraftIdentity(input: {
+export function buildRecognitionLocalContextKey(input: {
     torrentName: string;
     epPattern: string;
     resolutionPattern: string;
     titlePattern: string;
 }): string {
-    const raw = [
-        'recognition_v1',
+    return [
         input.torrentName.trim(),
         input.epPattern.trim(),
         input.resolutionPattern.trim(),
         input.titlePattern.trim(),
     ].join('\u0001');
-
-    // FNV-1a 32-bit — stable, sync, path-free; not cryptographic.
-    let hash = 0x811c9dc5;
-    for (let i = 0; i < raw.length; i += 1) {
-        hash ^= raw.charCodeAt(i);
-        hash = Math.imul(hash, 0x01000193);
-    }
-    return `rec:${(hash >>> 0).toString(16).padStart(8, '0')}`;
 }
 
 /**
- * One-shot release recognition request (mirrors Rust AiRecognizeRequest).
- * Display torrent name + template patterns only — never absolute paths or publish tokens.
- * snapshot_hash binds draft identity for stale-result rejection (caller-supplied; not publish authority).
+ * One-shot / start release recognition request (mirrors Rust AiRecognizeRequest).
+ * Content only: display torrent name + template patterns.
+ * Never includes snapshot_hash or request_generation — Rust allocates those on start.
  */
 export interface AiRecognizeRequest {
     /** Display torrent name only (never a filesystem path). */
@@ -353,25 +465,21 @@ export interface AiRecognizeRequest {
     resolution_pattern: string;
     /** Title pattern context (deterministic final title still uses this locally). */
     title_pattern: string;
-    /** Client edit/request generation for stale-result binding. */
-    request_generation: number;
-    /**
-     * Draft-identity binding for stale rejection only.
-     * Prefer `buildRecognitionDraftIdentity(...)`; never a publish-plan token.
-     */
-    snapshot_hash: string;
 }
 
 /**
  * Redacted, typed recognition result over IPC (mirrors Rust RecognitionResult).
  * episode / resolution / suggested_title are advisory only — never auto-fill the draft.
+ * request_generation + snapshot_hash are backend-owned context identity.
  */
 export interface RecognitionResult {
     schema_version: string;
     episode?: RecognitionCandidate | null;
     resolution?: RecognitionCandidate | null;
     suggested_title?: RecognitionCandidate | null;
+    /** Backend-allocated monotonic recognition generation. */
     request_generation: number;
+    /** Backend-computed cryptographic context hash (`sha256:…`). */
     snapshot_hash: string;
     job_id: string;
 }
@@ -380,11 +488,14 @@ export interface RecognitionResult {
  * Public Recognition job view from start/poll (mirrors Rust RecognitionJobView).
  * Validated result is present only when state === 'succeeded'.
  * Cancelled / stale / failed never include a usable result.
+ * request_generation + snapshot_hash are backend-owned context identity.
  */
 export interface RecognitionJobView {
     job_id: string;
     state: AiJob['state'];
+    /** Backend-allocated monotonic recognition generation. */
     request_generation: number;
+    /** Backend-computed cryptographic context hash (`sha256:…`). */
     snapshot_hash: string;
     progress: number;
     error_code?: string | null;

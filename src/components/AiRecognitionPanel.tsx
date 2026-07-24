@@ -1,4 +1,4 @@
-import { CircleDot, Loader2, Sparkles } from 'lucide-react';
+import { CircleDot, Loader2, Sparkles, X } from 'lucide-react';
 import type { RecognitionCandidate, RecognitionResult } from '../types/ai';
 
 export interface AiRecognitionPanelProps {
@@ -18,6 +18,11 @@ export interface AiRecognitionPanelProps {
      */
     canAdoptEpisode?: boolean;
     canAdoptResolution?: boolean;
+    /**
+     * Cancel while recognition is queued/running. Visible only when busy and provided.
+     * Must be idempotent; late success after cancel cannot surface candidates.
+     */
+    onCancel?: (() => void) | null;
 }
 
 function CandidateRow({
@@ -28,6 +33,7 @@ function CandidateRow({
     adopted,
     canAdopt,
     adoptLabel,
+    advisoryOnly,
 }: {
     label: string;
     candidate?: RecognitionCandidate | null;
@@ -36,6 +42,8 @@ function CandidateRow({
     adopted?: boolean;
     canAdopt?: boolean;
     adoptLabel?: string;
+    /** When true, never shows adopt — advisory comparison only (suggested_title). */
+    advisoryOnly?: boolean;
 }) {
     if (!candidate) {
         return (
@@ -49,7 +57,7 @@ function CandidateRow({
     const confidencePct = Number.isFinite(candidate.confidence)
         ? `${Math.round(Math.max(0, Math.min(1, candidate.confidence)) * 100)}%`
         : '—';
-    const showAdopt = typeof onAdopt === 'function';
+    const showAdopt = !advisoryOnly && typeof onAdopt === 'function';
     const adoptEnabled = canAdopt !== false && !adopted;
 
     return (
@@ -71,6 +79,14 @@ function CandidateRow({
                             {adopted ? '已采用' : (adoptLabel ?? '采用')}
                         </button>
                     ) : null}
+                    {advisoryOnly ? (
+                        <span
+                            className="rounded-md border border-slate-700/80 bg-slate-800/60 px-2 py-0.5 text-[10px] text-slate-500"
+                            data-testid={`${testId}-advisory`}
+                        >
+                            仅供参考
+                        </span>
+                    ) : null}
                 </div>
             </div>
             <div className="mt-1 break-words text-sm text-slate-200" data-testid={`${testId}-value`}>
@@ -88,6 +104,7 @@ function CandidateRow({
  * Reads episode / resolution / suggested_title directly from the result.
  * Never auto-fills drafts, never keyword-parses free text, never changes publish decisions.
  * Title remains display-only (deterministic local generation); only episode/resolution can adopt.
+ * Cancel is visible while queued/running when onCancel is provided.
  */
 export default function AiRecognitionPanel({
     busy,
@@ -99,10 +116,13 @@ export default function AiRecognitionPanel({
     resolutionAdopted = false,
     canAdoptEpisode = true,
     canAdoptResolution = true,
+    onCancel,
 }: AiRecognitionPanelProps) {
     if (!busy && !error && !result) {
         return null;
     }
+
+    const showCancel = busy && typeof onCancel === 'function';
 
     return (
         <section
@@ -116,9 +136,23 @@ export default function AiRecognitionPanel({
                     <Sparkles size={16} className="mt-0.5 shrink-0 text-violet-300" />
                 )}
                 <div className="min-w-0 flex-1">
-                    <div className="text-sm font-medium text-slate-200">AI 识别建议（仅供参考）</div>
+                    <div className="flex items-start justify-between gap-2">
+                        <div className="text-sm font-medium text-slate-200">AI 识别建议（仅供参考）</div>
+                        {showCancel ? (
+                            <button
+                                type="button"
+                                data-testid="ai-recognition-cancel"
+                                aria-label="取消 AI 识别"
+                                onClick={onCancel}
+                                className="inline-flex shrink-0 items-center gap-1 rounded-md border border-slate-600/80 bg-slate-900/60 px-2 py-0.5 text-[11px] font-medium text-slate-300 transition-colors hover:border-rose-400/40 hover:bg-rose-500/10 hover:text-rose-100"
+                            >
+                                <X size={12} />
+                                取消
+                            </button>
+                        ) : null}
+                    </div>
                     <div className="mt-1 text-xs text-slate-500">
-                        识别结果不会自动写入标题或发布字段；集数/分辨率需手动采用，最终标题仍由本地模板规则与你的编辑决定。
+                        识别结果不会自动写入标题或发布字段；集数/分辨率需手动采用，建议标题仅作对照且不可采用，最终标题仍由本地模板规则与你的编辑决定。
                     </div>
                 </div>
             </div>
@@ -155,15 +189,16 @@ export default function AiRecognitionPanel({
                         canAdopt={canAdoptResolution}
                     />
                     <CandidateRow
-                        label="建议标题"
+                        label="建议标题（仅对照，不可采用）"
                         candidate={result.suggested_title}
                         testId="ai-recognition-suggested-title"
+                        advisoryOnly
                     />
                     <div className="flex flex-wrap gap-x-3 gap-y-1 border-t border-slate-800/80 pt-2 text-[10px] text-slate-600">
                         <span data-testid="ai-recognition-job-id">job: {result.job_id || '—'}</span>
                         <span data-testid="ai-recognition-schema">schema: {result.schema_version || '—'}</span>
                         <span className="max-w-full truncate" data-testid="ai-recognition-snapshot" title={result.snapshot_hash}>
-                            draft: {result.snapshot_hash || '—'}
+                            ctx: {result.snapshot_hash || '—'}
                         </span>
                         <span data-testid="ai-recognition-generation">gen: {result.request_generation}</span>
                     </div>

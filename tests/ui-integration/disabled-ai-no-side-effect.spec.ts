@@ -2,6 +2,7 @@ import { expect, test } from '@playwright/test';
 import {
   buildDefaultBridgeState,
   defaultDisabledSettings,
+  ensureTauriMockOnPage,
   installTauriMock,
   navigateToPage,
   readBridgeState,
@@ -23,6 +24,7 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: { ...defaultDisabledSettings(), enabled: false },         decision: 'GO',       }));
     await navigateToPage(page, 'ai_settings');
 
     await expect(page.getByText('BYOK AI 连接')).toBeVisible();
@@ -55,6 +57,7 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
       }),
     );
     await page.goto('/');
+    await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: defaultDisabledSettings(),       }));
     await navigateToPage(page, 'ai_settings');
     await expect(page.getByTestId('capability-status')).toContainText(/未探测|未知/);
     const bridge = await readBridgeState(page);

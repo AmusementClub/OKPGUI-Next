@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ConsoleModal from '../components/ConsoleModal';
 import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
+import PreparationFeedback from '../components/PreparationFeedback';
 import PublishConfirmModal from '../components/PublishConfirmModal';
 import AiPreflightPanel from '../components/AiPreflightPanel';
 import AiRecognitionPanel from '../components/AiRecognitionPanel';
@@ -67,7 +68,7 @@ import {
     takeAutoTemplateSeedHandoff,
 } from '../services/ai';
 import {
-    buildRecognitionDraftIdentity,
+    buildRecognitionLocalContextKey,
     type PublishRequestPayload,
 } from '../types/ai';
 import {
@@ -138,6 +139,14 @@ export default function QuickPublishPage() {
     const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+    /**
+     * Auto-selected hydrated template until the user edits or confirms review.
+     * Cleared on covered edits / manual template change / successful publish start.
+     */
+    const [autoSelectedTemplate, setAutoSelectedTemplate] = useState<{
+        templateId: string;
+        templateRevision: number;
+    } | null>(null);
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
     /** Bumps on covered draft mutations so in-flight resolve/prepare cannot freeze stale data. */
@@ -255,6 +264,8 @@ export default function QuickPublishPage() {
         if (options?.clearHistoryAdopts) {
             clearAdoptedHistory();
         }
+        // Any covered edit ends the auto-selected hydration marker.
+        setAutoSelectedTemplate(null);
         if (frozenPlanRef.current || showConfirmRef.current || isPreparingPublishRef.current) {
             clearFrozenPreflight();
         }
@@ -483,6 +494,7 @@ export default function QuickPublishPage() {
                 await parseTorrentCovered(consumed.torrent_path);
             } catch {
                 clearAutoTemplateSeedHydrationCycle();
+                setAutoSelectedTemplate(null);
                 reportAutoTemplateHydrationFailure(
                     '自动选模板的种子文件无法解析，请重新选择种子或模板。',
                 );
@@ -491,8 +503,16 @@ export default function QuickPublishPage() {
             if (cancelled) {
                 return;
             }
+            // Mark after covered torrent parse so the covered-edit clear does not wipe it.
+            setAutoSelectedTemplate({
+                templateId: consumed.template_id,
+                templateRevision: consumed.template_revision,
+            });
             // Acknowledge only after torrent hydration has completed successfully.
             acknowledgeAutoTemplateSeedHydration();
+            setStatusMessage(
+                `已载入自动推荐模板“${liveTemplate.name || consumed.template_id}”（revision ${consumed.template_revision}），请审阅后再发布。`,
+            );
         };
 
         void attemptHydration();
@@ -525,6 +545,8 @@ export default function QuickPublishPage() {
 
         // Template identity mutation supersedes any live or in-flight prepare and history adopts.
         invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
+        // Manual pick ends auto-selected hydration marker.
+        setAutoSelectedTemplate(null);
         // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
@@ -846,7 +868,24 @@ export default function QuickPublishPage() {
         clearFrozenPreflight();
     };
 
-    const handleReturnToEdit = () => {
+    /**
+     * Return-to-edit: await atomic cancel/reconcile when a live token/job exists,
+     * then restore editable draft focus (same contract as HomePage).
+     */
+    const handleReturnToEdit = async () => {
+        const lifecycle = preflight.state.lifecycle;
+        const needsReconcile = Boolean(preflight.state.token)
+            || Boolean(preflight.state.job_id)
+            || lifecycle === 'reconciling'
+            || lifecycle === 'auditing'
+            || lifecycle === 'awaiting_vision'
+            || lifecycle === 'preparing';
+        if (needsReconcile) {
+            const ok = await preflight.cancel();
+            if (!ok && preflight.state.lifecycle === 'reconciling') {
+                return;
+            }
+        }
         if (confirmDraft) {
             // History-only episode/resolution return is not a covered identity mutation.
             setDraft((current) => ({
@@ -855,7 +894,17 @@ export default function QuickPublishPage() {
                 resolution: confirmDraft.resolution,
             }));
         }
-        clearFrozenPreflight();
+        frozenPlanRef.current = null;
+        setShowConfirm(false);
+        setConfirmDraft(null);
+        if (!needsReconcile) {
+            preflight.invalidate();
+        }
+        window.requestAnimationFrame(() => {
+            document
+                .querySelector<HTMLElement>('[data-testid="quick-publish-button"]')
+                ?.focus();
+        });
     };
 
     const updateConfirmDraftMetadata = useCallback(
@@ -882,11 +931,12 @@ export default function QuickPublishPage() {
         && activeTemplate.resolution_pattern.trim()
         && activeTemplate.title_pattern.trim(),
     );
-    const recognitionDraftIdentity = useMemo(() => {
+    /** Local content key for draft-drift detection only — never wire identity authority. */
+    const recognitionLocalContextKey = useMemo(() => {
         if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionPatternsActive) {
             return '';
         }
-        return buildRecognitionDraftIdentity({
+        return buildRecognitionLocalContextKey({
             torrentName: torrentInfo.name,
             epPattern: activeTemplate.ep_pattern,
             resolutionPattern: activeTemplate.resolution_pattern,
@@ -897,20 +947,20 @@ export default function QuickPublishPage() {
         recognitionPatternsActive,
         torrentInfo?.name,
     ]);
-    // Drop recognition when torrent/template draft identity drifts; also drop page-side adopts.
-    const previousRecognitionIdentityRef = useRef(recognitionDraftIdentity);
+    // Drop recognition when torrent/template content drifts; also drop page-side adopts.
+    const previousRecognitionContextKeyRef = useRef(recognitionLocalContextKey);
     useEffect(() => {
-        const previous = previousRecognitionIdentityRef.current;
-        previousRecognitionIdentityRef.current = recognitionDraftIdentity;
-        if (previous && previous !== recognitionDraftIdentity) {
+        const previous = previousRecognitionContextKeyRef.current;
+        previousRecognitionContextKeyRef.current = recognitionLocalContextKey;
+        if (previous && previous !== recognitionLocalContextKey) {
             clearAdoptedHistory();
         }
-        invalidateRecognitionIfDraftMismatch(recognitionDraftIdentity || null);
-    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionDraftIdentity]);
+        invalidateRecognitionIfDraftMismatch(recognitionLocalContextKey || null);
+    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionLocalContextKey]);
     const recognitionReady = isAiCapabilityReady(preflight.state.settings);
     const canRunRecognition = Boolean(
         torrentInfo?.name?.trim()
-        && recognitionDraftIdentity
+        && recognitionLocalContextKey
         && recognitionReady
         && recognitionPatternsActive
         && !recognition.busy,
@@ -928,12 +978,13 @@ export default function QuickPublishPage() {
     );
 
     const handleAiRecognize = useCallback(() => {
-        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionDraftIdentity) {
+        if (!activeTemplate || !torrentInfo?.name?.trim() || !recognitionLocalContextKey) {
             return;
         }
         // New recognition request: clear page-side adopts so prior adopt cannot outlive this run.
         // Also clear live draft chips only when they still match those adopts (AI-adopt provenance).
         // Unrelated user/manual values that differ from the dropped adopts are left alone.
+        // Content only is sent; Rust allocates context hash + generation.
         const adoptsBeingCleared = adoptedHistoryRef.current;
         clearAdoptedHistory();
         const clearedEpisode = adoptsBeingCleared.episode.trim();
@@ -958,9 +1009,8 @@ export default function QuickPublishPage() {
             epPattern: activeTemplate.ep_pattern,
             resolutionPattern: activeTemplate.resolution_pattern,
             titlePattern: activeTemplate.title_pattern,
-            draftIdentity: recognitionDraftIdentity,
         });
-    }, [activeTemplate, clearAdoptedHistory, recognition, recognitionDraftIdentity, setDraft, torrentInfo?.name]);
+    }, [activeTemplate, clearAdoptedHistory, recognition, recognitionLocalContextKey, setDraft, torrentInfo?.name]);
 
     const handleAdoptRecognitionField = useCallback((field: 'episode' | 'resolution') => {
         const value = recognition.adoptField(field);
@@ -1024,15 +1074,32 @@ export default function QuickPublishPage() {
                     </button>
                 </header>
 
-                {/* 2. Status / error banners */}
-                {statusMessage ? (
-                    <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-100">
-                        {statusMessage}
-                    </div>
-                ) : null}
-                {errorMessage ? (
-                    <div className="rounded-xl border border-rose-500/20 bg-rose-500/10 px-4 py-3 text-sm text-rose-100">
-                        {errorMessage}
+                {/* 2. Status / error banners (shared preparation feedback contract) */}
+                <PreparationFeedback
+                    status={statusMessage || null}
+                    error={errorMessage || null}
+                    onRetry={errorMessage ? () => { void handlePublishClick(); } : null}
+                    onDismiss={errorMessage ? () => setErrorMessage('') : null}
+                    retryDisabled={isPreparingPublish || isPublishing}
+                />
+                {autoSelectedTemplate ? (
+                    <div
+                        data-testid="auto-selected-template-banner"
+                        className="rounded-xl border border-cyan-500/25 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100"
+                    >
+                        当前为自动推荐模板
+                        <span className="font-medium">
+                            {' '}
+                            {quickPublishTemplates[autoSelectedTemplate.templateId]?.name
+                                || autoSelectedTemplate.templateId}
+                        </span>
+                        <span className="font-mono text-xs text-cyan-200/80">
+                            {' '}
+                            · id {autoSelectedTemplate.templateId}
+                            {' '}
+                            · revision {autoSelectedTemplate.templateRevision}
+                        </span>
+                        。请审阅字段后再发布；手动改选模板或编辑覆盖后标记将清除。
                     </div>
                 ) : null}
 
@@ -1301,6 +1368,7 @@ export default function QuickPublishPage() {
                         busy={recognition.busy}
                         error={recognition.error}
                         result={recognition.result}
+                        onCancel={recognition.busy ? () => recognition.cancel() : null}
                         onAdoptEpisode={() => handleAdoptRecognitionField('episode')}
                         onAdoptResolution={() => handleAdoptRecognitionField('resolution')}
                         episodeAdopted={recognition.adopted.episode}
@@ -1537,7 +1605,8 @@ export default function QuickPublishPage() {
                     ) : null}
                     <button
                         type="button"
-                        onClick={() => handlePublishClick()}
+                        data-testid="quick-publish-button"
+                        onClick={() => { void handlePublishClick(); }}
                         disabled={isPublishing || isPreparingPublish || !activeTemplate}
                         className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/40 bg-emerald-500 px-5 py-2.5 text-sm font-semibold text-white transition-colors hover:bg-emerald-600 disabled:cursor-not-allowed disabled:opacity-50"
                     >
@@ -1585,7 +1654,12 @@ export default function QuickPublishPage() {
                         canConfirm={preflight.canConfirm}
                         onAcknowledgementChange={preflight.setAcknowledgement}
                         onToggleVisionSelection={preflight.toggleVisionSelection}
+                        onSelectAllVision={preflight.selectAllVisionCandidates}
                         onConfirmVisionSelection={() => { void preflight.confirmVisionSelection(); }}
+                        onContinueTextOnlyVision={() => { void preflight.continueTextOnlyVision(); }}
+                        onCancel={() => { void preflight.cancel(); }}
+                        onRetry={() => { void preflight.retry(); }}
+                        onRetryReconciliation={() => { void preflight.retryReconciliation(); }}
                     />
                 )}
                 confirmDisabled={isPublishing || isPreparingPublish || !preflight.canConfirm}

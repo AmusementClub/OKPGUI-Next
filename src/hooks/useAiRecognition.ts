@@ -7,7 +7,7 @@ import type {
     RecognitionResult,
 } from '../types/ai';
 import {
-    buildRecognitionDraftIdentity,
+    buildRecognitionLocalContextKey,
     createEmptyFieldEditMeta,
     markFieldAdopted,
     markFieldManual,
@@ -37,8 +37,17 @@ export interface AiRecognitionState {
     result: RecognitionResult | null;
     jobId: string | null;
     progress: number;
-    /** Monotonic edit/request generation; late results must match this value. */
+    /**
+     * Local UI epoch only — never serialized as wire authority.
+     * Bumped on clear / new recognize / cancel / unmount / draft drift.
+     */
     requestGeneration: number;
+    /**
+     * Backend context identity from the active start/result (null when idle).
+     * Correlation authority: job_id + contextHash + contextGeneration.
+     */
+    contextHash: string | null;
+    contextGeneration: number | null;
     /** Explicit per-field adopt flags for the current result (never auto-fill). */
     adopted: RecognitionAdoptedState;
     /** Page-mirrored field provenance + edit generation for manual-edit protection. */
@@ -50,12 +59,6 @@ export interface AiRecognitionRecognizeInput {
     epPattern: string;
     resolutionPattern: string;
     titlePattern: string;
-    /**
-     * Optional override for the draft-identity binding sent as snapshot_hash.
-     * Default: `buildRecognitionDraftIdentity` from torrent + template patterns.
-     * Never a publish-plan token.
-     */
-    draftIdentity?: string;
 }
 
 /** Bounded poll interval for recognition job status (ms). */
@@ -78,24 +81,39 @@ const initialState: AiRecognitionState = {
     jobId: null,
     progress: 0,
     requestGeneration: 0,
+    contextHash: null,
+    contextGeneration: null,
     adopted: emptyAdopted,
     fieldOrigins: emptyFieldOrigins,
 };
 
+interface BackendContextIdentity {
+    contextHash: string;
+    contextGeneration: number;
+    jobId: string;
+}
+
 /**
  * Advisory release recognition via backend-owned start / poll / cancel lifecycle.
  * Never mutates draft title/episode/resolution, never auto-fills, never changes publish decisions.
- * Cancels on clear/unmount/new request. Late results are ignored unless both request generation
- * and draft identity still match. Cancelled/stale jobs never apply a recognition result.
+ * Cancels on clear/unmount/new request. Late results are ignored unless the local UI epoch and
+ * backend context identity still match. Cancelled/stale jobs never apply a recognition result.
  * Episode/resolution adoption is explicit and per-field; title is never adopted.
+ * Frontend local epoch is a stale UI guard only — never wire authority.
  */
 export function useAiRecognition() {
     const [state, setState] = useState<AiRecognitionState>(initialState);
     const stateRef = useRef(state);
     stateRef.current = state;
-    const generationRef = useRef(0);
-    /** Draft identity expected by the in-flight or last-applied recognition. */
-    const expectedDraftIdentityRef = useRef<string | null>(null);
+    /** Local UI epoch — never sent to the backend. */
+    const uiEpochRef = useRef(0);
+    /**
+     * Local content key for the in-flight request (torrent + patterns).
+     * Used only to detect page draft drift; never wire identity.
+     */
+    const expectedLocalContextKeyRef = useRef<string | null>(null);
+    /** Backend context identity captured from start response (authority for adopt/correlation). */
+    const backendIdentityRef = useRef<BackendContextIdentity | null>(null);
     const jobIdRef = useRef<string | null>(null);
     /** Recursive timeout id (not interval) so polls never overlap. */
     const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -117,8 +135,9 @@ export function useAiRecognition() {
         return () => {
             disposedRef.current = true;
             // Bump so any in-flight poll cannot commit after unmount.
-            generationRef.current += 1;
-            expectedDraftIdentityRef.current = null;
+            uiEpochRef.current += 1;
+            expectedLocalContextKeyRef.current = null;
+            backendIdentityRef.current = null;
             const jobId = jobIdRef.current;
             jobIdRef.current = null;
             stopPolling();
@@ -130,13 +149,14 @@ export function useAiRecognition() {
     }, [stopPolling]);
 
     /**
-     * Invalidate recognition on covered edits or draft-identity drift.
-     * Cancels the backend job and bumps generation so late polls cannot remain active.
+     * Invalidate recognition on covered edits or local context drift.
+     * Cancels the backend job and bumps UI epoch so late polls cannot remain active.
      * Resets adopt flags; leaves field origin generations intact unless resetOrigins.
      */
     const clear = useCallback((options?: { resetOrigins?: boolean }) => {
-        generationRef.current += 1;
-        expectedDraftIdentityRef.current = null;
+        uiEpochRef.current += 1;
+        expectedLocalContextKeyRef.current = null;
+        backendIdentityRef.current = null;
         const jobId = jobIdRef.current;
         jobIdRef.current = null;
         stopPolling();
@@ -150,27 +170,60 @@ export function useAiRecognition() {
             result: null,
             jobId: null,
             progress: 0,
-            requestGeneration: generationRef.current,
+            requestGeneration: uiEpochRef.current,
+            contextHash: null,
+            contextGeneration: null,
             adopted: emptyAdopted,
             fieldOrigins: options?.resetOrigins ? emptyFieldOrigins : current.fieldOrigins,
         }));
     }, [stopPolling]);
 
     /**
-     * Drop active result/error when the live draft identity no longer matches.
-     * Cancels in-flight work; bumps generation when clearing a bound identity.
+     * Explicit cancel while queued/running. Idempotent: safe if already terminal/cleared.
+     * Late success after cancel cannot surface candidates.
      */
-    const invalidateIfDraftMismatch = useCallback((currentDraftIdentity: string | null | undefined) => {
-        const expected = expectedDraftIdentityRef.current;
-        const live = currentDraftIdentity?.trim() || null;
+    const cancel = useCallback(() => {
+        uiEpochRef.current += 1;
+        expectedLocalContextKeyRef.current = null;
+        backendIdentityRef.current = null;
+        const jobId = jobIdRef.current;
+        jobIdRef.current = null;
+        stopPolling();
+        pollInFlightRef.current = false;
+        if (jobId) {
+            void cancelAiJob(jobId).catch(() => undefined);
+        }
+        setState((current) => ({
+            busy: false,
+            error: 'AI 识别已取消。',
+            result: null,
+            jobId: null,
+            progress: 100,
+            requestGeneration: uiEpochRef.current,
+            contextHash: null,
+            contextGeneration: null,
+            adopted: emptyAdopted,
+            fieldOrigins: current.fieldOrigins,
+        }));
+    }, [stopPolling]);
+
+    /**
+     * Drop active result/error when the live local context key no longer matches.
+     * Cancels in-flight work; bumps UI epoch when clearing a bound identity.
+     * `currentLocalContextKey` is page-local content only — never backend hash authority.
+     */
+    const invalidateIfDraftMismatch = useCallback((currentLocalContextKey: string | null | undefined) => {
+        const expected = expectedLocalContextKeyRef.current;
+        const live = currentLocalContextKey?.trim() || null;
         if (!expected) {
             return;
         }
         if (live && live === expected) {
             return;
         }
-        generationRef.current += 1;
-        expectedDraftIdentityRef.current = null;
+        uiEpochRef.current += 1;
+        expectedLocalContextKeyRef.current = null;
+        backendIdentityRef.current = null;
         const jobId = jobIdRef.current;
         jobIdRef.current = null;
         stopPolling();
@@ -184,13 +237,15 @@ export function useAiRecognition() {
             result: null,
             jobId: null,
             progress: 0,
-            requestGeneration: generationRef.current,
+            requestGeneration: uiEpochRef.current,
+            contextHash: null,
+            contextGeneration: null,
             adopted: emptyAdopted,
             fieldOrigins: current.fieldOrigins,
         }));
     }, [stopPolling]);
 
-    /** @deprecated Prefer invalidateIfDraftMismatch — same binding semantics. */
+    /** @deprecated Prefer invalidateIfDraftMismatch — same local-context drift semantics. */
     const invalidateIfSnapshotMismatch = invalidateIfDraftMismatch;
 
     /**
@@ -214,20 +269,25 @@ export function useAiRecognition() {
 
     /**
      * Explicit per-field adopt. Returns the candidate value when allowed; never mutates draft itself.
-     * Blocks when busy, no current result, generation/identity mismatch, or missing candidate.
+     * Blocks when busy, no current result, UI epoch / backend identity mismatch, or missing candidate.
      * Manual edits never auto-apply recognition; explicit adopt is always user-initiated and
      * only touches the requested field (other manually edited fields stay intact).
      * Callers apply the returned value to their own draft.
      */
     const adoptField = useCallback((field: RecognitionAdoptableField): string | null => {
         const current = stateRef.current;
-        const { result, busy, requestGeneration } = current;
+        const { result, busy, requestGeneration, contextHash, contextGeneration } = current;
+        const backend = backendIdentityRef.current;
         if (
             busy
             || !result
-            || requestGeneration !== generationRef.current
-            || expectedDraftIdentityRef.current !== result.snapshot_hash
-            || result.request_generation !== requestGeneration
+            || !backend
+            || requestGeneration !== uiEpochRef.current
+            || contextHash !== backend.contextHash
+            || contextGeneration !== backend.contextGeneration
+            || result.snapshot_hash !== backend.contextHash
+            || result.request_generation !== backend.contextGeneration
+            || result.job_id !== backend.jobId
         ) {
             return null;
         }
@@ -252,32 +312,44 @@ export function useAiRecognition() {
 
     const applyTerminal = useCallback((
         view: RecognitionJobView,
-        requestGeneration: number,
-        draftIdentity: string,
+        uiEpoch: number,
+        localContextKey: string,
+        expectedBackend: BackendContextIdentity | null,
     ) => {
         // Superseded request (clear / new recognize / unmount / identity drift): leave state alone.
         if (
             disposedRef.current
-            || requestGeneration !== generationRef.current
-            || expectedDraftIdentityRef.current !== draftIdentity
+            || uiEpoch !== uiEpochRef.current
+            || expectedLocalContextKeyRef.current !== localContextKey
         ) {
             return;
         }
 
-        // Fail closed when a still-active terminal view's identity does not match this request.
+        // Prefer backend identity from start; fall back to view identity when start was already terminal.
+        const identity: BackendContextIdentity = expectedBackend ?? {
+            contextHash: view.snapshot_hash,
+            contextGeneration: view.request_generation,
+            jobId: view.job_id,
+        };
+
+        // Fail closed when terminal view identity does not match the active backend binding.
         // Never leave busy=true after a terminal poll/start settles.
         if (
-            view.request_generation !== requestGeneration
-            || view.snapshot_hash !== draftIdentity
+            view.snapshot_hash !== identity.contextHash
+            || view.request_generation !== identity.contextGeneration
+            || view.job_id !== identity.jobId
         ) {
             jobIdRef.current = null;
+            backendIdentityRef.current = null;
             setState((current) => ({
                 busy: false,
                 error: 'AI 识别已过期。',
                 result: null,
                 jobId: null,
                 progress: 100,
-                requestGeneration,
+                requestGeneration: uiEpoch,
+                contextHash: null,
+                contextGeneration: null,
                 adopted: emptyAdopted,
                 fieldOrigins: current.fieldOrigins,
             }));
@@ -300,27 +372,34 @@ export function useAiRecognition() {
                 result: null,
                 jobId: view.job_id,
                 progress: 100,
-                requestGeneration,
+                requestGeneration: uiEpoch,
+                contextHash: identity.contextHash,
+                contextGeneration: identity.contextGeneration,
                 adopted: emptyAdopted,
                 fieldOrigins: current.fieldOrigins,
             }));
             jobIdRef.current = null;
+            backendIdentityRef.current = null;
             return;
         }
 
-        // Nested result identity must match; otherwise fail closed (stop busy, no result).
+        // Nested result identity must match backend binding; otherwise fail closed.
         if (
-            view.result.request_generation !== requestGeneration
-            || view.result.snapshot_hash !== draftIdentity
+            view.result.request_generation !== identity.contextGeneration
+            || view.result.snapshot_hash !== identity.contextHash
+            || view.result.job_id !== identity.jobId
         ) {
             jobIdRef.current = null;
+            backendIdentityRef.current = null;
             setState((current) => ({
                 busy: false,
                 error: 'AI 识别已过期。',
                 result: null,
                 jobId: null,
                 progress: 100,
-                requestGeneration,
+                requestGeneration: uiEpoch,
+                contextHash: null,
+                contextGeneration: null,
                 adopted: emptyAdopted,
                 fieldOrigins: current.fieldOrigins,
             }));
@@ -328,13 +407,16 @@ export function useAiRecognition() {
         }
 
         // Advisory only — never writes episode/resolution/title into any draft.
+        backendIdentityRef.current = identity;
         setState((current) => ({
             busy: false,
             error: null,
             result: view.result ?? null,
             jobId: view.job_id,
             progress: 100,
-            requestGeneration,
+            requestGeneration: uiEpoch,
+            contextHash: identity.contextHash,
+            contextGeneration: identity.contextGeneration,
             adopted: emptyAdopted,
             fieldOrigins: current.fieldOrigins,
         }));
@@ -343,17 +425,21 @@ export function useAiRecognition() {
 
     const startPolling = useCallback((
         jobId: string,
-        requestGeneration: number,
-        draftIdentity: string,
+        uiEpoch: number,
+        localContextKey: string,
+        backendIdentity: BackendContextIdentity,
     ) => {
         stopPolling();
         pollInFlightRef.current = false;
 
         const isActiveTick = () =>
             !disposedRef.current
-            && requestGeneration === generationRef.current
-            && expectedDraftIdentityRef.current === draftIdentity
-            && jobIdRef.current === jobId;
+            && uiEpoch === uiEpochRef.current
+            && expectedLocalContextKeyRef.current === localContextKey
+            && jobIdRef.current === jobId
+            && backendIdentityRef.current?.jobId === jobId
+            && backendIdentityRef.current?.contextHash === backendIdentity.contextHash
+            && backendIdentityRef.current?.contextGeneration === backendIdentity.contextGeneration;
 
         const scheduleNext = () => {
             // Stale ticks must not clear timers owned by a newer generation.
@@ -398,18 +484,18 @@ export function useAiRecognition() {
                     return;
                 }
                 stopPolling();
-                applyTerminal(polled, requestGeneration, draftIdentity);
+                applyTerminal(polled, uiEpoch, localContextKey, backendIdentity);
             } catch (error) {
                 // Stale/superseded ticks must not clear a newer generation or replace its UI.
                 if (!isActiveTick()) {
                     return;
                 }
                 // Fail closed like clear/invalidate: cancel backend job, drop identity binding,
-                // and bump generation so a later recognize cannot orphan or reuse this job.
-                // Capture jobId from the tick closure before clearing refs.
+                // and bump UI epoch so a later recognize cannot orphan or reuse this job.
                 stopPolling();
-                generationRef.current += 1;
-                expectedDraftIdentityRef.current = null;
+                uiEpochRef.current += 1;
+                expectedLocalContextKeyRef.current = null;
+                backendIdentityRef.current = null;
                 jobIdRef.current = null;
                 pollInFlightRef.current = false;
                 // Cancellation failures must never replace the original poll UI error.
@@ -420,15 +506,15 @@ export function useAiRecognition() {
                     result: null,
                     jobId: null,
                     progress: 0,
-                    requestGeneration: generationRef.current,
+                    requestGeneration: uiEpochRef.current,
+                    contextHash: null,
+                    contextGeneration: null,
                     adopted: emptyAdopted,
                     fieldOrigins: current.fieldOrigins,
                 }));
             } finally {
-                // Release latch when this request generation is still current.
-                // (jobId may already be cleared by applyTerminal on success; poll-error
-                // path bumps generation and releases the latch itself above.)
-                if (requestGeneration === generationRef.current) {
+                // Release latch when this UI epoch is still current.
+                if (uiEpoch === uiEpochRef.current) {
                     pollInFlightRef.current = false;
                 }
             }
@@ -439,8 +525,8 @@ export function useAiRecognition() {
 
     /**
      * Start backend recognition (non-blocking IPC) and poll until terminal.
-     * Uses draft identity from torrent + template patterns (not a publish-plan snapshot).
-     * Cancels any prior in-flight job; rejects stale generation/identity results.
+     * Sends content only; Rust allocates context hash + generation.
+     * Cancels any prior in-flight job; rejects stale UI-epoch / identity results.
      */
     const recognize = useCallback(async (input: AiRecognitionRecognizeInput): Promise<void> => {
         const torrentName = input.torrentName.trim();
@@ -453,24 +539,14 @@ export function useAiRecognition() {
             return;
         }
 
-        const draftIdentity = (input.draftIdentity?.trim()
-            || buildRecognitionDraftIdentity({
-                torrentName,
-                epPattern: input.epPattern ?? '',
-                resolutionPattern: input.resolutionPattern ?? '',
-                titlePattern: input.titlePattern ?? '',
-            })).trim();
+        const localContextKey = buildRecognitionLocalContextKey({
+            torrentName,
+            epPattern: input.epPattern ?? '',
+            resolutionPattern: input.resolutionPattern ?? '',
+            titlePattern: input.titlePattern ?? '',
+        });
 
-        if (!draftIdentity) {
-            setState((current) => ({
-                ...current,
-                busy: false,
-                error: '识别需要有效的草稿身份绑定。',
-            }));
-            return;
-        }
-
-        // Cancel any prior in-flight job; bump generation so late polls cannot commit.
+        // Cancel any prior in-flight job; bump UI epoch so late polls cannot commit.
         const previousJob = jobIdRef.current;
         if (previousJob) {
             void cancelAiJob(previousJob).catch(() => undefined);
@@ -478,8 +554,9 @@ export function useAiRecognition() {
         stopPolling();
         pollInFlightRef.current = false;
 
-        const requestGeneration = ++generationRef.current;
-        expectedDraftIdentityRef.current = draftIdentity;
+        const uiEpoch = ++uiEpochRef.current;
+        expectedLocalContextKeyRef.current = localContextKey;
+        backendIdentityRef.current = null;
         jobIdRef.current = null;
 
         setState((current) => ({
@@ -488,26 +565,27 @@ export function useAiRecognition() {
             result: null,
             jobId: null,
             progress: 0,
-            requestGeneration,
+            requestGeneration: uiEpoch,
+            contextHash: null,
+            contextGeneration: null,
             adopted: emptyAdopted,
             fieldOrigins: current.fieldOrigins,
         }));
 
+        // Content only — never client snapshot_hash / request_generation.
         const request: AiRecognizeRequest = {
             torrent_name: torrentName,
             ep_pattern: input.epPattern ?? '',
             resolution_pattern: input.resolutionPattern ?? '',
             title_pattern: input.titlePattern ?? '',
-            request_generation: requestGeneration,
-            snapshot_hash: draftIdentity,
         };
 
         try {
             const started = await startRecognition(request);
             if (
                 disposedRef.current
-                || requestGeneration !== generationRef.current
-                || expectedDraftIdentityRef.current !== draftIdentity
+                || uiEpoch !== uiEpochRef.current
+                || expectedLocalContextKeyRef.current !== localContextKey
             ) {
                 if (started.job_id) {
                     void cancelAiJob(started.job_id).catch(() => undefined);
@@ -515,6 +593,12 @@ export function useAiRecognition() {
                 return;
             }
 
+            const backendIdentity: BackendContextIdentity = {
+                contextHash: started.snapshot_hash,
+                contextGeneration: started.request_generation,
+                jobId: started.job_id,
+            };
+            backendIdentityRef.current = backendIdentity;
             jobIdRef.current = started.job_id;
 
             if (
@@ -523,7 +607,7 @@ export function useAiRecognition() {
                 || started.state === 'cancelled'
                 || started.state === 'stale'
             ) {
-                applyTerminal(started, requestGeneration, draftIdentity);
+                applyTerminal(started, uiEpoch, localContextKey, backendIdentity);
                 return;
             }
 
@@ -533,16 +617,18 @@ export function useAiRecognition() {
                 result: null,
                 jobId: started.job_id,
                 progress: started.progress ?? 0,
-                requestGeneration,
+                requestGeneration: uiEpoch,
+                contextHash: backendIdentity.contextHash,
+                contextGeneration: backendIdentity.contextGeneration,
                 adopted: emptyAdopted,
                 fieldOrigins: current.fieldOrigins,
             }));
-            startPolling(started.job_id, requestGeneration, draftIdentity);
+            startPolling(started.job_id, uiEpoch, localContextKey, backendIdentity);
         } catch (error) {
             if (
                 disposedRef.current
-                || requestGeneration !== generationRef.current
-                || expectedDraftIdentityRef.current !== draftIdentity
+                || uiEpoch !== uiEpochRef.current
+                || expectedLocalContextKeyRef.current !== localContextKey
             ) {
                 return;
             }
@@ -552,7 +638,9 @@ export function useAiRecognition() {
                 result: null,
                 jobId: null,
                 progress: 0,
-                requestGeneration,
+                requestGeneration: uiEpoch,
+                contextHash: null,
+                contextGeneration: null,
                 adopted: emptyAdopted,
                 fieldOrigins: current.fieldOrigins,
             }));
@@ -567,10 +655,13 @@ export function useAiRecognition() {
         jobId: state.jobId,
         progress: state.progress,
         requestGeneration: state.requestGeneration,
+        contextHash: state.contextHash,
+        contextGeneration: state.contextGeneration,
         adopted: state.adopted,
         fieldOrigins: state.fieldOrigins,
         recognize,
         clear,
+        cancel,
         adoptField,
         markFieldManualEdit,
         invalidateIfDraftMismatch,

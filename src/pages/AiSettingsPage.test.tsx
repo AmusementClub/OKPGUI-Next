@@ -186,4 +186,84 @@ describe('AiSettingsPage model discovery and capability probe', () => {
         expect(rendered.container.textContent).not.toContain('sk-');
         expect(rendered.container.textContent).toMatch(/未探测|未知/);
     });
+
+    it('shows persistent session-only warning when credential is not durable', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') {
+                return baseSettings({
+                    credential_session_only: true,
+                    credential_ref: { id: 'session-cred' },
+                });
+            }
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const banner = rendered.container.querySelector(
+            '[data-testid="credential-session-only-warning"]',
+        );
+        expect(banner).toBeTruthy();
+        expect(banner?.textContent).toContain('仅保存在本会话');
+        expect(banner?.textContent).toContain('重启');
+        expect(rendered.container.textContent).toContain('重启后丢失');
+        // Never surface secret material.
+        expect(rendered.container.textContent).not.toContain('sk-');
+        expect(rendered.container.querySelector('[data-testid="credential-session-only"]')).toBeTruthy();
+    });
+
+    it('does not show session-only warning for durable keyring credentials', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') {
+                return baseSettings({
+                    credential_session_only: false,
+                    credential_ref: { id: 'durable-cred' },
+                });
+            }
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        expect(
+            rendered.container.querySelector('[data-testid="credential-session-only-warning"]'),
+        ).toBeNull();
+        expect(rendered.container.textContent).toContain('密钥已配置');
+        expect(rendered.container.textContent).not.toContain('重启后丢失');
+    });
+
+    it('after save with session-only response keeps the restart warning visible', async () => {
+        const sessionSettings = baseSettings({
+            credential_session_only: true,
+            credential_ref: { id: 'session-after-save' },
+        });
+        invokeMock.mockImplementation(async (command: string) => {
+            switch (command) {
+                case 'ai_get_settings':
+                    return baseSettings({ credential_session_only: false, credential_ref: null });
+                case 'ai_save_settings':
+                    return sessionSettings;
+                default:
+                    throw new Error(`unexpected command ${command}`);
+            }
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const save = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('保存连接'),
+        );
+        expect(save).toBeTruthy();
+        save!.click();
+        await flushAsync();
+
+        expect(
+            rendered.container.querySelector('[data-testid="credential-session-only-warning"]'),
+        ).toBeTruthy();
+        expect(rendered.container.textContent).toContain('仅保存在本会话');
+        expect(rendered.container.textContent).not.toContain('sk-');
+    });
 });

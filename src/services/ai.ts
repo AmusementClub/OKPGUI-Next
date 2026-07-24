@@ -1,5 +1,8 @@
 import { invoke } from '@tauri-apps/api/core';
+import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 import type {
+    ActiveAiJobCancelResult,
+    ActiveAiJobSummary,
     AiAuditResult,
     AiCapabilityStatus,
     AiFormalAuditRequest,
@@ -9,18 +12,25 @@ import type {
     AiSelectTemplateRequest,
     AiSettings,
     AutoTemplateSeedHandoff,
+    CancelPendingAuditForPublishResult,
+    CancelPreflightSessionResult,
     ConsumedTemplateSeed,
     PlanPrepareResponse,
     PlanVisionBindRequest,
     PlanVisionBindResponse,
     PlanVisionCandidatesResponse,
+    PreflightSessionChangedPayload,
     PublishPlan,
     PublishRequestPayload,
     RecognitionJobView,
     RecognitionResult,
+    ReviewTemplateRecommendationResult,
     TemplateSeed,
     TemplateSelectionJobView,
 } from '../types/ai';
+
+/** Tauri event name for atomic preflight cancel/reconcile convergence. */
+export const PREFLIGHT_SESSION_CHANGED_EVENT = 'preflight-session-changed';
 
 export const AUTO_TEMPLATE_SEED_STORAGE_KEY = 'okpgui:autoTemplateSeed';
 
@@ -159,6 +169,7 @@ export async function computeAiAudit(request: AiFormalAuditRequest): Promise<AiA
 
 /**
  * Start a backend-owned Recognition job (returns immediately with queued/running view).
+ * Request is content-only (torrent name + patterns); Rust allocates context hash + generation.
  * Provider work runs in the background; poll via pollRecognition; cancel via cancelAiJob.
  * Never mutates publish drafts or decisions; capability-gated on the backend.
  */
@@ -246,6 +257,49 @@ export async function cancelAiJob(id: string): Promise<AiJob> {
     return invoke<AiJob>('ai_cancel_job', { id });
 }
 
+/**
+ * Publish-time PENDING audit cancel: stop the formal job so late completion cannot bind,
+ * but keep the frozen plan token live for `publish_prepared_plan`.
+ * Do not use `cancelAiJob` / session cancel here — those invalidate plan-bound Audit tokens.
+ */
+export async function cancelPendingAuditForPublish(
+    planToken: string,
+    jobId?: string | null,
+): Promise<CancelPendingAuditForPublishResult> {
+    return invoke<CancelPendingAuditForPublishResult>('ai_cancel_pending_audit_for_publish', {
+        planToken,
+        jobId: jobId?.trim() ? jobId : null,
+    });
+}
+
+/**
+ * Atomic preflight session cancel/reconcile.
+ * Cancels the related audit job (when known), invalidates the plan token, writes a
+ * cancellation tombstone, and emits `preflight-session-changed`.
+ * `jobId` is optional; when omitted Rust resolves the job from plan-bound evidence.
+ */
+export async function cancelPreflightSession(
+    planToken: string,
+    jobId?: string | null,
+): Promise<CancelPreflightSessionResult> {
+    return invoke<CancelPreflightSessionResult>('ai_cancel_preflight_session', {
+        planToken,
+        jobId: jobId?.trim() ? jobId : null,
+    });
+}
+
+/**
+ * Subscribe to sanitized preflight session lifecycle events.
+ * Returns the Tauri unlisten function (or a no-op when listen is unavailable).
+ */
+export async function subscribePreflightSessionChanged(
+    handler: (payload: PreflightSessionChangedPayload) => void,
+): Promise<UnlistenFn> {
+    return listen<PreflightSessionChangedPayload>(PREFLIGHT_SESSION_CHANGED_EVENT, (event) => {
+        handler(event.payload);
+    });
+}
+
 export function canPublishAudit(decision: AiAuditResult['decision'], acknowledgements: {
     warning: boolean;
     critical: boolean;
@@ -272,7 +326,7 @@ let autoTemplateSeedConsumeInFlight: Promise<ConsumedTemplateSeed | null> | null
 
 /**
  * Start a backend-owned TemplateSelection job.
- * Never invents a catalog pick client-side; seed is only present after poll reports succeeded.
+ * Never invents a catalog pick client-side; recommendation only after poll reports succeeded.
  */
 export async function startTemplateSelection(
     request: AiSelectTemplateRequest,
@@ -282,7 +336,7 @@ export async function startTemplateSelection(
 
 /**
  * Poll TemplateSelection job. Returns null while queued/running; terminal view when finished.
- * Cancelled/stale/failed never include a usable seed.
+ * Cancelled/stale/failed never include a recommendation or seed.
  */
 export async function pollTemplateSelection(
     jobId: string,
@@ -290,11 +344,43 @@ export async function pollTemplateSelection(
     return invoke<TemplateSelectionJobView | null>('ai_poll_template_selection', { jobId });
 }
 
-/** Whether a terminal TemplateSelection view may hand off an opaque seed. */
+/**
+ * Whether a terminal TemplateSelection view may show the recommendation review UI.
+ * Does not mint or write a handoff seed.
+ */
 export function isSuccessfulTemplateSelection(
     view: TemplateSelectionJobView | null | undefined,
 ): boolean {
-    return view?.state === 'succeeded' && Boolean(view.seed?.token && view.seed?.template_id);
+    return view?.state === 'succeeded'
+        && Boolean(
+            view.recommendation?.recommendation_id
+            && view.recommendation?.template_id,
+        );
+}
+
+/**
+ * Explicit Review: revalidate recommendation and mint exactly one handoff seed.
+ * Frontend writes opaque handoff only after a minted/already_minted response with seed.
+ */
+export async function reviewTemplateRecommendation(
+    recommendationId: string,
+): Promise<ReviewTemplateRecommendationResult> {
+    return invoke<ReviewTemplateRecommendationResult>('ai_review_template_recommendation', {
+        recommendationId,
+    });
+}
+
+/** Sanitized active AI jobs for the global status strip (never full AiJob list). */
+export async function listActiveAiJobs(): Promise<ActiveAiJobSummary[]> {
+    return invoke<ActiveAiJobSummary[]>('ai_list_active_jobs');
+}
+
+/**
+ * Kind-dispatching strip cancel. Rust resolves Audit/plan-bound association;
+ * React never chooses the authority path.
+ */
+export async function cancelActiveAiJob(jobId: string): Promise<ActiveAiJobCancelResult> {
+    return invoke<ActiveAiJobCancelResult>('ai_cancel_active_job', { jobId });
 }
 
 /** Persist only opaque token + public template identity for AutoTemplate → QuickPublish handoff. */

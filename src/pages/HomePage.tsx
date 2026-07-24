@@ -17,6 +17,7 @@ import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import AiPreflightPanel from '../components/AiPreflightPanel';
 import AiRecognitionPanel from '../components/AiRecognitionPanel';
+import PreparationFeedback from '../components/PreparationFeedback';
 import PublishConfirmModal from '../components/PublishConfirmModal';
 import PublishContentEditor from '../components/PublishContentEditor';
 import TagInput from '../components/TagInput';
@@ -83,7 +84,7 @@ import {
     readFriendlyError,
 } from '../services/ai';
 import {
-    buildRecognitionDraftIdentity,
+    buildRecognitionLocalContextKey,
     type PublishRequestPayload,
 } from '../types/ai';
 
@@ -273,6 +274,8 @@ export default function HomePage() {
     // Modal state
     const [showConsole, setShowConsole] = useState(false);
     const [showConfirm, setShowConfirm] = useState(false);
+    /** Shared prepare-failure surface (same contract as Quick Publish). */
+    const [preparationError, setPreparationError] = useState<string | null>(null);
     const [confirmMeta, setConfirmMeta] = useState<ConfirmPublishMeta | null>(null);
     /** Immutable request preview bound to the prepared token (render state, not ref). */
     const [confirmRequest, setConfirmRequest] = useState<PublishRequestPayload | null>(null);
@@ -1076,11 +1079,12 @@ export default function HomePage() {
         && template.resolution_pattern.trim()
         && template.title_pattern.trim(),
     );
-    const recognitionDraftIdentity = useMemo(() => {
+    /** Local content key for draft-drift detection only — never wire identity authority. */
+    const recognitionLocalContextKey = useMemo(() => {
         if (!torrentInfo?.name?.trim() || !recognitionPatternsActive) {
             return '';
         }
-        return buildRecognitionDraftIdentity({
+        return buildRecognitionLocalContextKey({
             torrentName: torrentInfo.name,
             epPattern: template.ep_pattern,
             resolutionPattern: template.resolution_pattern,
@@ -1093,20 +1097,20 @@ export default function HomePage() {
         template.title_pattern,
         torrentInfo?.name,
     ]);
-    // Drop recognition when torrent/template draft identity drifts; also drop page-side history adopts.
-    const previousRecognitionIdentityRef = useRef(recognitionDraftIdentity);
+    // Drop recognition when torrent/template content drifts; also drop page-side history adopts.
+    const previousRecognitionContextKeyRef = useRef(recognitionLocalContextKey);
     useEffect(() => {
-        const previous = previousRecognitionIdentityRef.current;
-        previousRecognitionIdentityRef.current = recognitionDraftIdentity;
-        if (previous && previous !== recognitionDraftIdentity) {
+        const previous = previousRecognitionContextKeyRef.current;
+        previousRecognitionContextKeyRef.current = recognitionLocalContextKey;
+        if (previous && previous !== recognitionLocalContextKey) {
             clearAdoptedHistory();
         }
-        invalidateRecognitionIfDraftMismatch(recognitionDraftIdentity || null);
-    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionDraftIdentity]);
+        invalidateRecognitionIfDraftMismatch(recognitionLocalContextKey || null);
+    }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionLocalContextKey]);
     const recognitionReady = isAiCapabilityReady(preflight.state.settings);
     const canRunRecognition = Boolean(
         torrentInfo?.name?.trim()
-        && recognitionDraftIdentity
+        && recognitionLocalContextKey
         && recognitionReady
         && recognitionPatternsActive
         && !recognition.busy,
@@ -1124,23 +1128,23 @@ export default function HomePage() {
     );
 
     const handleAiRecognize = useCallback(() => {
-        if (!torrentInfo?.name?.trim() || !recognitionDraftIdentity) {
+        if (!torrentInfo?.name?.trim() || !recognitionLocalContextKey) {
             return;
         }
         // New recognition request: drop page-side adopts so a prior adopt cannot outlive this run.
         // Hook recognize() also clears panel adopted flags for the new generation.
+        // Content only is sent; Rust allocates context hash + generation.
         clearAdoptedHistory();
         void recognition.recognize({
             torrentName: torrentInfo.name,
             epPattern: template.ep_pattern,
             resolutionPattern: template.resolution_pattern,
             titlePattern: template.title_pattern,
-            draftIdentity: recognitionDraftIdentity,
         });
     }, [
         clearAdoptedHistory,
         recognition,
-        recognitionDraftIdentity,
+        recognitionLocalContextKey,
         template.ep_pattern,
         template.resolution_pattern,
         template.title_pattern,
@@ -1230,6 +1234,7 @@ export default function HomePage() {
         // Reject re-entry while resolve/prepare is in flight (QuickPublish parity).
         // Check the ref as well so a same-tick second click cannot pass before re-render.
         if (isPublishing || isPreparingPublish || isPreparingPublishRef.current) return;
+        setPreparationError(null);
 
         const publishTemplateName = getTemplateName();
         const selectedSites = siteDefinitions.filter((site) => template.sites[site.key as keyof SiteSelection]);
@@ -1356,10 +1361,7 @@ export default function HomePage() {
             setShowConfirm(false);
             setConfirmMeta(null);
             setConfirmRequest(null);
-            showNotice({
-                title: '发布前检查失败',
-                message: readFriendlyError(error, '无法准备发布前检查。'),
-            });
+            setPreparationError(readFriendlyError(error, '无法准备发布前检查。'));
         } finally {
             isPreparingPublishRef.current = false;
             setIsPreparingPublish(false);
@@ -1479,8 +1481,38 @@ export default function HomePage() {
         clearFrozenPreflight();
     };
 
-    const handleReturnToEdit = () => {
-        clearFrozenPreflight();
+    /**
+     * Return-to-edit: when a live plan token/job exists, await atomic cancel/reconcile
+     * before closing confirmation and restoring editable draft focus.
+     */
+    const handleReturnToEdit = async () => {
+        const lifecycle = preflight.state.lifecycle;
+        const needsReconcile = Boolean(preflight.state.token)
+            || Boolean(preflight.state.job_id)
+            || lifecycle === 'reconciling'
+            || lifecycle === 'auditing'
+            || lifecycle === 'awaiting_vision'
+            || lifecycle === 'preparing';
+        if (needsReconcile) {
+            const ok = await preflight.cancel();
+            if (!ok && preflight.state.lifecycle === 'reconciling') {
+                // Keep confirm open with reconciling UI; only Retry Reconciliation is enabled.
+                return;
+            }
+        }
+        frozenPlanRef.current = null;
+        setShowConfirm(false);
+        setConfirmMeta(null);
+        setConfirmRequest(null);
+        if (!needsReconcile) {
+            preflight.invalidate();
+        }
+        // Restore focus to the primary publish control for continued editing.
+        window.requestAnimationFrame(() => {
+            document
+                .querySelector<HTMLElement>('[data-testid="home-publish-button"]')
+                ?.focus();
+        });
     };
 
     const updateConfirmHistoryField = useCallback(
@@ -1766,6 +1798,7 @@ export default function HomePage() {
                         resolutionAdopted={recognition.adopted.resolution}
                         canAdoptEpisode={canAdoptEpisode}
                         canAdoptResolution={canAdoptResolution}
+                        onCancel={recognition.busy ? () => recognition.cancel() : null}
                     />
                 </section>
 
@@ -1988,9 +2021,18 @@ export default function HomePage() {
                     </div>
                 </section>
 
-                <section>
+                <section className="space-y-3">
+                    <PreparationFeedback
+                        error={preparationError}
+                        onRetry={() => {
+                            void handlePublishClick();
+                        }}
+                        onDismiss={() => setPreparationError(null)}
+                        retryDisabled={isPreparingPublish || isPublishing}
+                    />
                     <button
                         type="button"
+                        data-testid="home-publish-button"
                         onClick={() => {
                             void handlePublishClick();
                         }}
@@ -2068,7 +2110,12 @@ export default function HomePage() {
                         canConfirm={preflight.canConfirm}
                         onAcknowledgementChange={preflight.setAcknowledgement}
                         onToggleVisionSelection={preflight.toggleVisionSelection}
+                        onSelectAllVision={preflight.selectAllVisionCandidates}
                         onConfirmVisionSelection={() => { void preflight.confirmVisionSelection(); }}
+                        onContinueTextOnlyVision={() => { void preflight.continueTextOnlyVision(); }}
+                        onCancel={() => { void preflight.cancel(); }}
+                        onRetry={() => { void preflight.retry(); }}
+                        onRetryReconciliation={() => { void preflight.retryReconciliation(); }}
                     />
                 )}
                 confirmDisabled={isPublishing || isPreparingPublish || !preflight.canConfirm}
