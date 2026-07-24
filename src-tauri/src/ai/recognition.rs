@@ -3,13 +3,20 @@
 //! Recognition is advisory only. Rust validates a strict schema, rejects unknown fields and
 //! any publish-decision payload, and never treats model text as an authoritative final title
 //! or publish GO/NO_GO. Final titles remain deterministic via `title_pattern`.
+//!
+//! Context identity (context hash + backend generation) is Rust-owned. Callers supply only
+//! content (torrent display name + template patterns); identity is never accepted from the client.
 
 use crate::ai::redaction::RedactionPolicy;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 /// Wire/schema version for recognition structured output (prompt + JSON schema).
 pub const RECOGNITION_SCHEMA_VERSION: &str = "recognition_v1";
+
+/// Version of the canonical recognition request-context snapshot used for hashing.
+pub const RECOGNITION_CONTEXT_VERSION: u32 = 1;
 
 const MAX_VALUE_CHARS: usize = 256;
 const MAX_EVIDENCE_CHARS: usize = 256;
@@ -36,15 +43,104 @@ pub struct RecognitionOutput {
 }
 
 /// Redacted, typed recognition result returned over IPC (identity-bound metadata).
+///
+/// `request_generation` and `snapshot_hash` are backend-allocated context identity only;
+/// they are never accepted from the client start request.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RecognitionResult {
     pub schema_version: String,
     pub episode: Option<RecognitionCandidate>,
     pub resolution: Option<RecognitionCandidate>,
     pub suggested_title: Option<RecognitionCandidate>,
+    /// Monotonic backend recognition generation for this job.
     pub request_generation: u64,
+    /// Cryptographic context hash (`sha256:…`) of the stored `RecognitionContextSnapshot`.
     pub snapshot_hash: String,
     pub job_id: String,
+}
+
+/// Versioned, sanitized recognition request context owned by Rust after start.
+///
+/// Built only from content the client supplies (torrent display name + template patterns).
+/// Serialized deterministically for SHA-256 context hashing; never accepts client identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RecognitionContextSnapshot {
+    pub version: u32,
+    pub torrent_name: String,
+    pub ep_pattern: String,
+    pub resolution_pattern: String,
+    pub title_pattern: String,
+}
+
+impl RecognitionContextSnapshot {
+    /// Build a snapshot from already-sanitized recognition context fields.
+    pub fn from_sanitized(
+        torrent_name: String,
+        ep_pattern: String,
+        resolution_pattern: String,
+        title_pattern: String,
+    ) -> Self {
+        Self {
+            version: RECOGNITION_CONTEXT_VERSION,
+            torrent_name,
+            ep_pattern,
+            resolution_pattern,
+            title_pattern,
+        }
+    }
+
+    /// Deterministic length-prefixed serialization for hashing (not JSON wire).
+    ///
+    /// Format: magic + version LE + for each string: u64 LE length + UTF-8 bytes.
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(128);
+        bytes.extend_from_slice(b"okpgui.recognition.context.v1");
+        bytes.extend_from_slice(&self.version.to_le_bytes());
+        for field in [
+            self.torrent_name.as_str(),
+            self.ep_pattern.as_str(),
+            self.resolution_pattern.as_str(),
+            self.title_pattern.as_str(),
+        ] {
+            let encoded = field.as_bytes();
+            bytes.extend_from_slice(&(encoded.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(encoded);
+        }
+        bytes
+    }
+
+    /// SHA-256 context hash as `sha256:<hex>` (backend identity only).
+    pub fn context_hash(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(self.canonical_bytes());
+        format!("sha256:{}", hex::encode(hasher.finalize()))
+    }
+}
+
+/// Sanitize caller content and build a versioned context snapshot + hash.
+pub fn build_recognition_context_snapshot(
+    torrent_name: &str,
+    ep_pattern: &str,
+    resolution_pattern: &str,
+    title_pattern: &str,
+    policy: &RedactionPolicy,
+) -> Result<(RecognitionContextSnapshot, String), String> {
+    let (torrent_name, ep_pattern, resolution_pattern, title_pattern) =
+        sanitize_recognition_context(
+            torrent_name,
+            ep_pattern,
+            resolution_pattern,
+            title_pattern,
+            policy,
+        )?;
+    let snapshot = RecognitionContextSnapshot::from_sanitized(
+        torrent_name,
+        ep_pattern,
+        resolution_pattern,
+        title_pattern,
+    );
+    let hash = snapshot.context_hash();
+    Ok((snapshot, hash))
 }
 
 /// Strict JSON Schema for provider structured outputs (`additionalProperties: false`).
@@ -355,7 +451,10 @@ fn looks_like_absolute_path_prefix(text: &str) -> bool {
             && matches!(text.as_bytes()[2], b'/' | b'\\'))
 }
 
-/// Bind a validated/redacted output to job identity metadata for IPC.
+/// Bind a validated/redacted output to backend-owned job identity metadata for IPC.
+///
+/// `request_generation` and `snapshot_hash` must come from the stored job/snapshot, never
+/// from caller-supplied start-request identity fields.
 pub fn bind_recognition_result(
     output: RecognitionOutput,
     request_generation: u64,
@@ -758,5 +857,74 @@ mod tests {
         assert_eq!(bound.request_generation, 7);
         assert_eq!(bound.snapshot_hash, "sha256:snap");
         assert_eq!(bound.job_id, "job-1");
+    }
+
+    #[test]
+    fn context_snapshot_hash_is_deterministic_and_sensitive_to_fields() {
+        let a = RecognitionContextSnapshot::from_sanitized(
+            "Show.S01E01.1080p".into(),
+            r"(?P<ep>\d+)".into(),
+            r"(?P<res>1080p)".into(),
+            "[<group>] <title> - <ep>".into(),
+        );
+        let b = RecognitionContextSnapshot::from_sanitized(
+            "Show.S01E01.1080p".into(),
+            r"(?P<ep>\d+)".into(),
+            r"(?P<res>1080p)".into(),
+            "[<group>] <title> - <ep>".into(),
+        );
+        assert_eq!(a.context_hash(), b.context_hash());
+        assert!(a.context_hash().starts_with("sha256:"));
+        assert_eq!(a.context_hash().len(), "sha256:".len() + 64);
+
+        let changed = RecognitionContextSnapshot::from_sanitized(
+            "Show.S01E02.1080p".into(),
+            r"(?P<ep>\d+)".into(),
+            r"(?P<res>1080p)".into(),
+            "[<group>] <title> - <ep>".into(),
+        );
+        assert_ne!(a.context_hash(), changed.context_hash());
+
+        let pattern_changed = RecognitionContextSnapshot::from_sanitized(
+            "Show.S01E01.1080p".into(),
+            r"(?P<ep>\d{2})".into(),
+            r"(?P<res>1080p)".into(),
+            "[<group>] <title> - <ep>".into(),
+        );
+        assert_ne!(a.context_hash(), pattern_changed.context_hash());
+    }
+
+    #[test]
+    fn build_snapshot_sanitizes_then_hashes() {
+        let policy = RedactionPolicy::default();
+        let (snapshot, hash) = build_recognition_context_snapshot(
+            "  Show.S01E01.1080p  ",
+            r"(?P<ep>\d+)",
+            r"(?P<res>1080p)",
+            "[<group>] <title> - <ep>",
+            &policy,
+        )
+        .expect("safe context");
+        assert_eq!(snapshot.version, RECOGNITION_CONTEXT_VERSION);
+        assert_eq!(snapshot.torrent_name, "Show.S01E01.1080p");
+        assert_eq!(hash, snapshot.context_hash());
+        assert!(hash.starts_with("sha256:"));
+    }
+
+    #[test]
+    fn build_snapshot_rejects_path_like_torrent_name() {
+        let policy = RedactionPolicy::default();
+        let err = build_recognition_context_snapshot(
+            "/Users/secret/show.torrent",
+            r"(?P<ep>\d+)",
+            "1080p",
+            "<ep>",
+            &policy,
+        )
+        .expect_err("absolute path must fail");
+        assert!(
+            err.contains("torrent_name") || err.contains("path"),
+            "{err}"
+        );
     }
 }

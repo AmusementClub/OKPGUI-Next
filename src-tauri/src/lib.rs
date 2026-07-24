@@ -3,6 +3,7 @@ mod atomic_file;
 mod commands;
 mod config;
 mod cookies;
+pub mod desktop_smoke;
 mod domain;
 mod entity_naming;
 mod profile;
@@ -76,8 +77,8 @@ pub fn run() {
             commands::ai_commands::ai_start_media_info,
             commands::ai_commands::ai_poll_media_info,
             commands::ai_commands::ai_get_media_info_result,
-            commands::ai_commands::ai_extract_vision_images,
-            commands::ai_commands::ai_normalize_vision_image,
+            // Legacy Vision IPC retired: ai_extract_vision_images / ai_normalize_vision_image
+            // are no longer registered. Plan-token Vision is the only public surface.
             // Plan-token Vision: list candidates from bound final content, bind after
             // explicit over-cap selection, then formal audit attaches provider image parts.
             commands::ai_commands::ai_list_plan_vision_candidates,
@@ -95,6 +96,8 @@ pub fn run() {
             commands::ai_commands::ai_prepare_template_seed,
             commands::ai_commands::ai_inspect_template_seed,
             commands::ai_commands::ai_consume_template_seed,
+            // Explicit Review: revalidate recommendation + mint one handoff seed.
+            commands::ai_commands::ai_review_template_recommendation,
             commands::ai_commands::ai_redact_value,
             commands::ai_commands::ai_project_context,
             commands::ai_commands::ai_compute_audit,
@@ -105,8 +108,16 @@ pub fn run() {
             commands::ai_commands::ai_start_formal_audit,
             commands::ai_commands::ai_poll_formal_audit,
             commands::ai_commands::ai_get_job,
+            // Full AiJob list remains registered for diagnostics; strip uses sanitized active list.
             commands::ai_commands::ai_list_jobs,
+            commands::ai_commands::ai_list_active_jobs,
             commands::ai_commands::ai_cancel_job,
+            // Kind-dispatching strip cancel (Audit → atomic preflight session).
+            commands::ai_commands::ai_cancel_active_job,
+            // Atomic preflight cancel/reconcile: plan token + optional job id, tombstone, event.
+            commands::ai_commands::ai_cancel_preflight_session,
+            // Publish-time PENDING cancel: stop formal job without invalidating the frozen token.
+            commands::ai_commands::ai_cancel_pending_audit_for_publish,
             // Non-secret debug-record IPC only (bounded retention; no raw bodies/secrets).
             // Export returns safe basename metadata only (redacted bundle + canary scan).
             commands::ai_commands::ai_list_debug_records,

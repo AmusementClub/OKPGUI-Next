@@ -1060,11 +1060,71 @@ fn digest_template(template: &Template) -> String {
     digest_json(&payload)
 }
 
+/// Final token state recorded by atomic preflight cancellation/reconciliation.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PreflightTokenState {
+    Invalidated,
+    AlreadyMissing,
+}
+
+/// Bounded cancellation tombstone keyed by SHA-256 digest of an opaque plan token.
+///
+/// Never stores the raw token, frozen request, paths, or provider data. Enables
+/// idempotent `ai_cancel_preflight_session` after IPC loss / client job-ID loss.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreflightCancellationTombstone {
+    /// SHA-256 hex digest of the opaque plan token (not the token itself).
+    pub token_digest: String,
+    /// Related formal-audit job id when known at cancel time.
+    pub job_id: Option<String>,
+    /// Final job lifecycle state after cancel (snake_case string), if any.
+    pub job_state: Option<String>,
+    pub token_state: PreflightTokenState,
+    /// True only when cancel/invalidate completed authoritatively.
+    pub reconciled: bool,
+    /// Unix seconds when the tombstone was written (for TTL pruning).
+    pub created_at_unix: u64,
+}
+
+/// Result of atomic preflight session cancellation/reconciliation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelPreflightSessionResult {
+    /// Final related job state (snake_case), or null when no job was bound.
+    pub job_state: Option<String>,
+    pub token_state: PreflightTokenState,
+    /// True only when job (if any) is terminal/absent and token is invalidated/missing.
+    pub reconciled: bool,
+}
+
+/// Default tombstone TTL (1 hour) and max retained entries.
+pub const PREFLIGHT_TOMBSTONE_TTL_SECONDS: u64 = 3600;
+pub const PREFLIGHT_TOMBSTONE_MAX_ENTRIES: usize = 256;
+
+/// SHA-256 hex digest of an opaque plan token (never log or store the raw token).
+pub fn plan_token_digest(token: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(token.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn job_state_label(state: &str) -> String {
+    state.to_string()
+}
+
 #[derive(Debug, Clone)]
 pub struct PlanRegistry {
     plans: HashMap<String, PublishPlan>,
     expires_at: HashMap<String, Instant>,
     ttl_seconds: u64,
+    /// Cancellation tombstones keyed by plan-token digest (not raw token).
+    cancellation_tombstones: HashMap<String, PreflightCancellationTombstone>,
+    /// Live plan-token digest → audit job id (survives only while plan is live or until tombstone).
+    plan_job_index: HashMap<String, String>,
+    /// Reverse: audit job id → raw plan token (for strip cancel kind-dispatch).
+    job_plan_tokens: HashMap<String, String>,
+    tombstone_ttl_seconds: u64,
+    tombstone_max_entries: usize,
 }
 
 impl PlanRegistry {
@@ -1135,6 +1195,183 @@ impl PlanRegistry {
             plans: HashMap::new(),
             expires_at: HashMap::new(),
             ttl_seconds,
+            cancellation_tombstones: HashMap::new(),
+            plan_job_index: HashMap::new(),
+            job_plan_tokens: HashMap::new(),
+            tombstone_ttl_seconds: PREFLIGHT_TOMBSTONE_TTL_SECONDS,
+            tombstone_max_entries: PREFLIGHT_TOMBSTONE_MAX_ENTRIES,
+        }
+    }
+
+    /// Test/helper override for tombstone bounds.
+    #[cfg(test)]
+    pub fn with_tombstone_bounds(mut self, ttl_seconds: u64, max_entries: usize) -> Self {
+        self.tombstone_ttl_seconds = ttl_seconds;
+        self.tombstone_max_entries = max_entries.max(1);
+        self
+    }
+
+    /// Record a live plan → audit job association for token-only cancel resolution.
+    pub fn note_plan_audit_job(&mut self, token: &str, job_id: &str) {
+        let token = token.trim();
+        let job_id = job_id.trim();
+        if token.is_empty() || job_id.is_empty() {
+            return;
+        }
+        self.plan_job_index
+            .insert(plan_token_digest(token), job_id.to_string());
+        self.job_plan_tokens
+            .insert(job_id.to_string(), token.to_string());
+    }
+
+    /// Resolve the raw plan token for an audit job id (strip cancel kind-dispatch).
+    pub fn resolve_plan_token_for_job(&mut self, job_id: &str) -> Option<String> {
+        let job_id = job_id.trim();
+        if job_id.is_empty() {
+            return None;
+        }
+        if let Some(token) = self.job_plan_tokens.get(job_id).cloned() {
+            // Prefer reverse index when the plan is still live.
+            if self.inspect_plan(&token).is_some() {
+                return Some(token);
+            }
+        }
+        // Scan live plans for bound audit job id (covers index loss after partial cleanup).
+        let mut matched: Option<String> = None;
+        let mut expired: Vec<String> = Vec::new();
+        for (token, plan) in &self.plans {
+            if self.is_expired(token) {
+                expired.push(token.clone());
+                continue;
+            }
+            if plan
+                .audit_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.job_id.as_deref())
+                .map(str::trim)
+                == Some(job_id)
+            {
+                matched = Some(token.clone());
+                break;
+            }
+        }
+        for token in expired {
+            self.remove(&token);
+        }
+        matched
+    }
+
+    /// Look up a cancellation tombstone by raw plan token (hashed internally).
+    pub fn get_cancellation_tombstone(
+        &mut self,
+        token: &str,
+    ) -> Option<&PreflightCancellationTombstone> {
+        self.prune_cancellation_tombstones();
+        let digest = plan_token_digest(token.trim());
+        self.cancellation_tombstones.get(&digest)
+    }
+
+    /// Write or replace a cancellation tombstone and prune bounds.
+    pub fn put_cancellation_tombstone(&mut self, tombstone: PreflightCancellationTombstone) {
+        let digest = tombstone.token_digest.clone();
+        // Drop reverse job→token for any job recorded on this tombstone.
+        if let Some(job_id) = tombstone.job_id.as_deref() {
+            self.job_plan_tokens.remove(job_id);
+        }
+        self.cancellation_tombstones
+            .insert(digest.clone(), tombstone);
+        // Drop plan→job index once reconciled; tombstone is the durable record.
+        self.plan_job_index.remove(&digest);
+        self.prune_cancellation_tombstones();
+    }
+
+    /// Prune expired and over-capacity cancellation tombstones (oldest first).
+    pub fn prune_cancellation_tombstones(&mut self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let ttl = self.tombstone_ttl_seconds;
+        self.cancellation_tombstones
+            .retain(|_, entry| now.saturating_sub(entry.created_at_unix) <= ttl);
+        if self.cancellation_tombstones.len() <= self.tombstone_max_entries {
+            return;
+        }
+        let mut entries: Vec<(String, u64)> = self
+            .cancellation_tombstones
+            .iter()
+            .map(|(digest, entry)| (digest.clone(), entry.created_at_unix))
+            .collect();
+        entries.sort_by_key(|(_, created)| *created);
+        let remove_count = self
+            .cancellation_tombstones
+            .len()
+            .saturating_sub(self.tombstone_max_entries);
+        for (digest, _) in entries.into_iter().take(remove_count) {
+            self.cancellation_tombstones.remove(&digest);
+        }
+    }
+
+    /// Resolve related audit job id from live plan evidence or plan→job index.
+    pub fn resolve_related_audit_job_id(&mut self, token: &str) -> Option<String> {
+        let token = token.trim();
+        if token.is_empty() {
+            return None;
+        }
+        if let Some(plan) = self.inspect_plan(token) {
+            if let Some(job_id) = plan
+                .audit_evidence
+                .as_ref()
+                .and_then(|evidence| evidence.job_id.as_ref())
+            {
+                let trimmed = job_id.trim();
+                if !trimmed.is_empty() {
+                    return Some(trimmed.to_string());
+                }
+            }
+        }
+        let digest = plan_token_digest(token);
+        self.plan_job_index.get(&digest).cloned()
+    }
+
+    /// Build a recorded cancel result from a tombstone (idempotent replay).
+    pub fn cancel_result_from_tombstone(
+        tombstone: &PreflightCancellationTombstone,
+    ) -> CancelPreflightSessionResult {
+        CancelPreflightSessionResult {
+            job_state: tombstone.job_state.clone(),
+            token_state: tombstone.token_state,
+            reconciled: tombstone.reconciled,
+        }
+    }
+
+    /// Record tombstone after cancel work and return the public result.
+    pub fn record_preflight_cancellation(
+        &mut self,
+        token: &str,
+        job_id: Option<String>,
+        job_state: Option<String>,
+        token_state: PreflightTokenState,
+        reconciled: bool,
+    ) -> CancelPreflightSessionResult {
+        let digest = plan_token_digest(token.trim());
+        let created_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let tombstone = PreflightCancellationTombstone {
+            token_digest: digest,
+            job_id,
+            job_state: job_state.clone().map(|state| job_state_label(&state)),
+            token_state,
+            reconciled,
+            created_at_unix,
+        };
+        self.put_cancellation_tombstone(tombstone);
+        CancelPreflightSessionResult {
+            job_state,
+            token_state,
+            reconciled,
         }
     }
 
@@ -1194,6 +1431,8 @@ impl PlanRegistry {
         // Always remove both maps; short-circuit `||` previously left orphan plan entries.
         let had_expiry = self.expires_at.remove(token).is_some();
         let had_plan = self.plans.remove(token).is_some();
+        // Keep plan_job_index until a cancellation tombstone is written so token-only
+        // cancel can still resolve the related audit job after plain invalidate.
         had_expiry || had_plan
     }
 
@@ -1206,6 +1445,17 @@ impl PlanRegistry {
         if self.is_expired(token) {
             self.remove(token);
             return Err("prepared plan token is missing or expired".to_string());
+        }
+        if !self.plans.contains_key(token) {
+            return Err("prepared plan token is missing or expired".to_string());
+        }
+        if let Some(job_id) = evidence.job_id.as_deref() {
+            let trimmed = job_id.trim();
+            if !trimmed.is_empty() {
+                // Index so token-only cancel can resolve the related audit job.
+                self.plan_job_index
+                    .insert(plan_token_digest(token), trimmed.to_string());
+            }
         }
         let plan = self
             .plans
@@ -2803,5 +3053,126 @@ mod tests {
     #[test]
     fn test_config_migration_default_old_schema_v2() {
         // legacy schema-v2 handling covered in config.rs tests already; future schema uses default via serde
+    }
+
+    #[test]
+    fn plan_token_digest_is_stable_and_non_empty() {
+        let digest_a = plan_token_digest("plan_abc");
+        let digest_b = plan_token_digest("plan_abc");
+        let digest_c = plan_token_digest("plan_xyz");
+        assert_eq!(digest_a, digest_b);
+        assert_ne!(digest_a, digest_c);
+        assert_eq!(digest_a.len(), 64);
+        assert!(!digest_a.contains("plan_abc"));
+    }
+
+    #[test]
+    fn cancellation_tombstone_replay_and_job_index_resolution() {
+        let mut registry = PlanRegistry::default();
+        let token = registry
+            .prepare_plan("sha256:cancel-tomb".into(), 1)
+            .expect("prepare");
+        registry.note_plan_audit_job(&token, "job-audit-1");
+        assert_eq!(
+            registry.resolve_related_audit_job_id(&token).as_deref(),
+            Some("job-audit-1")
+        );
+
+        let first = registry.record_preflight_cancellation(
+            &token,
+            Some("job-audit-1".into()),
+            Some("cancelled".into()),
+            PreflightTokenState::Invalidated,
+            true,
+        );
+        assert!(first.reconciled);
+        assert_eq!(first.token_state, PreflightTokenState::Invalidated);
+        assert_eq!(first.job_state.as_deref(), Some("cancelled"));
+
+        // Index is cleared once tombstone is written.
+        assert!(registry.resolve_related_audit_job_id(&token).is_none());
+
+        let tombstone = registry
+            .get_cancellation_tombstone(&token)
+            .expect("tombstone present")
+            .clone();
+        assert_eq!(tombstone.token_digest, plan_token_digest(&token));
+        assert_eq!(tombstone.job_id.as_deref(), Some("job-audit-1"));
+        let replay = PlanRegistry::cancel_result_from_tombstone(&tombstone);
+        assert_eq!(replay, first);
+    }
+
+    #[test]
+    fn cancellation_tombstone_prunes_by_size_and_ttl() {
+        let mut registry = PlanRegistry::default().with_tombstone_bounds(3600, 2);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        for index in 0..3 {
+            let token = format!("plan_tomb_{index}");
+            registry.put_cancellation_tombstone(PreflightCancellationTombstone {
+                token_digest: plan_token_digest(&token),
+                job_id: Some(format!("job-{index}")),
+                job_state: Some("cancelled".into()),
+                token_state: PreflightTokenState::Invalidated,
+                reconciled: true,
+                created_at_unix: now + index as u64,
+            });
+        }
+        assert_eq!(registry.cancellation_tombstones.len(), 2);
+        assert!(
+            registry.get_cancellation_tombstone("plan_tomb_0").is_none(),
+            "oldest must be pruned"
+        );
+        assert!(registry.get_cancellation_tombstone("plan_tomb_1").is_some());
+        assert!(registry.get_cancellation_tombstone("plan_tomb_2").is_some());
+
+        let mut short_ttl = PlanRegistry::default().with_tombstone_bounds(0, 256);
+        short_ttl.put_cancellation_tombstone(PreflightCancellationTombstone {
+            token_digest: plan_token_digest("plan_expired"),
+            job_id: None,
+            job_state: None,
+            token_state: PreflightTokenState::AlreadyMissing,
+            reconciled: true,
+            created_at_unix: now.saturating_sub(10),
+        });
+        // TTL 0 retains only entries created at exactly "now"; past entries prune.
+        assert!(short_ttl
+            .get_cancellation_tombstone("plan_expired")
+            .is_none());
+    }
+
+    #[test]
+    fn bind_audit_evidence_indexes_job_for_token_only_cancel() {
+        let mut registry = PlanRegistry::default();
+        let token = registry
+            .prepare_plan("sha256:indexed".into(), 2)
+            .expect("prepare");
+        registry
+            .bind_audit_evidence(
+                &token,
+                PlanAuditEvidence {
+                    decision: AuditDecision::Pending,
+                    findings: Vec::new(),
+                    unknown_codes: Vec::new(),
+                    formal_ran: false,
+                    job_id: Some("job-from-bind".into()),
+                    snapshot_hash: "sha256:indexed".into(),
+                    request_generation: 2,
+                },
+            )
+            .expect("bind");
+        assert_eq!(
+            registry.resolve_related_audit_job_id(&token).as_deref(),
+            Some("job-from-bind")
+        );
+        // After plain invalidate, plan is gone but index remains for cancel resolution.
+        assert!(registry.invalidate_plan(&token));
+        assert!(registry.inspect_plan(&token).is_none());
+        assert_eq!(
+            registry.resolve_related_audit_job_id(&token).as_deref(),
+            Some("job-from-bind")
+        );
     }
 }

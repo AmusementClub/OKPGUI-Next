@@ -304,6 +304,20 @@ pub fn resolve_public_address(url: &Url) -> Result<std::net::SocketAddr, VisionE
         .ok_or_else(|| VisionError::UnsafeUrl(url.to_string()))
 }
 
+/// Classify HTTP status before reading a Vision image body.
+/// Redirects are never followed and are hard failures (no multi-hop allowance).
+pub fn classify_vision_http_status(status: reqwest::StatusCode) -> Result<(), VisionError> {
+    if status.is_redirection() {
+        return Err(VisionError::UnsafeUrl(
+            "redirects are disabled for Vision".to_string(),
+        ));
+    }
+    if !status.is_success() {
+        return Err(VisionError::Fetch(format!("HTTP {status}")));
+    }
+    Ok(())
+}
+
 pub fn fetch_image(url: &str, timeout: Duration) -> Result<(String, Vec<u8>), VisionError> {
     let url = validate_public_image_url(url)?;
     let address = resolve_public_address(&url)?;
@@ -322,14 +336,7 @@ pub fn fetch_image(url: &str, timeout: Duration) -> Result<(String, Vec<u8>), Vi
         .get(url.clone())
         .send()
         .map_err(|error| VisionError::Fetch(error.to_string()))?;
-    if response.status().is_redirection() {
-        return Err(VisionError::UnsafeUrl(
-            "redirects are disabled for Vision".to_string(),
-        ));
-    }
-    if !response.status().is_success() {
-        return Err(VisionError::Fetch(format!("HTTP {}", response.status())));
-    }
+    classify_vision_http_status(response.status())?;
     if let Some(length) = response.content_length() {
         if length > MAX_DOWNLOAD_BYTES as u64 {
             return Err(VisionError::TooLarge(
@@ -513,11 +520,10 @@ pub fn resolve_selected_vision_inputs(
         .map(|image| (image.url.as_str(), image))
         .collect::<std::collections::HashMap<_, _>>();
 
+    // Any non-empty candidate set requires an explicit URL selection (product consent).
+    // Empty selected_urls never means "bind all under the cap".
     if selected_urls.is_empty() {
-        if candidates.len() > MAX_IMAGES {
-            return Err(VisionError::TooManyImages(candidates.len()));
-        }
-        return Ok(candidates.to_vec());
+        return Err(VisionError::TooManyImages(candidates.len()));
     }
 
     let mut seen = HashSet::new();
@@ -892,14 +898,37 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selected_auto_accepts_at_or_below_cap() {
+    fn resolve_selected_requires_explicit_urls_even_at_or_below_cap() {
         let candidates = (0..3)
             .map(|index| VisionImageInput {
                 url: format!("https://example.test/{index}.jpg"),
                 source: "markdown".into(),
             })
             .collect::<Vec<_>>();
-        let resolved = resolve_selected_vision_inputs(&candidates, &[]).unwrap();
+        // Empty selection is never "bind all under the cap".
+        assert!(matches!(
+            resolve_selected_vision_inputs(&candidates, &[]),
+            Err(VisionError::TooManyImages(3))
+        ));
+        let selected = candidates.iter().map(|c| c.url.clone()).collect::<Vec<_>>();
+        let resolved = resolve_selected_vision_inputs(&candidates, &selected).unwrap();
         assert_eq!(resolved.len(), 3);
+    }
+
+    #[test]
+    fn redirect_http_status_is_hard_failure_without_following() {
+        // Offline regression: Vision rejects all 3xx; no multi-hop following.
+        for code in [301u16, 302, 303, 307, 308] {
+            let status = reqwest::StatusCode::from_u16(code).expect("valid status");
+            let err = classify_vision_http_status(status).expect_err("redirect must fail");
+            assert!(
+                matches!(err, VisionError::UnsafeUrl(ref message) if message.contains("redirects are disabled")),
+                "expected redirect UnsafeUrl for HTTP {code}, got {err:?}"
+            );
+        }
+        assert!(classify_vision_http_status(reqwest::StatusCode::OK).is_ok());
+        let fetch_err = classify_vision_http_status(reqwest::StatusCode::NOT_FOUND)
+            .expect_err("non-success non-redirect must fail");
+        assert!(matches!(fetch_err, VisionError::Fetch(_)));
     }
 }

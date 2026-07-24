@@ -161,14 +161,6 @@ impl TemplateSeedRegistry {
         Ok((stored.public, stored.binding))
     }
 
-    /// Legacy remove-only consume. Prefer `consume_validated`.
-    pub fn consume(&mut self, token: &str) -> Option<(TemplateSeed, TemplateSeedBinding)> {
-        self.remove_expired();
-        self.seeds
-            .remove(token)
-            .map(|seed| (seed.public, seed.binding))
-    }
-
     fn remove_expired(&mut self) {
         self.seeds
             .retain(|_, seed| Instant::now() < seed.expires_at);
@@ -422,6 +414,7 @@ fn digest_json<T: Serialize>(value: &T) -> String {
 }
 
 static SEED_COUNTER: AtomicU64 = AtomicU64::new(0);
+static RECOMMENDATION_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn opaque_seed_token() -> String {
     let counter = SEED_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -433,6 +426,359 @@ fn opaque_seed_token() -> String {
     hasher.update(timestamp.to_le_bytes());
     hasher.update(counter.to_le_bytes());
     format!("seed_{}", hex::encode(hasher.finalize()))
+}
+
+fn opaque_recommendation_id() -> String {
+    let counter = RECOMMENDATION_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let mut hasher = Sha256::new();
+    hasher.update(b"rec_");
+    hasher.update(timestamp.to_le_bytes());
+    hasher.update(counter.to_le_bytes());
+    format!("rec_{}", hex::encode(hasher.finalize()))
+}
+
+/// Max alternatives returned with a recommendation (catalog-backed only).
+pub const MAX_RECOMMENDATION_ALTERNATIVES: usize = 5;
+/// Max chars for sanitized public summary/evidence fields.
+pub const MAX_RECOMMENDATION_SUMMARY_CHARS: usize = 240;
+/// Default recommendation TTL (10 minutes) — seed mint must revalidate within this window.
+pub const RECOMMENDATION_TTL_SECONDS: u64 = 600;
+
+/// Bounded catalog-backed alternative shown on the auto-template result view.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemplateRecommendationAlternative {
+    pub template_id: String,
+    pub template_revision: u64,
+    pub template_digest: String,
+    pub name: String,
+    pub summary: String,
+}
+
+/// Backend-owned validated recommendation (never a pre-minted handoff seed).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TemplateRecommendation {
+    pub recommendation_id: String,
+    pub template_id: String,
+    pub template_revision: u64,
+    pub template_digest: String,
+    pub template_name: String,
+    /// Sanitized evidence/summary (never secrets, paths, or provider bodies).
+    pub summary: String,
+    pub alternatives: Vec<TemplateRecommendationAlternative>,
+    pub torrent_digest: String,
+    pub torrent_name: String,
+    /// Catalog snapshot hash at recommendation time (identity drift detection).
+    pub catalog_hash: String,
+    pub generation: u64,
+    pub expires_at_unix: u64,
+}
+
+/// Result status of explicit Review-in-Quick-Publish mint.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewTemplateRecommendationStatus {
+    /// Fresh mint of exactly one live seed.
+    Minted,
+    /// Repeated review while the prior seed is still unconsumed — same seed returned.
+    AlreadyMinted,
+    /// Seed was already consumed by Quick Publish — no second mint.
+    AlreadyConsumed,
+}
+
+/// Atomic review/mint response. Seed is present only for Minted / AlreadyMinted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReviewTemplateRecommendationResult {
+    pub status: ReviewTemplateRecommendationStatus,
+    pub seed: Option<TemplateSeed>,
+    pub recommendation_id: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+enum RecommendationMintState {
+    Unminted,
+    Minted { seed_token: String },
+    Consumed,
+}
+
+#[derive(Debug, Clone)]
+struct StoredRecommendation {
+    public: TemplateRecommendation,
+    torrent_path: String,
+    torrent_len: u64,
+    mint: RecommendationMintState,
+    expires_at: Instant,
+}
+
+/// Registry of validated auto-template recommendations (seed mint is explicit Review only).
+#[derive(Debug, Clone)]
+pub struct TemplateRecommendationRegistry {
+    recommendations: HashMap<String, StoredRecommendation>,
+    /// seed_token → recommendation_id for consume-time mint-state updates.
+    seed_to_recommendation: HashMap<String, String>,
+    ttl: Duration,
+    generation: u64,
+}
+
+impl Default for TemplateRecommendationRegistry {
+    fn default() -> Self {
+        Self {
+            recommendations: HashMap::new(),
+            seed_to_recommendation: HashMap::new(),
+            ttl: Duration::from_secs(RECOMMENDATION_TTL_SECONDS),
+            generation: 0,
+        }
+    }
+}
+
+impl TemplateRecommendationRegistry {
+    #[allow(dead_code)]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            recommendations: HashMap::new(),
+            seed_to_recommendation: HashMap::new(),
+            ttl,
+            generation: 0,
+        }
+    }
+
+    /// Store a validated recommendation without minting a handoff seed.
+    pub fn store(
+        &mut self,
+        selected: &EligibleTemplateCatalogEntry,
+        catalog: &[EligibleTemplateCatalogEntry],
+        catalog_hash: String,
+        torrent_name: String,
+        torrent_path: String,
+        summary: String,
+    ) -> Result<TemplateRecommendation, String> {
+        let torrent_identity = read_torrent_identity(&torrent_path)?;
+        self.remove_expired();
+        self.generation = self.generation.saturating_add(1);
+        let recommendation_id = opaque_recommendation_id();
+        let expires_at = Instant::now() + self.ttl;
+        let expires_at_unix = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_add(self.ttl.as_secs());
+        let alternatives = build_bounded_alternatives(catalog, &selected.id);
+        let public = TemplateRecommendation {
+            recommendation_id: recommendation_id.clone(),
+            template_id: selected.id.clone(),
+            template_revision: selected.revision,
+            template_digest: selected.digest.clone(),
+            template_name: selected.name.clone(),
+            summary: truncate_sanitized_summary(&summary),
+            alternatives,
+            torrent_digest: torrent_identity.digest.clone(),
+            torrent_name,
+            catalog_hash,
+            generation: self.generation,
+            expires_at_unix,
+        };
+        self.recommendations.insert(
+            recommendation_id,
+            StoredRecommendation {
+                public: public.clone(),
+                torrent_path: torrent_identity.path,
+                torrent_len: torrent_identity.len,
+                mint: RecommendationMintState::Unminted,
+                expires_at,
+            },
+        );
+        Ok(public)
+    }
+
+    /// Explicit Review: revalidate identity/TTL then mint exactly one seed (or replay).
+    ///
+    /// Semantics:
+    /// - unminted → mint one seed, status=`minted`
+    /// - minted + unconsumed seed → same seed, status=`already_minted`
+    /// - consumed (or seed missing after mint) → `already_consumed`, no second seed
+    /// - expired/drifted → Err (terminal retryable)
+    pub fn review_and_mint(
+        &mut self,
+        recommendation_id: &str,
+        catalog: &[EligibleTemplateCatalogEntry],
+        seeds: &mut TemplateSeedRegistry,
+    ) -> Result<ReviewTemplateRecommendationResult, String> {
+        self.remove_expired();
+        let recommendation_id = recommendation_id.trim();
+        if recommendation_id.is_empty() {
+            return Err("recommendation_id is required".to_string());
+        }
+        let stored = self
+            .recommendations
+            .get(recommendation_id)
+            .cloned()
+            .ok_or_else(|| {
+                "template recommendation is missing, expired, or already discarded".to_string()
+            })?;
+
+        if let Err(reason) = validate_recommendation_against_current_state(&stored, catalog) {
+            self.drop_recommendation(recommendation_id);
+            return Err(reason);
+        }
+
+        match &stored.mint {
+            RecommendationMintState::Consumed => Ok(ReviewTemplateRecommendationResult {
+                status: ReviewTemplateRecommendationStatus::AlreadyConsumed,
+                seed: None,
+                recommendation_id: recommendation_id.to_string(),
+                message: Some("该推荐生成的种子已被模板发布消费，请重新自动选择模板。".to_string()),
+            }),
+            RecommendationMintState::Minted { seed_token } => {
+                // Replay same unexpired seed when still present; otherwise consumed.
+                if let Some(seed) = seeds.inspect_validated(seed_token, catalog) {
+                    Ok(ReviewTemplateRecommendationResult {
+                        status: ReviewTemplateRecommendationStatus::AlreadyMinted,
+                        seed: Some(seed),
+                        recommendation_id: recommendation_id.to_string(),
+                        message: Some("已返回先前生成的发布种子。".to_string()),
+                    })
+                } else {
+                    if let Some(entry) = self.recommendations.get_mut(recommendation_id) {
+                        entry.mint = RecommendationMintState::Consumed;
+                    }
+                    self.seed_to_recommendation.remove(seed_token);
+                    Ok(ReviewTemplateRecommendationResult {
+                        status: ReviewTemplateRecommendationStatus::AlreadyConsumed,
+                        seed: None,
+                        recommendation_id: recommendation_id.to_string(),
+                        message: Some(
+                            "该推荐生成的种子已被模板发布消费，请重新自动选择模板。".to_string(),
+                        ),
+                    })
+                }
+            }
+            RecommendationMintState::Unminted => {
+                let seed = seeds.prepare(
+                    stored.public.template_id.clone(),
+                    stored.public.template_revision,
+                    stored.public.template_digest.clone(),
+                    stored.public.torrent_name.clone(),
+                    stored.torrent_path.clone(),
+                )?;
+                if let Some(entry) = self.recommendations.get_mut(recommendation_id) {
+                    entry.mint = RecommendationMintState::Minted {
+                        seed_token: seed.token.clone(),
+                    };
+                }
+                self.seed_to_recommendation
+                    .insert(seed.token.clone(), recommendation_id.to_string());
+                Ok(ReviewTemplateRecommendationResult {
+                    status: ReviewTemplateRecommendationStatus::Minted,
+                    seed: Some(seed),
+                    recommendation_id: recommendation_id.to_string(),
+                    message: Some("已生成一次性发布种子。".to_string()),
+                })
+            }
+        }
+    }
+
+    /// Mark the recommendation that minted `seed_token` as consumed (after Quick Publish consume).
+    pub fn mark_seed_consumed(&mut self, seed_token: &str) {
+        let seed_token = seed_token.trim();
+        if seed_token.is_empty() {
+            return;
+        }
+        if let Some(recommendation_id) = self.seed_to_recommendation.remove(seed_token) {
+            if let Some(entry) = self.recommendations.get_mut(&recommendation_id) {
+                entry.mint = RecommendationMintState::Consumed;
+            }
+        }
+    }
+
+    fn drop_recommendation(&mut self, recommendation_id: &str) {
+        if let Some(stored) = self.recommendations.remove(recommendation_id) {
+            if let RecommendationMintState::Minted { seed_token } = stored.mint {
+                self.seed_to_recommendation.remove(&seed_token);
+            }
+        }
+    }
+
+    fn remove_expired(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<String> = self
+            .recommendations
+            .iter()
+            .filter(|(_, stored)| now >= stored.expires_at)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in expired {
+            self.drop_recommendation(&id);
+        }
+    }
+}
+
+fn truncate_sanitized_summary(summary: &str) -> String {
+    let trimmed = summary.trim();
+    if trimmed.chars().count() <= MAX_RECOMMENDATION_SUMMARY_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed
+        .chars()
+        .take(MAX_RECOMMENDATION_SUMMARY_CHARS.saturating_sub(1))
+        .collect();
+    out.push('…');
+    out
+}
+
+fn build_bounded_alternatives(
+    catalog: &[EligibleTemplateCatalogEntry],
+    selected_id: &str,
+) -> Vec<TemplateRecommendationAlternative> {
+    catalog
+        .iter()
+        .filter(|entry| entry.id != selected_id)
+        .take(MAX_RECOMMENDATION_ALTERNATIVES)
+        .map(|entry| TemplateRecommendationAlternative {
+            template_id: entry.id.clone(),
+            template_revision: entry.revision,
+            template_digest: entry.digest.clone(),
+            name: entry.name.clone(),
+            summary: truncate_sanitized_summary(&entry.summary),
+        })
+        .collect()
+}
+
+fn validate_recommendation_against_current_state(
+    stored: &StoredRecommendation,
+    catalog: &[EligibleTemplateCatalogEntry],
+) -> Result<(), String> {
+    find_catalog_match(
+        catalog,
+        &stored.public.template_id,
+        stored.public.template_revision,
+        &stored.public.template_digest,
+    )
+    .ok_or_else(|| {
+        "template recommendation catalog identity is stale or missing (id/revision/digest mismatch)"
+            .to_string()
+    })?;
+
+    let current_catalog_hash = catalog_snapshot_hash(catalog);
+    if current_catalog_hash != stored.public.catalog_hash {
+        return Err(
+            "template recommendation catalog snapshot drifted; please re-run selection".to_string(),
+        );
+    }
+
+    let current = read_torrent_identity(&stored.torrent_path).map_err(|_| {
+        "template recommendation torrent is missing or no longer a regular .torrent file"
+            .to_string()
+    })?;
+    if current.digest != stored.public.torrent_digest || current.len != stored.torrent_len {
+        return Err(
+            "template recommendation torrent identity changed (file was replaced)".to_string(),
+        );
+    }
+    Ok(())
 }
 
 #[cfg(test)]

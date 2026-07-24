@@ -11,7 +11,13 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Manager};
 
 const TEMPLATE_REGEX_MAX_CHARS: usize = 4096;
-const CONFIG_SCHEMA_VERSION: u32 = 2;
+/// Current on-disk config schema. Bump only with an explicit migration step.
+const CONFIG_SCHEMA_VERSION: u32 = 3;
+
+/// Public read of the compiled config schema version (desktop smoke / release probes).
+pub fn config_schema_version() -> u32 {
+    CONFIG_SCHEMA_VERSION
+}
 const TEMPLATE_REVISION_CONFLICT_PREFIX: &str = "TEMPLATE_REVISION_CONFLICT:";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -325,7 +331,9 @@ impl Default for ProxyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
-    #[serde(default = "default_config_schema_version")]
+    /// Missing on-disk field deserializes as 0 so upgrade migration always runs.
+    /// `AppConfig::default()` always sets the current `CONFIG_SCHEMA_VERSION`.
+    #[serde(default = "default_missing_config_schema_version")]
     pub schema_version: u32,
     pub last_used_template: Option<String>,
     #[serde(default)]
@@ -396,6 +404,12 @@ pub struct AIConfig {
     pub discovered_models: Vec<String>,
     #[serde(default)]
     pub models_fetched_at_unix: Option<u64>,
+    /// Non-secret marker: last successful secret write used session-only storage
+    /// (e.g. Linux keyring operational fallback). Never holds secret material.
+    /// Cold-start recovery clears `credential_ref` when this is true and the
+    /// process session no longer holds the secret; it never claims restore.
+    #[serde(default)]
+    pub credential_session_only: bool,
 }
 
 fn default_ai_provider() -> String {
@@ -413,7 +427,7 @@ fn default_ai_auth_mode() -> String {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            schema_version: default_config_schema_version(),
+            schema_version: CONFIG_SCHEMA_VERSION,
             last_used_template: None,
             last_used_quick_publish_template: None,
             proxy: ProxyConfig::default(),
@@ -426,8 +440,9 @@ impl Default for AppConfig {
     }
 }
 
-fn default_config_schema_version() -> u32 {
-    CONFIG_SCHEMA_VERSION
+/// Serde default for a missing `schema_version` field on disk (pre-versioned files).
+fn default_missing_config_schema_version() -> u32 {
+    0
 }
 
 fn revision_conflict_error(
@@ -662,6 +677,9 @@ fn config_write_lock() -> &'static Mutex<()> {
 
 /// Read config from disk without taking the process lock.
 /// Parse failures return Err so callers do not silently treat a corrupt file as empty.
+/// Future schema versions are refused without rewrite. Older schemas are migrated
+/// in memory; when an upgrade is needed the original file is backed up and the
+/// migrated config is written back so the bump is durable and idempotent.
 fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
     if !path.exists() {
         return Ok(AppConfig::default());
@@ -675,8 +693,49 @@ fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
 
     let mut config: AppConfig = serde_json::from_str(&data)
         .map_err(|error| format!("配置文件解析失败（已拒绝用默认配置覆盖）: {}", error))?;
+
+    if config.schema_version > CONFIG_SCHEMA_VERSION {
+        return Err(format!(
+            "配置文件 schema 版本过新 (v{})，当前应用仅支持 v{}。已拒绝覆盖写入。",
+            config.schema_version, CONFIG_SCHEMA_VERSION
+        ));
+    }
+
+    let from_version = config.schema_version;
+    let needs_upgrade = from_version < CONFIG_SCHEMA_VERSION;
     migrate_config(&mut config);
+
+    if needs_upgrade {
+        backup_config_before_upgrade(path, from_version)?;
+        write_config_file(path, &config)?;
+    }
+
     Ok(config)
+}
+
+/// Copy the pre-upgrade config beside the live file. Best-effort: failure aborts
+/// the upgrade so we never rewrite without a backup.
+fn backup_config_before_upgrade(path: &std::path::Path, from_version: u32) -> Result<(), String> {
+    let backup_name = format!(
+        "{}.v{}-backup.json",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("okpgui_config.json"),
+        from_version
+    );
+    let backup_path = path
+        .parent()
+        .map(|parent| parent.join(&backup_name))
+        .unwrap_or_else(|| PathBuf::from(&backup_name));
+    std::fs::copy(path, &backup_path).map_err(|error| {
+        format!(
+            "配置升级前备份失败（已拒绝写入新 schema）: {} -> {}: {}",
+            path.display(),
+            backup_path.display(),
+            error
+        )
+    })?;
+    Ok(())
 }
 
 fn load_config_unlocked(app: &AppHandle) -> Result<AppConfig, String> {
@@ -871,7 +930,14 @@ fn apply_upsert_quick_publish_template(
     config.quick_publish_templates.insert(template_id, template);
 }
 
+/// Migrate in-memory config to `CONFIG_SCHEMA_VERSION`.
+///
+/// Field migrations are idempotent. Explicit version steps document each bump even
+/// when no structural AI fields change (v2 → v3 is currently field-preserving).
 fn migrate_config(config: &mut AppConfig) {
+    let from_version = config.schema_version;
+
+    // Shared field normalizations (safe on every load, including already-current schema).
     migrate_quick_publish_templates(config);
     config.last_used_template =
         resolve_existing_key(&config.templates, config.last_used_template.take());
@@ -879,7 +945,27 @@ fn migrate_config(config: &mut AppConfig) {
         &config.quick_publish_templates,
         config.last_used_quick_publish_template.take(),
     );
+
+    // Explicit stepwise upgrades. Steps are no-ops when from_version already exceeds them.
+    if from_version < 2 {
+        // Pre-v2 → v2: quick-publish body migration is covered by migrate_quick_publish_templates.
+    }
+    if from_version < 3 {
+        // v2 → v3: field-preserving schema bump for BYOK AI Preflight V2 contract lock.
+        // AI fields (enabled/provider/endpoint/model/auth/capability/discovered_models/
+        // credential_ref/credential_session_only) round-trip unchanged; missing keys use defaults.
+        migrate_ai_config_v2_to_v3(&mut config.ai);
+    }
+
     config.schema_version = CONFIG_SCHEMA_VERSION;
+}
+
+/// Explicit v2→v3 AI config step. Currently preserves all AI fields and only ensures
+/// defaults for newly introduced non-secret markers (e.g. `credential_session_only`).
+fn migrate_ai_config_v2_to_v3(ai: &mut AIConfig) {
+    // credential_session_only defaults via serde; leave explicit false when absent.
+    // Never invent secrets or claim restore during migration.
+    let _ = ai.credential_session_only;
 }
 
 fn migrate_quick_publish_templates(config: &mut AppConfig) {
@@ -2307,5 +2393,218 @@ mod tests {
             .expect_err("expected unsafely creating over an existing id to be rejected");
 
         assert!(error.starts_with(TEMPLATE_REVISION_CONFLICT_PREFIX));
+    }
+
+    #[test]
+    fn test_migrate_v2_config_without_ai_fields_to_v3() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "proxy": { "proxy_type": "none", "proxy_host": "" },
+                "templates": {},
+                "quick_publish_templates": {},
+                "content_templates": {}
+            }"#,
+        )
+        .expect("v2 without ai should deserialize");
+
+        assert_eq!(config.schema_version, 2);
+        assert!(!config.ai.enabled);
+        assert!(!config.ai.credential_session_only);
+
+        migrate_config(&mut config);
+
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(CONFIG_SCHEMA_VERSION, 3);
+        assert!(!config.ai.enabled);
+        assert!(config.ai.credential_ref.is_none());
+        assert!(!config.ai.credential_session_only);
+        assert!(config.ai.capability.is_none());
+        assert!(config.ai.discovered_models.is_empty());
+    }
+
+    #[test]
+    fn test_migrate_v2_config_with_ai_fields_round_trips() {
+        let mut config: AppConfig = serde_json::from_str(
+            r#"{
+                "schema_version": 2,
+                "proxy": { "proxy_type": "none", "proxy_host": "" },
+                "ai": {
+                    "enabled": true,
+                    "provider": "anthropic",
+                    "model": "claude-3-5-sonnet",
+                    "endpoint": "https://api.anthropic.com",
+                    "mode": "anthropic_messages",
+                    "auth_mode": "anthropic_api_key",
+                    "custom_header_name": null,
+                    "credential_ref": {
+                        "provider": "anthropic",
+                        "key_ref": "cred-abc"
+                    },
+                    "capability": {
+                        "state": "ready",
+                        "identity_digest": "sha256:probe",
+                        "resolved_mode": "anthropic_messages",
+                        "message": "ok",
+                        "probed_at_unix": 42
+                    },
+                    "discovered_models": ["claude-3-5-sonnet", "claude-3-haiku"],
+                    "models_fetched_at_unix": 99
+                }
+            }"#,
+        )
+        .expect("v2 with AI fields should deserialize");
+
+        migrate_config(&mut config);
+
+        assert_eq!(config.schema_version, 3);
+        assert!(config.ai.enabled);
+        assert_eq!(config.ai.provider, "anthropic");
+        assert_eq!(config.ai.model, "claude-3-5-sonnet");
+        assert_eq!(config.ai.endpoint, "https://api.anthropic.com");
+        assert_eq!(config.ai.mode, "anthropic_messages");
+        assert_eq!(config.ai.auth_mode, "anthropic_api_key");
+        assert_eq!(
+            config
+                .ai
+                .credential_ref
+                .as_ref()
+                .and_then(|r| r.key_ref.as_deref()),
+            Some("cred-abc")
+        );
+        assert_eq!(
+            config
+                .ai
+                .capability
+                .as_ref()
+                .map(|c| c.identity_digest.as_str()),
+            Some("sha256:probe")
+        );
+        assert_eq!(
+            config.ai.discovered_models,
+            vec!["claude-3-5-sonnet", "claude-3-haiku"]
+        );
+        assert_eq!(config.ai.models_fetched_at_unix, Some(99));
+        // Non-secret marker defaults false; migration never invents secrets.
+        assert!(!config.ai.credential_session_only);
+
+        // Idempotent v3 round-trip: serialize → deserialize → migrate leaves AI intact.
+        let encoded = serde_json::to_string(&config).expect("serialize v3");
+        assert!(
+            !encoded.contains("sk-") && !encoded.to_ascii_lowercase().contains("api_key_value"),
+            "config must never serialize secret material"
+        );
+        let mut round_trip: AppConfig =
+            serde_json::from_str(&encoded).expect("deserialize v3 round-trip");
+        assert_eq!(round_trip.schema_version, 3);
+        migrate_config(&mut round_trip);
+        assert_eq!(round_trip.schema_version, 3);
+        assert_eq!(round_trip.ai.enabled, config.ai.enabled);
+        assert_eq!(round_trip.ai.provider, config.ai.provider);
+        assert_eq!(round_trip.ai.model, config.ai.model);
+        assert_eq!(round_trip.ai.endpoint, config.ai.endpoint);
+        assert_eq!(round_trip.ai.mode, config.ai.mode);
+        assert_eq!(round_trip.ai.auth_mode, config.ai.auth_mode);
+        assert_eq!(round_trip.ai.credential_ref, config.ai.credential_ref);
+        assert_eq!(round_trip.ai.capability, config.ai.capability);
+        assert_eq!(round_trip.ai.discovered_models, config.ai.discovered_models);
+        assert_eq!(
+            round_trip.ai.models_fetched_at_unix,
+            config.ai.models_fetched_at_unix
+        );
+        assert_eq!(
+            round_trip.ai.credential_session_only,
+            config.ai.credential_session_only
+        );
+    }
+
+    #[test]
+    fn test_future_schema_version_is_refused_without_rewrite() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui-config-future-schema-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_config.json");
+        let future = r#"{
+            "schema_version": 99,
+            "proxy": { "proxy_type": "none", "proxy_host": "" }
+        }"#;
+        std::fs::write(&path, future).expect("write future schema");
+
+        let err = read_config_file(&path).expect_err("future schema must refuse");
+        assert!(
+            err.contains("过新") || err.contains("99"),
+            "expected future-version message, got: {err}"
+        );
+
+        // File must not have been rewritten.
+        let on_disk = std::fs::read_to_string(&path).expect("reread");
+        assert!(on_disk.contains("\"schema_version\": 99"));
+        // No backup should be written for a refused future version.
+        let backups: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().contains("backup"))
+            .collect();
+        assert!(backups.is_empty(), "future schema must not create a backup");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v2_file_upgrade_writes_backup_and_v3() {
+        let dir =
+            std::env::temp_dir().join(format!("okpgui-config-v2-upgrade-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("okpgui_config.json");
+        let v2 = r#"{
+            "schema_version": 2,
+            "proxy": { "proxy_type": "none", "proxy_host": "" },
+            "ai": {
+                "enabled": true,
+                "provider": "openai",
+                "model": "gpt-4o",
+                "endpoint": "https://api.openai.com/v1",
+                "mode": "auto",
+                "auth_mode": "bearer",
+                "credential_ref": { "provider": "openai", "key_ref": "keep-me" },
+                "discovered_models": ["gpt-4o"]
+            }
+        }"#;
+        std::fs::write(&path, v2).expect("write v2");
+
+        let loaded = read_config_file(&path).expect("v2 upgrade");
+        assert_eq!(loaded.schema_version, 3);
+        assert!(loaded.ai.enabled);
+        assert_eq!(
+            loaded
+                .ai
+                .credential_ref
+                .as_ref()
+                .and_then(|r| r.key_ref.as_deref()),
+            Some("keep-me")
+        );
+        assert_eq!(loaded.ai.model, "gpt-4o");
+        assert_eq!(loaded.ai.discovered_models, vec!["gpt-4o"]);
+
+        let on_disk: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("reread"))
+                .expect("parse upgraded");
+        assert_eq!(on_disk.schema_version, 3);
+
+        let backup_path = dir.join("okpgui_config.json.v2-backup.json");
+        assert!(backup_path.exists(), "upgrade must write v2 backup");
+        let backup = std::fs::read_to_string(&backup_path).expect("read backup");
+        assert!(backup.contains("\"schema_version\": 2"));
+
+        // Idempotent second load: no error, schema stays 3, backup preserved.
+        let again = read_config_file(&path).expect("v3 round-trip load");
+        assert_eq!(again.schema_version, 3);
+        assert_eq!(again.ai.model, "gpt-4o");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

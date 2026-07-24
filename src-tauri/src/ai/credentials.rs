@@ -630,6 +630,45 @@ pub fn apply_public_credential_session_flag(
         };
 }
 
+/// Decision for cold-start recovery of a session-only credential generation.
+///
+/// When the persisted non-secret marker says the last secret write was session-only
+/// and the process session no longer holds that secret (typical after app restart),
+/// clear the stale config pointer and journal. Never invents or restores secrets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SessionOnlyColdStartAction {
+    /// No session-only marker or secret still present in this process — leave config alone.
+    LeaveUnchanged,
+    /// Clear `credential_ref`, session-only marker, capability, and journal; mark unconfigured.
+    ClearStalePointer,
+}
+
+/// Pure cold-start policy for session-only credentials.
+///
+/// - `persisted_session_only`: non-secret marker from `AIConfig.credential_session_only`
+/// - `active_ref_id`: live config credential pointer id (if any)
+/// - `secret_present_in_session`: whether the process session still holds that secret
+///
+/// Missing secret after a session-only generation always requires re-entry.
+pub fn decide_session_only_cold_start(
+    persisted_session_only: bool,
+    active_ref_id: Option<&str>,
+    secret_present_in_session: bool,
+) -> SessionOnlyColdStartAction {
+    if !persisted_session_only {
+        return SessionOnlyColdStartAction::LeaveUnchanged;
+    }
+    // Marker set but no pointer: still clear the stale marker so UI stays honest.
+    if active_ref_id.is_none() {
+        return SessionOnlyColdStartAction::ClearStalePointer;
+    }
+    if secret_present_in_session {
+        SessionOnlyColdStartAction::LeaveUnchanged
+    } else {
+        SessionOnlyColdStartAction::ClearStalePointer
+    }
+}
+
 /// Managed auth/transport names plus RFC hop-by-hop headers that must not be
 /// set via custom BYOK headers (case-insensitive).
 const DENIED_CUSTOM_HEADER_NAMES: &[&str] = &[
@@ -1808,6 +1847,50 @@ mod tests {
         store.set(id, "os-recovered", true);
         assert_eq!(store.overlay(id), LinuxLocalOverlay::None);
         assert_eq!(store.get(id).as_deref(), Some("os-recovered"));
+    }
+
+    #[test]
+    fn session_only_cold_start_clears_stale_pointer_when_secret_gone() {
+        assert_eq!(
+            decide_session_only_cold_start(false, Some("cred-1"), false),
+            SessionOnlyColdStartAction::LeaveUnchanged
+        );
+        assert_eq!(
+            decide_session_only_cold_start(true, Some("cred-1"), true),
+            SessionOnlyColdStartAction::LeaveUnchanged
+        );
+        assert_eq!(
+            decide_session_only_cold_start(true, Some("cred-1"), false),
+            SessionOnlyColdStartAction::ClearStalePointer
+        );
+        // Marker without pointer still clears so UI cannot claim a configured secret.
+        assert_eq!(
+            decide_session_only_cold_start(true, None, false),
+            SessionOnlyColdStartAction::ClearStalePointer
+        );
+        // Durable (non-session) missing secret is not session-only recovery territory.
+        assert_eq!(
+            decide_session_only_cold_start(false, Some("cred-1"), false),
+            SessionOnlyColdStartAction::LeaveUnchanged
+        );
+    }
+
+    #[test]
+    fn session_only_cold_start_never_implies_restore_or_plaintext() {
+        // Policy returns only clear-or-leave; there is no "restore" action.
+        let actions = [
+            decide_session_only_cold_start(true, Some("a"), false),
+            decide_session_only_cold_start(true, Some("a"), true),
+            decide_session_only_cold_start(false, Some("a"), false),
+            decide_session_only_cold_start(true, None, false),
+        ];
+        for action in actions {
+            assert!(matches!(
+                action,
+                SessionOnlyColdStartAction::LeaveUnchanged
+                    | SessionOnlyColdStartAction::ClearStalePointer
+            ));
+        }
     }
 
     #[test]

@@ -98,6 +98,64 @@ pub struct AiJob {
     pub created_at_unix: u64,
 }
 
+/// Sanitized active-job projection for the lightweight global status strip.
+/// Never includes secrets, paths, snapshot hashes, capability identity, or provider bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ActiveAiJobSummary {
+    /// Opaque job id only.
+    pub job_id: String,
+    pub kind: JobKind,
+    /// Sanitized stage label (never raw provider text).
+    pub stage: String,
+    /// Bounded progress 0–100.
+    pub progress: u8,
+    /// Whether the strip Cancel action is offered.
+    pub cancellable: bool,
+    /// Optional app navigation target (page id); never a filesystem path.
+    pub navigation_target: Option<String>,
+    pub started_at_unix: u64,
+}
+
+/// Build a sanitized strip summary for a non-terminal job.
+pub fn active_job_summary(job: &AiJob) -> Option<ActiveAiJobSummary> {
+    if job.state.is_terminal() {
+        return None;
+    }
+    Some(ActiveAiJobSummary {
+        job_id: job.id.clone(),
+        kind: job.kind,
+        stage: sanitized_stage_for_job(job),
+        progress: job.progress.min(100),
+        cancellable: true,
+        navigation_target: navigation_target_for_kind(job.kind),
+        started_at_unix: job.created_at_unix,
+    })
+}
+
+fn sanitized_stage_for_job(job: &AiJob) -> String {
+    match job.state {
+        AiJobState::Queued => "排队中".to_string(),
+        AiJobState::Running => match job.kind {
+            JobKind::CapabilityProbe => "能力探测".to_string(),
+            JobKind::Recognition => "识别中".to_string(),
+            JobKind::TemplateSelection => "自动选模板".to_string(),
+            JobKind::MediaInfo => "媒体信息".to_string(),
+            JobKind::Vision => "视觉处理".to_string(),
+            JobKind::Audit => "发布前检查".to_string(),
+        },
+        _ => "处理中".to_string(),
+    }
+}
+
+fn navigation_target_for_kind(kind: JobKind) -> Option<String> {
+    match kind {
+        JobKind::TemplateSelection => Some("auto_template".to_string()),
+        JobKind::CapabilityProbe => Some("ai_settings".to_string()),
+        // Audit / recognition / media / vision live on the current publish entry.
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DebugRecord {
     pub id: String,
@@ -264,6 +322,18 @@ impl AiJobManager {
 
     pub fn list(&self) -> Vec<AiJob> {
         self.jobs.values().cloned().collect()
+    }
+
+    /// Active (non-terminal) jobs as sanitized strip summaries, ordered by start time then id.
+    pub fn list_active_summaries(&self) -> Vec<ActiveAiJobSummary> {
+        let mut summaries: Vec<ActiveAiJobSummary> =
+            self.jobs.values().filter_map(active_job_summary).collect();
+        summaries.sort_by(|left, right| {
+            left.started_at_unix
+                .cmp(&right.started_at_unix)
+                .then_with(|| left.job_id.cmp(&right.job_id))
+        });
+        summaries
     }
 
     pub fn update_progress(&mut self, id: &str, progress: u8) -> Result<(), String> {

@@ -11,18 +11,20 @@ use crate::ai::credentials::{
     apply_credential_journal_recovery, apply_public_credential_session_flag,
     apply_public_identity_matches, capability_identity, capability_identity_matches,
     cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
-    credential_write_plan_needs_journal, load_credential_journal,
+    credential_write_plan_needs_journal, decide_session_only_cold_start, load_credential_journal,
     may_read_credential_store_for_settings, plan_credential_secret_write,
     reconcile_existing_credential_journal_before_new, rollback_candidate_or_retain_journal,
     rollback_credential_candidate, validate_custom_header_name, write_credential_journal, AuthMode,
     CredentialJournalPhase, CredentialJournalSettingsMetadata, CredentialMutationGate,
     CredentialRef, CredentialRotationJournal, OsCredentialStore, PublicCapabilityStatus,
-    PublicConnectionConfig, SecretStore, SecretValue, CREDENTIAL_JOURNAL_TTL_SECS,
+    PublicConnectionConfig, SecretStore, SecretValue, SessionOnlyColdStartAction,
+    CREDENTIAL_JOURNAL_TTL_SECS,
 };
 use crate::ai::jobs::{
     formal_audit_may_bind_terminal_evidence, media_info_may_bind_plan_evidence,
-    media_info_may_report_success, recognition_may_return_result, AiJob, AiJobManager, AiJobState,
-    DebugExportMetadata, DebugRecord, JobKind, DEBUG_EXPORT_RELATIVE_DIR, DEBUG_STORE_RELATIVE_DIR,
+    media_info_may_report_success, recognition_may_return_result, ActiveAiJobSummary, AiJob,
+    AiJobManager, AiJobState, DebugExportMetadata, DebugRecord, JobKind, DEBUG_EXPORT_RELATIVE_DIR,
+    DEBUG_STORE_RELATIVE_DIR,
 };
 use crate::ai::media::{
     build_plan_media_evidence, clamp_media_probe_timeout_ms, discover_media_files,
@@ -40,22 +42,22 @@ use crate::ai::provider::{
     VisionRequestImage,
 };
 use crate::ai::recognition::{
-    bind_recognition_result, build_recognition_prompt, recognition_from_provider_outcome,
-    recognition_schema, redact_recognition_output, sanitize_recognition_context, RecognitionResult,
-    RECOGNITION_SCHEMA_VERSION,
+    bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
+    recognition_from_provider_outcome, recognition_schema, redact_recognition_output,
+    RecognitionContextSnapshot, RecognitionResult, RECOGNITION_SCHEMA_VERSION,
 };
 use crate::ai::redaction::RedactionPolicy;
 use crate::ai::template_seed::{
     build_eligible_catalog, build_template_selection_prompt, catalog_snapshot_hash,
-    parse_template_selection, template_selection_schema, TemplateSeed, TemplateSeedRegistry,
+    parse_template_selection, template_selection_schema, ReviewTemplateRecommendationResult,
+    TemplateRecommendation, TemplateRecommendationRegistry, TemplateSeed, TemplateSeedRegistry,
 };
 use crate::ai::vision::{
-    content_digest, extract_final_image_urls, normalize_image, prepare_images_soft,
-    resolve_selected_vision_inputs, VisionImageInput, VisionImageResult, MAX_DOWNLOAD_BYTES,
-    MAX_IMAGES,
+    extract_final_image_urls, prepare_images_soft, resolve_selected_vision_inputs, MAX_IMAGES,
 };
 use crate::domain::publish_plan::{
-    get_or_create_registry, PlanAuditEvidence, PlanVisionEvidence, PlanVisionImage,
+    get_or_create_registry, plan_token_digest, CancelPreflightSessionResult, PlanAuditEvidence,
+    PlanRegistry, PlanVisionEvidence, PlanVisionImage, PreflightTokenState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -66,7 +68,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(test)]
 use std::time::Instant;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
 fn jobs() -> &'static Mutex<AiJobManager> {
@@ -103,6 +105,8 @@ type MediaInfoResultMap = HashMap<String, MediaInfoJobView>;
 type TemplateSelectionResultMap = HashMap<String, TemplateSelectionJobView>;
 /// Process-global recognition results keyed by job id.
 type RecognitionResultMap = HashMap<String, RecognitionJobView>;
+/// Process-global recognition context snapshots keyed by job id (backend-owned identity).
+type RecognitionSnapshotMap = HashMap<String, RecognitionContextSnapshot>;
 
 /// Cooperative cancel flags for in-flight MediaInfo child probes (job_id → flag).
 fn media_cancel_flags() -> &'static Mutex<JobCancelFlagMap> {
@@ -193,15 +197,20 @@ fn journal_settings_metadata(
     }
 }
 
-/// Startup hook: reconcile any in-flight credential rotation journal before normal AI use.
+/// Startup hook: reconcile any in-flight credential rotation journal before normal AI use,
+/// then clear stale session-only credential pointers that cannot survive process restart.
 ///
 /// Idempotent and fail closed. Never exposes secrets over IPC. Host-only gap: Linux
 /// session-only secrets do not survive process restart, so recovery can only clean
-/// durable OS keyring entries + the journal file after a cold start on that path.
+/// durable OS keyring entries + the journal file after a cold start on that path, and
+/// must clear the non-secret config pointer (never claim restore, never write plaintext).
 pub fn init_ai_credential_journal_recovery(app: AppHandle) {
     if let Err(error) = recover_ai_credential_journal(&app) {
         // Best-effort startup reconciliation; do not abort app launch.
         eprintln!("ai credential journal recovery: {error}");
+    }
+    if let Err(error) = recover_session_only_credentials_on_cold_start(&app) {
+        eprintln!("ai session-only credential recovery: {error}");
     }
 }
 
@@ -227,9 +236,56 @@ fn recover_ai_credential_journal(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Cold-start: if the last credential generation was session-only and the secret is
+/// gone from process memory, clear the stale non-secret pointer/journal and mark
+/// the connection unconfigured. Never restores secrets and never writes plaintext.
+fn recover_session_only_credentials_on_cold_start(app: &AppHandle) -> Result<(), String> {
+    let _mutation_guard = credential_mutation_gate().lock()?;
+    let config = crate::config::load_config(app);
+    let active_ref = config
+        .ai
+        .credential_ref
+        .as_ref()
+        .and_then(|reference| reference.key_ref.clone());
+    let secret_present = match active_ref.as_deref() {
+        Some(id) => credential_store()
+            .get(&CredentialRef { id: id.to_string() })?
+            .is_some(),
+        None => false,
+    };
+    let action = decide_session_only_cold_start(
+        config.ai.credential_session_only,
+        active_ref.as_deref(),
+        secret_present,
+    );
+    if action != SessionOnlyColdStartAction::ClearStalePointer {
+        return Ok(());
+    }
+
+    // Clear journal first (non-secret), then reconcile config pointer.
+    if let Ok(path) = ai_credential_journal_path(app) {
+        let _ = clear_credential_journal(&path);
+    }
+
+    let mut ai = config.ai;
+    // Drop the non-secret pointer; require re-entry. Never invent a secret.
+    ai.credential_ref = None;
+    ai.credential_session_only = false;
+    // Capability identity depended on the lost secret — invalidate without claiming restore.
+    ai.capability = None;
+    crate::config::save_ai_config(app.clone(), ai)?;
+    Ok(())
+}
+
 fn template_seeds() -> &'static Mutex<TemplateSeedRegistry> {
     static SEEDS: OnceLock<Mutex<TemplateSeedRegistry>> = OnceLock::new();
     SEEDS.get_or_init(|| Mutex::new(TemplateSeedRegistry::default()))
+}
+
+/// Backend-owned validated recommendations (seed mint only on explicit Review).
+fn template_recommendations() -> &'static Mutex<TemplateRecommendationRegistry> {
+    static RECS: OnceLock<Mutex<TemplateRecommendationRegistry>> = OnceLock::new();
+    RECS.get_or_init(|| Mutex::new(TemplateRecommendationRegistry::default()))
 }
 
 /// Cooperative cancel flags for in-flight TemplateSelection provider work (job_id → flag).
@@ -247,11 +303,11 @@ fn template_job_results() -> &'static Mutex<TemplateSelectionResultMap> {
 /// Bound process-global TemplateSelection result/cancel maps (active jobs are never pruned).
 const TEMPLATE_STATE_MAX_RECORDS: usize = 200;
 
-/// Whether a TemplateSelection job may mint or return a usable seed.
+/// Whether a TemplateSelection job may surface a validated recommendation (not a seed).
 ///
 /// Only `Succeeded` qualifies. `Cancelled` / `Stale` / `Failed` (and non-terminal states)
-/// must never mint a seed, return a handoff token, or resurrect after late completion.
-fn template_selection_may_return_seed(state: AiJobState) -> bool {
+/// must never return a recommendation, mint a handoff seed, or resurrect after late completion.
+fn template_selection_may_return_recommendation(state: AiJobState) -> bool {
     matches!(state, AiJobState::Succeeded)
 }
 
@@ -267,7 +323,19 @@ fn recognition_job_results() -> &'static Mutex<RecognitionResultMap> {
     RESULTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// Bound process-global Recognition result/cancel maps (active jobs are never pruned).
+/// Backend-owned recognition context snapshots keyed by job id.
+fn recognition_snapshots() -> &'static Mutex<RecognitionSnapshotMap> {
+    static SNAPSHOTS: OnceLock<Mutex<RecognitionSnapshotMap>> = OnceLock::new();
+    SNAPSHOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Monotonic backend generation for recognition jobs (never client-supplied).
+fn next_recognition_generation() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Bound process-global Recognition result/cancel/snapshot maps (active jobs are never pruned).
 const RECOGNITION_STATE_MAX_RECORDS: usize = 200;
 
 #[tauri::command]
@@ -518,6 +586,26 @@ pub fn ai_save_settings(
         }
     }
 
+    // Non-secret session-only marker for cold-start recovery (never secret material).
+    // Evaluated after candidate write so Linux fallback is reflected accurately.
+    // Never trust the webview-supplied connection.credential_session_only flag.
+    let persisted_session_only = match next_ref.as_ref() {
+        Some(id) if connection.auth_mode != AuthMode::None => {
+            let reference = CredentialRef { id: id.clone() };
+            if credential_store().credential_is_session_only(&reference) {
+                true
+            } else if matches!(credential_store().get(&reference), Ok(Some(_))) {
+                // Durable OS secret present.
+                false
+            } else {
+                // Secret not readable: preserve prior marker so cold-start can still
+                // clear a dead session-only generation; durable missing stays false.
+                current.ai.credential_session_only
+            }
+        }
+        _ => false,
+    };
+
     let mut ai = crate::config::AIConfig {
         enabled: connection.enabled,
         provider: match connection.provider {
@@ -554,6 +642,7 @@ pub fn ai_save_settings(
         capability: current.ai.capability.clone(),
         discovered_models: current.ai.discovered_models.clone(),
         models_fetched_at_unix: current.ai.models_fetched_at_unix,
+        credential_session_only: persisted_session_only,
     };
 
     // Secret rotation or identity-field edits immediately invalidate Ready capability.
@@ -1512,39 +1601,6 @@ fn redact_media_message(message: &str) -> String {
     output.trim().to_string()
 }
 
-#[tauri::command]
-pub fn ai_extract_vision_images(
-    poster: String,
-    markdown: String,
-    html: String,
-) -> Vec<VisionImageInput> {
-    extract_final_image_urls(&poster, &markdown, &html)
-}
-
-#[tauri::command]
-pub fn ai_normalize_vision_image(
-    content_type: String,
-    bytes: Vec<u8>,
-) -> Result<VisionImageResult, String> {
-    // Mirror fetch streaming ceiling so local/command paths cannot force giant decodes.
-    if bytes.len() > MAX_DOWNLOAD_BYTES {
-        return Err("image too large: download exceeds streaming ceiling".to_string());
-    }
-    let (normalized, width, height) =
-        normalize_image(&content_type, &bytes).map_err(|error| error.to_string())?;
-    Ok(VisionImageResult {
-        url: String::new(),
-        source: "local".to_string(),
-        content_hash: content_digest(&normalized),
-        mime_type: "image/jpeg".to_string(),
-        normalized_bytes: normalized.len(),
-        width,
-        height,
-        // Payload is never returned over IPC (serde skip); hash/size only.
-        payload: Vec::new(),
-    })
-}
-
 /// Public Vision candidate (URL + source only). Never includes bytes or hashes as authority.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanVisionCandidate {
@@ -1575,11 +1631,11 @@ pub struct PlanVisionCandidatesResponse {
     pub max_images: usize,
 }
 
-/// Bind request: plan token + optional explicit selection (subset of candidates).
+/// Bind request: plan token + explicit selection (subset of candidates).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanVisionBindRequest {
     pub plan_token: String,
-    /// Empty means "all candidates" only when `candidates.len() <= 5`.
+    /// Required when candidates exist. Empty never means "bind all under the cap".
     #[serde(default)]
     pub selected_urls: Vec<String>,
 }
@@ -1813,7 +1869,8 @@ pub struct AiSelectTemplateRequest {
     pub torrent_path: String,
 }
 
-/// Public TemplateSelection job view: progress + redacted errors; seed only on Succeeded.
+/// Public TemplateSelection job view: progress + redacted errors.
+/// Recommendation only on Succeeded — never a pre-minted handoff seed.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateSelectionJobView {
     pub job_id: String,
@@ -1824,7 +1881,12 @@ pub struct TemplateSelectionJobView {
     pub error_code: Option<String>,
     /// Redacted human-readable status/error (never secrets, raw paths, or provider bodies).
     pub message: Option<String>,
-    /// Present only when `state == Succeeded` and seed mint was allowed.
+    /// Backend-owned validated recommendation when `state == Succeeded`.
+    /// Explicit Review mints the one-shot handoff seed separately.
+    #[serde(default)]
+    pub recommendation: Option<TemplateRecommendation>,
+    /// Deprecated: always `None` after recommendation handoff. Kept for wire compatibility.
+    #[serde(default)]
     pub seed: Option<TemplateSeed>,
 }
 
@@ -1958,6 +2020,7 @@ pub async fn ai_start_template_selection(
         progress: 0,
         error_code: None,
         message: Some("template selection queued".to_string()),
+        recommendation: None,
         seed: None,
     };
     {
@@ -2036,20 +2099,16 @@ fn template_selection_terminal_view(job: &AiJob) -> TemplateSelectionJobView {
         progress: 100,
         error_code: job.error_code.clone(),
         message: None,
+        recommendation: None,
         seed: None,
     });
     view.state = job.state;
     view.progress = 100;
     view.error_code = job.error_code.clone();
-    // Fail closed: only Succeeded may surface a seed token.
-    if !template_selection_may_return_seed(job.state) {
-        if let Some(seed) = view.seed.take() {
-            // Drop any race-minted seed so it cannot be consumed later.
-            let _ = template_seeds()
-                .lock()
-                .unwrap_or_else(|error| error.into_inner())
-                .consume(&seed.token);
-        }
+    // Fail closed: only Succeeded may surface a recommendation; never auto-mint seeds.
+    view.seed = None;
+    if !template_selection_may_return_recommendation(job.state) {
+        view.recommendation = None;
         if job.state == AiJobState::Cancelled {
             view.error_code = job
                 .error_code
@@ -2149,7 +2208,7 @@ fn finish_template_selection_failure(
             debug_record_id: None,
             created_at_unix: now_unix(),
         });
-    // If cancel/stale won the race, honor that terminal state without a seed.
+    // If cancel/stale won the race, honor that terminal state without a recommendation.
     store_template_selection_view(TemplateSelectionJobView {
         job_id: job_id.to_string(),
         state: job.state,
@@ -2158,12 +2217,13 @@ fn finish_template_selection_failure(
         progress: 100,
         error_code: job.error_code.clone().or(error_code),
         message: Some(message),
+        recommendation: None,
         seed: None,
     })
 }
 
-/// Mint a seed only when the job is still non-terminal; complete as Succeeded only then.
-/// Late cancel between mint and complete drops the seed (fail closed).
+/// Store a validated recommendation when the job is still non-terminal; complete as Succeeded.
+/// Does **not** mint a handoff seed — explicit Review does that. Late cancel drops the rec.
 #[allow(clippy::too_many_arguments)]
 fn finish_template_selection_success(
     job_id: &str,
@@ -2172,6 +2232,9 @@ fn finish_template_selection_success(
     selected_id: &str,
     selected_revision: u64,
     selected_digest: &str,
+    selected_name: &str,
+    selected_summary: &str,
+    catalog: &[crate::ai::template_seed::EligibleTemplateCatalogEntry],
     torrent_name: String,
     torrent_path: String,
     cancel_flag: &AtomicBool,
@@ -2181,53 +2244,60 @@ fn finish_template_selection_success(
             job_id,
             request_generation,
             snapshot_hash,
-            "template selection cancelled before seed mint",
+            "template selection cancelled before recommendation store",
         );
     }
 
-    let seed = match template_seeds()
+    let selected_entry = crate::ai::template_seed::EligibleTemplateCatalogEntry {
+        id: selected_id.to_string(),
+        name: selected_name.to_string(),
+        revision: selected_revision,
+        digest: selected_digest.to_string(),
+        summary: selected_summary.to_string(),
+    };
+    let summary_text = format!(
+        "推荐模板「{}」(revision {})",
+        selected_name, selected_revision
+    );
+    let recommendation = match template_recommendations()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .prepare(
-            selected_id.to_string(),
-            selected_revision,
-            selected_digest.to_string(),
+        .store(
+            &selected_entry,
+            catalog,
+            snapshot_hash.to_string(),
             torrent_name,
             torrent_path,
+            summary_text.clone(),
         ) {
-        Ok(seed) => seed,
+        Ok(rec) => rec,
         Err(error) => {
             return finish_template_selection_failure(
                 job_id,
                 request_generation,
                 snapshot_hash,
-                Some("SEED_PREPARE".to_string()),
+                Some("RECOMMENDATION_STORE".to_string()),
                 error,
             );
         }
     };
 
-    let summary =
-        format!("template selection matched id={selected_id} revision={selected_revision}");
-    let job = complete_job_backend(job_id, true, None, summary).unwrap_or_else(|_| AiJob {
-        id: job_id.to_string(),
-        kind: JobKind::TemplateSelection,
-        state: AiJobState::Succeeded,
-        request_generation,
-        snapshot_hash: snapshot_hash.to_string(),
-        provider_identity: None,
-        progress: 100,
-        error_code: None,
-        debug_record_id: None,
-        created_at_unix: now_unix(),
-    });
+    let job =
+        complete_job_backend(job_id, true, None, summary_text.clone()).unwrap_or_else(|_| AiJob {
+            id: job_id.to_string(),
+            kind: JobKind::TemplateSelection,
+            state: AiJobState::Succeeded,
+            request_generation,
+            snapshot_hash: snapshot_hash.to_string(),
+            provider_identity: None,
+            progress: 100,
+            error_code: None,
+            debug_record_id: None,
+            created_at_unix: now_unix(),
+        });
 
-    if !template_selection_may_return_seed(job.state) {
-        // Cancel/stale won the race after mint: drop the seed so it is unusable.
-        let _ = template_seeds()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .consume(&seed.token);
+    if !template_selection_may_return_recommendation(job.state) {
+        // Cancel/stale won the race after store: do not surface the recommendation.
         return store_template_selection_view(TemplateSelectionJobView {
             job_id: job_id.to_string(),
             state: job.state,
@@ -2238,7 +2308,8 @@ fn finish_template_selection_success(
                 .error_code
                 .clone()
                 .or_else(|| Some("CANCELLED".to_string())),
-            message: Some("template selection cancelled; seed discarded".to_string()),
+            message: Some("template selection cancelled; recommendation discarded".to_string()),
+            recommendation: None,
             seed: None,
         });
     }
@@ -2253,7 +2324,8 @@ fn finish_template_selection_success(
         message: Some(format!(
             "selected template {selected_id} revision {selected_revision}"
         )),
-        seed: Some(seed),
+        recommendation: Some(recommendation),
+        seed: None,
     })
 }
 
@@ -2291,6 +2363,7 @@ fn finish_template_selection_cancelled(
             .clone()
             .or_else(|| Some("CANCELLED".to_string())),
         message: Some(message),
+        recommendation: None,
         seed: None,
     })
 }
@@ -2540,7 +2613,7 @@ async fn run_template_selection_worker(
         }
     };
 
-    update_template_job_progress(&job_id, 90, "minting template seed");
+    update_template_job_progress(&job_id, 90, "storing template recommendation");
 
     finish_template_selection_success(
         &job_id,
@@ -2549,14 +2622,20 @@ async fn run_template_selection_worker(
         &selected.id,
         selected.revision,
         &selected.digest,
+        &selected.name,
+        &selected.summary,
+        &catalog,
         torrent_name,
         torrent_path,
         &cancel_flag,
     );
 }
 
-/// One-shot / start release recognition request: safe torrent name + template pattern context only.
-/// Never accepts absolute torrent paths, publish-plan tokens, or model-owned final titles.
+/// One-shot / start release recognition request: safe torrent name + template pattern content only.
+///
+/// Never accepts absolute torrent paths, publish-plan tokens, model-owned final titles, or
+/// client identity (`snapshot_hash` / `request_generation`). Context hash and generation are
+/// allocated by Rust when the job is created.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiRecognizeRequest {
     /// Display torrent name only (never a filesystem path).
@@ -2570,21 +2649,20 @@ pub struct AiRecognizeRequest {
     /// Optional title pattern context (deterministic final title still uses this locally).
     #[serde(default)]
     pub title_pattern: String,
-    /// Client request generation for stale-result binding.
-    pub request_generation: u64,
-    /// Snapshot hash for identity binding (caller-supplied; not a publish plan authority).
-    pub snapshot_hash: String,
 }
 
 /// Public Recognition job view: progress + redacted errors; result only on Succeeded.
 ///
 /// Validated redacted `RecognitionResult` is stored by job id and surfaced only when
 /// `state == Succeeded`. Cancelled / Stale / Failed / late completion never return a result.
+/// `request_generation` and `snapshot_hash` are backend-owned context identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RecognitionJobView {
     pub job_id: String,
     pub state: AiJobState,
+    /// Backend-allocated monotonic recognition generation.
     pub request_generation: u64,
+    /// Backend-computed cryptographic context hash of the stored recognition snapshot.
     pub snapshot_hash: String,
     pub progress: u8,
     pub error_code: Option<String>,
@@ -2596,19 +2674,15 @@ pub struct RecognitionJobView {
 
 /// Start a backend-owned Recognition job (queued/running immediately with job id).
 ///
-/// Provider work runs in the background. The client polls via `ai_poll_recognition`
-/// and cancels via `ai_cancel_job`. Reuses recognition schema/prompt/strict validation
-/// and redaction utilities. Disabled/unconfigured AI is rejected with zero provider work.
+/// Rust sanitizes content, builds a versioned context snapshot, computes the context hash,
+/// and allocates a monotonic generation before any provider work. The client polls via
+/// `ai_poll_recognition` and cancels via `ai_cancel_job`. Disabled/unconfigured AI is
+/// rejected with zero provider work.
 #[tauri::command]
 pub async fn ai_start_recognition(
     app: AppHandle,
     request: AiRecognizeRequest,
 ) -> Result<RecognitionJobView, String> {
-    let snapshot_hash = request.snapshot_hash.trim().to_string();
-    if snapshot_hash.is_empty() {
-        return Err("recognition requires a non-empty snapshot_hash".to_string());
-    }
-
     let connection = ai_get_settings(app.clone());
     if !connection.enabled {
         return Err("请先在 AI 设置中启用并完成连接和模型配置。".to_string());
@@ -2640,21 +2714,22 @@ pub async fn ai_start_recognition(
     }
     let policy = RedactionPolicy::new(redaction_secrets);
 
-    let (safe_torrent_name, safe_ep, safe_res, safe_title) = sanitize_recognition_context(
+    // Backend-owned identity: sanitize → snapshot → hash → monotonic generation.
+    let (snapshot, context_hash) = build_recognition_context_snapshot(
         &request.torrent_name,
         &request.ep_pattern,
         &request.resolution_pattern,
         &request.title_pattern,
         &policy,
     )?;
-    let safe_snapshot_hash = policy.redact_text(&snapshot_hash);
+    let request_generation = next_recognition_generation();
 
     let job_id = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
         manager.start(
             JobKind::Recognition,
-            request.request_generation,
-            safe_snapshot_hash.clone(),
+            request_generation,
+            context_hash.clone(),
             Some(identity),
         )
     };
@@ -2665,7 +2740,14 @@ pub async fn ai_start_recognition(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         flags.insert(job_id.clone(), Arc::clone(&cancel_flag));
-        retain_recognition_global_state(Some(&mut flags), None);
+        retain_recognition_global_state(Some(&mut flags), None, None);
+    }
+    {
+        let mut store = recognition_snapshots()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        store.insert(job_id.clone(), snapshot.clone());
+        retain_recognition_global_state(None, None, Some(&mut store));
     }
 
     let manager_state = {
@@ -2678,8 +2760,8 @@ pub async fn ai_start_recognition(
     let initial = RecognitionJobView {
         job_id: job_id.clone(),
         state: manager_state,
-        request_generation: request.request_generation,
-        snapshot_hash: safe_snapshot_hash.clone(),
+        request_generation,
+        snapshot_hash: context_hash.clone(),
         progress: 0,
         error_code: None,
         message: Some("recognition queued".to_string()),
@@ -2690,24 +2772,24 @@ pub async fn ai_start_recognition(
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         store.insert(job_id.clone(), initial.clone());
-        retain_recognition_global_state(None, Some(&mut store));
+        retain_recognition_global_state(None, Some(&mut store), None);
     }
 
     let bg_job_id = job_id.clone();
     let bg_connection = connection;
-    let bg_generation = request.request_generation;
-    let bg_snapshot = safe_snapshot_hash;
-    let bg_torrent = safe_torrent_name;
-    let bg_ep = safe_ep;
-    let bg_res = safe_res;
-    let bg_title = safe_title;
+    let bg_generation = request_generation;
+    let bg_snapshot_hash = context_hash;
+    let bg_torrent = snapshot.torrent_name.clone();
+    let bg_ep = snapshot.ep_pattern.clone();
+    let bg_res = snapshot.resolution_pattern.clone();
+    let bg_title = snapshot.title_pattern.clone();
     tauri::async_runtime::spawn(async move {
         run_recognition_worker(
             bg_connection,
             secret,
             bg_job_id,
             bg_generation,
-            bg_snapshot,
+            bg_snapshot_hash,
             bg_torrent,
             bg_ep,
             bg_res,
@@ -2789,7 +2871,7 @@ fn recognition_terminal_view(job: &AiJob) -> RecognitionJobView {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         store.insert(job.id.clone(), view.clone());
-        retain_recognition_global_state(None, Some(&mut store));
+        retain_recognition_global_state(None, Some(&mut store), None);
     }
     view
 }
@@ -2841,7 +2923,7 @@ fn store_recognition_view(view: RecognitionJobView) -> RecognitionJobView {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         store.insert(view.job_id.clone(), view.clone());
-        retain_recognition_global_state(None, Some(&mut store));
+        retain_recognition_global_state(None, Some(&mut store), None);
     }
     view
 }
@@ -2988,6 +3070,7 @@ fn finish_recognition_cancelled(
 fn retain_recognition_global_state(
     flags: Option<&mut JobCancelFlagMap>,
     results: Option<&mut RecognitionResultMap>,
+    snapshots: Option<&mut RecognitionSnapshotMap>,
 ) {
     let active_ids: std::collections::HashSet<String> = {
         let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -3015,6 +3098,26 @@ fn retain_recognition_global_state(
                 terminal_ids.sort();
                 for id in terminal_ids.into_iter().take(surplus) {
                     results.remove(&id);
+                }
+            }
+        }
+    }
+    if let Some(snapshots) = snapshots {
+        if snapshots.len() > RECOGNITION_STATE_MAX_RECORDS {
+            snapshots.retain(|id, _| active_ids.contains(id));
+            // If still over cap, drop arbitrary surplus of non-active (terminal) entries.
+            if snapshots.len() > RECOGNITION_STATE_MAX_RECORDS {
+                let surplus = snapshots
+                    .len()
+                    .saturating_sub(RECOGNITION_STATE_MAX_RECORDS);
+                let mut drop_ids = snapshots
+                    .keys()
+                    .filter(|id| !active_ids.contains(*id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                drop_ids.sort();
+                for id in drop_ids.into_iter().take(surplus) {
+                    snapshots.remove(&id);
                 }
             }
         }
@@ -3308,6 +3411,11 @@ pub fn ai_consume_template_seed(
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .consume_validated(&token, &catalog)?;
+    // Mark the parent recommendation as consumed so repeated Review cannot remint.
+    template_recommendations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .mark_seed_consumed(&public.token);
     Ok(ConsumedTemplateSeed {
         template_id: public.template_id,
         template_revision: public.template_revision,
@@ -3315,6 +3423,27 @@ pub fn ai_consume_template_seed(
         torrent_name: public.torrent_name,
         torrent_path: binding.torrent_path,
     })
+}
+
+/// Explicit Review: revalidate a stored recommendation and mint exactly one handoff seed.
+///
+/// Repeated Review:
+/// - minted but unconsumed → same seed (`already_minted`)
+/// - consumed by Quick Publish → `already_consumed` (no second live seed)
+/// - expired / catalog or torrent drift → terminal error
+#[tauri::command]
+pub fn ai_review_template_recommendation(
+    app: AppHandle,
+    recommendation_id: String,
+) -> Result<ReviewTemplateRecommendationResult, String> {
+    let catalog = load_eligible_catalog(&app);
+    let mut seeds = template_seeds()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut recommendations = template_recommendations()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    recommendations.review_and_mint(&recommendation_id, &catalog, &mut seeds)
 }
 
 #[tauri::command]
@@ -3540,6 +3669,10 @@ fn bind_audit_to_plan(result: &AiFormalAuditResult) -> Result<(), String> {
             request_generation: result.request_generation,
         },
     )?;
+    // Index live plan → audit job so token-only cancel and strip cancel can resolve.
+    if let Some(job_id) = result.job_id.as_deref() {
+        guard.note_plan_audit_job(&result.plan_token, job_id);
+    }
     Ok(())
 }
 
@@ -4427,6 +4560,351 @@ pub(crate) fn mark_job_stale_backend(id: &str, reason: impl Into<String>) -> Res
     Ok(job)
 }
 
+/// Sanitized cross-surface lifecycle event after preflight cancel/reconcile.
+/// Never includes frozen request, paths, secrets, or provider bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreflightSessionChangedPayload {
+    /// Opaque plan token when still known to the caller path (optional if unsafe).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan_token: Option<String>,
+    /// SHA-256 digest of the opaque plan token (always present; never the raw secret material).
+    pub token_digest: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub job_id: Option<String>,
+    /// Authoritative UI lifecycle after reconciliation (`cancelled` / `unavailable` / …).
+    pub lifecycle: String,
+    /// `invalidated` | `already_missing`
+    pub token_state: PreflightTokenState,
+    pub reconciled: bool,
+}
+
+fn ai_job_state_label(state: AiJobState) -> String {
+    match state {
+        AiJobState::Queued => "queued".to_string(),
+        AiJobState::Running => "running".to_string(),
+        AiJobState::Succeeded => "succeeded".to_string(),
+        AiJobState::Failed => "failed".to_string(),
+        AiJobState::Cancelled => "cancelled".to_string(),
+        AiJobState::Stale => "stale".to_string(),
+    }
+}
+
+fn emit_preflight_session_changed(
+    app: &AppHandle,
+    plan_token: &str,
+    job_id: Option<String>,
+    result: &CancelPreflightSessionResult,
+    lifecycle: &str,
+) {
+    let payload = PreflightSessionChangedPayload {
+        plan_token: Some(plan_token.to_string()),
+        token_digest: plan_token_digest(plan_token),
+        job_id,
+        lifecycle: lifecycle.to_string(),
+        token_state: result.token_state,
+        reconciled: result.reconciled,
+    };
+    let _ = app.emit("preflight-session-changed", payload);
+}
+
+/// Atomic preflight cancellation/reconciliation (core logic; unit-testable without emit).
+///
+/// Accepts the plan token and optional job id. When job id is omitted, resolves the
+/// related audit job from plan-bound evidence or the plan→job index. When supplied,
+/// validates the relationship and rejects mismatches without acting on unrelated jobs.
+///
+/// On success: terminally cancels a non-terminal job, invalidates the plan token,
+/// writes a bounded cancellation tombstone keyed by token digest, and returns
+/// `{ job_state, token_state, reconciled }`. Repeated calls replay the tombstone.
+pub fn cancel_preflight_session_core(
+    plan_token: &str,
+    job_id: Option<&str>,
+) -> Result<(CancelPreflightSessionResult, Option<String>), String> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required".to_string());
+    }
+    let supplied_job = job_id.map(str::trim).filter(|id| !id.is_empty());
+
+    // 1) Tombstone hit → idempotent replay (still reject mismatched job ids).
+    {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if let Some(tombstone) = registry.get_cancellation_tombstone(plan_token).cloned() {
+            if let (Some(supplied), Some(recorded)) = (supplied_job, tombstone.job_id.as_deref()) {
+                if supplied != recorded {
+                    return Err(
+                        "job id does not match the preflight session cancellation record"
+                            .to_string(),
+                    );
+                }
+            }
+            let result = PlanRegistry::cancel_result_from_tombstone(&tombstone);
+            return Ok((result, tombstone.job_id));
+        }
+    }
+
+    // 2) Resolve related audit job from live plan evidence / plan→job index.
+    let resolved_job_id = {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.resolve_related_audit_job_id(plan_token)
+    };
+
+    // Validate supplied job id against the session relationship before any mutation.
+    let target_job_id: Option<String> = match (supplied_job, resolved_job_id.as_deref()) {
+        (Some(supplied), Some(resolved)) if supplied == resolved => Some(supplied.to_string()),
+        (Some(_), Some(_)) => {
+            return Err("job id does not match the prepared plan audit session".to_string());
+        }
+        (Some(_), None) => {
+            // Never cancel an unproven job id (plan missing or session has no audit job).
+            return Err(
+                "job id cannot be validated against the prepared plan audit session".to_string(),
+            );
+        }
+        (None, Some(resolved)) => Some(resolved.to_string()),
+        (None, None) => None,
+    };
+
+    // 3) Cancel / read terminal state of related job (never act when target is None).
+    let mut final_job_state: Option<String> = None;
+    let mut final_job_id: Option<String> = None;
+    if let Some(ref id) = target_job_id {
+        final_job_id = Some(id.clone());
+        // Cooperative signals before flipping job state (same as ai_cancel_job).
+        signal_media_cancel(id);
+        signal_template_cancel(id);
+        signal_recognition_cancel(id);
+        {
+            let mut pending = media_pending_work()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.remove(id);
+        }
+        match jobs()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .cancel(id)
+        {
+            Ok(job) => {
+                final_job_state = Some(ai_job_state_label(job.state));
+            }
+            Err(_) => {
+                // Job already absent: treat as no live work for this session.
+                final_job_state = None;
+                // Keep job_id for tombstone correlation when client/plan knew it.
+            }
+        }
+    }
+
+    // 4) Invalidate plan token and write tombstone.
+    let token_state = {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let removed = registry.invalidate_plan(plan_token);
+        if removed {
+            PreflightTokenState::Invalidated
+        } else {
+            PreflightTokenState::AlreadyMissing
+        }
+    };
+
+    let result = {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.record_preflight_cancellation(
+            plan_token,
+            final_job_id.clone(),
+            final_job_state,
+            token_state,
+            true,
+        )
+    };
+
+    Ok((result, final_job_id))
+}
+
+/// Result of publish-time pending-audit suppression.
+/// Keeps the frozen plan token live so PENDING + pending-ack can still publish.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CancelPendingAuditForPublishResult {
+    /// Final related job state (snake_case), or null when no job was bound.
+    pub job_state: Option<String>,
+    /// True when the prepared plan token remains inspectable after cancel.
+    pub plan_token_live: bool,
+    /// Authoritative audit decision still bound on the plan (typically PENDING).
+    pub decision: String,
+}
+
+/// Publish-time pending-audit cancel: cooperatively cancel the formal-audit job so late
+/// completion cannot bind terminal evidence, **without** invalidating the frozen plan token.
+///
+/// Distinct from [`ai_cancel_preflight_session`] / plan-bound [`ai_cancel_job`] escalation,
+/// which invalidate the token (return-to-edit, strip cancel, poll failure).
+///
+/// Callers must already have bound `pending` acknowledgement when decision is PENDING.
+#[tauri::command]
+pub fn ai_cancel_pending_audit_for_publish(
+    plan_token: String,
+    job_id: Option<String>,
+) -> Result<CancelPendingAuditForPublishResult, String> {
+    cancel_pending_audit_for_publish_core(&plan_token, job_id.as_deref())
+}
+
+pub(crate) fn cancel_pending_audit_for_publish_core(
+    plan_token: &str,
+    job_id: Option<&str>,
+) -> Result<CancelPendingAuditForPublishResult, String> {
+    let plan_token = plan_token.trim();
+    if plan_token.is_empty() {
+        return Err("prepared plan token is required".to_string());
+    }
+
+    // Plan must still be live — this path never creates or resurrects tokens.
+    let (bound_job_id, decision_label, pending_ack) = {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let plan = registry
+            .inspect_plan(plan_token)
+            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        let decision = match plan.publish_decision() {
+            crate::ai::audit::AuditDecision::Go => "GO",
+            crate::ai::audit::AuditDecision::Warning => "WARNING",
+            crate::ai::audit::AuditDecision::NoGo => "NO_GO",
+            crate::ai::audit::AuditDecision::Pending => "PENDING",
+            crate::ai::audit::AuditDecision::LocalBlocked => "LOCAL_BLOCKED",
+        }
+        .to_string();
+        let pending_ack = plan.acknowledgements.pending;
+        let from_related = registry.resolve_related_audit_job_id(plan_token);
+        (from_related, decision, pending_ack)
+    };
+
+    // Publish-time cancel is only for PENDING formal audit with bound pending ack.
+    if decision_label != "PENDING" {
+        return Err(format!(
+            "publish-time audit cancel requires PENDING decision (got {decision_label})"
+        ));
+    }
+    if !pending_ack {
+        return Err("publish-time audit cancel requires bound pending acknowledgement".to_string());
+    }
+
+    let requested = job_id.map(str::trim).filter(|id| !id.is_empty());
+    let resolved_job_id = match (requested, bound_job_id) {
+        (Some(req), Some(bound)) if req != bound => {
+            // Client job id must match plan-bound audit; never cancel an unrelated job.
+            return Err(format!(
+                "job id {req} is not bound to the prepared plan audit (expected {bound})"
+            ));
+        }
+        (Some(req), Some(bound)) => {
+            // Bound path already validated equality above.
+            let _ = bound;
+            Some(req.to_string())
+        }
+        (Some(req), None) => {
+            // Reject caller-supplied IDs with no registry mapping — never cancel unbound jobs.
+            let mut registry = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            match registry.resolve_plan_token_for_job(req) {
+                Some(resolved_token) if resolved_token == plan_token => Some(req.to_string()),
+                Some(_) => {
+                    return Err("job id is bound to a different prepared plan".to_string());
+                }
+                None => {
+                    return Err(format!(
+                        "job id {req} is not bound to the prepared plan audit"
+                    ));
+                }
+            }
+        }
+        (None, Some(bound)) => Some(bound),
+        (None, None) => None,
+    };
+
+    let job_state = if let Some(id) = resolved_job_id.as_deref() {
+        match cancel_job_ordinary(id) {
+            Ok(job) => Some(ai_job_state_label(job.state)),
+            Err(_) => {
+                // Job already terminal or missing — still publishable with plan PENDING + ack.
+                jobs()
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .get(id)
+                    .map(|job| ai_job_state_label(job.state))
+            }
+        }
+    } else {
+        None
+    };
+
+    // Critical: plan token must remain live for publish_prepared_plan.
+    let plan_token_live = {
+        let mut registry = get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        registry.inspect_plan(plan_token).is_some()
+    };
+    if !plan_token_live {
+        return Err("prepared plan token was lost during publish-time audit cancel".to_string());
+    }
+
+    Ok(CancelPendingAuditForPublishResult {
+        job_state,
+        plan_token_live: true,
+        decision: decision_label,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn ai_cancel_pending_audit_for_publish_for_test(
+    plan_token: String,
+    job_id: Option<String>,
+) -> Result<CancelPendingAuditForPublishResult, String> {
+    cancel_pending_audit_for_publish_core(&plan_token, job_id.as_deref())
+}
+
+/// Atomic preflight session cancel: cancel related audit job, invalidate plan token,
+/// write bounded cancellation tombstone, emit `preflight-session-changed`.
+#[tauri::command]
+pub fn ai_cancel_preflight_session(
+    app: AppHandle,
+    plan_token: String,
+    job_id: Option<String>,
+) -> Result<CancelPreflightSessionResult, String> {
+    let (result, resolved_job_id) = cancel_preflight_session_core(&plan_token, job_id.as_deref())?;
+    let lifecycle = if result.reconciled {
+        "cancelled"
+    } else {
+        "reconciling"
+    };
+    emit_preflight_session_changed(
+        &app,
+        plan_token.trim(),
+        resolved_job_id.or(job_id),
+        &result,
+        lifecycle,
+    );
+    Ok(result)
+}
+
+/// Test/helper path without AppHandle (no event emission).
+#[cfg(test)]
+pub(crate) fn ai_cancel_preflight_session_for_test(
+    plan_token: String,
+    job_id: Option<String>,
+) -> Result<CancelPreflightSessionResult, String> {
+    cancel_preflight_session_core(&plan_token, job_id.as_deref()).map(|(result, _)| result)
+}
+
 #[tauri::command]
 pub fn ai_get_job(id: String) -> Option<AiJob> {
     jobs()
@@ -4444,28 +4922,139 @@ pub fn ai_list_jobs() -> Vec<AiJob> {
         .list()
 }
 
+/// Sanitized active-job list for the global status strip (never full AiJob).
+/// Ordered by start time then job id; completed jobs are omitted.
 #[tauri::command]
-pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
+pub fn ai_list_active_jobs() -> Vec<ActiveAiJobSummary> {
+    jobs()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .list_active_summaries()
+}
+
+/// Kind-dispatching cancel for the status strip.
+///
+/// - Audit / plan-bound → atomic preflight session cancel + `preflight-session-changed`
+/// - Other kinds → ordinary cooperative job cancel
+///
+/// React never chooses the authority path; Rust resolves association here.
+#[tauri::command]
+pub fn ai_cancel_active_job(
+    app: AppHandle,
+    job_id: String,
+) -> Result<ActiveAiJobCancelResult, String> {
+    let job_id = job_id.trim().to_string();
+    if job_id.is_empty() {
+        return Err("job_id is required".to_string());
+    }
+    let job = {
+        let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
+        manager
+            .get(&job_id)
+            .cloned()
+            .ok_or_else(|| "job not found".to_string())?
+    };
+
+    if job.kind == JobKind::Audit || is_plan_bound_audit_job(&job_id) {
+        let plan_token = {
+            let mut registry = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            registry.resolve_plan_token_for_job(&job_id)
+        };
+        let Some(plan_token) = plan_token else {
+            // Orphan audit with no resolvable plan: ordinary cancel only (no live token).
+            let cancelled = cancel_job_ordinary(&job_id)?;
+            return Ok(ActiveAiJobCancelResult {
+                job_id: cancelled.id,
+                kind: cancelled.kind,
+                job_state: ai_job_state_label(cancelled.state),
+                used_preflight_session: false,
+                reconciled: true,
+            });
+        };
+        let (result, resolved_job) = cancel_preflight_session_core(&plan_token, Some(&job_id))?;
+        let lifecycle = if result.reconciled {
+            "cancelled"
+        } else {
+            "reconciling"
+        };
+        emit_preflight_session_changed(
+            &app,
+            plan_token.trim(),
+            resolved_job.or(Some(job_id.clone())),
+            &result,
+            lifecycle,
+        );
+        return Ok(ActiveAiJobCancelResult {
+            job_id,
+            kind: JobKind::Audit,
+            job_state: result
+                .job_state
+                .clone()
+                .unwrap_or_else(|| "cancelled".to_string()),
+            used_preflight_session: true,
+            reconciled: result.reconciled,
+        });
+    }
+
+    let cancelled = cancel_job_ordinary(&job_id)?;
+    Ok(ActiveAiJobCancelResult {
+        job_id: cancelled.id,
+        kind: cancelled.kind,
+        job_state: ai_job_state_label(cancelled.state),
+        used_preflight_session: false,
+        reconciled: true,
+    })
+}
+
+/// Public result of strip cancel (no secrets/paths/provider bodies).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActiveAiJobCancelResult {
+    pub job_id: String,
+    pub kind: JobKind,
+    pub job_state: String,
+    /// True when atomic preflight session path was used.
+    pub used_preflight_session: bool,
+    pub reconciled: bool,
+}
+
+fn is_plan_bound_audit_job(job_id: &str) -> bool {
+    let mut registry = get_or_create_registry()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    registry.resolve_plan_token_for_job(job_id).is_some()
+}
+
+/// Ordinary cooperative cancel (non-audit path shared by strip and legacy cancel).
+fn cancel_job_ordinary(id: &str) -> Result<AiJob, String> {
     // Signal MediaInfo child probes before flipping job state so waiters observe cancel.
-    signal_media_cancel(&id);
+    signal_media_cancel(id);
     // Signal TemplateSelection provider work so late completion cannot mint a seed.
-    signal_template_cancel(&id);
+    signal_template_cancel(id);
     // Signal Recognition provider work so late completion cannot surface a result.
-    signal_recognition_cancel(&id);
+    signal_recognition_cancel(id);
     // Drop any deferred probe work for this id (Queued cancel must not later spawn).
     {
         let mut pending = media_pending_work()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        pending.remove(&id);
+        pending.remove(id);
     }
     let job = jobs()
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .cancel(&id)?;
+        .cancel(id)?;
+    apply_job_kind_cancel_side_effects(id, &job);
+    // Cancelling any Running job frees capacity and may promote Queued MediaInfo work.
+    try_start_promoted_media_info_jobs();
+    Ok(job)
+}
+
+fn apply_job_kind_cancel_side_effects(id: &str, job: &AiJob) {
+    let id = id.to_string();
     if job.kind == JobKind::MediaInfo {
         if media_info_may_report_success(job.state) {
-            // Cancel-after-success is idempotent: never mutate or strip measured results.
             if let Ok(mut store) = media_job_results().lock() {
                 if let Some(view) = store.get_mut(&id) {
                     view.state = job.state;
@@ -4475,7 +5064,6 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
                 retain_media_global_state(None, Some(&mut store));
             }
         } else if let Ok(mut store) = media_job_results().lock() {
-            // Cancel-before-complete (or re-cancel of Cancelled/Failed/Stale): sanitize.
             if let Some(view) = store.get_mut(&id) {
                 view.state = job.state;
                 view.progress = 100;
@@ -4501,25 +5089,20 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
         }
     }
     if job.kind == JobKind::TemplateSelection {
-        if template_selection_may_return_seed(job.state) {
-            // Cancel-after-success is idempotent: keep the already-minted seed.
+        if template_selection_may_return_recommendation(job.state) {
             if let Ok(mut store) = template_job_results().lock() {
                 if let Some(view) = store.get_mut(&id) {
                     view.state = job.state;
                     view.progress = job.progress;
                     view.error_code = job.error_code.clone();
+                    view.seed = None;
                 }
                 retain_template_global_state(None, Some(&mut store));
             }
         } else if let Ok(mut store) = template_job_results().lock() {
-            // Cancel-before-success: drop any race-minted seed and never hand it off.
             if let Some(view) = store.get_mut(&id) {
-                if let Some(seed) = view.seed.take() {
-                    let _ = template_seeds()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .consume(&seed.token);
-                }
+                view.recommendation = None;
+                view.seed = None;
                 view.state = job.state;
                 view.progress = 100;
                 view.error_code = job
@@ -4543,6 +5126,7 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
                             .clone()
                             .or_else(|| Some("CANCELLED".to_string())),
                         message: Some("template selection cancelled".to_string()),
+                        recommendation: None,
                         seed: None,
                     },
                 );
@@ -4552,17 +5136,15 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
     }
     if job.kind == JobKind::Recognition {
         if recognition_may_return_result(job.state) {
-            // Cancel-after-success is idempotent: keep the already-stored result.
             if let Ok(mut store) = recognition_job_results().lock() {
                 if let Some(view) = store.get_mut(&id) {
                     view.state = job.state;
                     view.progress = job.progress;
                     view.error_code = job.error_code.clone();
                 }
-                retain_recognition_global_state(None, Some(&mut store));
+                retain_recognition_global_state(None, Some(&mut store), None);
             }
         } else if let Ok(mut store) = recognition_job_results().lock() {
-            // Cancel-before-success: drop any race-stored result and never surface it.
             if let Some(view) = store.get_mut(&id) {
                 view.result = None;
                 view.state = job.state;
@@ -4574,31 +5156,49 @@ pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
                 if view.message.is_none() {
                     view.message = Some("recognition cancelled".to_string());
                 }
-            } else {
-                store.insert(
-                    id.clone(),
-                    RecognitionJobView {
-                        job_id: id.clone(),
-                        state: job.state,
-                        request_generation: job.request_generation,
-                        snapshot_hash: job.snapshot_hash.clone(),
-                        progress: 100,
-                        error_code: job
-                            .error_code
-                            .clone()
-                            .or_else(|| Some("CANCELLED".to_string())),
-                        message: Some("recognition cancelled".to_string()),
-                        result: None,
-                    },
-                );
             }
-            retain_recognition_global_state(None, Some(&mut store));
+            retain_recognition_global_state(None, Some(&mut store), None);
         }
     }
-    // Cancelling any Running job (MediaInfo or cross-kind) frees capacity and may
-    // promote Queued MediaInfo work. Drain after releasing the jobs lock above.
-    try_start_promoted_media_info_jobs();
-    Ok(job)
+}
+
+#[tauri::command]
+pub fn ai_cancel_job(id: String) -> Result<AiJob, String> {
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("job id is required".to_string());
+    }
+
+    // Harden: plan-bound Audit must escalate to atomic session reconciliation so a
+    // job-only cancel never leaves a live plan token with cancelled audit evidence.
+    // Orphan Audit (no resolvable plan) may use ordinary cancel.
+    let kind = {
+        let manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
+        manager.get(&id).map(|job| job.kind)
+    };
+    if matches!(kind, Some(JobKind::Audit)) || is_plan_bound_audit_job(&id) {
+        let plan_token = {
+            let mut registry = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            registry.resolve_plan_token_for_job(&id)
+        };
+        if let Some(plan_token) = plan_token {
+            // Escalate to atomic session reconciliation (no AppHandle → no event; callers
+            // that need PreflightSessionChanged should use ai_cancel_active_job / session).
+            let _ = cancel_preflight_session_core(&plan_token, Some(&id))?;
+            return jobs()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| {
+                    "audit job reconciled via preflight session but is no longer listed".to_string()
+                });
+        }
+    }
+
+    cancel_job_ordinary(&id)
 }
 
 /// Read-only list of bounded, non-secret AI job debug records (no raw provider bodies/secrets).
@@ -4696,19 +5296,15 @@ pub fn cancel_unfinished_ai_jobs_on_exit() {
         signal_template_cancel(&id);
         signal_recognition_cancel(&id);
     }
-    // Strip non-success TemplateSelection seeds before/after cancel_unfinished.
+    // Strip non-success TemplateSelection recommendations before/after cancel_unfinished.
     {
         let mut store = template_job_results()
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         for view in store.values_mut() {
             if !view.state.is_terminal() {
-                if let Some(seed) = view.seed.take() {
-                    let _ = template_seeds()
-                        .lock()
-                        .unwrap_or_else(|error| error.into_inner())
-                        .consume(&seed.token);
-                }
+                view.recommendation = None;
+                view.seed = None;
                 view.state = AiJobState::Cancelled;
                 view.progress = 100;
                 view.error_code = Some("CANCELLED".to_string());
@@ -5171,6 +5767,295 @@ mod formal_audit_lifecycle_tests {
             Some(job_id.to_string()),
             &RedactionPolicy::default(),
         )
+    }
+
+    fn prepare_pending_audit_session(snapshot: &str, generation: u64) -> (String, String) {
+        let job_id = start_job_backend(JobKind::Audit, generation, snapshot, None);
+        let token = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .prepare_plan(snapshot.to_string(), generation)
+                .expect("prepare")
+        };
+        let pending = pending_audit_result(
+            token.clone(),
+            snapshot.to_string(),
+            generation,
+            Vec::new(),
+            job_id.clone(),
+            &RedactionPolicy::default(),
+        );
+        bind_audit_to_plan(&pending).expect("bind pending");
+        (token, job_id)
+    }
+
+    #[test]
+    fn cancel_pending_audit_for_publish_keeps_token_and_pending_publishable() {
+        use crate::ai::audit::Acknowledgements;
+
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:publish-pending-ack", 21);
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .set_acknowledgements(
+                    &token,
+                    Acknowledgements {
+                        warning: false,
+                        critical: false,
+                        pending: true,
+                    },
+                )
+                .expect("pending ack");
+            let plan = guard.inspect_plan(&token).expect("plan live");
+            assert_eq!(
+                plan.publish_decision(),
+                crate::ai::audit::AuditDecision::Pending
+            );
+            assert!(plan.can_publish_now());
+        }
+
+        let result =
+            ai_cancel_pending_audit_for_publish_for_test(token.clone(), Some(job_id.clone()))
+                .expect("publish-time cancel");
+        assert!(result.plan_token_live);
+        assert_eq!(result.decision, "PENDING");
+        assert_eq!(result.job_state.as_deref(), Some("cancelled"));
+        assert_eq!(
+            ai_get_job(job_id.clone()).map(|job| job.state),
+            Some(AiJobState::Cancelled)
+        );
+
+        // Frozen token remains inspectable and PENDING+ack remains publishable.
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            let plan = guard.inspect_plan(&token).expect("token must survive");
+            assert_eq!(
+                plan.publish_decision(),
+                crate::ai::audit::AuditDecision::Pending
+            );
+            assert!(plan.can_publish_now());
+            // Session cancel would tombstone; publish-time path must not.
+            assert!(guard.get_cancellation_tombstone(&token).is_none());
+        }
+
+        // Unbound caller-supplied job id must be rejected (no registry mapping).
+        let (token_unbound, _) = prepare_pending_audit_session("sha256:publish-unbound-job", 23);
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard
+                .set_acknowledgements(
+                    &token_unbound,
+                    Acknowledgements {
+                        warning: false,
+                        critical: false,
+                        pending: true,
+                    },
+                )
+                .expect("pending ack");
+            let snap = guard
+                .inspect_plan(&token_unbound)
+                .expect("plan")
+                .snapshot_hash
+                .clone();
+            guard
+                .bind_audit_evidence(
+                    &token_unbound,
+                    PlanAuditEvidence {
+                        decision: crate::ai::audit::AuditDecision::Pending,
+                        findings: vec![],
+                        unknown_codes: vec![],
+                        formal_ran: false,
+                        job_id: None,
+                        snapshot_hash: snap,
+                        request_generation: 23,
+                    },
+                )
+                .expect("rebind without job");
+            // bind_audit_evidence clears acks — re-bind pending for publish-time cancel gate.
+            guard
+                .set_acknowledgements(
+                    &token_unbound,
+                    Acknowledgements {
+                        warning: false,
+                        critical: false,
+                        pending: true,
+                    },
+                )
+                .expect("re-ack pending");
+        }
+        let err = ai_cancel_pending_audit_for_publish_for_test(
+            token_unbound,
+            Some("job-unrelated-forged".into()),
+        )
+        .expect_err("unbound job id must fail");
+        assert!(err.contains("not bound"), "unexpected error: {err}");
+
+        // Missing pending ack must fail closed.
+        let (token_no_ack, job_no_ack) =
+            prepare_pending_audit_session("sha256:publish-no-pending-ack", 24);
+        let err_ack = ai_cancel_pending_audit_for_publish_for_test(token_no_ack, Some(job_no_ack))
+            .expect_err("missing pending ack");
+        assert!(
+            err_ack.contains("pending acknowledgement"),
+            "unexpected error: {err_ack}"
+        );
+
+        // Contrasting regression: generic ai_cancel_job escalates and invalidates.
+        let (token2, job2) = prepare_pending_audit_session("sha256:cancel-job-escalates", 22);
+        let _ = ai_cancel_job(job2).expect("escalating cancel");
+        assert!(get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inspect_plan(&token2)
+            .is_none());
+    }
+
+    #[test]
+    fn cancel_preflight_session_running_job_invalidates_and_tombstones() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-run", 11);
+        let result = ai_cancel_preflight_session_for_test(token.clone(), Some(job_id.clone()))
+            .expect("cancel running");
+        assert!(result.reconciled);
+        assert_eq!(result.token_state, PreflightTokenState::Invalidated);
+        assert_eq!(result.job_state.as_deref(), Some("cancelled"));
+        assert_eq!(
+            ai_get_job(job_id.clone()).map(|job| job.state),
+            Some(AiJobState::Cancelled)
+        );
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(guard.inspect_plan(&token).is_none());
+            assert!(guard.get_cancellation_tombstone(&token).is_some());
+        }
+    }
+
+    #[test]
+    fn cancel_preflight_session_terminal_job_still_invalidates_token() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-term", 12);
+        complete_job_backend(&job_id, true, None, "already done").unwrap();
+        let result = ai_cancel_preflight_session_for_test(token.clone(), Some(job_id.clone()))
+            .expect("cancel terminal");
+        assert!(result.reconciled);
+        assert_eq!(result.token_state, PreflightTokenState::Invalidated);
+        assert_eq!(result.job_state.as_deref(), Some("succeeded"));
+        assert!(get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inspect_plan(&token)
+            .is_none());
+    }
+
+    #[test]
+    fn cancel_preflight_session_token_only_after_client_job_id_loss() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-token-only", 13);
+        let result =
+            ai_cancel_preflight_session_for_test(token.clone(), None).expect("token-only cancel");
+        assert!(result.reconciled);
+        assert_eq!(result.token_state, PreflightTokenState::Invalidated);
+        assert_eq!(result.job_state.as_deref(), Some("cancelled"));
+        assert_eq!(
+            ai_get_job(job_id).map(|job| job.state),
+            Some(AiJobState::Cancelled)
+        );
+    }
+
+    #[test]
+    fn cancel_preflight_session_already_missing_and_tombstone_replay() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-replay", 14);
+        let first = ai_cancel_preflight_session_for_test(token.clone(), Some(job_id.clone()))
+            .expect("first cancel");
+        assert_eq!(first.token_state, PreflightTokenState::Invalidated);
+
+        let second = ai_cancel_preflight_session_for_test(token.clone(), Some(job_id.clone()))
+            .expect("replay");
+        assert_eq!(second, first);
+        assert!(second.reconciled);
+
+        // Token already gone without prior cancel-session (plain invalidate) → already_missing.
+        let (token2, job_id2) = prepare_pending_audit_session("sha256:cancel-missing", 15);
+        {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            assert!(guard.invalidate_plan(&token2));
+        }
+        // Index still resolves job after plain invalidate.
+        let missing = ai_cancel_preflight_session_for_test(token2.clone(), Some(job_id2.clone()))
+            .expect("already missing path");
+        assert_eq!(missing.token_state, PreflightTokenState::AlreadyMissing);
+        assert!(missing.reconciled);
+        assert_eq!(missing.job_state.as_deref(), Some("cancelled"));
+
+        let replay_missing =
+            ai_cancel_preflight_session_for_test(token2, Some(job_id2)).expect("tombstone replay");
+        assert_eq!(replay_missing, missing);
+    }
+
+    #[test]
+    fn cancel_preflight_session_mismatched_job_is_error() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-mismatch", 16);
+        let other = start_job_backend(JobKind::Audit, 16, "sha256:other", None);
+        let err = ai_cancel_preflight_session_for_test(token.clone(), Some(other.clone()))
+            .expect_err("mismatched job");
+        assert!(
+            err.contains("does not match") || err.contains("validated"),
+            "{err}"
+        );
+        // Session must remain live after rejected mismatch.
+        assert!(get_or_create_registry()
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inspect_plan(&token)
+            .is_some());
+        let session_state = ai_get_job(job_id.clone()).expect("session job").state;
+        assert!(
+            !session_state.is_terminal(),
+            "mismatched cancel must not terminate session job: {session_state:?}"
+        );
+        // Unrelated job must not be cancelled.
+        let other_state = ai_get_job(other).expect("other job").state;
+        assert!(
+            !other_state.is_terminal(),
+            "mismatched cancel must not act on unrelated job: {other_state:?}"
+        );
+
+        // After successful cancel, mismatched job on tombstone also errors.
+        ai_cancel_preflight_session_for_test(token.clone(), Some(job_id)).expect("cancel session");
+        let err_after = ai_cancel_preflight_session_for_test(token, Some("job-unrelated".into()))
+            .expect_err("tombstone mismatch");
+        assert!(
+            err_after.contains("does not match") || err_after.contains("cancellation record"),
+            "{err_after}"
+        );
+    }
+
+    #[test]
+    fn cancel_preflight_session_repeated_returns_recorded_result() {
+        let _guard = command_test_guard();
+        let (token, job_id) = prepare_pending_audit_session("sha256:cancel-idempotent", 17);
+        let first = ai_cancel_preflight_session_for_test(token.clone(), None).expect("first");
+        let second =
+            ai_cancel_preflight_session_for_test(token.clone(), Some(job_id)).expect("second");
+        let third = ai_cancel_preflight_session_for_test(token, None).expect("third");
+        assert_eq!(first, second);
+        assert_eq!(second, third);
+        assert!(first.reconciled);
     }
 
     #[test]
@@ -5957,6 +6842,107 @@ mod recognition_command_tests {
         assert!(!recognition_may_return_result(AiJobState::Stale));
         assert!(!recognition_may_return_result(AiJobState::Running));
         assert!(!recognition_may_return_result(AiJobState::Queued));
+    }
+
+    #[test]
+    fn ai_recognize_request_has_no_client_identity_fields() {
+        // Wire inventory: start request accepts content only. Caller-supplied
+        // snapshot_hash / request_generation are not struct fields (serde ignores extras).
+        let value = serde_json::json!({
+            "torrent_name": "Show.S01E01.1080p",
+            "ep_pattern": r"(?P<ep>\d+)",
+            "resolution_pattern": r"(?P<res>1080p)",
+            "title_pattern": "<ep>",
+            "snapshot_hash": "sha256:forged-client-identity",
+            "request_generation": 999_u64
+        });
+        let request: AiRecognizeRequest =
+            serde_json::from_value(value).expect("content-only request deserializes");
+        assert_eq!(request.torrent_name, "Show.S01E01.1080p");
+        assert_eq!(request.ep_pattern, r"(?P<ep>\d+)");
+        // Round-trip must not re-emit forbidden identity fields.
+        let encoded = serde_json::to_value(&request).expect("serialize");
+        let object = encoded.as_object().expect("object");
+        assert!(
+            !object.contains_key("snapshot_hash"),
+            "start request must not serialize snapshot_hash"
+        );
+        assert!(
+            !object.contains_key("request_generation"),
+            "start request must not serialize request_generation"
+        );
+        assert!(object.contains_key("torrent_name"));
+        assert!(object.contains_key("ep_pattern"));
+        assert!(object.contains_key("resolution_pattern"));
+        assert!(object.contains_key("title_pattern"));
+    }
+
+    #[test]
+    fn recognition_context_identity_is_backend_owned_and_deterministic() {
+        let policy = RedactionPolicy::default();
+        let (snap_a, hash_a) = build_recognition_context_snapshot(
+            "Show.S01E01.1080p",
+            r"(?P<ep>\d+)",
+            r"(?P<res>1080p)",
+            "[Group] <title> - <ep>",
+            &policy,
+        )
+        .expect("safe");
+        let (snap_b, hash_b) = build_recognition_context_snapshot(
+            "Show.S01E01.1080p",
+            r"(?P<ep>\d+)",
+            r"(?P<res>1080p)",
+            "[Group] <title> - <ep>",
+            &policy,
+        )
+        .expect("safe");
+        assert_eq!(hash_a, hash_b);
+        assert_eq!(snap_a, snap_b);
+        assert!(hash_a.starts_with("sha256:"));
+        assert_eq!(hash_a.len(), "sha256:".len() + 64);
+
+        let (_, hash_changed) = build_recognition_context_snapshot(
+            "Show.S01E02.1080p",
+            r"(?P<ep>\d+)",
+            r"(?P<res>1080p)",
+            "[Group] <title> - <ep>",
+            &policy,
+        )
+        .expect("safe");
+        assert_ne!(hash_a, hash_changed);
+
+        // Monotonic backend generation (independent of content).
+        let g1 = next_recognition_generation();
+        let g2 = next_recognition_generation();
+        assert!(g2 > g1);
+
+        // Stored snapshot is the source of prompt fields and identity binding.
+        let job_id = "job-recog-identity-test".to_string();
+        {
+            let mut store = recognition_snapshots().lock().unwrap();
+            store.insert(job_id.clone(), snap_a.clone());
+        }
+        let stored = recognition_snapshots()
+            .lock()
+            .unwrap()
+            .get(&job_id)
+            .cloned()
+            .expect("stored");
+        assert_eq!(stored.context_hash(), hash_a);
+        assert_eq!(stored.torrent_name, "Show.S01E01.1080p");
+        let bound = bind_recognition_result(
+            crate::ai::recognition::RecognitionOutput {
+                episode: None,
+                resolution: None,
+                suggested_title: None,
+            },
+            g1,
+            stored.context_hash(),
+            job_id.clone(),
+        );
+        assert_eq!(bound.snapshot_hash, hash_a);
+        assert_eq!(bound.request_generation, g1);
+        assert_eq!(bound.job_id, job_id);
     }
 }
 
@@ -7168,29 +8154,67 @@ mod media_info_plan_bind_tests {
 #[cfg(test)]
 mod template_selection_job_tests {
     use super::*;
+    use crate::ai::template_seed::{
+        EligibleTemplateCatalogEntry, ReviewTemplateRecommendationStatus,
+    };
+    use crate::config::Template;
+    use crate::publish::PublishRequest;
+    use std::io::Write;
+    use std::path::PathBuf;
 
-    fn sample_seed(token: &str) -> TemplateSeed {
-        TemplateSeed {
-            token: token.to_string(),
+    fn sample_recommendation(id: &str) -> TemplateRecommendation {
+        TemplateRecommendation {
+            recommendation_id: id.to_string(),
             template_id: "zzz-last".into(),
             template_revision: 2,
             template_digest: "sha256:zzz".into(),
+            template_name: "Last".into(),
+            summary: "推荐模板".into(),
+            alternatives: vec![],
+            torrent_digest: "sha256:torrent".into(),
             torrent_name: "show.mkv".into(),
+            catalog_hash: "sha256:catalog".into(),
+            generation: 1,
+            expires_at_unix: now_unix() + 600,
         }
     }
 
-    #[test]
-    fn template_selection_seed_gate_allows_only_succeeded() {
-        assert!(template_selection_may_return_seed(AiJobState::Succeeded));
-        assert!(!template_selection_may_return_seed(AiJobState::Failed));
-        assert!(!template_selection_may_return_seed(AiJobState::Cancelled));
-        assert!(!template_selection_may_return_seed(AiJobState::Stale));
-        assert!(!template_selection_may_return_seed(AiJobState::Running));
-        assert!(!template_selection_may_return_seed(AiJobState::Queued));
+    fn write_temp_torrent(file_name: &str, contents: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "okpgui_rec_{}_{}_{}",
+            std::process::id(),
+            now_unix(),
+            file_name
+        ));
+        let mut file = std::fs::File::create(&path).expect("create temp torrent");
+        file.write_all(contents).expect("write torrent");
+        path
     }
 
     #[test]
-    fn poll_template_selection_returns_none_until_terminal() {
+    fn template_selection_recommendation_gate_allows_only_succeeded() {
+        assert!(template_selection_may_return_recommendation(
+            AiJobState::Succeeded
+        ));
+        assert!(!template_selection_may_return_recommendation(
+            AiJobState::Failed
+        ));
+        assert!(!template_selection_may_return_recommendation(
+            AiJobState::Cancelled
+        ));
+        assert!(!template_selection_may_return_recommendation(
+            AiJobState::Stale
+        ));
+        assert!(!template_selection_may_return_recommendation(
+            AiJobState::Running
+        ));
+        assert!(!template_selection_may_return_recommendation(
+            AiJobState::Queued
+        ));
+    }
+
+    #[test]
+    fn poll_template_selection_returns_recommendation_not_seed() {
         let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:catalog", None);
         store_template_selection_view(TemplateSelectionJobView {
@@ -7201,6 +8225,7 @@ mod template_selection_job_tests {
             progress: 35,
             error_code: None,
             message: Some("requesting provider selection".into()),
+            recommendation: None,
             seed: None,
         });
         assert!(ai_poll_template_selection(job_id.clone())
@@ -7216,27 +8241,34 @@ mod template_selection_job_tests {
             progress: 100,
             error_code: None,
             message: Some("selected".into()),
-            seed: Some(sample_seed("seed_ok")),
+            recommendation: Some(sample_recommendation("rec_ok")),
+            // Legacy seed field must be stripped by terminal view sanitization.
+            seed: Some(TemplateSeed {
+                token: "seed_must_not_surface".into(),
+                template_id: "zzz-last".into(),
+                template_revision: 2,
+                template_digest: "sha256:zzz".into(),
+                torrent_name: "show.mkv".into(),
+            }),
         });
         let terminal = ai_poll_template_selection(job_id)
             .unwrap()
             .expect("terminal");
         assert_eq!(terminal.state, AiJobState::Succeeded);
+        assert!(terminal.seed.is_none(), "success must not auto-mint seed");
         assert_eq!(
-            terminal.seed.as_ref().map(|seed| seed.token.as_str()),
-            Some("seed_ok")
+            terminal
+                .recommendation
+                .as_ref()
+                .map(|rec| rec.recommendation_id.as_str()),
+            Some("rec_ok")
         );
-        assert_eq!(
-            terminal.seed.as_ref().map(|seed| seed.template_id.as_str()),
-            Some("zzz-last")
-        );
-        // Opaque seed must never include a torrent path field in the public view shape.
         let serialized = serde_json::to_string(&terminal).unwrap();
         assert!(!serialized.contains("torrent_path"));
     }
 
     #[test]
-    fn cancel_template_selection_strips_seed_and_blocks_late_success() {
+    fn cancel_template_selection_strips_recommendation_and_blocks_late_success() {
         let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:cancel", None);
         let flag = Arc::new(AtomicBool::new(false));
@@ -7252,15 +8284,14 @@ mod template_selection_job_tests {
             progress: 50,
             error_code: None,
             message: Some("in flight".into()),
-            // Race seed that must be discarded on cancel-before-success.
-            seed: Some(sample_seed("seed_race")),
+            recommendation: Some(sample_recommendation("rec_race")),
+            seed: None,
         });
 
         let cancelled = ai_cancel_job(job_id.clone()).unwrap();
         assert_eq!(cancelled.state, AiJobState::Cancelled);
         assert!(flag.load(Ordering::Relaxed), "cancel must signal flag");
 
-        // Late complete cannot resurrect Succeeded or keep a handoff seed.
         let late = complete_job_backend(&job_id, true, None, "late success").unwrap();
         assert_eq!(late.state, AiJobState::Cancelled);
 
@@ -7268,7 +8299,11 @@ mod template_selection_job_tests {
             .unwrap()
             .expect("terminal");
         assert_eq!(terminal.state, AiJobState::Cancelled);
-        assert!(terminal.seed.is_none(), "cancelled must not hand off seed");
+        assert!(terminal.seed.is_none());
+        assert!(
+            terminal.recommendation.is_none(),
+            "cancelled must not hand off recommendation"
+        );
         assert_eq!(
             terminal.error_code.as_deref(),
             Some("CANCELLED"),
@@ -7278,7 +8313,7 @@ mod template_selection_job_tests {
     }
 
     #[test]
-    fn failed_selection_never_returns_seed() {
+    fn failed_selection_never_returns_recommendation() {
         let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:fail", None);
         let view = finish_template_selection_failure(
@@ -7290,6 +8325,7 @@ mod template_selection_job_tests {
         );
         assert_eq!(view.state, AiJobState::Failed);
         assert!(view.seed.is_none());
+        assert!(view.recommendation.is_none());
         assert_eq!(view.error_code.as_deref(), Some("SELECTION_INVALID"));
 
         let polled = ai_poll_template_selection(job_id)
@@ -7297,6 +8333,7 @@ mod template_selection_job_tests {
             .expect("terminal");
         assert_eq!(polled.state, AiJobState::Failed);
         assert!(polled.seed.is_none());
+        assert!(polled.recommendation.is_none());
         assert!(
             polled
                 .message
@@ -7309,13 +8346,18 @@ mod template_selection_job_tests {
     }
 
     #[test]
-    fn stale_or_cancelled_finish_success_discards_seed() {
+    fn stale_or_cancelled_finish_success_discards_recommendation() {
         let _guard = command_test_guard();
         let job_id = start_job_backend(JobKind::TemplateSelection, 0, "sha256:stale", None);
         ai_cancel_job(job_id.clone()).unwrap();
 
-        // finish_success after cancel must not return a seed even if prepare would work
-        // with a real torrent — the job is already terminal Cancelled.
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "zzz-last".into(),
+            name: "Last".into(),
+            revision: 2,
+            digest: "sha256:zzz".into(),
+            summary: String::new(),
+        }];
         let view = finish_template_selection_success(
             &job_id,
             0,
@@ -7323,13 +8365,270 @@ mod template_selection_job_tests {
             "zzz-last",
             2,
             "sha256:zzz",
+            "Last",
+            "",
+            &catalog,
             "show.mkv".into(),
             "/tmp/does-not-matter.torrent".into(),
             &AtomicBool::new(true),
         );
         assert_ne!(view.state, AiJobState::Succeeded);
         assert!(view.seed.is_none());
-        assert!(!template_selection_may_return_seed(view.state));
+        assert!(view.recommendation.is_none());
+        assert!(!template_selection_may_return_recommendation(view.state));
+    }
+
+    #[test]
+    fn review_mints_once_replays_unconsumed_and_refuses_consumed() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent("review.torrent", b"d4:infod4:name4:testee");
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-a".into(),
+            name: "Alpha".into(),
+            revision: 1,
+            digest: "sha256:alpha".into(),
+            summary: "summary".into(),
+        }];
+        let catalog_hash = catalog_snapshot_hash(&catalog);
+        let rec = template_recommendations()
+            .lock()
+            .unwrap()
+            .store(
+                &catalog[0],
+                &catalog,
+                catalog_hash,
+                "test".into(),
+                torrent_path.to_string_lossy().into_owned(),
+                "推荐模板「Alpha」".into(),
+            )
+            .expect("store recommendation");
+
+        // First review mints exactly one seed.
+        let first = {
+            let mut seeds = template_seeds().lock().unwrap();
+            let mut recs = template_recommendations().lock().unwrap();
+            recs.review_and_mint(&rec.recommendation_id, &catalog, &mut seeds)
+                .expect("first mint")
+        };
+        assert_eq!(first.status, ReviewTemplateRecommendationStatus::Minted);
+        let seed_token = first.seed.as_ref().unwrap().token.clone();
+
+        // Repeated review while unconsumed returns the same seed.
+        let second = {
+            let mut seeds = template_seeds().lock().unwrap();
+            let mut recs = template_recommendations().lock().unwrap();
+            recs.review_and_mint(&rec.recommendation_id, &catalog, &mut seeds)
+                .expect("replay")
+        };
+        assert_eq!(
+            second.status,
+            ReviewTemplateRecommendationStatus::AlreadyMinted
+        );
+        assert_eq!(
+            second.seed.as_ref().map(|s| s.token.as_str()),
+            Some(seed_token.as_str())
+        );
+
+        // Consume via seed registry + mark recommendation.
+        {
+            let mut seeds = template_seeds().lock().unwrap();
+            let _ = seeds
+                .consume_validated(&seed_token, &catalog)
+                .expect("consume");
+            template_recommendations()
+                .lock()
+                .unwrap()
+                .mark_seed_consumed(&seed_token);
+        }
+        let third = {
+            let mut seeds = template_seeds().lock().unwrap();
+            let mut recs = template_recommendations().lock().unwrap();
+            recs.review_and_mint(&rec.recommendation_id, &catalog, &mut seeds)
+                .expect("consumed")
+        };
+        assert_eq!(
+            third.status,
+            ReviewTemplateRecommendationStatus::AlreadyConsumed
+        );
+        assert!(third.seed.is_none());
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn review_expired_recommendation_is_terminal_error() {
+        let _guard = command_test_guard();
+        let mut recs = crate::ai::template_seed::TemplateRecommendationRegistry::with_ttl(
+            std::time::Duration::from_millis(20),
+        );
+        let torrent_path = write_temp_torrent("expire.torrent", b"d4:infod4:name4:testee");
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-b".into(),
+            name: "Beta".into(),
+            revision: 1,
+            digest: "sha256:beta".into(),
+            summary: String::new(),
+        }];
+        let rec = recs
+            .store(
+                &catalog[0],
+                &catalog,
+                catalog_snapshot_hash(&catalog),
+                "test".into(),
+                torrent_path.to_string_lossy().into_owned(),
+                "rec".into(),
+            )
+            .expect("store");
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        let mut seeds = TemplateSeedRegistry::default();
+        let err = recs
+            .review_and_mint(&rec.recommendation_id, &catalog, &mut seeds)
+            .expect_err("expired");
+        assert!(
+            err.contains("missing") || err.contains("expired") || err.contains("discarded"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn review_catalog_drift_is_terminal_error() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent("drift.torrent", b"d4:infod4:name4:testee");
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-c".into(),
+            name: "Gamma".into(),
+            revision: 1,
+            digest: "sha256:gamma".into(),
+            summary: String::new(),
+        }];
+        let rec = template_recommendations()
+            .lock()
+            .unwrap()
+            .store(
+                &catalog[0],
+                &catalog,
+                catalog_snapshot_hash(&catalog),
+                "test".into(),
+                torrent_path.to_string_lossy().into_owned(),
+                "rec".into(),
+            )
+            .expect("store");
+        // Drift: revision change changes catalog hash + identity.
+        let drifted = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-c".into(),
+            name: "Gamma".into(),
+            revision: 2,
+            digest: "sha256:gamma-v2".into(),
+            summary: String::new(),
+        }];
+        let mut seeds = template_seeds().lock().unwrap();
+        let mut recs = template_recommendations().lock().unwrap();
+        let err = recs
+            .review_and_mint(&rec.recommendation_id, &drifted, &mut seeds)
+            .expect_err("drift");
+        assert!(
+            err.contains("stale") || err.contains("drift") || err.contains("mismatch"),
+            "{err}"
+        );
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn active_job_summaries_order_and_exclude_terminal() {
+        let _guard = command_test_guard();
+        let early = start_job_backend(JobKind::Recognition, 0, "sha256:a", None);
+        let late = start_job_backend(JobKind::TemplateSelection, 0, "sha256:b", None);
+        complete_job_backend(&early, true, None, "done").unwrap();
+        let summaries = ai_list_active_jobs();
+        assert!(
+            summaries.iter().all(|s| s.job_id != early),
+            "terminal jobs must not appear"
+        );
+        assert!(summaries.iter().any(|s| s.job_id == late));
+        // Ordering: started_at then id
+        let mut sorted = summaries.clone();
+        sorted.sort_by(|a, b| {
+            a.started_at_unix
+                .cmp(&b.started_at_unix)
+                .then_with(|| a.job_id.cmp(&b.job_id))
+        });
+        assert_eq!(summaries, sorted);
+        for summary in &summaries {
+            assert!(!summary.job_id.is_empty());
+            assert!(summary.progress <= 100);
+            // Never leak snapshot hash into strip projection fields.
+            let json = serde_json::to_string(summary).unwrap();
+            assert!(!json.contains("snapshot_hash"));
+            assert!(!json.contains("provider_identity"));
+        }
+    }
+
+    #[test]
+    fn cancel_active_audit_uses_preflight_session_not_job_only() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent("audit-cancel.torrent", b"d4:infod4:name4:testee");
+        let request = PublishRequest {
+            publish_id: "pub-audit-cancel".into(),
+            torrent_path: torrent_path.display().to_string(),
+            profile_name: "profile".into(),
+            template: Template::default(),
+        };
+        let prepared = {
+            let mut registry = get_or_create_registry().lock().unwrap();
+            registry
+                .prepare_plan_with_request_and_blockers(1, request, vec![], true, None)
+                .expect("prepare")
+        };
+        let job_id = start_job_backend(JobKind::Audit, 1, prepared.snapshot_hash.clone(), None);
+        {
+            let mut registry = get_or_create_registry().lock().unwrap();
+            registry.note_plan_audit_job(&prepared.token, &job_id);
+        }
+
+        // Job-only path for plan-bound audit must escalate (token invalidated).
+        let cancelled = ai_cancel_job(job_id.clone()).expect("escalate cancel");
+        assert_eq!(cancelled.state, AiJobState::Cancelled);
+        {
+            let mut registry = get_or_create_registry().lock().unwrap();
+            assert!(
+                registry.inspect_plan(&prepared.token).is_none(),
+                "plan token must not remain live after plan-bound audit cancel"
+            );
+        }
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn plan_bound_audit_cancel_path_reconciles_session() {
+        let _guard = command_test_guard();
+        let torrent_path = write_temp_torrent("audit-session.torrent", b"d4:infod4:name4:testee");
+        let request = PublishRequest {
+            publish_id: "pub-audit-session".into(),
+            torrent_path: torrent_path.display().to_string(),
+            profile_name: "profile".into(),
+            template: Template::default(),
+        };
+        let prepared = {
+            let mut registry = get_or_create_registry().lock().unwrap();
+            registry
+                .prepare_plan_with_request_and_blockers(2, request, vec![], true, None)
+                .expect("prepare")
+        };
+        let job_id = start_job_backend(JobKind::Audit, 2, prepared.snapshot_hash.clone(), None);
+        {
+            let mut registry = get_or_create_registry().lock().unwrap();
+            registry.note_plan_audit_job(&prepared.token, &job_id);
+        }
+        // Strip kind-dispatch uses the same core path as session cancel.
+        let (result, resolved) =
+            cancel_preflight_session_core(&prepared.token, Some(&job_id)).expect("session");
+        assert!(result.reconciled);
+        assert_eq!(resolved.as_deref(), Some(job_id.as_str()));
+        assert!(matches!(
+            result.token_state,
+            PreflightTokenState::Invalidated | PreflightTokenState::AlreadyMissing
+        ));
+        let _ = std::fs::remove_file(&torrent_path);
     }
 
     #[test]
@@ -7372,6 +8671,7 @@ mod template_selection_job_tests {
 #[cfg(test)]
 mod plan_vision_command_tests {
     use super::*;
+    use crate::ai::vision::{content_digest, VisionImageInput};
     use crate::config::{SiteSelection, Template};
     use crate::publish::PublishRequest;
     use std::time::{SystemTime, UNIX_EPOCH};
