@@ -10,12 +10,14 @@ import {
     Trash2,
     Send,
     Loader2,
+    Pencil,
     RefreshCw,
 } from 'lucide-react';
 import FieldHelpHint from '../components/FieldHelpHint';
 import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import PublishContentEditor from '../components/PublishContentEditor';
+import RenameTemplateDialog from '../components/RenameTemplateDialog';
 import TagInput from '../components/TagInput';
 import TemplateSelect, { TemplateSelectOption } from '../components/TemplateSelect';
 import WarningBanner from '../components/WarningBanner';
@@ -215,6 +217,8 @@ export default function HomePage() {
     const [templateNameDraft, setTemplateNameDraft] = useState('');
     const [newTemplateName, setNewTemplateName] = useState('');
     const [template, setTemplate] = useState<Template>(defaultTemplate);
+    const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
+    const [isRenamingTemplate, setIsRenamingTemplate] = useState(false);
 
     // Profile state
     const [profileList, setProfileList] = useState<string[]>([]);
@@ -577,15 +581,34 @@ export default function HomePage() {
         void persistTemplateToDisk(templateToSave, explicitName);
     };
 
-    const handleTemplateRenameBlur = () => {
+    const openTemplateRenameDialog = () => {
+        if (!currentTemplateNameRef.current) return;
+        setTemplateNameDraft(currentTemplateNameRef.current);
+        setIsRenameDialogOpen(true);
+    };
+
+    const closeTemplateRenameDialog = () => {
+        if (isRenamingTemplate) return;
+        setTemplateNameDraft(currentTemplateNameRef.current);
+        setIsRenameDialogOpen(false);
+    };
+
+    const handleTemplateRenameConfirm = async () => {
         const nextName = trimEntityName(templateNameDraft);
         const previousName = currentTemplateNameRef.current;
         if (!previousName || !nextName || nextName === previousName) {
             setTemplateNameDraft(previousName);
+            setIsRenameDialogOpen(false);
             return;
         }
 
-        void persistTemplateToDisk(withSelectedProfile(templateRef.current), nextName);
+        setIsRenamingTemplate(true);
+        try {
+            const saved = await persistTemplateToDisk(withSelectedProfile(templateRef.current), nextName);
+            if (saved) setIsRenameDialogOpen(false);
+        } finally {
+            setIsRenamingTemplate(false);
+        }
     };
 
     const handleCreateTemplateBlur = (value: string) => {
@@ -1179,67 +1202,66 @@ export default function HomePage() {
                 {/* Template Selection */}
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">模板管理</h2>
-                    <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
-                        <div>
-                            <TemplateSelect
-                                options={templateOptions}
-                                value={currentTemplateName}
-                                onChange={(name) => {
-                                    void handleTemplateSelection(name);
-                                }}
+                    <div className="space-y-2">
+                        <TemplateSelect
+                            options={templateOptions}
+                            value={currentTemplateName}
+                            onChange={(name) => {
+                                void handleTemplateSelection(name);
+                            }}
+                        />
+                        <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto]">
+                            <input
+                                type="text"
+                                aria-label="新建模板名称"
+                                value={newTemplateName}
+                                maxLength={ENTITY_NAME_MAX_LENGTH}
+                                onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
+                                onBlur={(e) => handleCreateTemplateBlur(e.target.value)}
+                                placeholder="新建模板名称（失焦自动创建）"
+                                className="min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
-                        </div>
-                        <input
-                            type="text"
-                            aria-label="当前模板名称"
-                            value={templateNameDraft}
-                            maxLength={ENTITY_NAME_MAX_LENGTH}
-                            disabled={!currentTemplateName}
-                            onChange={(e) => setTemplateNameDraft(sanitizeEntityNameInput(e.target.value))}
-                            onBlur={handleTemplateRenameBlur}
-                            placeholder="当前模板名称（失焦自动保存）"
-                            className="min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
-                        />
-                        <button
-                            onClick={deleteTemplate}
-                            disabled={!currentTemplateName}
-                            className="flex items-center gap-1.5 px-3 py-2 bg-red-600/80 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
-                        >
-                            <Trash2 size={14} />
-                            删除
-                        </button>
-                        <input
-                            type="text"
-                            aria-label="新建模板名称"
-                            value={newTemplateName}
-                            maxLength={ENTITY_NAME_MAX_LENGTH}
-                            onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
-                            onBlur={(e) => handleCreateTemplateBlur(e.target.value)}
-                            placeholder="新建模板名称（失焦自动创建）"
-                            className="min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 lg:col-span-2"
-                        />
-                        <div className="flex gap-2">
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    void handleImportTemplate();
-                                }}
-                                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
-                            >
-                                <Download size={14} />
-                                导入
-                            </button>
-                            <button
-                                type="button"
-                                onClick={() => {
-                                    void handleExportTemplate();
-                                }}
-                                disabled={!currentTemplateName.trim() && !newTemplateName.trim()}
-                                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
-                            >
-                                <Upload size={14} />
-                                导出
-                            </button>
+                            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        void handleImportTemplate();
+                                    }}
+                                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                                >
+                                    <Download size={14} />
+                                    导入
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => {
+                                        void handleExportTemplate();
+                                    }}
+                                    disabled={!currentTemplateName.trim() && !newTemplateName.trim()}
+                                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                                >
+                                    <Upload size={14} />
+                                    导出
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={openTemplateRenameDialog}
+                                    disabled={!currentTemplateName}
+                                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                                >
+                                    <Pencil size={14} />
+                                    重命名
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={deleteTemplate}
+                                    disabled={!currentTemplateName}
+                                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600/80 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
+                                >
+                                    <Trash2 size={14} />
+                                    删除
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </section>
@@ -1610,6 +1632,17 @@ export default function HomePage() {
                 result={publishResult}
             />
             {importConflictDialog}
+            <RenameTemplateDialog
+                isOpen={isRenameDialogOpen}
+                value={templateNameDraft}
+                maxLength={ENTITY_NAME_MAX_LENGTH}
+                isSaving={isRenamingTemplate}
+                onChange={(value) => setTemplateNameDraft(sanitizeEntityNameInput(value))}
+                onConfirm={() => {
+                    void handleTemplateRenameConfirm();
+                }}
+                onCancel={closeTemplateRenameDialog}
+            />
             {noticeDialog}
         </div>
     );

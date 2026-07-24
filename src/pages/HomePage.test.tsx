@@ -175,8 +175,8 @@ function findAboutInput(container: HTMLElement): HTMLInputElement {
     return input!;
 }
 
-function findTemplateNameInput(container: HTMLElement): HTMLInputElement {
-    const input = container.querySelector<HTMLInputElement>('input[aria-label="当前模板名称"]');
+function findRenameTemplateNameInput(): HTMLInputElement {
+    const input = document.querySelector<HTMLInputElement>('input[aria-label="模板名称"]');
     expect(input).not.toBeNull();
     return input!;
 }
@@ -231,7 +231,47 @@ describe('HomePage template save guards', () => {
         }
     });
 
-    it('renames the selected template when its name input loses focus', async () => {
+    it('does not rename the selected template when the dialog is cancelled', async () => {
+        const saveRequests: Record<string, unknown>[] = [];
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'save_template') {
+                saveRequests.push(args ?? {});
+            }
+            return routeInvoke(command, args);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            const renameButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '重命名',
+            );
+            await act(async () => {
+                renameButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            await act(async () => setInputValue(findRenameTemplateNameInput(), 'cancelled-name'));
+            const cancelButton = Array.from(document.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '取消',
+            );
+            await act(async () => {
+                cancelButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            expect(saveRequests).toHaveLength(0);
+            await act(async () => {
+                renameButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+            expect(findRenameTemplateNameInput().value).toBe('default');
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('renames the selected template only after confirming the rename dialog', async () => {
         const saveRequests: Record<string, unknown>[] = [];
         invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
             if (command === 'save_template') {
@@ -245,10 +285,25 @@ describe('HomePage template save guards', () => {
         const rendered = await renderElement(<HomePage />);
         try {
             await flushAsync();
-            const templateName = findTemplateNameInput(rendered.container);
+            expect(rendered.container.querySelector('input[aria-label="当前模板名称"]')).toBeNull();
+            const renameButton = Array.from(rendered.container.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '重命名',
+            );
+            expect(renameButton).toBeTruthy();
             await act(async () => {
-                setInputValue(templateName, 'renamed');
-                templateName.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+                renameButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            });
+            await flushAsync();
+
+            const templateName = findRenameTemplateNameInput();
+            expect(templateName.value).toBe('default');
+            await act(async () => setInputValue(templateName, 'renamed'));
+            const confirmButton = Array.from(document.querySelectorAll('button')).find(
+                (button) => button.textContent?.trim() === '确认重命名',
+            );
+            expect(confirmButton).toBeTruthy();
+            await act(async () => {
+                confirmButton!.dispatchEvent(new MouseEvent('click', { bubbles: true }));
             });
             await flushAsync();
 

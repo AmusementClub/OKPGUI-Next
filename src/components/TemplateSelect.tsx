@@ -54,21 +54,24 @@ export default function TemplateSelect({
             disabled={isDisabled}
         >
             <div className="relative">
-                <div className="relative flex w-full items-center overflow-hidden rounded-lg border border-slate-700 bg-slate-800 text-sm text-slate-200 focus-within:ring-2 focus-within:ring-emerald-500 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-60">
-                    <Search size={16} className="pointer-events-none absolute left-3 text-slate-500" />
+                <div className="flex w-full items-center overflow-hidden rounded-lg border border-slate-700 bg-slate-800 text-sm text-slate-200 focus-within:ring-2 focus-within:ring-emerald-500 data-[disabled]:cursor-not-allowed data-[disabled]:opacity-60">
+                    <Search size={16} className="pointer-events-none ml-3 shrink-0 text-slate-500" />
                     <ComboboxInput
                         aria-label="选择模板"
                         displayValue={(option: TemplateSelectOption | null) => option?.label ?? ''}
                         onChange={(event) => setQuery(event.target.value)}
                         placeholder={placeholder}
-                        className="w-full bg-transparent py-2 pr-24 pl-10 text-left text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none disabled:cursor-not-allowed"
+                        className="min-w-0 flex-1 truncate bg-transparent py-2 pr-3 pl-3 text-left text-sm text-slate-200 placeholder:text-slate-500 focus:outline-none disabled:cursor-not-allowed"
                     />
                     {selectedOption && !query ? (
-                        <span className="pointer-events-none absolute right-9 max-w-28 truncate text-xs text-slate-500">
+                        <span
+                            aria-label="上次发布时间"
+                            className="pointer-events-none max-w-32 shrink-0 truncate text-xs text-slate-500"
+                        >
                             {selectedOption.latestPublishedAtLabel}
                         </span>
                     ) : null}
-                    <ComboboxButton className="absolute inset-y-0 right-0 flex items-center pr-3 text-slate-500 focus:outline-none disabled:cursor-not-allowed">
+                    <ComboboxButton className="flex shrink-0 items-center px-3 text-slate-500 focus:outline-none disabled:cursor-not-allowed">
                         <ChevronDown size={16} className="shrink-0" />
                     </ComboboxButton>
                 </div>
