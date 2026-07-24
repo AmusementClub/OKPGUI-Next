@@ -212,6 +212,7 @@ export default function HomePage() {
     const [templateOptions, setTemplateOptions] = useState<TemplateSelectOption[]>([]);
     const [currentTemplateName, setCurrentTemplateName] = useState('');
     const [configLoadError, setConfigLoadError] = useState<string | null>(null);
+    const [templateNameDraft, setTemplateNameDraft] = useState('');
     const [newTemplateName, setNewTemplateName] = useState('');
     const [template, setTemplate] = useState<Template>(defaultTemplate);
 
@@ -272,6 +273,10 @@ export default function HomePage() {
     const titleGenerationRef = useRef(0);
     const manualTitleEditGenerationRef = useRef(0);
     const profileLoadGenerationRef = useRef(0);
+
+    useEffect(() => {
+        setTemplateNameDraft(currentTemplateName);
+    }, [currentTemplateName]);
 
     // Load templates and profiles on mount
     useEffect(() => {
@@ -513,6 +518,7 @@ export default function HomePage() {
         templateToSave: Template = withSelectedProfile(templateRef.current),
         explicitName?: string,
         expectedEditorSnapshot?: string,
+        identityMode: 'save' | 'create' = 'save',
     ) => {
         const name = getTemplateName(explicitName);
         const capturedTemplateName = currentTemplateNameRef.current;
@@ -523,7 +529,9 @@ export default function HomePage() {
                 const saved = await invoke<ImportedTemplatePayload>('save_template', {
                     name,
                     template: templateToSave,
-                    previousName: capturedTemplateName || undefined,
+                    ...(identityMode === 'create'
+                        ? {}
+                        : { previousName: capturedTemplateName || undefined }),
                 });
                 const nextTemplate = normalizeTemplate(saved.template);
 
@@ -567,6 +575,26 @@ export default function HomePage() {
 
     const autosaveTemplate = (templateToSave: Template = withSelectedProfile(templateRef.current), explicitName?: string) => {
         void persistTemplateToDisk(templateToSave, explicitName);
+    };
+
+    const handleTemplateRenameBlur = () => {
+        const nextName = trimEntityName(templateNameDraft);
+        const previousName = currentTemplateNameRef.current;
+        if (!previousName || !nextName || nextName === previousName) {
+            setTemplateNameDraft(previousName);
+            return;
+        }
+
+        void persistTemplateToDisk(withSelectedProfile(templateRef.current), nextName);
+    };
+
+    const handleCreateTemplateBlur = (value: string) => {
+        const name = trimEntityName(value);
+        if (!name) {
+            return;
+        }
+
+        void persistTemplateToDisk(withSelectedProfile(templateRef.current), name, undefined, 'create');
     };
 
     const deleteTemplate = async () => {
@@ -1151,8 +1179,8 @@ export default function HomePage() {
                 {/* Template Selection */}
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-2">模板管理</h2>
-                    <div className="flex gap-2">
-                        <div className="flex-1">
+                    <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_auto]">
+                        <div>
                             <TemplateSelect
                                 options={templateOptions}
                                 value={currentTemplateName}
@@ -1163,17 +1191,14 @@ export default function HomePage() {
                         </div>
                         <input
                             type="text"
-                            value={newTemplateName}
+                            aria-label="当前模板名称"
+                            value={templateNameDraft}
                             maxLength={ENTITY_NAME_MAX_LENGTH}
-                            onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
-                            onBlur={(e) => {
-                                const trimmedName = trimEntityName(e.target.value);
-                                if (trimmedName) {
-                                    autosaveTemplate(withSelectedProfile(templateRef.current), trimmedName);
-                                }
-                            }}
-                            placeholder="新模板名称（失焦自动创建）"
-                            className="w-56 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                            disabled={!currentTemplateName}
+                            onChange={(e) => setTemplateNameDraft(sanitizeEntityNameInput(e.target.value))}
+                            onBlur={handleTemplateRenameBlur}
+                            placeholder="当前模板名称（失焦自动保存）"
+                            className="min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 disabled:cursor-not-allowed disabled:opacity-40"
                         />
                         <button
                             onClick={deleteTemplate}
@@ -1183,27 +1208,39 @@ export default function HomePage() {
                             <Trash2 size={14} />
                             删除
                         </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void handleImportTemplate();
-                            }}
-                            className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
-                        >
-                            <Download size={14} />
-                            导入
-                        </button>
-                        <button
-                            type="button"
-                            onClick={() => {
-                                void handleExportTemplate();
-                            }}
-                            disabled={!currentTemplateName.trim() && !newTemplateName.trim()}
-                            className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
-                        >
-                            <Upload size={14} />
-                            导出
-                        </button>
+                        <input
+                            type="text"
+                            aria-label="新建模板名称"
+                            value={newTemplateName}
+                            maxLength={ENTITY_NAME_MAX_LENGTH}
+                            onChange={(e) => setNewTemplateName(sanitizeEntityNameInput(e.target.value))}
+                            onBlur={(e) => handleCreateTemplateBlur(e.target.value)}
+                            placeholder="新建模板名称（失焦自动创建）"
+                            className="min-w-0 bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500 lg:col-span-2"
+                        />
+                        <div className="flex gap-2">
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void handleImportTemplate();
+                                }}
+                                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                            >
+                                <Download size={14} />
+                                导入
+                            </button>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void handleExportTemplate();
+                                }}
+                                disabled={!currentTemplateName.trim() && !newTemplateName.trim()}
+                                className="flex flex-1 items-center justify-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 disabled:cursor-not-allowed border border-slate-700 text-slate-200 text-sm rounded-lg transition-colors"
+                            >
+                                <Upload size={14} />
+                                导出
+                            </button>
+                        </div>
                     </div>
                 </section>
 
