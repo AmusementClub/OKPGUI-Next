@@ -34,3 +34,9 @@ src-tauri/.omc/*
 # Staged MediaInfo sidecars (scripts/stage-mediainfo.*); keep directory via .gitkeep.
 src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
+
+# Desktop E2E / packaged-smoke evidence output (local or CI artifact; not source)
+tests/desktop-e2e/out/
+
+# Playwright runtime output
+test-results/

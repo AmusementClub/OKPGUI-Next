@@ -1,0 +1,35 @@
+{
+  "commitSha": "deadbeefcafebabe0123456789abcdef01234567",
+  "targetTriple": "x86_64-unknown-linux-gnu",
+  "harnessType": "host-binary-smoke",
+  "binarySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "packageSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "productionIpcMarker": false,
+  "productionBinaryMarker": true,
+  "namedTests": [
+    {
+      "name": "shared-backend-prepare-observe-ack-publish",
+      "result": "pass",
+      "detail": "Fixture only: backend prepare + cancel contract (not WebView IPC)."
+    },
+    {
+      "name": "home-prepare-observe-ack-publish",
+      "result": "skipped",
+      "detail": "Dual-entry UI requires desktop-webdriver; host smoke skips Home entry."
+    },
+    {
+      "name": "minimal-backend-roundtrip",
+      "result": "pass",
+      "detail": "Fixture only: backend round-trip marker."
+    }
+  ],
+  "result": "pass",
+  "timestamps": {
+    "startedAt": "2026-07-24T00:00:00.000Z",
+    "finishedAt": "2026-07-24T00:01:00.000Z"
+  },
+  "artifactPaths": [
+    "tests/desktop-e2e/out/example-artifacts/driver.log"
+  ],
+  "notes": "Example host-binary-smoke evidence: productionBinaryMarker true, productionIpcMarker false (not WebDriver)."
+}

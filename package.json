@@ -9,6 +9,8 @@
     "dev": "vite",
     "test": "vitest run --environment jsdom --exclude 'tests/ui-integration/**'",
     "test:ui-integration": "node scripts/run-playwright-ui-integration.mjs",
+    "test:desktop-e2e": "node scripts/run-desktop-e2e.mjs",
+    "test:macos-packaged-smoke": "node scripts/run-macos-packaged-smoke.mjs",
     "test:provider-contract": "node scripts/verify-provider-contract.mjs",
     "test:security-offline": "node scripts/verify-provider-contract.mjs && node scripts/verify-ui-integration-inventory.mjs",
     "verify:mediainfo": "node scripts/verify-mediainfo-package.mjs --manifest-only",

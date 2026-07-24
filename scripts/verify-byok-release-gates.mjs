@@ -15,7 +15,7 @@
  *   - src-tauri/tauri.conf.json
  *   - src-tauri/capabilities/default.json
  */
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
@@ -292,15 +292,74 @@ function checkWorkflows() {
     'draft-release archive membership',
   );
 
-  // Build artifact must keep the platform-limited notice step.
-  requireIncludes(
+  // Build artifact / draft-release: separate named evidence-class steps (Milestone 6).
+  for (const workflow of [
     '.github/workflows/build-artifact.yml',
-    [
-      'Platform-limited gates',
-      'mocked Tauri IPC',
-      'WebDriver',
-    ],
-    'build-artifact platform-limited notice',
+    '.github/workflows/draft-release.yml',
+  ]) {
+    requireIncludes(
+      workflow,
+      [
+        'Desktop production critical flows (Windows/Linux)',
+        'macOS packaged production smoke',
+        'Upload desktop / packaged evidence JSON',
+        'desktop-webdriver',
+        'macos-packaged-smoke',
+        'host-binary-smoke',
+        'productionBinaryMarker',
+        'DESKTOP_E2E_REQUIRE_PASS',
+        'run-desktop-e2e.mjs',
+        'run-macos-packaged-smoke.mjs',
+        'mocked Tauri IPC',
+        'productionIpcMarker',
+      ],
+      'workflow desktop evidence steps',
+    );
+  }
+}
+
+/**
+ * Milestone 4: legacy Vision IPC must stay unregistered and off the frontend service API.
+ * Plan-token Vision commands remain the only public surface.
+ */
+function checkLegacyVisionIpcRetired() {
+  const libRs = readText('src-tauri/src/lib.rs');
+  if (libRs !== null) {
+    // Only the invoke_handler registration block (not prose comments alone).
+    const handlerStart = libRs.indexOf('tauri::generate_handler!');
+    const handlerSlice =
+      handlerStart >= 0 ? libRs.slice(handlerStart, handlerStart + 8000) : libRs;
+    for (const name of ['ai_extract_vision_images', 'ai_normalize_vision_image']) {
+      // Match registration-style references: commands::...::name or bare name as path segment.
+      const registration = new RegExp(
+        `(?:commands::ai_commands::|::)${name}\\b|\\b${name}\\s*,`,
+      );
+      if (registration.test(handlerSlice)) {
+        fail(
+          `src-tauri/src/lib.rs: legacy Vision command ${JSON.stringify(name)} must not be registered in invoke_handler`,
+        );
+      }
+    }
+    // Positive baseline: plan-token Vision remains.
+    for (const name of ['ai_list_plan_vision_candidates', 'ai_bind_plan_vision']) {
+      if (!handlerSlice.includes(name)) {
+        fail(
+          `src-tauri/src/lib.rs: plan-token Vision command ${JSON.stringify(name)} must remain registered`,
+        );
+      }
+    }
+  }
+
+  // Frontend service public API must not reintroduce legacy Vision invokes.
+  requireAbsent(
+    'src/services/ai.ts',
+    ["'ai_extract_vision_images'", '"ai_extract_vision_images"', "'ai_normalize_vision_image'", '"ai_normalize_vision_image"'],
+    'legacy Vision service API',
+  );
+  requireIncludes(
+    'src/services/ai.ts',
+    ["'ai_list_plan_vision_candidates'", "'ai_bind_plan_vision'"],
+    'plan-token Vision service API',
   );
 }
 
@@ -316,12 +375,273 @@ function checkPackageJson() {
     'verify:mediainfo': 'node scripts/verify-mediainfo-package.mjs --manifest-only',
     'verify:ui-integration-inventory': 'node scripts/verify-ui-integration-inventory.mjs',
     'test:ui-integration': 'node scripts/run-playwright-ui-integration.mjs',
+    'test:desktop-e2e': 'node scripts/run-desktop-e2e.mjs',
+    'test:macos-packaged-smoke': 'node scripts/run-macos-packaged-smoke.mjs',
   };
   for (const [name, command] of Object.entries(requiredScripts)) {
     if (scripts[name] !== command) {
       fail(
         `package.json: scripts.${name} must be ${JSON.stringify(command)}, got ${JSON.stringify(scripts[name])}`,
       );
+    }
+  }
+}
+
+/**
+ * Milestone 0A/6 desktop harness inventory + frozen evidence schema.
+ * Empty tests/desktop-e2e/out/ does not fail offline (no binary required).
+ *
+ * Separately named inventory classes:
+ *   1. mocked Playwright UI integration (not desktop E2E)
+ *   2. desktop WebDriver (Windows/Linux critical flows)
+ *   3. macOS packaged smoke (IPC/event/sidecar/keyring)
+ */
+function checkDesktopHarnessInventory() {
+  const requiredFiles = [
+    'tests/desktop-e2e/README.md',
+    'tests/desktop-e2e/evidence.schema.json',
+    'tests/desktop-e2e/evidence.example.json',
+    'tests/desktop-e2e/spike/minimal-ipc-roundtrip.md',
+    'tests/desktop-e2e/suite/critical-flows.mjs',
+    'tests/desktop-e2e/suite/run-critical-flows.execute.mjs',
+    'tests/desktop-e2e/suite/run-macos-smoke.execute.mjs',
+    'tests/desktop-e2e/suite/wdio.conf.stub.mjs',
+    'tests/desktop-e2e/fixtures/deterministic-profile.json',
+    'tests/desktop-e2e/fixtures/mock-provider.md',
+    'tests/desktop-e2e/specs/home-prepare-observe-ack-publish.md',
+    'tests/desktop-e2e/specs/quick-publish-prepare-observe-ack-publish.md',
+    'tests/desktop-e2e/specs/cancellation-and-failed-poll-recovery.md',
+    'tests/desktop-e2e/specs/vision-disclosure-consent.md',
+    'scripts/run-desktop-e2e.mjs',
+    'scripts/run-macos-packaged-smoke.mjs',
+  ];
+  for (const relPath of requiredFiles) {
+    if (!existsSync(path.join(rootDir, relPath))) {
+      fail(`missing desktop harness inventory file: ${relPath}`);
+    }
+  }
+
+  requireIncludes(
+    'tests/desktop-e2e/README.md',
+    [
+      'tauri-driver',
+      'WebdriverIO',
+      'not desktop E2E',
+      'macos-packaged-smoke',
+      'desktop-webdriver',
+      'host-binary-smoke',
+      'productionIpcMarker',
+      'productionBinaryMarker',
+      'v2.tauri.app/develop/tests/webdriver',
+      'macOS',
+      'home-prepare-observe-ack-publish',
+      'quick-publish-prepare-observe-ack-publish',
+      'cancellation-and-failed-poll-recovery',
+      'vision-disclosure-consent',
+    ],
+    'desktop harness README',
+  );
+
+  requireIncludes(
+    'tests/desktop-e2e/evidence.schema.json',
+    [
+      'commitSha',
+      'targetTriple',
+      'harnessType',
+      'desktop-webdriver',
+      'macos-packaged-smoke',
+      'mocked-playwright-not-desktop',
+      'binarySha256',
+      'packageSha256',
+      'productionIpcMarker',
+      'namedTests',
+      'artifactPaths',
+      'startedAt',
+      'finishedAt',
+    ],
+    'desktop evidence schema',
+  );
+
+  requireIncludes(
+    'tests/desktop-e2e/evidence.example.json',
+    ['productionIpcMarker', 'host-binary-smoke', 'productionBinaryMarker', 'commitSha'],
+    'desktop evidence example',
+  );
+
+  // Inventory item: desktop WebDriver runner (critical flow IDs live in suite catalog).
+  requireIncludes(
+    'scripts/run-desktop-e2e.mjs',
+    [
+      'not desktop E2E',
+      'desktop-webdriver',
+      'host-binary-smoke',
+      'blocked',
+      'productionIpcMarker',
+      'darwin',
+      'CRITICAL_FLOWS',
+      'skippedCriticalFlowTests',
+      'DESKTOP_E2E_ALLOW_BLOCKED',
+      'run-critical-flows.execute.mjs',
+      'evidence-webdriver-blocked',
+    ],
+    'desktop WebDriver runner inventory',
+  );
+
+  // Inventory item: macOS packaged smoke runner + probe names.
+  requireIncludes(
+    'scripts/run-macos-packaged-smoke.mjs',
+    [
+      'macos-packaged-smoke',
+      'blocked',
+      'productionIpcMarker',
+      'WebDriver',
+      'bundle/macos',
+      'DESKTOP_E2E_ALLOW_BLOCKED',
+      'run-macos-smoke.execute.mjs',
+      '.app/Contents/MacOS',
+    ],
+    'macOS packaged smoke runner inventory',
+  );
+  requireIncludes(
+    'tests/desktop-e2e/suite/run-critical-flows.execute.mjs',
+    [
+      'OKPGUI_DESKTOP_SMOKE_OUT',
+      'productionIpcMarker',
+      'OKPGUI_PRODUCTION_BINARY_V1',
+      'productionBinaryMarker',
+      'CRITICAL_FLOWS',
+    ],
+    'desktop execute suite inventory',
+  );
+
+  requireIncludes(
+    'tests/desktop-e2e/suite/critical-flows.mjs',
+    [
+      'home-prepare-observe-ack-publish',
+      'quick-publish-prepare-observe-ack-publish',
+      'cancellation-and-failed-poll-recovery',
+      'vision-disclosure-consent',
+      'production-binary-probe',
+      'sidecar-mediainfo-probe',
+      'keyring-session-only-probe',
+    ],
+    'critical flow catalog',
+  );
+
+  requireIncludes(
+    'tests/desktop-e2e/fixtures/deterministic-profile.json',
+    [
+      'mockProvider',
+      '127.0.0.1',
+      'formalAuditGo',
+      'formalAuditWarning',
+      'transportError',
+      'visionCandidates',
+      'prepare_plan',
+      'publish_prepared_plan',
+      'productionIpcMarkerRule',
+    ],
+    'deterministic fixture profile',
+  );
+
+  // Forbidden: claiming desktop E2E from Playwright paths alone.
+  const playwrightPaths = [
+    'scripts/run-playwright-ui-integration.mjs',
+    'scripts/verify-ui-integration-inventory.mjs',
+    'playwright.config.ts',
+  ];
+  for (const relPath of playwrightPaths) {
+    requireAbsent(
+      relPath,
+      [
+        'desktop E2E passed',
+        'desktop E2E complete',
+        'real desktop E2E',
+        'harnessType": "desktop-webdriver',
+      ],
+      'Playwright-as-desktop claim',
+    );
+  }
+
+  // Optional: if evidence files exist under out/, validate required keys.
+  // Empty out/ must not fail the offline gate.
+  const evidenceOutDir = path.join(rootDir, 'tests', 'desktop-e2e', 'out');
+  if (!existsSync(evidenceOutDir)) {
+    return;
+  }
+  let names = [];
+  try {
+    names = readdirSync(evidenceOutDir).filter(
+      (n) => n.startsWith('evidence-') && n.endsWith('.json'),
+    );
+  } catch {
+    return;
+  }
+  const requiredKeys = [
+    'commitSha',
+    'targetTriple',
+    'harnessType',
+    'binarySha256',
+    'productionIpcMarker',
+    'namedTests',
+    'result',
+    'timestamps',
+    'artifactPaths',
+  ];
+  const harnessTypes = new Set([
+    'desktop-webdriver',
+    'macos-packaged-smoke',
+    'host-binary-smoke',
+    'mocked-playwright-not-desktop',
+  ]);
+  for (const name of names) {
+    const relPath = `tests/desktop-e2e/out/${name}`;
+    const data = readJson(relPath);
+    if (!data || typeof data !== 'object') continue;
+    for (const key of requiredKeys) {
+      if (!Object.prototype.hasOwnProperty.call(data, key)) {
+        fail(`${relPath}: missing required evidence field ${key}`);
+      }
+    }
+    if (data.harnessType && !harnessTypes.has(data.harnessType)) {
+      fail(
+        `${relPath}: harnessType must be one of ${[...harnessTypes].join(', ')}`,
+      );
+    }
+    if (
+      data.result === 'pass' &&
+      data.harnessType === 'mocked-playwright-not-desktop'
+    ) {
+      fail(
+        `${relPath}: mocked-playwright-not-desktop cannot claim result pass as desktop proof`,
+      );
+    }
+    // Real WebDriver UI path only: pass requires productionIpcMarker.
+    if (
+      data.result === 'pass' &&
+      data.harnessType === 'desktop-webdriver' &&
+      data.productionIpcMarker !== true
+    ) {
+      fail(
+        `${relPath}: desktop-webdriver result pass requires productionIpcMarker true`,
+      );
+    }
+    // Host binary + macOS packaged binary smoke: productionBinaryMarker, never IPC claim.
+    if (
+      data.result === 'pass' &&
+      (data.harnessType === 'host-binary-smoke' ||
+        data.harnessType === 'macos-packaged-smoke')
+    ) {
+      if (data.productionBinaryMarker !== true) {
+        fail(
+          `${relPath}: ${data.harnessType} pass requires productionBinaryMarker true`,
+        );
+      }
+      if (data.productionIpcMarker === true) {
+        fail(
+          `${relPath}: ${data.harnessType} must not set productionIpcMarker true (not WebView IPC)`,
+        );
+      }
     }
   }
 }
@@ -350,7 +670,7 @@ function checkDesktopE2EHonesty() {
     'UI inventory honesty',
   );
 
-  // Checklist must document the evidence boundary without claiming desktop E2E pass.
+  // Checklist must document the three evidence classes without claiming desktop E2E pass.
   requireIncludes(
     'docs/byok-ai-preflight-v2-release-checklist.md',
     [
@@ -363,6 +683,12 @@ function checkDesktopE2EHonesty() {
       'THIRD_PARTY_NOTICES',
       'no shell',
       'platform-limited',
+      'desktop-webdriver',
+      'macos-packaged-smoke',
+      'mocked-playwright-not-desktop',
+      'evidence.schema.json',
+      'home-prepare-observe-ack-publish',
+      'productionIpcMarker',
     ],
     'release checklist',
   );
@@ -376,6 +702,8 @@ function checkDesktopE2EHonesty() {
     ],
     'false checklist claim',
   );
+
+  checkDesktopHarnessInventory();
 }
 
 /**
@@ -402,6 +730,7 @@ function main() {
   checkNoShellCapability();
   checkMediaInfoPackageGate();
   checkReleaseArchiveGate();
+  checkLegacyVisionIpcRetired();
   checkPackageJson();
   checkWorkflows();
   checkDesktopE2EHonesty();
@@ -420,7 +749,20 @@ function main() {
   console.log(`  externalBin: ${EXTERNAL_BIN}`);
   console.log(`  notice: ${NOTICE_REPO_PATH}`);
   console.log('  capability: no frontend shell permission');
-  console.log('  UI layer: mocked Playwright browser integration (not desktop E2E)');
+  console.log('  legacy Vision IPC: retired (plan-token only)');
+  // Separately named evidence inventory (Milestone 6).
+  console.log(
+    '  evidence class [mocked UI]: Playwright browser integration (mocked-playwright-not-desktop; not desktop E2E)',
+  );
+  console.log(
+    '  evidence class [desktop WebDriver]: Windows/Linux critical flows via run-desktop-e2e.mjs (desktop-webdriver)',
+  );
+  console.log(
+    '  evidence class [packaged smoke]: macOS IPC/event/sidecar/keyring via run-macos-packaged-smoke.mjs (macos-packaged-smoke)',
+  );
+  console.log(
+    '  desktop harness: tests/desktop-e2e execute suite + evidence schema (empty out/ OK offline; binary required for pass)',
+  );
   console.log(`  root: ${rel(rootDir)}`);
 }
 

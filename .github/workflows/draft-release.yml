@@ -140,10 +140,92 @@ jobs:
       - name: Build Tauri application binary
         run: pnpm tauri build --no-bundle
 
-      - name: Desktop E2E / macOS packaged smoke (platform-limited notice)
-        if: runner.os == 'Linux'
+      # --- Evidence class: host-binary-smoke (Windows/Linux) ---
+      # DESKTOP_E2E_ALLOW_BLOCKED is not used when binary exists (REQUIRE_PASS instead).
+      # desktop-webdriver side-evidence may be blocked (WDIO specs still stubs).
+      - name: Desktop production critical flows (Windows/Linux)
+        if: runner.os == 'Windows' || runner.os == 'Linux'
+        shell: bash
+        env:
+          DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
         run: |
-          echo "::notice title=Platform-limited gates::Release packaging asserts sidecar/archive membership below. Windows/Linux desktop WebDriver E2E and macOS packaged IPC/keyring smoke remain platform-limited (no in-repo harness)."
+          set -euo pipefail
+          mkdir -p tests/desktop-e2e/out
+          if [[ "${{ runner.os }}" == "Windows" ]]; then
+            BINARY="src-tauri/target/release/okpgui-next.exe"
+          else
+            BINARY="src-tauri/target/release/okpgui-next"
+          fi
+          if [[ ! -f "$BINARY" ]]; then
+            echo "::error title=Desktop production smoke::Built binary not found at $BINARY"
+            exit 1
+          fi
+          export DESKTOP_E2E_BINARY="$BINARY"
+          export DESKTOP_E2E_REQUIRE_PASS=1
+          node scripts/run-desktop-e2e.mjs
+          shopt -s nullglob
+          evidence_files=(tests/desktop-e2e/out/evidence-*.json)
+          primary=()
+          for f in "${evidence_files[@]}"; do
+            case "$(basename "$f")" in
+              evidence-webdriver-blocked-*) ;;
+              *) primary+=("$f") ;;
+            esac
+          done
+          if [[ ${#primary[@]} -eq 0 ]]; then
+            echo "::error title=Desktop production smoke::Required host-binary-smoke evidence JSON missing"
+            exit 1
+          fi
+          for f in "${primary[@]}"; do
+            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(e.result!=="pass"||e.harnessType!=="host-binary-smoke"||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(process.argv[1],e);process.exit(1);}' "$f"
+          done
+          echo "::notice title=Host binary smoke::pass with productionBinaryMarker=true (not WebDriver)."
+
+      # --- Evidence class: macos-packaged-smoke ---
+      # Draft release uses --no-bundle, so this is typically the raw release binary with
+      # harnessType macos-packaged-smoke (not .app). Full .app proof is on build-artifact.
+      - name: macOS packaged production smoke
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
+        run: |
+          set -euo pipefail
+          mkdir -p tests/desktop-e2e/out
+          BINARY="src-tauri/target/release/okpgui-next"
+          if [[ ! -f "$BINARY" ]]; then
+            echo "::error title=macOS packaged smoke::Built binary not found"
+            exit 1
+          fi
+          export DESKTOP_E2E_BINARY="$BINARY"
+          export DESKTOP_E2E_REQUIRE_PASS=1
+          node scripts/run-macos-packaged-smoke.mjs
+          shopt -s nullglob
+          evidence_files=(tests/desktop-e2e/out/evidence-*.json)
+          primary=()
+          for f in "${evidence_files[@]}"; do
+            case "$(basename "$f")" in
+              evidence-webdriver-blocked-*) ;;
+              *) primary+=("$f") ;;
+            esac
+          done
+          if [[ ${#primary[@]} -eq 0 ]]; then
+            echo "::error title=macOS packaged smoke::Required evidence JSON missing"
+            exit 1
+          fi
+          for f in "${primary[@]}"; do
+            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(e.result!=="pass"||e.harnessType!=="macos-packaged-smoke"||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(process.argv[1],e);process.exit(1);}' "$f"
+          done
+          echo "::notice title=macOS packaged smoke::pass with productionBinaryMarker=true, productionIpcMarker=false."
+
+      - name: Upload desktop / packaged evidence JSON
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: desktop-evidence-${{ matrix.platform.slug }}
+          if-no-files-found: warn
+          path: |
+            tests/desktop-e2e/out/evidence-*.json
 
       - name: Package Windows asset
         if: runner.os == 'Windows'

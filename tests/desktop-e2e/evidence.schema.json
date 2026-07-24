@@ -1,0 +1,117 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://okpgui-next.local/schemas/desktop-e2e-evidence.schema.json",
+  "title": "BYOK desktop / package evidence (per target)",
+  "description": "Machine-readable evidence for real desktop WebDriver or macOS packaged smoke. Mocked Playwright must use harnessType mocked-playwright-not-desktop and must not claim production desktop pass.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "commitSha",
+    "targetTriple",
+    "harnessType",
+    "binarySha256",
+    "productionIpcMarker",
+    "namedTests",
+    "result",
+    "timestamps",
+    "artifactPaths"
+  ],
+  "properties": {
+    "commitSha": {
+      "type": "string",
+      "minLength": 7,
+      "description": "Git commit SHA of the build under test."
+    },
+    "targetTriple": {
+      "type": "string",
+      "enum": [
+        "x86_64-pc-windows-msvc",
+        "x86_64-unknown-linux-gnu",
+        "x86_64-apple-darwin",
+        "aarch64-apple-darwin"
+      ],
+      "description": "Rust / packaging target triple."
+    },
+    "harnessType": {
+      "type": "string",
+      "enum": [
+        "desktop-webdriver",
+        "macos-packaged-smoke",
+        "host-binary-smoke",
+        "mocked-playwright-not-desktop"
+      ],
+      "description": "How the evidence was produced. host-binary-smoke exercises production Rust in the built binary without WebView IPC/WebDriver. desktop-webdriver is reserved for real WebDriver. mocked-playwright-not-desktop is never real desktop E2E."
+    },
+    "productionBinaryMarker": {
+      "type": "boolean",
+      "description": "True when host-binary-smoke exercised production Rust modules inside the built binary. Not a substitute for productionIpcMarker (webview/Tauri IPC)."
+    },
+    "binarySha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$|^unknown$|^not-built$",
+      "description": "SHA-256 of the built app binary, or not-built/unknown when blocked."
+    },
+    "packageSha256": {
+      "type": "string",
+      "pattern": "^[a-fA-F0-9]{64}$|^unknown$|^not-built$",
+      "description": "Optional SHA-256 of the installer/package artifact."
+    },
+    "productionIpcMarker": {
+      "type": "boolean",
+      "description": "Must be true only when production Tauri WebView command/event IPC was exercised (desktop-webdriver). Must be false for host-binary-smoke, macos-packaged-smoke binary paths, blocked, and mocked runs."
+    },
+    "namedTests": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "result"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "result": {
+            "type": "string",
+            "enum": ["pass", "fail", "skipped"]
+          },
+          "detail": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "result": {
+      "type": "string",
+      "enum": ["pass", "fail", "blocked"],
+      "description": "Overall outcome. blocked = harness/binary not available (fail-closed honesty)."
+    },
+    "timestamps": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["startedAt", "finishedAt"],
+      "properties": {
+        "startedAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "finishedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "artifactPaths": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Relative or absolute paths to logs, screenshots, and related artifacts."
+    },
+    "notes": {
+      "type": "string",
+      "description": "Optional human-readable context (e.g. macOS WebDriver limitation)."
+    }
+  }
+}
