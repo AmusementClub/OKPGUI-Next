@@ -175,9 +175,88 @@ function findAboutInput(container: HTMLElement): HTMLInputElement {
     return input!;
 }
 
+function findTemplateNameInput(container: HTMLElement): HTMLInputElement {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="当前模板名称"]');
+    expect(input).not.toBeNull();
+    return input!;
+}
+
+function findNewTemplateNameInput(container: HTMLElement): HTMLInputElement {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="新建模板名称"]');
+    expect(input).not.toBeNull();
+    return input!;
+}
+
 describe('HomePage template save guards', () => {
     beforeEach(() => {
         invokeMock.mockReset();
+    });
+
+    it('creates B without renaming A when the new-template input loses focus', async () => {
+        const config = {
+            last_used_template: 'alpha',
+            okp_executable_path: '/okp',
+            templates: {
+                alpha: { profile: 'p1', about: '模板 A' } as Record<string, unknown>,
+            } as Record<string, Record<string, unknown>>,
+        };
+        const saveRequests: Record<string, unknown>[] = [];
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'get_config') return Promise.resolve(config);
+            if (command === 'save_template') {
+                const request = args ?? {};
+                saveRequests.push(request);
+                config.templates[String(request.name)] = request.template as Record<string, unknown>;
+                return Promise.resolve({ name: request.name, template: request.template });
+            }
+            return routeInvoke(command, args);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            const newTemplateName = findNewTemplateNameInput(rendered.container);
+            await act(async () => {
+                setInputValue(newTemplateName, 'beta');
+                newTemplateName.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            });
+            await flushAsync();
+
+            expect(saveRequests).toHaveLength(1);
+            expect(saveRequests[0]).toMatchObject({ name: 'beta' });
+            expect(saveRequests[0]).not.toHaveProperty('previousName');
+            expect(Object.keys(config.templates).sort()).toEqual(['alpha', 'beta']);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('renames the selected template when its name input loses focus', async () => {
+        const saveRequests: Record<string, unknown>[] = [];
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'save_template') {
+                const request = args ?? {};
+                saveRequests.push(request);
+                return Promise.resolve({ name: request.name, template: request.template });
+            }
+            return routeInvoke(command, args);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            const templateName = findTemplateNameInput(rendered.container);
+            await act(async () => {
+                setInputValue(templateName, 'renamed');
+                templateName.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            });
+            await flushAsync();
+
+            expect(saveRequests).toHaveLength(1);
+            expect(saveRequests[0]).toMatchObject({ name: 'renamed', previousName: 'default' });
+        } finally {
+            await rendered.unmount();
+        }
     });
 
     it('drains description edits made while switching before beta is applied', async () => {
