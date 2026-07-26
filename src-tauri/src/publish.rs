@@ -4,6 +4,8 @@ use crate::profile::{
     get_site_cookie_text, load_profiles, normalize_site_cookie_text,
     resolve_site_cookie_user_agent, site_cookie_has_entries, Profile,
 };
+#[cfg(target_os = "windows")]
+use encoding_rs::GB18030;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

@@ -131,7 +131,7 @@ jobs:
 
       - name: Playwright browser/UI integration (mocked Tauri IPC; not desktop E2E)
         run: |
-          # Browser/UI integration with mocked Tauri IPC only (not desktop E2E).
+          # Installs pinned Chromium; mocked Tauri IPC only (not desktop E2E).
           pnpm run test:ui-integration
 
       - name: Run backend tests

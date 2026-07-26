@@ -173,7 +173,7 @@ pub(crate) fn collect_browser_executable_candidates(
             push_browser_candidate(&mut candidates, &mut seen, PathBuf::from(path));
         }
 
-        if let Some(local_app_data) = local_app_data {
+        if let Some(local_app_data) = _local_app_data {
             push_browser_candidate(
                 &mut candidates,
                 &mut seen,

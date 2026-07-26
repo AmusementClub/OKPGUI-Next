@@ -112,8 +112,7 @@ jobs:
 
       - name: Playwright browser/UI integration (mocked Tauri IPC; not desktop E2E)
         run: |
-          # Uses scripts/run-playwright-ui-integration.mjs so frozen-lockfile installs
-          # still run browser/UI integration without a committed Playwright lock entry.
+          # The runner installs Chromium matching the pinned Playwright dependency.
           # This is not desktop E2E / WebDriver / packaged-app automation.
           pnpm run test:ui-integration
 

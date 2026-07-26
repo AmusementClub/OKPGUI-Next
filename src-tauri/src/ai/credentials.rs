@@ -227,10 +227,10 @@ impl OsCredentialStore {
     pub fn public_status(&self) -> CredentialStorePublicStatus {
         #[cfg(target_os = "linux")]
         {
-            return CredentialStorePublicStatus {
+            CredentialStorePublicStatus {
                 backend: CredentialStorageBackend::OsKeyring,
                 linux_session_fallback_enabled: true,
-            };
+            }
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
@@ -401,7 +401,7 @@ impl SecretStore for OsCredentialStore {
     fn set(&self, reference: &CredentialRef, value: SecretValue) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            return self.set_linux(reference, value);
+            self.set_linux(reference, value)
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -420,7 +420,7 @@ impl SecretStore for OsCredentialStore {
     fn get(&self, reference: &CredentialRef) -> Result<Option<SecretValue>, String> {
         #[cfg(target_os = "linux")]
         {
-            return self.get_linux(reference);
+            self.get_linux(reference)
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -441,7 +441,7 @@ impl SecretStore for OsCredentialStore {
     fn delete(&self, reference: &CredentialRef) -> Result<(), String> {
         #[cfg(target_os = "linux")]
         {
-            return self.delete_linux(reference);
+            self.delete_linux(reference)
         }
 
         #[cfg(any(target_os = "macos", target_os = "windows"))]
