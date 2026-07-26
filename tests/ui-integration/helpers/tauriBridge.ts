@@ -166,7 +166,9 @@ export function tauriMockInitScript(initial: BridgeState): string {
         }
         case 'ai_list_models':
           return {
-            models: state.settings.discovered_models || ['mock-gpt-contract'],
+            models: (args?.connection?.discovered_models?.length > 0)
+              ? args.connection.discovered_models
+              : ['mock-gpt-contract'],
             fetched_at_unix: 99,
             manual_fallback: false,
             message: 'ok',

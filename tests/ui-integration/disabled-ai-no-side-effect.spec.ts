@@ -30,11 +30,12 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
     await expect(page.getByText('BYOK AI 连接')).toBeVisible();
     await expect(page.getByText('启用 AI 建议层')).toBeVisible();
 
-    // Probe / model refresh must remain disabled while AI is off.
+    // Formal probing remains disabled. Model discovery is an explicit setup action and may be
+    // used before enabling AI, but must not run until the user clicks it.
     const probe = page.getByRole('button', { name: '运行探测' });
     const refresh = page.getByRole('button', { name: '刷新模型' });
     await expect(probe).toBeDisabled();
-    await expect(refresh).toBeDisabled();
+    await expect(refresh).toBeEnabled();
 
     const bridge = await readBridgeState(page);
     const commands = bridge.invokeLog.map((entry) => entry.command);

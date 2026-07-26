@@ -5365,28 +5365,134 @@ pub struct AiModelDiscoveryResult {
     pub message: String,
 }
 
-/// Discover models for the saved connection. Disabled/unconfigured AI makes zero network calls.
+#[cfg(debug_assertions)]
+fn debug_safe_provider_url(raw: &str) -> String {
+    let raw = raw.trim();
+    let without_query = raw.split(['?', '#']).next().unwrap_or(raw);
+    let Some((scheme, remainder)) = without_query.split_once("://") else {
+        return "<invalid-url>".to_string();
+    };
+    let authority_end = remainder.find('/').unwrap_or(remainder.len());
+    let authority = remainder[..authority_end]
+        .rsplit('@')
+        .next()
+        .unwrap_or("<invalid-host>");
+    let path = &remainder[authority_end..];
+    format!("{scheme}://{authority}{path}")
+}
+
+#[cfg(debug_assertions)]
+fn debug_model_response_shape(body: &str) -> String {
+    match serde_json::from_str::<Value>(body) {
+        Ok(Value::Object(object)) => {
+            let data_items = object
+                .get("data")
+                .and_then(Value::as_array)
+                .map_or("missing".to_string(), |items| items.len().to_string());
+            format!("json-object data-items={data_items}")
+        }
+        Ok(Value::Array(items)) => format!("json-array items={}", items.len()),
+        Ok(_) => "json-scalar".to_string(),
+        Err(_) => "non-json".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod model_discovery_debug_tests {
+    use super::{
+        debug_model_response_shape, debug_safe_provider_url, model_discovery_may_use_stored_secret,
+        PublicConnectionConfig,
+    };
+
+    #[test]
+    fn diagnostics_strip_url_secrets_and_summarize_response_without_values() {
+        let safe_url = debug_safe_provider_url(
+            "https://user:password@example.test/v1/models?api_key=secret#fragment",
+        );
+        assert_eq!(safe_url, "https://example.test/v1/models");
+
+        let shape = debug_model_response_shape(r#"{"data":[{"id":"secret-model"}]}"#);
+        assert_eq!(shape, "json-object data-items=1");
+        assert!(!shape.contains("secret-model"));
+    }
+
+    #[test]
+    fn stored_model_discovery_secret_requires_exact_draft_auth_identity() {
+        let saved = PublicConnectionConfig::default();
+        let mut draft = saved.clone();
+        assert!(model_discovery_may_use_stored_secret(&draft, &saved));
+
+        draft.endpoint = "https://gateway.example/v1".to_string();
+        assert!(!model_discovery_may_use_stored_secret(&draft, &saved));
+
+        draft.endpoint = format!("  {}/  ", saved.endpoint);
+        assert!(model_discovery_may_use_stored_secret(&draft, &saved));
+    }
+}
+
+fn model_discovery_may_use_stored_secret(
+    draft: &PublicConnectionConfig,
+    saved: &PublicConnectionConfig,
+) -> bool {
+    draft.provider == saved.provider
+        && draft.endpoint.trim().trim_end_matches('/')
+            == saved.endpoint.trim().trim_end_matches('/')
+        && draft.auth_mode == saved.auth_mode
+        && draft.custom_header_name.as_deref().map(str::trim)
+            == saved.custom_header_name.as_deref().map(str::trim)
+        && draft.credential_ref == saved.credential_ref
+}
+
+/// Discover models for a settings draft without persisting the connection or credential.
+/// This explicit setup request does not require `enabled` or a selected model. When the draft
+/// secret is empty, an existing stored secret is reusable only for the exact saved auth identity.
 /// Failures never return secrets or response bodies; callers may keep a manual model.
 #[tauri::command]
-pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, String> {
-    let connection = ai_get_settings(app.clone());
-    if !connection.enabled {
-        return Err("AI is disabled; model discovery makes no network calls".to_string());
-    }
+pub async fn ai_list_models(
+    app: AppHandle,
+    connection: PublicConnectionConfig,
+    secret: Option<String>,
+) -> Result<AiModelDiscoveryResult, String> {
+    let saved = ai_get_settings(app);
+    let draft_secret = secret
+        .filter(|value| !value.is_empty())
+        .map(SecretValue::new);
+    #[cfg(debug_assertions)]
+    let credential_source = if draft_secret.is_some() {
+        "draft"
+    } else if model_discovery_may_use_stored_secret(&connection, &saved) {
+        "stored"
+    } else {
+        "missing"
+    };
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BYOK:model-list] start provider={:?} endpoint={} auth={:?} credential_source={} cached_models={}",
+        connection.provider,
+        debug_safe_provider_url(&connection.endpoint),
+        connection.auth_mode,
+        credential_source,
+        connection.discovered_models.len(),
+    );
     if connection.endpoint.trim().is_empty() {
         return Err("configure a provider endpoint before refreshing models".to_string());
     }
-    if connection.auth_mode != AuthMode::None && connection.credential_ref.is_none() {
-        return Err("configure a credential before refreshing models".to_string());
-    }
 
-    let secret = match resolve_stored_secret(&connection)? {
+    let secret = match draft_secret {
         Some(value) => Some(value),
+        None if model_discovery_may_use_stored_secret(&connection, &saved) => {
+            resolve_stored_secret(&saved)?
+        }
         None if connection.auth_mode == AuthMode::None => None,
         None => {
-            return Err("AI credential is missing from the secure store".to_string());
+            return Err(
+                "enter a credential for this draft connection before refreshing models".to_string(),
+            );
         }
     };
+    if connection.auth_mode != AuthMode::None && secret.is_none() {
+        return Err("AI credential is missing from the secure store".to_string());
+    }
 
     let client = build_no_redirect_client()?;
     let request = build_models_list_request(
@@ -5394,6 +5500,12 @@ pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, St
         &connection.endpoint,
         connection.auth_mode,
     )?;
+    #[cfg(debug_assertions)]
+    eprintln!(
+        "[BYOK:model-list] request method={} url={}",
+        request.method,
+        debug_safe_provider_url(&request.url),
+    );
 
     let send_result = send_managed_provider_request(
         &client,
@@ -5408,13 +5520,17 @@ pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, St
     let fetched_at_unix = now_unix();
     match send_result {
         Ok((status, body)) => {
+            #[cfg(debug_assertions)]
+            eprintln!(
+                "[BYOK:model-list] response status={} bytes={} shape={}",
+                status,
+                body.len(),
+                debug_model_response_shape(&body),
+            );
             match parse_models_list_response(connection.provider, status, &body) {
-                Ok(models) => {
-                    let _ = crate::config::save_ai_discovered_models(
-                        &app,
-                        models.clone(),
-                        Some(fetched_at_unix),
-                    );
+                Ok(models) if !models.is_empty() => {
+                    #[cfg(debug_assertions)]
+                    eprintln!("[BYOK:model-list] parsed models={}", models.len());
                     Ok(AiModelDiscoveryResult {
                         models,
                         fetched_at_unix,
@@ -5422,7 +5538,25 @@ pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, St
                         message: "models refreshed".to_string(),
                     })
                 }
+                Ok(_) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[BYOK:model-list] fallback reason=no-model-ids cached_models={}",
+                        connection.discovered_models.len(),
+                    );
+                    Ok(AiModelDiscoveryResult {
+                        models: connection.discovered_models,
+                        fetched_at_unix,
+                        manual_fallback: true,
+                        message: "provider returned no model IDs; verify the base endpoint and model-list permissions".to_string(),
+                    })
+                }
                 Err(failure) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[BYOK:model-list] fallback kind={:?} status={:?} message={}",
+                        failure.kind, failure.status, failure.message,
+                    );
                     // Keep any previous cached list; UI keeps manual model entry.
                     Ok(AiModelDiscoveryResult {
                         models: connection.discovered_models,
@@ -5433,12 +5567,16 @@ pub async fn ai_list_models(app: AppHandle) -> Result<AiModelDiscoveryResult, St
                 }
             }
         }
-        Err(error) => Ok(AiModelDiscoveryResult {
-            models: connection.discovered_models,
-            fetched_at_unix,
-            manual_fallback: true,
-            message: error.chars().take(240).collect(),
-        }),
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[BYOK:model-list] transport fallback message={error}");
+            Ok(AiModelDiscoveryResult {
+                models: connection.discovered_models,
+                fetched_at_unix,
+                manual_fallback: true,
+                message: error.chars().take(240).collect(),
+            })
+        }
     }
 }
 

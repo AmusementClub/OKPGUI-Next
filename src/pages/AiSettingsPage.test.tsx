@@ -1,5 +1,6 @@
+import { act } from 'react';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { deferred, flushAsync, renderElement } from '../test-utils/react';
+import { flushAsync, renderElement } from '../test-utils/react';
 import type { AiSettings } from '../types/ai';
 import AiSettingsPage from './AiSettingsPage';
 
@@ -16,7 +17,7 @@ function baseSettings(overrides: Partial<AiSettings> = {}): AiSettings {
         provider: 'open_ai',
         endpoint: 'https://api.openai.com/v1',
         model: 'gpt-4o',
-        mode: 'auto',
+        mode: 'responses',
         auth_mode: 'bearer',
         custom_header_name: null,
         credential_ref: { id: 'cred-1' },
@@ -31,6 +32,97 @@ function baseSettings(overrides: Partial<AiSettings> = {}): AiSettings {
 describe('AiSettingsPage model discovery and capability probe', () => {
     beforeEach(() => {
         invokeMock.mockReset();
+    });
+
+    it('shows only Messages for Anthropic and normalizes legacy incompatible modes', async () => {
+        invokeMock.mockResolvedValue(baseSettings({
+            provider: 'anthropic',
+            mode: 'auto',
+            auth_mode: 'bearer',
+        }));
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const mode = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="调用模式"]');
+        expect(mode).toBeTruthy();
+        expect(Array.from(mode!.options).map((option) => [option.value, option.textContent])).toEqual([
+            ['anthropic_messages', 'Messages strict'],
+        ]);
+        expect(mode!.value).toBe('anthropic_messages');
+        expect(rendered.container.querySelector<HTMLInputElement>('input[value="https://api.anthropic.com/v1"]')).toBeTruthy();
+        const auth = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="认证"]');
+        expect(Array.from(auth!.options).map((option) => [option.value, option.textContent])).toEqual([
+            ['anthropic_api_key', 'Anthropic API Key (x-api-key)'],
+            ['custom_header', '自定义 Header'],
+        ]);
+        expect(auth!.value).toBe('anthropic_api_key');
+
+        const save = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('保存连接'),
+        );
+        expect(save).toBeTruthy();
+        await act(async () => save!.click());
+        await flushAsync();
+
+        const saveCall = invokeMock.mock.calls.find(([command]) => command === 'ai_save_settings');
+        expect(saveCall?.[1]).toMatchObject({
+            connection: {
+                provider: 'anthropic',
+                endpoint: 'https://api.anthropic.com/v1',
+                mode: 'anthropic_messages',
+                auth_mode: 'anthropic_api_key',
+            },
+        });
+    });
+
+    it('shows only Responses and Chat for OpenAI Compatible and removes automatic mode', async () => {
+        invokeMock.mockResolvedValue(baseSettings({ provider: 'anthropic', mode: 'anthropic_messages' }));
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const provider = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="提供商"]');
+        expect(provider).toBeTruthy();
+        await act(async () => {
+            provider!.value = 'open_ai';
+            provider!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+        await flushAsync();
+
+        const mode = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="调用模式"]');
+        expect(Array.from(mode!.options).map((option) => [option.value, option.textContent])).toEqual([
+            ['responses', 'Responses strict'],
+            ['chat', 'Chat strict'],
+        ]);
+        expect(mode!.value).toBe('responses');
+        expect(rendered.container.textContent).not.toContain('Messages strict');
+        expect(rendered.container.querySelector<HTMLInputElement>('input[value="https://api.openai.com/v1"]')).toBeTruthy();
+        const auth = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="认证"]');
+        expect(Array.from(auth!.options).map((option) => [option.value, option.textContent])).toEqual([
+            ['bearer', 'OpenAI API Key (Authorization: Bearer)'],
+            ['custom_header', '自定义 Header'],
+        ]);
+        expect(auth!.value).toBe('bearer');
+    });
+
+    it('preserves a custom endpoint when switching providers', async () => {
+        invokeMock.mockResolvedValue(baseSettings({
+            endpoint: 'https://gateway.example/v1',
+            auth_mode: 'custom_header',
+        }));
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+        const provider = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="提供商"]');
+        await act(async () => {
+            provider!.value = 'anthropic';
+            provider!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
+
+        expect(rendered.container.querySelector<HTMLInputElement>('input[value="https://gateway.example/v1"]')).toBeTruthy();
+        const auth = rendered.container.querySelector<HTMLSelectElement>('select[aria-label="认证"]');
+        expect(auth!.value).toBe('custom_header');
     });
 
     it('loads settings without exposing secrets and shows manual model fallback path', async () => {
@@ -62,8 +154,6 @@ describe('AiSettingsPage model discovery and capability probe', () => {
             switch (command) {
                 case 'ai_get_settings':
                     return saved;
-                case 'ai_save_settings':
-                    return saved;
                 case 'ai_list_models':
                     return {
                         models: ['gpt-4o'],
@@ -84,7 +174,11 @@ describe('AiSettingsPage model discovery and capability probe', () => {
         refresh!.click();
         await flushAsync();
 
-        expect(invokeMock).toHaveBeenCalledWith('ai_list_models');
+        expect(invokeMock).toHaveBeenCalledWith('ai_list_models', {
+            connection: saved,
+            secret: null,
+        });
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_save_settings')).toBe(false);
         expect(rendered.container.textContent).toContain('可继续手动输入模型');
         expect(rendered.container.textContent).not.toContain('sk-');
     });
@@ -136,25 +230,47 @@ describe('AiSettingsPage model discovery and capability probe', () => {
         expect(rendered.container.textContent).not.toContain('sk-');
     });
 
-    it('does not call model discovery while AI is disabled (zero-network path)', async () => {
-        const pending = deferred<AiSettings>();
+    it('discovers models from an incomplete disabled draft without saving first', async () => {
+        const draft = baseSettings({ enabled: false, model: '', credential_ref: null });
         invokeMock.mockImplementation(async (command: string) => {
-            if (command === 'ai_get_settings') {
-                return pending.promise;
+            if (command === 'ai_get_settings') return draft;
+            if (command === 'ai_list_models') {
+                return {
+                    models: ['gpt-draft-model'],
+                    fetched_at_unix: 101,
+                    manual_fallback: false,
+                    message: 'models refreshed',
+                };
             }
             throw new Error(`unexpected command ${command}`);
         });
 
         const rendered = await renderElement(<AiSettingsPage />);
-        pending.resolve(baseSettings({ enabled: false, model: '', credential_ref: null }));
         await flushAsync();
+
+        const secret = rendered.container.querySelector<HTMLInputElement>('input[type="password"]');
+        expect(secret).toBeTruthy();
+        await act(async () => {
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            setter?.call(secret, 'draft-secret');
+            secret!.dispatchEvent(new Event('input', { bubbles: true }));
+            secret!.dispatchEvent(new Event('change', { bubbles: true }));
+        });
 
         const refresh = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
             button.textContent?.includes('刷新模型'),
         );
         expect(refresh).toBeTruthy();
-        expect(refresh).toHaveProperty('disabled', true);
-        expect(invokeMock.mock.calls.every(([command]) => command === 'ai_get_settings')).toBe(true);
+        expect(refresh).toHaveProperty('disabled', false);
+        await act(async () => refresh!.click());
+        await flushAsync();
+
+        expect(invokeMock).toHaveBeenCalledWith('ai_list_models', {
+            connection: draft,
+            secret: 'draft-secret',
+        });
+        expect(invokeMock.mock.calls.some(([command]) => command === 'ai_save_settings')).toBe(false);
+        expect(rendered.container.textContent).toContain('已刷新 1 个模型');
     });
 
     it('keeps capability probe disabled and zero-network when AI is off (release-gate regression)', async () => {

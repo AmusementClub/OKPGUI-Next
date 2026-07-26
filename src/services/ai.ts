@@ -38,7 +38,7 @@ export const disabledAiSettings: AiSettings = {
     provider: 'open_ai',
     endpoint: 'https://api.openai.com/v1',
     model: '',
-    mode: 'auto',
+    mode: 'responses',
     auth_mode: 'bearer',
     custom_header_name: null,
     credential_ref: null,
@@ -76,12 +76,15 @@ export async function saveAiSettings(settings: AiSettings, secret?: string): Pro
 }
 
 /**
- * Refresh provider model list for the saved connection.
+ * Refresh provider model list for the current settings draft.
  * Never returns secrets; on failure sets manual_fallback so the UI keeps a manual model.
- * Disabled AI must not be called (backend also zero-networks).
+ * This explicit setup request does not require the draft to be enabled or have a model yet.
  */
-export async function listAiModels(): Promise<AiModelDiscoveryResult> {
-    return invoke<AiModelDiscoveryResult>('ai_list_models');
+export async function listAiModels(settings: AiSettings, secret?: string): Promise<AiModelDiscoveryResult> {
+    return invoke<AiModelDiscoveryResult>('ai_list_models', {
+        connection: settings,
+        secret: secret || null,
+    });
 }
 
 /** Live backend-owned strict capability probe; persists non-secret Ready/Failed state. */

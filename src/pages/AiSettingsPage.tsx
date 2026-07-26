@@ -1,5 +1,6 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Activity, BrainCircuit, KeyRound, RefreshCw, Save } from 'lucide-react';
+import ModelCombobox from '../components/ModelCombobox';
 import {
     getAiSettings,
     isAiCapabilityReady,
@@ -9,6 +10,59 @@ import {
     saveAiSettings,
 } from '../services/ai';
 import type { AiAuthMode, AiMode, AiProvider, AiSettings } from '../types/ai';
+
+const MODE_OPTIONS: Record<AiProvider, ReadonlyArray<{ value: AiMode; label: string }>> = {
+    open_ai: [
+        { value: 'responses', label: 'Responses strict' },
+        { value: 'chat', label: 'Chat strict' },
+    ],
+    anthropic: [
+        { value: 'anthropic_messages', label: 'Messages strict' },
+    ],
+};
+
+const AUTH_OPTIONS: Record<AiProvider, ReadonlyArray<{ value: AiAuthMode; label: string }>> = {
+    open_ai: [
+        { value: 'bearer', label: 'OpenAI API Key (Authorization: Bearer)' },
+        { value: 'custom_header', label: '自定义 Header' },
+    ],
+    anthropic: [
+        { value: 'anthropic_api_key', label: 'Anthropic API Key (x-api-key)' },
+        { value: 'custom_header', label: '自定义 Header' },
+    ],
+};
+
+const DEFAULT_ENDPOINTS: Record<AiProvider, string> = {
+    open_ai: 'https://api.openai.com/v1',
+    anthropic: 'https://api.anthropic.com/v1',
+};
+
+function normalizeMode(provider: AiProvider, mode: AiMode): AiMode {
+    const options = MODE_OPTIONS[provider];
+    return options.some((option) => option.value === mode) ? mode : options[0].value;
+}
+
+function normalizeAuthMode(provider: AiProvider, authMode: AiAuthMode): AiAuthMode {
+    const options = AUTH_OPTIONS[provider];
+    return options.some((option) => option.value === authMode) ? authMode : options[0].value;
+}
+
+function normalizeEndpoint(provider: AiProvider, endpoint: string): string {
+    const otherProvider: AiProvider = provider === 'open_ai' ? 'anthropic' : 'open_ai';
+    return endpoint.trim().replace(/\/+$/, '') === DEFAULT_ENDPOINTS[otherProvider]
+        ? DEFAULT_ENDPOINTS[provider]
+        : endpoint;
+}
+
+function normalizeSettings(settings: AiSettings): AiSettings {
+    const endpoint = normalizeEndpoint(settings.provider, settings.endpoint);
+    return {
+        ...settings,
+        endpoint,
+        mode: normalizeMode(settings.provider, settings.mode),
+        auth_mode: normalizeAuthMode(settings.provider, settings.auth_mode),
+    };
+}
 
 function capabilityLabel(settings: AiSettings): string {
     const capability = settings.capability;
@@ -36,12 +90,14 @@ export default function AiSettingsPage() {
     const [settings, setSettings] = useState<AiSettings | null>(null);
     const [secret, setSecret] = useState('');
     const [status, setStatus] = useState('');
+    const [modelFeedback, setModelFeedback] = useState('');
     const [error, setError] = useState('');
     const [busy, setBusy] = useState<'save' | 'models' | 'probe' | null>(null);
 
     const load = async () => {
         setError('');
-        setSettings(await getAiSettings());
+        setModelFeedback('');
+        setSettings(normalizeSettings(await getAiSettings()));
     };
 
     useEffect(() => { void load(); }, []);
@@ -49,13 +105,24 @@ export default function AiSettingsPage() {
     const update = <K extends keyof AiSettings>(key: K, value: AiSettings[K]) => {
         setSettings((current) => (current ? { ...current, [key]: value } : current));
         setStatus('');
+        setModelFeedback('');
     };
 
-    const modelOptions = useMemo(() => {
-        const discovered = settings?.discovered_models ?? [];
-        const current = settings?.model?.trim() ? [settings.model.trim()] : [];
-        return Array.from(new Set([...current, ...discovered]));
-    }, [settings?.discovered_models, settings?.model]);
+    const updateProvider = (provider: AiProvider) => {
+        setSettings((current) => {
+            if (!current) return current;
+            const endpoint = normalizeEndpoint(provider, current.endpoint);
+            return {
+                ...current,
+                provider,
+                endpoint,
+                mode: normalizeMode(provider, current.mode),
+                auth_mode: normalizeAuthMode(provider, current.auth_mode),
+            };
+        });
+        setStatus('');
+        setModelFeedback('');
+    };
 
     const save = async () => {
         if (!settings) return;
@@ -63,7 +130,7 @@ export default function AiSettingsPage() {
         setBusy('save');
         try {
             const saved = await saveAiSettings(settings, secret);
-            setSettings(saved);
+            setSettings(normalizeSettings(saved));
             setSecret('');
             setStatus(
                 saved.credential_session_only
@@ -80,27 +147,23 @@ export default function AiSettingsPage() {
     const refreshModels = async () => {
         if (!settings) return;
         setError('');
+        setStatus('');
+        setModelFeedback('正在刷新模型列表...');
         setBusy('models');
         try {
-            // Persist draft connection first so discovery uses the intended endpoint/auth.
-            const saved = await saveAiSettings(settings, secret);
-            setSecret('');
-            const discovery = await listAiModels();
-            const next = await getAiSettings();
-            setSettings({
-                ...next,
-                // Keep the in-form model if the user typed a manual id not in the list.
-                model: saved.model || next.model,
+            const discovery = await listAiModels(settings, secret);
+            setSettings((current) => current ? {
+                ...current,
                 discovered_models: discovery.models,
                 models_fetched_at_unix: discovery.fetched_at_unix,
-            });
+            } : current);
             if (discovery.manual_fallback) {
-                setStatus(`模型列表刷新失败，可继续手动输入模型：${discovery.message}`);
+                setModelFeedback(`模型列表刷新失败，可继续手动输入模型：${discovery.message}`);
             } else {
-                setStatus(`已刷新 ${discovery.models.length} 个模型。`);
+                setModelFeedback(`已刷新 ${discovery.models.length} 个模型。`);
             }
         } catch (refreshError) {
-            setError(readFriendlyError(refreshError, '刷新模型列表失败。'));
+            setModelFeedback(readFriendlyError(refreshError, '刷新模型列表失败。'));
         } finally {
             setBusy(null);
         }
@@ -114,7 +177,7 @@ export default function AiSettingsPage() {
             const saved = await saveAiSettings(settings, secret);
             setSecret('');
             const capability = await runAiCapabilityProbe();
-            const next = await getAiSettings();
+            const next = normalizeSettings(await getAiSettings());
             setSettings({ ...next, model: saved.model || next.model, capability });
             if (capability.state === 'ready' && capability.identity_matches) {
                 setStatus(`能力探测通过（${capability.resolved_mode ?? saved.mode}）。正式 AI 任务已解锁。`);
@@ -176,7 +239,8 @@ export default function AiSettingsPage() {
                             提供商
                             <select
                                 value={settings.provider}
-                                onChange={(event) => update('provider', event.target.value as AiProvider)}
+                                onChange={(event) => updateProvider(event.target.value as AiProvider)}
+                                aria-label="提供商"
                                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
                             >
                                 <option value="open_ai">OpenAI 兼容</option>
@@ -188,12 +252,12 @@ export default function AiSettingsPage() {
                             <select
                                 value={settings.mode}
                                 onChange={(event) => update('mode', event.target.value as AiMode)}
+                                aria-label="调用模式"
                                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
                             >
-                                <option value="auto">自动</option>
-                                <option value="responses">Responses strict</option>
-                                <option value="chat">Chat strict</option>
-                                <option value="anthropic_messages">Messages strict</option>
+                                {MODE_OPTIONS[settings.provider].map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
                             </select>
                         </label>
                     </div>
@@ -212,30 +276,27 @@ export default function AiSettingsPage() {
                         <div className="flex flex-wrap items-end gap-2">
                             <label className="min-w-0 flex-1 text-xs text-slate-500">
                                 模型（可从列表选择或手动输入）
-                                <input
-                                    list="ai-model-options"
+                                <ModelCombobox
+                                    options={settings.discovered_models ?? []}
                                     value={settings.model}
-                                    onChange={(event) => update('model', event.target.value)}
-                                    className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
-                                    placeholder="输入或选择模型名"
-                                    aria-label="模型"
+                                    onChange={(model) => update('model', model)}
                                 />
-                                <datalist id="ai-model-options">
-                                    {modelOptions.map((model) => (
-                                        <option key={model} value={model} />
-                                    ))}
-                                </datalist>
                             </label>
                             <button
                                 type="button"
                                 onClick={() => void refreshModels()}
-                                disabled={busy !== null || !settings.enabled}
+                                disabled={busy !== null}
                                 className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-3 py-2 text-sm text-slate-300 hover:bg-slate-700 disabled:opacity-50"
                             >
-                                <RefreshCw size={15} />
-                                刷新模型
+                                <RefreshCw size={15} className={busy === 'models' ? 'animate-spin' : ''} />
+                                {busy === 'models' ? '正在刷新...' : '刷新模型'}
                             </button>
                         </div>
+                        {modelFeedback ? (
+                            <p role="status" aria-live="polite" className="text-[11px] text-amber-300">
+                                {modelFeedback}
+                            </p>
+                        ) : null}
                         <p className="text-[11px] text-slate-500">
                             {settings.models_fetched_at_unix
                                 ? `上次拉取 ${settings.discovered_models?.length ?? 0} 个模型；失败时可继续手动填写。`
@@ -249,12 +310,12 @@ export default function AiSettingsPage() {
                             <select
                                 value={settings.auth_mode}
                                 onChange={(event) => update('auth_mode', event.target.value as AiAuthMode)}
+                                aria-label="认证"
                                 className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
                             >
-                                <option value="bearer">Bearer</option>
-                                <option value="anthropic_api_key">Anthropic API key</option>
-                                <option value="custom_header">自定义 header</option>
-                                <option value="none">无认证</option>
+                                {AUTH_OPTIONS[settings.provider].map((option) => (
+                                    <option key={option.value} value={option.value}>{option.label}</option>
+                                ))}
                             </select>
                         </label>
                         {settings.auth_mode === 'custom_header' ? (

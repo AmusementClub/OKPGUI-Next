@@ -30,7 +30,7 @@ test.describe('UI integration · settings/capability', () => {
     await expect(page.getByText('密钥已配置')).toBeVisible();
 
     // Change model then re-probe through mocked IPC.
-    await page.getByLabel('模型').fill('mock-gpt-mini');
+    await page.getByRole('combobox', { name: '模型' }).fill('mock-gpt-mini');
     await page.getByRole('button', { name: '运行探测' }).click();
     await expect(page.getByText(/能力探测通过|正式 AI 任务已解锁/)).toBeVisible({
       timeout: 15_000,

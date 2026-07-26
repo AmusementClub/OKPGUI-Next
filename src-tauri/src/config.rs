@@ -1058,19 +1058,6 @@ pub fn save_ai_capability(
     })
 }
 
-/// Persist non-secret discovered model ids from the Models API refresh.
-pub fn save_ai_discovered_models(
-    app: &AppHandle,
-    models: Vec<String>,
-    fetched_at_unix: Option<u64>,
-) -> Result<(), String> {
-    mutate_config(app, |config| {
-        config.ai.discovered_models = models;
-        config.ai.models_fetched_at_unix = fetched_at_unix;
-        Ok(((), true))
-    })
-}
-
 /// Whether two AI connection snapshots differ in fields that key capability identity.
 pub fn ai_connection_identity_fields_changed(before: &AIConfig, after: &AIConfig) -> bool {
     before.provider != after.provider

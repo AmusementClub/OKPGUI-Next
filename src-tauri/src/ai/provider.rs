@@ -176,6 +176,7 @@ pub fn build_models_list_request(
     endpoint: &str,
     auth_mode: AuthMode,
 ) -> Result<ProviderRequest, String> {
+    let endpoint = endpoint.trim();
     if !matches!(endpoint.split(':').next(), Some("http") | Some("https")) {
         return Err("provider endpoint must use http or https".to_string());
     }
@@ -2129,7 +2130,7 @@ mod tests {
     fn models_list_requests_use_get_and_no_body() {
         let openai = build_models_list_request(
             ProviderKind::OpenAi,
-            "https://example.test/v1/",
+            "  https://example.test/v1/  ",
             AuthMode::Bearer,
         )
         .unwrap();
