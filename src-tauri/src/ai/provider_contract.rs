@@ -10,10 +10,11 @@
 
 use super::credentials::AuthMode;
 use super::provider::{
-    build_models_list_request, build_probe_request, build_structured_request,
-    build_structured_request_with_vision, classify_http_failure, classify_probe_response,
-    extract_structured_json, parse_models_list_response, CapabilityState, ProviderFailureKind,
-    ProviderKind, ProviderMode, ProviderRequest, ProviderUsage, VisionRequestImage,
+    build_models_list_request, build_probe_request, build_structured_request_with_system,
+    build_structured_request_with_vision_and_system, classify_http_failure,
+    classify_probe_response, extract_structured_json, parse_models_list_response, CapabilityState,
+    ProviderFailureKind, ProviderKind, ProviderMode, ProviderRequest, ProviderUsage,
+    VisionRequestImage,
 };
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -89,7 +90,7 @@ pub fn build_contract_request(
         | MockScenario::TimeoutHttp
         | MockScenario::AuthFailure
         | MockScenario::Redirect => {
-            let request = build_structured_request(
+            let request = build_structured_request_with_system(
                 ProviderKind::OpenAi,
                 ProviderMode::Responses,
                 endpoint,
@@ -97,13 +98,14 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::Bearer,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "contract-audit-prompt",
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Responses, request))
         }
         MockScenario::ChatStrictOk | MockScenario::ChatRefusal => {
-            let request = build_structured_request(
+            let request = build_structured_request_with_system(
                 ProviderKind::OpenAi,
                 ProviderMode::Chat,
                 endpoint,
@@ -111,13 +113,14 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::Bearer,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "contract-audit-prompt",
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Chat, request))
         }
         MockScenario::AnthropicMessagesStrictOk | MockScenario::AnthropicRefusal => {
-            let request = build_structured_request(
+            let request = build_structured_request_with_system(
                 ProviderKind::Anthropic,
                 ProviderMode::AnthropicMessages,
                 endpoint,
@@ -125,6 +128,7 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::AnthropicApiKey,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "contract-audit-prompt",
                 256,
             )?;
@@ -139,7 +143,7 @@ pub fn build_contract_request(
                 mime_type: "image/jpeg".into(),
                 bytes: b"mock-jpeg".to_vec(),
             }];
-            let request = build_structured_request_with_vision(
+            let request = build_structured_request_with_vision_and_system(
                 ProviderKind::OpenAi,
                 ProviderMode::Responses,
                 endpoint,
@@ -147,6 +151,7 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::Bearer,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "vision-audit-prompt",
                 256,
                 &images,
@@ -158,7 +163,7 @@ pub fn build_contract_request(
                 mime_type: "image/png".into(),
                 bytes: b"mock-png".to_vec(),
             }];
-            let request = build_structured_request_with_vision(
+            let request = build_structured_request_with_vision_and_system(
                 ProviderKind::OpenAi,
                 ProviderMode::Chat,
                 endpoint,
@@ -166,6 +171,7 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::Bearer,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "vision-audit-prompt",
                 256,
                 &images,
@@ -177,7 +183,7 @@ pub fn build_contract_request(
                 mime_type: "image/webp".into(),
                 bytes: b"mock-webp".to_vec(),
             }];
-            let request = build_structured_request_with_vision(
+            let request = build_structured_request_with_vision_and_system(
                 ProviderKind::Anthropic,
                 ProviderMode::AnthropicMessages,
                 endpoint,
@@ -185,6 +191,7 @@ pub fn build_contract_request(
                 &schema,
                 AuthMode::AnthropicApiKey,
                 "okpgui_audit",
+                "contract-system-prompt",
                 "vision-audit-prompt",
                 256,
                 &images,
@@ -478,10 +485,13 @@ pub fn classify_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::audit::parse_formal_audit_findings;
     use crate::ai::provider::{
         build_no_redirect_client, classify_and_validate_probe_response, encode_base64,
         formal_attempt_modes, minimal_probe_schema, send_managed_provider_request,
     };
+    use crate::ai::recognition::parse_recognition;
+    use crate::ai::template_seed::{parse_template_selection, EligibleTemplateCatalogEntry};
 
     #[test]
     fn contract_matrix_covers_required_scenarios() {
@@ -604,6 +614,14 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+        assert_eq!(
+            responses.body.pointer("/input/0/role"),
+            Some(&json!("system"))
+        );
+        assert_eq!(
+            responses.body.pointer("/input/1/role"),
+            Some(&json!("user"))
+        );
         assert_request_body_sanitary(&responses.body);
 
         let chat = build_probe_request(
@@ -622,6 +640,11 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+        assert_eq!(
+            chat.body.pointer("/messages/0/role"),
+            Some(&json!("system"))
+        );
+        assert_eq!(chat.body.pointer("/messages/1/role"), Some(&json!("user")));
         assert_request_body_sanitary(&chat.body);
 
         let anthropic = build_probe_request(
@@ -641,12 +664,115 @@ mod tests {
                 .and_then(Value::as_str),
             Some("json_schema")
         );
+        assert!(anthropic
+            .body
+            .get("system")
+            .and_then(Value::as_str)
+            .is_some());
+        assert_eq!(
+            anthropic.body.pointer("/messages/0/role"),
+            Some(&json!("user"))
+        );
         assert_request_body_sanitary(&anthropic.body);
 
         let models =
             build_models_list_request(ProviderKind::OpenAi, endpoint, AuthMode::Bearer).unwrap();
         assert_eq!(models.method, "GET");
         assert!(models.body.is_null());
+    }
+
+    #[test]
+    fn chinese_structured_outputs_cross_provider_envelopes_and_business_parsers() {
+        let recognition = json!({
+            "集数": {"值": "01", "置信度": 0.95, "依据": "种子名称包含 E01"},
+            "分辨率": null,
+            "建议标题": null
+        });
+        let recognition_text = serde_json::to_string(&recognition).unwrap();
+        let envelopes = [
+            (
+                ProviderKind::OpenAi,
+                ProviderMode::Responses,
+                json!({"output": [{"type": "message", "content": [{"type": "output_text", "text": recognition_text}]}]}),
+            ),
+            (
+                ProviderKind::OpenAi,
+                ProviderMode::Chat,
+                json!({"choices": [{"message": {"content": recognition_text}}]}),
+            ),
+            (
+                ProviderKind::Anthropic,
+                ProviderMode::AnthropicMessages,
+                json!({"content": [{"type": "text", "text": recognition_text}]}),
+            ),
+        ];
+        for (provider, mode, envelope) in envelopes {
+            let body = serde_json::to_string(&envelope).unwrap();
+            let structured = extract_structured_json(provider, mode, &body)
+                .expect("provider envelope extracts structured object");
+            let parsed = parse_recognition(&structured)
+                .expect("Chinese recognition object maps to internal DTO");
+            assert_eq!(parsed.episode.expect("episode").value, "01");
+        }
+
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-a".into(),
+            name: "模板 A".into(),
+            revision: 3,
+            digest: "sha256:abc".into(),
+            summary: "测试模板".into(),
+        }];
+        let selected = parse_template_selection(
+            &json!({
+                "已匹配": true,
+                "模板ID": "tpl-a",
+                "模板修订号": 3,
+                "模板摘要": "sha256:abc"
+            }),
+            &catalog,
+        )
+        .expect("Chinese selection object maps to catalog entry");
+        assert_eq!(selected.id, "tpl-a");
+
+        let findings = parse_formal_audit_findings(&json!({
+            "问题": [{
+                "代码": "PROVIDER_WARNING",
+                "严重程度": "WARNING",
+                "说明": "需要人工复核",
+                "证据路径": null
+            }]
+        }));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "需要人工复核");
+    }
+
+    #[test]
+    fn chinese_probe_payload_is_ready_for_every_provider_mode() {
+        let cases = [
+            (
+                ProviderKind::OpenAi,
+                ProviderMode::Responses,
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"正常\":true}"}]}]}"#,
+            ),
+            (
+                ProviderKind::OpenAi,
+                ProviderMode::Chat,
+                r#"{"choices":[{"message":{"content":"{\"正常\":true}"}}]}"#,
+            ),
+            (
+                ProviderKind::Anthropic,
+                ProviderMode::AnthropicMessages,
+                r#"{"content":[{"type":"text","text":"{\"正常\":true}"}]}"#,
+            ),
+        ];
+        for (provider, mode, body) in cases {
+            let result = classify_and_validate_probe_response(provider, mode, 200, body);
+            assert_eq!(
+                result.state,
+                CapabilityState::Ready,
+                "{provider:?} {mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -712,14 +838,14 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"ok\":true,\"extra\":1}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"正常\":true,\"额外\":1}"}}]}"#,
         );
         assert_eq!(wrong.state, CapabilityState::Unsupported);
         let ready = classify_and_validate_probe_response(
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"正常\":true}"}}]}"#,
         );
         assert_eq!(ready.state, CapabilityState::Ready);
     }

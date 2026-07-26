@@ -1,7 +1,8 @@
 use crate::ai::audit::{
-    build_formal_audit_prompt, compute_decision, formal_audit_schema, parse_formal_audit_findings,
-    redact_provider_error, sanitize_audit_input, validate_findings_against_projection,
-    AuditDecision, AuditInput, Finding, FindingSeverity, ValidatedAudit,
+    build_formal_audit_prompt, compute_decision, formal_audit_schema, formal_audit_system_prompt,
+    parse_formal_audit_findings, redact_provider_error, sanitize_audit_input,
+    validate_findings_against_projection, AuditDecision, AuditInput, Finding, FindingSeverity,
+    ValidatedAudit,
 };
 use crate::ai::context::{
     context_error_to_public, project_context_from_binding, ContextError, ContextProjection,
@@ -34,23 +35,25 @@ use crate::ai::media::{
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
-    build_probe_request, build_structured_request, build_structured_request_with_vision,
-    classify_and_validate_probe_response, classify_http_failure, extract_structured_json,
-    formal_attempt_modes, formal_attempt_modes_for_ready_capability, minimal_probe_schema,
-    parse_models_list_response, send_managed_provider_request, CapabilityIdentity,
-    CapabilityProbeResult, CapabilityState, ProviderFailure, ProviderKind, ProviderMode,
-    VisionRequestImage,
+    build_probe_request, build_structured_request_with_system,
+    build_structured_request_with_vision_and_system, classify_and_validate_probe_response,
+    classify_http_failure, extract_structured_json, formal_attempt_modes,
+    formal_attempt_modes_for_ready_capability, minimal_probe_schema, parse_models_list_response,
+    send_managed_provider_request, CapabilityIdentity, CapabilityProbeResult, CapabilityState,
+    ProviderFailure, ProviderKind, ProviderMode, VisionRequestImage,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
     recognition_from_provider_outcome, recognition_schema, redact_recognition_output,
     RecognitionContextSnapshot, RecognitionResult, RECOGNITION_SCHEMA_VERSION,
+    RECOGNITION_SYSTEM_PROMPT,
 };
 use crate::ai::redaction::RedactionPolicy;
 use crate::ai::template_seed::{
     build_eligible_catalog, build_template_selection_prompt, catalog_snapshot_hash,
     parse_template_selection, template_selection_schema, ReviewTemplateRecommendationResult,
     TemplateRecommendation, TemplateRecommendationRegistry, TemplateSeed, TemplateSeedRegistry,
+    TEMPLATE_SELECTION_SYSTEM_PROMPT,
 };
 use crate::ai::vision::{
     extract_final_image_urls, prepare_images_soft, resolve_selected_vision_inputs, MAX_IMAGES,
@@ -2481,7 +2484,7 @@ async fn run_template_selection_worker(
             return;
         }
 
-        let provider_request = match build_structured_request(
+        let provider_request = match build_structured_request_with_system(
             connection.provider,
             attempted_mode,
             &connection.endpoint,
@@ -2489,6 +2492,7 @@ async fn run_template_selection_worker(
             &schema,
             connection.auth_mode,
             "okpgui_template_selection",
+            TEMPLATE_SELECTION_SYSTEM_PROMPT,
             &prompt,
             512,
         ) {
@@ -3205,7 +3209,7 @@ async fn run_recognition_worker(
             return;
         }
 
-        let provider_request = match build_structured_request(
+        let provider_request = match build_structured_request_with_system(
             connection.provider,
             attempted_mode,
             &connection.endpoint,
@@ -3213,6 +3217,7 @@ async fn run_recognition_worker(
             &schema,
             connection.auth_mode,
             "okpgui_recognition",
+            RECOGNITION_SYSTEM_PROMPT,
             &prompt,
             512,
         ) {
@@ -4153,7 +4158,8 @@ async fn run_provider_formal_audit(
     let mut structured: Option<Value> = None;
 
     for attempted_mode in attempt_modes {
-        let provider_request = match build_structured_request_with_vision(
+        let system_prompt = formal_audit_system_prompt();
+        let provider_request = match build_structured_request_with_vision_and_system(
             connection.provider,
             attempted_mode,
             &connection.endpoint,
@@ -4161,6 +4167,7 @@ async fn run_provider_formal_audit(
             &schema,
             connection.auth_mode,
             "okpgui_audit",
+            &system_prompt,
             &prompt,
             1024,
             &vision_images,
