@@ -15,13 +15,9 @@
 //! - Event delivery to a WebView is **skipped** (no AppHandle/WebView in this path).
 
 use crate::ai::audit::{Acknowledgements, AuditDecision};
-use crate::ai::credentials::{
-    decide_session_only_cold_start, SessionOnlyColdStartAction,
-};
+use crate::ai::credentials::{decide_session_only_cold_start, SessionOnlyColdStartAction};
 use crate::ai::jobs::{AiJobState, JobKind};
-use crate::ai::media::{
-    packaged_mediainfo_candidates, resolve_packaged_mediainfo,
-};
+use crate::ai::media::{packaged_mediainfo_candidates, resolve_packaged_mediainfo};
 use crate::ai::vision::{resolve_selected_vision_inputs, VisionError, VisionImageInput};
 use crate::commands::ai_commands::{
     ai_cancel_job, ai_get_job, cancel_pending_audit_for_publish_core,
@@ -98,12 +94,7 @@ fn push(tests: &mut Vec<SmokeNamedTest>, name: &str, result: &str, detail: Strin
 }
 
 fn push_ok(tests: &mut Vec<SmokeNamedTest>, name: &str, ok: bool, detail: String) {
-    push(
-        tests,
-        name,
-        if ok { "pass" } else { "fail" },
-        detail,
-    );
+    push(tests, name, if ok { "pass" } else { "fail" }, detail);
 }
 
 fn bind_pending_audit(
@@ -452,12 +443,10 @@ pub fn run_and_write(out_path: &Path) -> i32 {
         &mut named,
         "cancellation-and-failed-poll-recovery",
         cancel_recovery_pass,
-        cancel_recovery_ok
-            .err()
-            .unwrap_or_else(|| {
-                "session cancel invalidates token; job cancelled (backend lifecycle, not event bus)"
-                    .to_string()
-            }),
+        cancel_recovery_ok.err().unwrap_or_else(|| {
+            "session cancel invalidates token; job cancelled (backend lifecycle, not event bus)"
+                .to_string()
+        }),
     );
     all_ok &= cancel_recovery_pass;
 
