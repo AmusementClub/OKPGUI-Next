@@ -15,7 +15,6 @@
  *
  * Full WebView UI automation remains a separate desktop-webdriver class (wdio runner).
  */
-import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -26,6 +25,7 @@ import {
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { sha256RegularFile } from '../../../scripts/evidence-hash.mjs';
 import { CRITICAL_FLOWS, FIXTURE_PROFILE_REL } from './critical-flows.mjs';
 
 const scriptDir = path.dirname(fileURLToPath(import.meta.url));
@@ -52,13 +52,6 @@ function gitCommitSha() {
     return result.stdout.trim();
   }
   return process.env.GITHUB_SHA || process.env.COMMIT_SHA || 'unknown-commit';
-}
-
-function sha256File(filePath) {
-  if (!filePath || !existsSync(filePath)) return 'not-built';
-  const hash = createHash('sha256');
-  hash.update(readFileSync(filePath));
-  return hash.digest('hex');
 }
 
 function writeEvidence(evidence) {
@@ -88,6 +81,7 @@ function main() {
   const startedAt = nowIso();
   const binaryPath = process.env.DESKTOP_E2E_BINARY || '';
   const packagePath = process.env.DESKTOP_E2E_PACKAGE || '';
+  const packageSha256 = sha256RegularFile(packagePath);
   const targetTriple = resolveTargetTriple();
   const harnessType =
     process.env.DESKTOP_E2E_HARNESS_TYPE || 'host-binary-smoke';
@@ -152,8 +146,8 @@ function main() {
       commitSha: gitCommitSha(),
       targetTriple,
       harnessType,
-      binarySha256: sha256File(binaryPath),
-      ...(packagePath ? { packageSha256: sha256File(packagePath) } : {}),
+      binarySha256: sha256RegularFile(binaryPath) || 'not-built',
+      ...(packageSha256 ? { packageSha256 } : {}),
       productionIpcMarker: false,
       productionBinaryMarker: false,
       namedTests: [
@@ -260,8 +254,8 @@ function main() {
     commitSha: gitCommitSha(),
     targetTriple,
     harnessType,
-    binarySha256: sha256File(binaryPath),
-    ...(packagePath ? { packageSha256: sha256File(packagePath) } : {}),
+    binarySha256: sha256RegularFile(binaryPath) || 'not-built',
+    ...(packageSha256 ? { packageSha256 } : {}),
     // Hard rule: this harness is never WebView/Tauri IPC or WebDriver.
     productionIpcMarker: false,
     productionBinaryMarker: smokeOk,

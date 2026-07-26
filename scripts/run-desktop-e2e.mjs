@@ -30,7 +30,6 @@
  *   DESKTOP_E2E_SKIP_HOST_SMOKE=1  Skip host binary smoke (WebDriver-only attempt)
  *   DESKTOP_E2E_ATTEMPT_WDIO=1     Force WDIO attempt even when tools missing (writes blocked)
  */
-import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
@@ -40,6 +39,7 @@ import {
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { sha256RegularFile } from './evidence-hash.mjs';
 import {
   CRITICAL_FLOWS,
   FIXTURE_PROFILE_REL,
@@ -88,15 +88,6 @@ function resolveTargetTriple() {
   return PLATFORM_TRIPLES[process.platform] || `unknown-${process.platform}`;
 }
 
-function sha256File(filePath) {
-  if (!filePath || !existsSync(filePath)) {
-    return 'not-built';
-  }
-  const hash = createHash('sha256');
-  hash.update(readFileSync(filePath));
-  return hash.digest('hex');
-}
-
 function commandExists(name) {
   const probe = process.platform === 'win32' ? 'where' : 'which';
   const result = spawnSync(probe, [name], {
@@ -137,12 +128,13 @@ function blockedEvidence({
 }) {
   const startedAt = nowIso();
   const finishedAt = nowIso();
+  const packageSha256 = sha256RegularFile(packagePath);
   return {
     commitSha: gitCommitSha(),
     targetTriple,
     harnessType,
-    binarySha256: sha256File(binaryPath),
-    ...(packagePath ? { packageSha256: sha256File(packagePath) } : {}),
+    binarySha256: sha256RegularFile(binaryPath) || 'not-built',
+    ...(packageSha256 ? { packageSha256 } : {}),
     productionIpcMarker: false,
     productionBinaryMarker: false,
     namedTests,
@@ -269,6 +261,7 @@ function writeWebdriverBlockedSideEvidence({
   packagePath,
   tools,
 }) {
+  const packageSha256 = sha256RegularFile(packagePath);
   const notes =
     'desktop-webdriver not executable in this environment. ' +
     `tauri-driver=${tools.hasTauriDriver}, wdio=${tools.hasWdio}, executableSpecs=${tools.executableSpecs}. ` +
@@ -279,8 +272,8 @@ function writeWebdriverBlockedSideEvidence({
     commitSha: gitCommitSha(),
     targetTriple,
     harnessType: 'desktop-webdriver',
-    binarySha256: sha256File(binaryPath),
-    ...(packagePath ? { packageSha256: sha256File(packagePath) } : {}),
+    binarySha256: sha256RegularFile(binaryPath) || 'not-built',
+    ...(packageSha256 ? { packageSha256 } : {}),
     productionIpcMarker: false,
     productionBinaryMarker: false,
     namedTests: [

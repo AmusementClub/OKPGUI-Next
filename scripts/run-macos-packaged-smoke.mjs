@@ -17,17 +17,16 @@
  *   DESKTOP_E2E_ALLOW_BLOCKED=1              Exit 0 after blocked evidence (CI upload)
  *   DESKTOP_E2E_REQUIRE_PASS=1               Exit non-zero unless result=pass
  */
-import { createHash } from 'node:crypto';
 import {
   existsSync,
   mkdirSync,
-  readFileSync,
   readdirSync,
   writeFileSync,
 } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import { sha256RegularFile } from './evidence-hash.mjs';
 import {
   MACOS_PACKAGED_SMOKE_PROBES,
   skippedMacosSmokeTests,
@@ -67,15 +66,6 @@ function resolveTargetTriple() {
   }
   const arch = process.arch === 'arm64' ? 'aarch64' : 'x86_64';
   return `${arch}-apple-darwin`;
-}
-
-function sha256File(filePath) {
-  if (!filePath || !existsSync(filePath)) {
-    return 'not-built';
-  }
-  const hash = createHash('sha256');
-  hash.update(readFileSync(filePath));
-  return hash.digest('hex');
 }
 
 function writeEvidence(evidence) {
@@ -210,6 +200,7 @@ function main() {
 
   const binaryPath = resolveBinaryPath();
   const packagePath = process.env.DESKTOP_E2E_PACKAGE || '';
+  const packageSha256 = sha256RegularFile(packagePath);
 
   if (!binaryPath) {
     const evidence = {
@@ -217,7 +208,7 @@ function main() {
       targetTriple,
       harnessType: 'macos-packaged-smoke',
       binarySha256: 'not-built',
-      ...(packagePath ? { packageSha256: sha256File(packagePath) } : {}),
+      ...(packageSha256 ? { packageSha256 } : {}),
       productionIpcMarker: false,
       productionBinaryMarker: false,
       namedTests: skippedMacosSmokeTests(
@@ -252,7 +243,7 @@ function main() {
       commitSha: gitCommitSha(),
       targetTriple,
       harnessType: 'macos-packaged-smoke',
-      binarySha256: sha256File(binaryPath),
+      binarySha256: sha256RegularFile(binaryPath) || 'not-built',
       productionIpcMarker: false,
       productionBinaryMarker: false,
       namedTests: skippedMacosSmokeTests(notes),
