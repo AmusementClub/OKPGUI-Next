@@ -40,21 +40,6 @@
       },
       "staged_name": "mediainfo-x86_64-unknown-linux-gnu"
     },
-    "x86_64-apple-darwin": {
-      "platform": "macos",
-      "arch": "x86_64",
-      "archive": {
-        "url": "https://mediaarea.net/download/binary/mediainfo/26.05/MediaInfo_CLI_26.05_Mac.dmg",
-        "sha256": "507605a7c8f1054a6996d99a4ef5b5a0711cfbf2f8ca2ef5161d6ee701ea8015",
-        "format": "dmg"
-      },
-      "extracted": {
-        "path": "/usr/local/bin/mediainfo",
-        "sha256": "d070140e4d60b3f49aae1cab752d77dc3611aac451b6109b9d2b1812b602b17e",
-        "note": "Mac CLI page states x86_64 and arm64 (universal binary)"
-      },
-      "staged_name": "mediainfo-x86_64-apple-darwin"
-    },
     "aarch64-apple-darwin": {
       "platform": "macos",
       "arch": "arm64",
@@ -66,7 +51,7 @@
       "extracted": {
         "path": "/usr/local/bin/mediainfo",
         "sha256": "d070140e4d60b3f49aae1cab752d77dc3611aac451b6109b9d2b1812b602b17e",
-        "note": "Mac CLI page states x86_64 and arm64 (universal binary)"
+        "note": "Official project packaging supports Apple Silicon macOS only"
       },
       "staged_name": "mediainfo-aarch64-apple-darwin"
     }

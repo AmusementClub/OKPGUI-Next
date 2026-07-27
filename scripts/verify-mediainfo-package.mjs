@@ -15,14 +15,12 @@ const rootDir = path.resolve(scriptDir, '..');
 const REQUIRED_TARGETS = [
   'x86_64-pc-windows-msvc',
   'x86_64-unknown-linux-gnu',
-  'x86_64-apple-darwin',
   'aarch64-apple-darwin',
 ];
 
 const STAGED_NAMES = {
   'x86_64-pc-windows-msvc': 'mediainfo-x86_64-pc-windows-msvc.exe',
   'x86_64-unknown-linux-gnu': 'mediainfo-x86_64-unknown-linux-gnu',
-  'x86_64-apple-darwin': 'mediainfo-x86_64-apple-darwin',
   'aarch64-apple-darwin': 'mediainfo-aarch64-apple-darwin',
 };
 
@@ -270,7 +268,9 @@ function main() {
     }
     process.exit(1);
   }
-  console.log('Manifest schema OK (version 26.05, 4 targets, official URLs + hashes).');
+  console.log(
+    `Manifest schema OK (version 26.05, ${Object.keys(manifest.targets).length} targets, official URLs + hashes).`,
+  );
 
   const noticeErrors = validateNoticeFile(rootDir);
   if (noticeErrors.length > 0) {

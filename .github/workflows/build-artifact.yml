@@ -21,10 +21,6 @@ jobs:
             os: windows-latest
             artifact_name: okpgui-next-windows-artifact
             mediainfo_target: x86_64-pc-windows-msvc
-          - name: macOS x64
-            os: macos-15-intel
-            artifact_name: okpgui-next-macos-x64-artifact
-            mediainfo_target: x86_64-apple-darwin
           - name: macOS arm64
             os: macos-latest
             artifact_name: okpgui-next-macos-arm64-artifact

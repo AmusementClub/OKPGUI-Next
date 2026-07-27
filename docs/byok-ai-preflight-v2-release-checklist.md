@@ -14,20 +14,18 @@ with the correct markers for that `harnessType`:
 
 ## Required target triples (exact)
 
-MediaInfo sidecar staging and CI matrices must cover exactly these four triples:
+MediaInfo sidecar staging and CI matrices must cover exactly these three triples:
 
 | Triple | Platform matrix role |
 | --- | --- |
 | `x86_64-pc-windows-msvc` | Windows x64 |
 | `x86_64-unknown-linux-gnu` | Linux x64 |
-| `x86_64-apple-darwin` | macOS Intel |
 | `aarch64-apple-darwin` | macOS Apple Silicon |
 
 Staged sidecar names (under `src-tauri/binaries/`):
 
 - `mediainfo-x86_64-pc-windows-msvc.exe`
 - `mediainfo-x86_64-unknown-linux-gnu`
-- `mediainfo-x86_64-apple-darwin`
 - `mediainfo-aarch64-apple-darwin`
 
 ## Sidecar and notice requirements

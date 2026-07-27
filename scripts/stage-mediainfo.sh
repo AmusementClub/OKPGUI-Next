@@ -15,7 +15,6 @@ Usage: stage-mediainfo.sh <target-triple>
 Supported targets (from scripts/mediainfo-manifest.json):
   x86_64-pc-windows-msvc
   x86_64-unknown-linux-gnu
-  x86_64-apple-darwin
   aarch64-apple-darwin
 
 Environment:
@@ -252,9 +251,8 @@ smoke_check_staged() {
         can_exec=1
       fi
       ;;
-    x86_64-apple-darwin|aarch64-apple-darwin)
-      # Official Mac CLI is universal (x86_64 + arm64); run smoke check on any Darwin host.
-      if [[ "${host_os}" == "Darwin" ]]; then
+    aarch64-apple-darwin)
+      if [[ "${host_os}" == "Darwin" && "${host_arch}" == "arm64" ]]; then
         can_exec=1
       fi
       ;;

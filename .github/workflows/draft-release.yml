@@ -32,13 +32,6 @@ jobs:
             mediainfo_target: x86_64-pc-windows-msvc
             mediainfo_staged: mediainfo-x86_64-pc-windows-msvc.exe
             archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-windows-x64.zip
-          - name: macOS x64
-            os: macos-15-intel
-            slug: macos-x64
-            binary_name: okpgui-next
-            mediainfo_target: x86_64-apple-darwin
-            mediainfo_staged: mediainfo-x86_64-apple-darwin
-            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-x64.tar.gz
           - name: macOS arm64
             os: macos-latest
             slug: macos-arm64

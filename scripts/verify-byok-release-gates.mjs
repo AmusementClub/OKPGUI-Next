@@ -2,7 +2,7 @@
 /**
  * Offline BYOK AI Preflight V2 release-gate verifier.
  *
- * Cross-checks Tauri sidecar/resource mapping, the four required target triples,
+ * Cross-checks Tauri sidecar/resource mapping, the three required target triples,
  * MediaInfo staging/archive/notice script references, the no-shell frontend
  * capability boundary, and the honest mocked-UI vs unrun desktop-E2E boundary.
  *
@@ -27,14 +27,12 @@ const rootDir = path.resolve(scriptDir, '..');
 const REQUIRED_TARGETS = [
   'x86_64-pc-windows-msvc',
   'x86_64-unknown-linux-gnu',
-  'x86_64-apple-darwin',
   'aarch64-apple-darwin',
 ];
 
 const STAGED_NAMES = {
   'x86_64-pc-windows-msvc': 'mediainfo-x86_64-pc-windows-msvc.exe',
   'x86_64-unknown-linux-gnu': 'mediainfo-x86_64-unknown-linux-gnu',
-  'x86_64-apple-darwin': 'mediainfo-x86_64-apple-darwin',
   'aarch64-apple-darwin': 'mediainfo-aarch64-apple-darwin',
 };
 
