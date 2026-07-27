@@ -126,7 +126,7 @@ export default function MiscPage() {
                             <input
                                 value={defaultMediaFolder}
                                 readOnly
-                                placeholder="未设置（不会自动运行 MediaInfo）"
+                                placeholder="MediaInfo 将检查种子中的文件是否存在，并对比文件内容与种子标题"
                                 className="min-w-0 flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200"
                             />
                             <button
