@@ -114,6 +114,18 @@ export default function AiPreflightPanel({
                 AI 检查结果仅供参考。本地校验与您确认的冻结草稿共同决定是否发布；AI 不能单独授权发布。
             </p>
 
+            {!reconciling && !terminalFailure && state.audit?.description ? (
+                <div
+                    className="mt-3 border-t border-slate-700/60 pt-3"
+                    data-testid="ai-preflight-description"
+                >
+                    <div className="text-[11px] font-medium text-slate-400">AI 审核说明</div>
+                    <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-slate-200">
+                        {state.audit.description}
+                    </p>
+                </div>
+            ) : null}
+
             {!reconciling && !terminalFailure && state.audit?.findings.map((finding) => (
                 <div key={`${finding.code}-${finding.message}`} className="mt-2 flex gap-2 text-xs text-slate-300">
                     {finding.severity === 'CRITICAL' ? <ShieldAlert size={14} className="mt-0.5 shrink-0 text-rose-300" /> : <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-300" />}

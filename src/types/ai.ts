@@ -104,6 +104,8 @@ export interface AiFormalAuditRequest {
 
 export interface AiAuditResult {
     decision: AiDecision;
+    /** AI-generated Simplified Chinese summary for the user; absent on local-only paths. */
+    description?: string | null;
     findings: AiFinding[];
     unknown_codes: string[];
     local_blockers?: string[];
@@ -133,6 +135,7 @@ export interface PublishRequestPayload {
 /** Backend-owned audit evidence bound to a prepared plan token at prepare time. */
 export interface PlanAuditEvidence {
     decision: AiDecision;
+    description?: string | null;
     findings: AiFinding[];
     unknown_codes?: string[];
     /** False for prepare-time local-only / PENDING seeds; true only after formal provider audit. */

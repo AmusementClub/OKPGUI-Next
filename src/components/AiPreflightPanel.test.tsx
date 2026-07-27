@@ -87,6 +87,33 @@ describe('AiPreflightPanel', () => {
         unmount();
     });
 
+    it('shows the provider audit description for a terminal result', () => {
+        const description = '标题、视频 MediaInfo 与种子文件信息符合预期。';
+        const { container, unmount } = renderPanel({
+            state: baseState({
+                decision: 'GO',
+                lifecycle: 'terminal',
+                job_id: null,
+                audit: {
+                    decision: 'GO',
+                    description,
+                    findings: [],
+                    unknown_codes: [],
+                    formal_ran: true,
+                    plan_token: 'plan-token',
+                    snapshot_hash: 'sha256:x',
+                    request_generation: 1,
+                },
+            }),
+            canConfirm: true,
+        });
+
+        const summary = container.querySelector('[data-testid="ai-preflight-description"]');
+        expect(summary?.textContent).toContain('AI 审核说明');
+        expect(summary?.textContent).toContain(description);
+        unmount();
+    });
+
     it('shows retry reconciliation only while reconciling and never live error-free pending', () => {
         const onRetryReconciliation = vi.fn();
         const { container, unmount } = renderPanel({

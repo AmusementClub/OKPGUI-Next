@@ -1,6 +1,6 @@
 use crate::ai::audit::{
     build_formal_audit_prompt, compute_decision, formal_audit_schema, formal_audit_system_prompt,
-    redact_provider_error, sanitize_audit_input, try_parse_formal_audit_findings,
+    redact_provider_error, sanitize_audit_input, try_parse_formal_audit_output,
     validate_findings_against_projection, AuditDecision, AuditInput, Finding, FindingSeverity,
     ValidatedAudit,
 };
@@ -66,7 +66,7 @@ const FORMAL_PROVIDER_ATTEMPTS: usize = 2;
 
 fn validation_retry_prompt(original: &str) -> String {
     format!(
-        "{original}\n\n上一次返回未通过 JSON 解析或结构校验。请重新生成完整的单一 JSON object，严格遵循既定 schema；不要输出 Markdown 代码围栏、解释文字或额外字段。"
+        "{original}\n\n上一次返回未通过 JSON 解析或结构校验。请重新生成完整的单一 JSON object，严格遵循既定 schema；只返回业务结果实例，不得返回 JSON Schema 定义本身，也不得包含 type、properties、required、additionalProperties 等 schema 字段；不要输出 Markdown 代码围栏、解释文字或额外字段。"
     )
 }
 
@@ -2438,6 +2438,8 @@ pub struct AiFormalAuditRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AiFormalAuditResult {
     pub decision: AuditDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub findings: Vec<Finding>,
     pub unknown_codes: Vec<String>,
     pub local_blockers: Vec<String>,
@@ -2524,6 +2526,7 @@ fn local_audit_result(
     let validated = compute_decision(&input);
     AiFormalAuditResult {
         decision: validated.decision,
+        description: None,
         findings: validated.findings,
         unknown_codes: validated.unknown_codes,
         local_blockers: input.local_blockers,
@@ -2562,6 +2565,7 @@ fn bind_audit_to_plan(result: &AiFormalAuditResult) -> Result<(), String> {
         &result.plan_token,
         PlanAuditEvidence {
             decision: result.decision,
+            description: result.description.clone(),
             findings: result.findings.clone(),
             unknown_codes: result.unknown_codes.clone(),
             formal_ran: result.formal_ran,
@@ -2600,6 +2604,7 @@ fn pending_audit_result(
     }
     AiFormalAuditResult {
         decision: AuditDecision::Pending,
+        description: None,
         findings: Vec::new(),
         unknown_codes: Vec::new(),
         local_blockers,
@@ -2618,6 +2623,7 @@ fn formal_result_from_plan_evidence(
 ) -> AiFormalAuditResult {
     AiFormalAuditResult {
         decision: evidence.decision,
+        description: evidence.description.clone(),
         findings: evidence.findings.clone(),
         unknown_codes: evidence.unknown_codes.clone(),
         local_blockers,
@@ -3013,7 +3019,7 @@ async fn run_provider_formal_audit(
         &prompt,
         || false,
         |structured| {
-            try_parse_formal_audit_findings(structured).map_err(|message| FormalValidationError {
+            try_parse_formal_audit_output(structured).map_err(|message| FormalValidationError {
                 message,
                 code: "PROVIDER_SCHEMA",
                 retryable: true,
@@ -3023,9 +3029,9 @@ async fn run_provider_formal_audit(
     .await;
 
     match outcome {
-        FormalProviderCallResult::Success(findings) => {
-            let findings = validate_findings_against_projection(findings, &projection);
-            let result = local_audit_result(
+        FormalProviderCallResult::Success(output) => {
+            let findings = validate_findings_against_projection(output.findings, &projection);
+            let mut result = local_audit_result(
                 plan_token,
                 snapshot_hash,
                 request_generation,
@@ -3035,6 +3041,10 @@ async fn run_provider_formal_audit(
                 Some(job_id.clone()),
                 &policy,
             );
+            let description = policy.redact_text(&output.description);
+            if !description.trim().is_empty() {
+                result.description = Some(description.chars().take(600).collect());
+            }
             let summary = format!(
                 "formal audit decision={} findings={}",
                 match result.decision {
@@ -3053,7 +3063,12 @@ async fn run_provider_formal_audit(
             formal_ran,
             error_code,
         } => {
-            let message = redact_provider_error(&failure.message, &policy);
+            let message = if error_code == "PROVIDER_SCHEMA" {
+                "AI 返回格式不符合审核要求，自动纠正后仍无法解析。请重试检查或更换模型。"
+                    .to_string()
+            } else {
+                redact_provider_error(&failure.message, &policy)
+            };
             let result = local_audit_result(
                 plan_token,
                 snapshot_hash,
@@ -4467,6 +4482,7 @@ mod formal_audit_lifecycle_tests {
                     &token_unbound,
                     PlanAuditEvidence {
                         decision: crate::ai::audit::AuditDecision::Pending,
+                        description: None,
                         findings: vec![],
                         unknown_codes: vec![],
                         formal_ran: false,
@@ -5079,6 +5095,8 @@ mod formal_configuration_tests {
         assert!(!formal_retry_remaining(1));
         let prompt = validation_retry_prompt("可信原始输入");
         assert!(prompt.contains("可信原始输入"));
+        assert!(prompt.contains("不得返回 JSON Schema 定义本身"));
+        assert!(prompt.contains("additionalProperties"));
         assert!(prompt.contains("上一次返回未通过"));
     }
 

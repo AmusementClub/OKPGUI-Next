@@ -398,7 +398,7 @@ pub fn build_structured_request_with_system(
         let serialized_schema = serde_json::to_string(schema)
             .map_err(|_| "structured output schema serialization failed".to_string())?;
         format!(
-            "{system_prompt}\n输出必须是单一 JSON object，字段名和状态值必须严格符合以下结构约定：\n{serialized_schema}\n不要输出 Markdown 代码围栏或解释文字。"
+            "{system_prompt}\n输出必须是单一 JSON object，字段名和状态值必须严格符合以下结构约定：\n{serialized_schema}\n以上内容只是结构约束，不是要返回的数据。不得复制或返回 JSON Schema 本身，尤其不得把 type、properties、required、additionalProperties 当作结果字段。不要输出 Markdown 代码围栏或解释文字。"
         )
     } else {
         system_prompt.to_string()
@@ -1255,6 +1255,7 @@ mod tests {
             let prompt = prompt.expect("JSON mode must carry a system prompt");
             assert!(prompt.contains("单一 JSON object"));
             assert!(prompt.contains("additionalProperties"));
+            assert!(prompt.contains("不得复制或返回 JSON Schema"));
         }
     }
 

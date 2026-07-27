@@ -293,6 +293,7 @@ mod tests {
     ) -> PlanAuditEvidence {
         PlanAuditEvidence {
             decision,
+            description: None,
             findings: Vec::<Finding>::new(),
             unknown_codes: Vec::new(),
             formal_ran: true,

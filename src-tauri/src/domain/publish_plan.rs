@@ -20,6 +20,8 @@ use crate::publish::{OkpExecutableIdentity, PublishRequest, ResolvedOkpExecutabl
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanAuditEvidence {
     pub decision: AuditDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub unknown_codes: Vec<String>,
@@ -147,6 +149,7 @@ impl PlanAuditEvidence {
         };
         Self {
             decision,
+            description: None,
             findings: Vec::new(),
             unknown_codes: Vec::new(),
             formal_ran: false,
@@ -278,6 +281,7 @@ impl PublishPlan {
         };
         self.audit_evidence = Some(PlanAuditEvidence {
             decision,
+            description: evidence.description,
             findings: evidence.findings,
             unknown_codes: evidence.unknown_codes,
             formal_ran: evidence.formal_ran,
@@ -1698,6 +1702,7 @@ mod tests {
                 &token,
                 PlanAuditEvidence {
                     decision: AuditDecision::Warning,
+                    description: Some("标题与媒体信息需要进一步确认。".to_string()),
                     findings: vec![],
                     unknown_codes: vec![],
                     formal_ran: true,
@@ -1710,6 +1715,12 @@ mod tests {
         {
             let plan = registry.inspect_plan(&token).expect("plan");
             assert_eq!(plan.publish_decision(), AuditDecision::Warning);
+            assert_eq!(
+                plan.audit_evidence
+                    .as_ref()
+                    .and_then(|evidence| evidence.description.as_deref()),
+                Some("标题与媒体信息需要进一步确认。")
+            );
             assert!(!plan.can_publish_now());
         }
         registry
@@ -1742,6 +1753,7 @@ mod tests {
                 &blocked.token,
                 PlanAuditEvidence {
                     decision: AuditDecision::Go,
+                    description: None,
                     findings: vec![],
                     unknown_codes: vec![],
                     formal_ran: false,
@@ -2135,6 +2147,7 @@ mod tests {
         // Mismatched evidence is also unusable.
         plan.audit_evidence = Some(PlanAuditEvidence {
             decision: AuditDecision::Go,
+            description: None,
             findings: vec![],
             unknown_codes: vec![],
             formal_ran: false,
@@ -2454,6 +2467,7 @@ mod tests {
                 &token,
                 PlanAuditEvidence {
                     decision: AuditDecision::Pending,
+                    description: None,
                     findings: Vec::new(),
                     unknown_codes: Vec::new(),
                     formal_ran: false,

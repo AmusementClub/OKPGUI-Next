@@ -107,6 +107,7 @@ fn bind_pending_audit(
         token,
         PlanAuditEvidence {
             decision: AuditDecision::Pending,
+            description: None,
             findings: vec![],
             unknown_codes: vec![],
             formal_ran: false,
