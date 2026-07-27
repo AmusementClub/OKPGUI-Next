@@ -66,7 +66,7 @@ const FORMAL_PROVIDER_ATTEMPTS: usize = 2;
 
 fn validation_retry_prompt(original: &str) -> String {
     format!(
-        "{original}\n\n上一次返回未通过 JSON 解析或结构校验。请重新生成完整的单一 JSON object，严格遵循既定 schema；只返回业务结果实例，不得返回 JSON Schema 定义本身，也不得包含 type、properties、required、additionalProperties 等 schema 字段；不要输出 Markdown 代码围栏、解释文字或额外字段。"
+        "{original}\n\n上一次返回未通过 JSON 解析或结果结构校验。请重新执行检查并生成完整的单一 JSON object，严格遵循既定输出约定；只返回业务结果实例，不得返回 JSON Schema 定义本身，也不得包含 type、properties、required、additionalProperties、json_schema、strict 等 schema 字段；不要输出 Markdown 代码围栏、解释文字或额外字段。"
     )
 }
 

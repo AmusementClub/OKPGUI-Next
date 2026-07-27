@@ -394,7 +394,14 @@ pub fn build_structured_request_with_system(
 
     let base = endpoint.trim_end_matches('/');
     let resolved_mode = resolve_mode(provider, mode);
-    let schema_prompt = if output_capability == OutputCapability::JsonObject {
+    // OpenAI-compatible Chat Completions uses traditional JSON mode. Some compatible
+    // providers reject or only partially implement the newer json_schema envelope.
+    let effective_output_capability = if resolved_mode == ProviderMode::Chat {
+        OutputCapability::JsonObject
+    } else {
+        output_capability
+    };
+    let schema_prompt = if effective_output_capability == OutputCapability::JsonObject {
         let serialized_schema = serde_json::to_string(schema)
             .map_err(|_| "structured output schema serialization failed".to_string())?;
         format!(
@@ -419,7 +426,7 @@ pub fn build_structured_request_with_system(
                     "input": input,
                     "max_output_tokens": max_tokens
                 });
-                body["text"] = match output_capability {
+                body["text"] = match effective_output_capability {
                     OutputCapability::StrictSchema => {
                         json!({"format": {"type": "json_schema", "name": schema_name, "strict": true, "schema": schema}})
                     }
@@ -443,12 +450,7 @@ pub fn build_structured_request_with_system(
                     "messages": messages,
                     "max_completion_tokens": max_tokens
                 });
-                body["response_format"] = match output_capability {
-                    OutputCapability::StrictSchema => {
-                        json!({"type": "json_schema", "json_schema": {"name": schema_name, "strict": true, "schema": schema}})
-                    }
-                    OutputCapability::JsonObject => json!({"type": "json_object"}),
-                };
+                body["response_format"] = json!({"type": "json_object"});
                 body
             })
         }
@@ -458,7 +460,7 @@ pub fn build_structured_request_with_system(
                 "max_tokens": max_tokens,
                 "messages": [{"role": "user", "content": user_prompt}]
             });
-            if output_capability == OutputCapability::StrictSchema {
+            if effective_output_capability == OutputCapability::StrictSchema {
                 body["output_config"] =
                     json!({"format": {"type": "json_schema", "schema": schema}});
             }
@@ -1179,7 +1181,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn openai_responses_and_chat_have_distinct_strict_shapes() {
+    fn openai_responses_keeps_strict_schema_while_chat_uses_json_object() {
         let schema = json!({"type": "object"});
         let responses = build_probe_request(
             ProviderKind::OpenAi,
@@ -1204,7 +1206,12 @@ mod tests {
         assert_eq!(responses.body["max_output_tokens"], 4096);
         assert_eq!(chat.body["max_completion_tokens"], 4096);
         assert_eq!(responses.body["text"]["format"]["strict"], true);
-        assert_eq!(chat.body["response_format"]["json_schema"]["strict"], true);
+        assert_eq!(chat.body["response_format"], json!({"type": "json_object"}));
+        assert!(chat.body["response_format"].get("json_schema").is_none());
+        assert!(chat.body["response_format"].get("strict").is_none());
+        assert!(chat.body["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|prompt| prompt.contains("单一 JSON object")));
     }
 
     #[test]

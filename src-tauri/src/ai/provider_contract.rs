@@ -563,11 +563,11 @@ mod tests {
             Some(&json!(4096))
         );
         assert_eq!(
-            chat.body
-                .pointer("/response_format/type")
-                .and_then(Value::as_str),
-            Some("json_object")
+            chat.body.get("response_format"),
+            Some(&json!({"type": "json_object"}))
         );
+        assert!(chat.body.pointer("/response_format/json_schema").is_none());
+        assert!(chat.body.pointer("/response_format/strict").is_none());
         assert_eq!(
             chat.body.pointer("/messages/0/role"),
             Some(&json!("system"))
