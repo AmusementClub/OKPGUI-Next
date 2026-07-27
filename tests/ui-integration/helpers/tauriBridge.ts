@@ -38,7 +38,6 @@ export interface BridgeState {
   invokeLog: Array<{ command: string; args?: Record<string, unknown> }>;
   publishCalls: number;
   formalAuditStarts: number;
-  seedHandoff: { seed_id: string } | null;
   acknowledgements: { warning: boolean; critical: boolean; pending: boolean };
   decision: 'GO' | 'WARNING' | 'NO_GO' | 'PENDING' | 'LOCAL_BLOCKED';
 }
@@ -88,7 +87,6 @@ export function buildDefaultBridgeState(overrides: Partial<BridgeState> = {}): B
     invokeLog: [],
     publishCalls: 0,
     formalAuditStarts: 0,
-    seedHandoff: null,
     acknowledgements: { warning: false, critical: false, pending: false },
     decision: 'GO',
     ...overrides,
@@ -273,81 +271,6 @@ export function tauriMockInitScript(initial: BridgeState): string {
             state: 'succeeded',
             job_id: 'job-mock-1',
             audit: auditFor(state.decision),
-          };
-        case 'ai_start_template_selection':
-          return {
-            job_id: 'job-template-1',
-            state: 'running',
-            request_generation: 1,
-            snapshot_hash: 'sha256:catalog-mock',
-            progress: 10,
-            error_code: null,
-            message: 'selecting',
-            recommendation: null,
-            seed: null,
-          };
-        case 'ai_poll_template_selection':
-          return {
-            job_id: 'job-template-1',
-            state: 'succeeded',
-            request_generation: 1,
-            snapshot_hash: 'sha256:catalog-mock',
-            progress: 100,
-            error_code: null,
-            message: 'matched',
-            recommendation: {
-              recommendation_id: 'rec-mock-1',
-              template_id: 'qp-default',
-              template_revision: 1,
-              template_digest: 'sha256:template',
-              template_name: 'Default QP',
-              summary: '推荐模板「Default QP」(revision 1)',
-              alternatives: [],
-              torrent_digest: 'sha256:torrent',
-              torrent_name: 'Mock.Torrent',
-              catalog_hash: 'sha256:catalog-mock',
-              generation: 1,
-              expires_at_unix: Math.floor(Date.now() / 1000) + 600,
-            },
-            seed: null,
-          };
-        case 'ai_review_template_recommendation':
-          state.seedHandoff = { seed_id: 'seed-mock-1' };
-          return {
-            status: 'minted',
-            recommendation_id: 'rec-mock-1',
-            seed: {
-              token: 'seed-mock-1',
-              template_id: 'qp-default',
-              template_revision: 1,
-              template_digest: 'sha256:template',
-              torrent_name: 'Mock.Torrent',
-            },
-            message: '已生成一次性发布种子。',
-          };
-        case 'ai_prepare_template_seed':
-          return {
-            token: 'seed-mock-1',
-            template_id: 'qp-default',
-            template_revision: 1,
-            template_digest: 'sha256:template',
-            torrent_name: 'Mock.Torrent',
-          };
-        case 'ai_inspect_template_seed':
-          return {
-            token: 'seed-mock-1',
-            template_id: 'qp-default',
-            template_revision: 1,
-            template_digest: 'sha256:template',
-            torrent_name: 'Mock.Torrent',
-          };
-        case 'ai_consume_template_seed':
-          return {
-            template_id: 'qp-default',
-            template_revision: 1,
-            template_digest: 'sha256:template',
-            torrent_path: '/mock/release.torrent',
-            torrent_name: 'Mock.Torrent',
           };
         case 'ai_list_jobs':
           return [];

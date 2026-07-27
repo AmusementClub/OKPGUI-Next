@@ -408,7 +408,6 @@ mod tests {
         minimal_probe_schema, send_managed_provider_request,
     };
     use crate::ai::recognition::parse_recognition;
-    use crate::ai::template_seed::{parse_template_selection, EligibleTemplateCatalogEntry};
 
     #[test]
     fn contract_matrix_covers_required_scenarios() {
@@ -635,25 +634,6 @@ mod tests {
             assert_eq!(parsed.episode.expect("episode").value, "01");
         }
 
-        let catalog = vec![EligibleTemplateCatalogEntry {
-            id: "tpl-a".into(),
-            name: "模板 A".into(),
-            revision: 3,
-            digest: "sha256:abc".into(),
-            summary: "测试模板".into(),
-        }];
-        let selected = parse_template_selection(
-            &json!({
-                "matched": true,
-                "template_id": "tpl-a",
-                "template_revision": 3,
-                "template_digest": "sha256:abc"
-            }),
-            &catalog,
-        )
-        .expect("English selection object maps to catalog entry");
-        assert_eq!(selected.id, "tpl-a");
-
         let findings = parse_formal_audit_findings(&json!({
             "findings": [{
                 "code": "PROVIDER_WARNING",
@@ -673,24 +653,6 @@ mod tests {
             "分辨率": null,
             "建议标题": null
         }))
-        .is_err());
-
-        let catalog = vec![EligibleTemplateCatalogEntry {
-            id: "tpl-a".into(),
-            name: "模板 A".into(),
-            revision: 3,
-            digest: "sha256:abc".into(),
-            summary: "测试模板".into(),
-        }];
-        assert!(parse_template_selection(
-            &json!({
-                "已匹配": true,
-                "模板ID": "tpl-a",
-                "模板修订号": 3,
-                "模板摘要": "sha256:abc"
-            }),
-            &catalog,
-        )
         .is_err());
 
         let findings = parse_formal_audit_findings(&json!({

@@ -213,7 +213,7 @@ export interface MediaInfoJobView {
 
 export interface AiJob {
     id: string;
-    kind: 'capability_probe' | 'recognition' | 'template_selection' | 'media_info' | 'audit';
+    kind: 'capability_probe' | 'recognition' | 'media_info' | 'audit';
     state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'stale';
     request_generation: number;
     snapshot_hash: string;
@@ -255,96 +255,6 @@ export interface PreflightSessionChangedPayload {
     lifecycle: AiPreflightLifecycle | string;
     token_state: PreflightTokenState;
     reconciled: boolean;
-}
-
-export interface TemplateSeed {
-    token: string;
-    template_id: string;
-    template_revision: number;
-    template_digest: string;
-    torrent_name: string;
-}
-
-/** Bounded catalog-backed alternative on an auto-template recommendation. */
-export interface TemplateRecommendationAlternative {
-    template_id: string;
-    template_revision: number;
-    template_digest: string;
-    name: string;
-    summary: string;
-}
-
-/**
- * Backend-owned validated recommendation (never a pre-minted handoff seed).
- * Explicit Review revalidates and mints exactly one seed.
- */
-export interface TemplateRecommendation {
-    recommendation_id: string;
-    template_id: string;
-    template_revision: number;
-    template_digest: string;
-    template_name: string;
-    /** Sanitized evidence/summary (never secrets, paths, or provider bodies). */
-    summary: string;
-    alternatives: TemplateRecommendationAlternative[];
-    torrent_digest: string;
-    torrent_name: string;
-    catalog_hash: string;
-    generation: number;
-    expires_at_unix: number;
-}
-
-export type ReviewTemplateRecommendationStatus =
-    | 'minted'
-    | 'already_minted'
-    | 'already_consumed';
-
-/** Result of explicit Review-in-Quick-Publish mint. */
-export interface ReviewTemplateRecommendationResult {
-    status: ReviewTemplateRecommendationStatus;
-    seed?: TemplateSeed | null;
-    recommendation_id: string;
-    message?: string | null;
-}
-
-/** Opaque browser handoff only — never includes torrent_path. */
-export interface AutoTemplateSeedHandoff {
-    token: string;
-    template_id: string;
-}
-
-/** Result of a successful one-shot backend consume (public identity + bound path). */
-export interface ConsumedTemplateSeed {
-    template_id: string;
-    template_revision: number;
-    template_digest: string;
-    torrent_path: string;
-    torrent_name?: string;
-}
-
-/** Request for Rust-owned automatic template selection (torrent path only). */
-export interface AiSelectTemplateRequest {
-    torrent_path: string;
-}
-
-/**
- * Public TemplateSelection job view from start/poll.
- * Recommendation only when state === 'succeeded'. Never includes torrent_path.
- * Seed is never auto-minted (explicit Review only).
- */
-export interface TemplateSelectionJobView {
-    job_id: string;
-    state: AiJob['state'];
-    request_generation: number;
-    snapshot_hash: string;
-    progress: number;
-    error_code?: string | null;
-    /** Redacted status/error message (never secrets or raw provider bodies). */
-    message?: string | null;
-    /** Backend-owned validated recommendation when succeeded. */
-    recommendation?: TemplateRecommendation | null;
-    /** Deprecated: always absent after recommendation handoff. */
-    seed?: TemplateSeed | null;
 }
 
 /**

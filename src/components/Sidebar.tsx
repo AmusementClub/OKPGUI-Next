@@ -8,7 +8,6 @@ import {
     Home,
     Send,
     Settings,
-    WandSparkles,
     UserCircle,
 } from 'lucide-react';
 import { useAppVersion } from '../utils/appVersion';
@@ -20,8 +19,7 @@ export type Page =
     | 'content_templates'
     | 'identity'
     | 'misc'
-    | 'ai_settings'
-    | 'auto_template';
+    | 'ai_settings';
 
 interface SidebarProps {
     activePage: Page;
@@ -47,7 +45,6 @@ const navSections: { title: string; items: { key: Page; label: string; icon: typ
         title: 'AI 发布助手',
         items: [
             { key: 'ai_settings', label: 'AI 连接设置', icon: BrainCircuit },
-            { key: 'auto_template', label: '自动选择模板', icon: WandSparkles },
         ],
     },
     {

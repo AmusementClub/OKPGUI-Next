@@ -22,7 +22,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum JobKind {
     CapabilityProbe,
     Recognition,
-    TemplateSelection,
     MediaInfo,
     Audit,
 }
@@ -137,7 +136,6 @@ fn sanitized_stage_for_job(job: &AiJob) -> String {
         AiJobState::Running => match job.kind {
             JobKind::CapabilityProbe => "能力探测".to_string(),
             JobKind::Recognition => "识别中".to_string(),
-            JobKind::TemplateSelection => "自动选模板".to_string(),
             JobKind::MediaInfo => "媒体信息".to_string(),
             JobKind::Audit => "发布前检查".to_string(),
         },
@@ -147,7 +145,6 @@ fn sanitized_stage_for_job(job: &AiJob) -> String {
 
 fn navigation_target_for_kind(kind: JobKind) -> Option<String> {
     match kind {
-        JobKind::TemplateSelection => Some("auto_template".to_string()),
         JobKind::CapabilityProbe => Some("ai_settings".to_string()),
         // Audit / recognition / media live on the current publish entry.
         _ => None,

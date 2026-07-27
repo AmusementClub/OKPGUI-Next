@@ -17,7 +17,6 @@ const REQUIRED_FILES = [
   'scripts/run-playwright-ui-integration.mjs',
   'tests/ui-integration/helpers/tauriBridge.ts',
   'tests/ui-integration/settings-capability.spec.ts',
-  'tests/ui-integration/auto-template-handoff.spec.ts',
   'tests/ui-integration/confirmation-states.spec.ts',
   'tests/ui-integration/disabled-ai-no-side-effect.spec.ts',
 ];
@@ -44,11 +43,6 @@ const REQUIRED_MARKERS = {
     'UI integration',
     'capability',
     'ai_run_capability_probe',
-  ],
-  'tests/ui-integration/auto-template-handoff.spec.ts': [
-    'UI integration',
-    'auto_template',
-    'seed',
   ],
   'tests/ui-integration/confirmation-states.spec.ts': [
     'UI integration',
@@ -94,8 +88,8 @@ function main() {
 
   const specDir = path.join(rootDir, 'tests', 'ui-integration');
   const specs = readdirSync(specDir).filter((name) => name.endsWith('.spec.ts'));
-  if (specs.length < 4) {
-    die(`expected at least 4 UI integration specs, found ${specs.length}`);
+  if (specs.length < 3) {
+    die(`expected at least 3 UI integration specs, found ${specs.length}`);
   }
 
   console.log('verify-ui-integration-inventory: ok');

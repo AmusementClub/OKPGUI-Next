@@ -78,21 +78,12 @@ pub fn run() {
             commands::ai_commands::ai_start_media_info,
             commands::ai_commands::ai_poll_media_info,
             commands::ai_commands::ai_get_media_info_result,
-            // TemplateSelection is a backend-owned AiJob: start / poll; cancel via ai_cancel_job.
-            // Seed mint only on Succeeded; cancel/stale/late completion never hand off a seed.
-            commands::ai_commands::ai_start_template_selection,
-            commands::ai_commands::ai_poll_template_selection,
             // Recognition is a backend-owned AiJob: start / poll; cancel via ai_cancel_job.
             // Validated result only on Succeeded; cancel/stale/late completion never surfaces it.
             // ai_recognize remains as a one-shot compatibility path over the same lifecycle.
             commands::ai_commands::ai_start_recognition,
             commands::ai_commands::ai_poll_recognition,
             commands::ai_commands::ai_recognize,
-            commands::ai_commands::ai_prepare_template_seed,
-            commands::ai_commands::ai_inspect_template_seed,
-            commands::ai_commands::ai_consume_template_seed,
-            // Explicit Review: revalidate recommendation + mint one handoff seed.
-            commands::ai_commands::ai_review_template_recommendation,
             commands::ai_commands::ai_redact_value,
             commands::ai_commands::ai_project_context,
             commands::ai_commands::ai_compute_audit,

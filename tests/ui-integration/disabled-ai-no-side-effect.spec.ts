@@ -43,7 +43,6 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
     expect(commands).not.toContain('ai_run_capability_probe');
     expect(commands).not.toContain('ai_list_models');
     expect(commands).not.toContain('ai_start_formal_audit');
-    expect(commands).not.toContain('ai_start_template_selection');
     expect(commands).not.toContain('publish_prepared_plan');
     expect(bridge.formalAuditStarts).toBe(0);
     expect(bridge.publishCalls).toBe(0);

@@ -10,7 +10,6 @@ import ContentTemplatesPage from './pages/ContentTemplatesPage';
 import IdentityPage from './pages/IdentityPage';
 import MiscPage from './pages/MiscPage';
 import AiSettingsPage from './pages/AiSettingsPage';
-import AutoTemplatePage from './pages/AutoTemplatePage';
 
 const pageComponents: Record<Page, ComponentType> = {
     home: HomePage,
@@ -20,7 +19,6 @@ const pageComponents: Record<Page, ComponentType> = {
     identity: IdentityPage,
     misc: MiscPage,
     ai_settings: AiSettingsPage,
-    auto_template: AutoTemplatePage,
 };
 
 const PAGE_ENTER_TIMING = 'ease-[cubic-bezier(0.16,1,0.3,1)]';

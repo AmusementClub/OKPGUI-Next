@@ -56,16 +56,9 @@ import {
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
 import {
-    acknowledgeAutoTemplateSeedHydration,
-    clearAutoTemplateSeedHydrationCycle,
-    consumeTemplateSeed,
-    hasAutoTemplateSeedConsumeInFlight,
     isAiCapabilityReady,
-    peekAutoTemplateSeedHandoff,
     publishPreparedPlan,
     readFriendlyError,
-    takeAndConsumeAutoTemplateSeed,
-    takeAutoTemplateSeedHandoff,
 } from '../services/ai';
 import {
     buildRecognitionLocalContextKey,
@@ -75,6 +68,7 @@ import {
     resolvePublishTitleMetadata,
     type ParsedTitleDetails,
 } from '../utils/publishTitleMetadata';
+import { recommendLocalTemplate } from '../utils/localTemplateRecommendation';
 
 interface PublishAttemptContext {
     publishId: string;
@@ -139,14 +133,6 @@ export default function QuickPublishPage() {
     const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
-    /**
-     * Auto-selected hydrated template until the user edits or confirms review.
-     * Cleared on covered edits / manual template change / successful publish start.
-     */
-    const [autoSelectedTemplate, setAutoSelectedTemplate] = useState<{
-        templateId: string;
-        templateRevision: number;
-    } | null>(null);
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
     /** Bumps on covered draft mutations so in-flight resolve/prepare cannot freeze stale data. */
@@ -265,8 +251,6 @@ export default function QuickPublishPage() {
         if (options?.clearHistoryAdopts) {
             clearAdoptedHistory();
         }
-        // Any covered edit ends the auto-selected hydration marker.
-        setAutoSelectedTemplate(null);
         if (frozenPlanRef.current || showConfirmRef.current || isPreparingPublishRef.current) {
             clearFrozenPreflight();
         }
@@ -331,6 +315,10 @@ export default function QuickPublishPage() {
         () => buildTemplateOptions(quickPublishTemplates),
         [quickPublishTemplates],
     );
+    const localTemplateRecommendation = useMemo(
+        () => recommendLocalTemplate(torrentInfo?.name ?? '', quickPublishTemplates),
+        [quickPublishTemplates, torrentInfo?.name],
+    );
 
     const publishSitesList = useMemo(
         () => Object.values(publishSites).sort((left, right) => left.siteLabel.localeCompare(right.siteLabel, 'zh-CN')),
@@ -383,157 +371,6 @@ export default function QuickPublishPage() {
         };
     }, [parseTorrentCovered, selectContentRootCovered]);
 
-    // AutoTemplate seed hydration: wait for catalog load, validate backend metadata
-    // against the currently loaded catalog, then mutate the runtime draft only on success.
-    // Fail-closed paths never mutate runtime and always surface a concise sanitized error.
-    const autoTemplateSeedHandledRef = useRef(false);
-
-    /** User-visible, non-sensitive hydration failures (no paths, secrets, or raw provider bodies). */
-    const reportAutoTemplateHydrationFailure = useCallback((message: string) => {
-        setStatusMessage('');
-        setErrorMessage(message);
-    }, []);
-    useEffect(() => {
-        if (autoTemplateSeedHandledRef.current) {
-            return;
-        }
-
-        let cancelled = false;
-
-        const attemptHydration = async () => {
-            const handoff = peekAutoTemplateSeedHandoff();
-            const inFlight = hasAutoTemplateSeedConsumeInFlight();
-            if (!handoff && !inFlight) {
-                return;
-            }
-
-            // After a StrictMode remount the module-scoped consume may still be in flight
-            // while runtime catalog state is empty again — wait for reload before validating.
-            if (!handoff && inFlight && Object.keys(quickPublishTemplates).length === 0) {
-                return;
-            }
-
-            // When a handoff is still present, wait until the target template is in the
-            // runtime catalog (or confirm it is truly missing after config load).
-            if (handoff) {
-                const catalogTemplate = quickPublishTemplates[handoff.template_id];
-                if (!catalogTemplate) {
-                    try {
-                        const config = await invoke<{
-                            quick_publish_templates?: Record<string, { revision?: number }>;
-                        }>('get_config');
-                        if (cancelled) {
-                            return;
-                        }
-                        const remote = config.quick_publish_templates?.[handoff.template_id];
-                        if (!remote) {
-                            // Template deleted/missing: fail closed, invalidate handoff + seed.
-                            autoTemplateSeedHandledRef.current = true;
-                            const token = handoff.token;
-                            takeAutoTemplateSeedHandoff();
-                            void consumeTemplateSeed(token);
-                            clearAutoTemplateSeedHydrationCycle();
-                            reportAutoTemplateHydrationFailure(
-                                '自动选模板对应的发布模板不存在或已变更，请重新选择模板。',
-                            );
-                            return;
-                        }
-                        // Config has the template but runtime state is not ready yet — wait.
-                        return;
-                    } catch {
-                        return;
-                    }
-                }
-            }
-
-            const consumed = await takeAndConsumeAutoTemplateSeed();
-            if (cancelled) {
-                // StrictMode remount: the shared in-flight promise will be applied by the next effect.
-                return;
-            }
-            if (!consumed || !consumed.template_id || !consumed.torrent_path) {
-                // Transport/invoke failure leaves the opaque handoff in place for remount retry.
-                // Explicit terminal consume rejection already cleared storage — only then finalize.
-                if (peekAutoTemplateSeedHandoff()) {
-                    return;
-                }
-                // Replay / expired / stale / missing: fail closed, do not hydrate as success.
-                autoTemplateSeedHandledRef.current = true;
-                clearAutoTemplateSeedHydrationCycle();
-                reportAutoTemplateHydrationFailure(
-                    '自动选模板结果已失效或无法使用，请重新选择模板。',
-                );
-                return;
-            }
-
-            // Validate backend seed metadata against the currently loaded catalog.
-            const liveTemplate = quickPublishTemplates[consumed.template_id];
-            if (!liveTemplate || liveTemplate.revision !== consumed.template_revision) {
-                // Missing template or revision/digest drift — do not mutate user state.
-                autoTemplateSeedHandledRef.current = true;
-                clearAutoTemplateSeedHydrationCycle();
-                reportAutoTemplateHydrationFailure(
-                    '自动选模板对应的发布模板不存在或已变更，请重新选择模板。',
-                );
-                return;
-            }
-
-            // Validate torrent parse before mutating runtime as a successful seed hydration.
-            // Fail closed on terminal parse errors without acknowledging success.
-            try {
-                await invoke('parse_torrent', { path: consumed.torrent_path });
-            } catch {
-                if (cancelled) {
-                    return;
-                }
-                autoTemplateSeedHandledRef.current = true;
-                clearAutoTemplateSeedHydrationCycle();
-                // Sanitized: never surface absolute paths or raw parse provider bodies.
-                reportAutoTemplateHydrationFailure(
-                    '自动选模板的种子文件无法解析，请重新选择种子或模板。',
-                );
-                return;
-            }
-            if (cancelled) {
-                return;
-            }
-
-            autoTemplateSeedHandledRef.current = true;
-            // Seed hydration mutates template + torrent identity: supersede any prepared plan.
-            coveredEditGenerationRef.current += 1;
-            selectRuntimeTemplate(consumed.template_id);
-            try {
-                await parseTorrentCovered(consumed.torrent_path);
-            } catch {
-                clearAutoTemplateSeedHydrationCycle();
-                setAutoSelectedTemplate(null);
-                reportAutoTemplateHydrationFailure(
-                    '自动选模板的种子文件无法解析，请重新选择种子或模板。',
-                );
-                return;
-            }
-            if (cancelled) {
-                return;
-            }
-            // Mark after covered torrent parse so the covered-edit clear does not wipe it.
-            setAutoSelectedTemplate({
-                templateId: consumed.template_id,
-                templateRevision: consumed.template_revision,
-            });
-            // Acknowledge only after torrent hydration has completed successfully.
-            acknowledgeAutoTemplateSeedHydration();
-            setStatusMessage(
-                `已载入自动推荐模板“${liveTemplate.name || consumed.template_id}”（revision ${consumed.template_revision}），请审阅后再发布。`,
-            );
-        };
-
-        void attemptHydration();
-
-        return () => {
-            cancelled = true;
-        };
-    }, [parseTorrentCovered, quickPublishTemplates, reportAutoTemplateHydrationFailure, selectRuntimeTemplate]);
-
     const siteRows = useSiteRows({
         publishSites,
         selectedProfileData,
@@ -557,8 +394,6 @@ export default function QuickPublishPage() {
 
         // Template identity mutation supersedes any live or in-flight prepare and history adopts.
         invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
-        // Manual pick ends auto-selected hydration marker.
-        setAutoSelectedTemplate(null);
         // UI selection is sync; persist is serialized so the last pick wins on disk.
         selectRuntimeTemplate(templateId);
         setStatusMessage('');
@@ -1094,24 +929,32 @@ export default function QuickPublishPage() {
                     onDismiss={errorMessage ? () => setErrorMessage('') : null}
                     retryDisabled={isPreparingPublish || isPublishing}
                 />
-                {autoSelectedTemplate ? (
+                {torrentInfo && localTemplateRecommendation ? (
                     <div
-                        data-testid="auto-selected-template-banner"
-                        className="rounded-xl border border-cyan-500/25 bg-cyan-500/10 px-4 py-3 text-sm text-cyan-100"
+                        data-testid="local-template-recommendation"
+                        className="flex flex-wrap items-center justify-between gap-3 border-y border-emerald-500/20 bg-emerald-500/5 px-4 py-3 text-sm text-emerald-100"
                     >
-                        当前为自动推荐模板
-                        <span className="font-medium">
-                            {' '}
-                            {quickPublishTemplates[autoSelectedTemplate.templateId]?.name
-                                || autoSelectedTemplate.templateId}
-                        </span>
-                        <span className="font-mono text-xs text-cyan-200/80">
-                            {' '}
-                            · id {autoSelectedTemplate.templateId}
-                            {' '}
-                            · revision {autoSelectedTemplate.templateRevision}
-                        </span>
-                        。请审阅字段后再发布；手动改选模板或编辑覆盖后标记将清除。
+                        <div className="min-w-0">
+                            <span className="text-emerald-300">本地推荐</span>
+                            <span className="ml-2 font-medium text-slate-100">
+                                {quickPublishTemplates[localTemplateRecommendation.templateId]?.name
+                                    || localTemplateRecommendation.templateId}
+                            </span>
+                            <span className="ml-2 text-xs text-slate-400">
+                                {localTemplateRecommendation.reasons.join('；')}
+                            </span>
+                        </div>
+                        {selectedTemplateId === localTemplateRecommendation.templateId ? (
+                            <span className="text-xs text-emerald-300">当前已应用</span>
+                        ) : (
+                            <button
+                                type="button"
+                                onClick={() => handleTemplateSelection(localTemplateRecommendation.templateId)}
+                                className="rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-1.5 text-sm text-emerald-100 transition-colors hover:bg-emerald-500/20"
+                            >
+                                应用推荐
+                            </button>
+                        )}
                     </div>
                 ) : null}
 

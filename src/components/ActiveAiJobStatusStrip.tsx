@@ -17,8 +17,6 @@ function kindLabel(kind: ActiveAiJobSummary['kind']): string {
             return '发布前检查';
         case 'recognition':
             return '识别';
-        case 'template_selection':
-            return '自动选模板';
         case 'media_info':
             return '媒体信息';
         case 'capability_probe':

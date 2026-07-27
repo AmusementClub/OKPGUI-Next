@@ -36,12 +36,12 @@ describe('ActiveAiJobStatusStrip', () => {
                         started_at_unix: 100,
                     },
                     {
-                        job_id: 'job-tpl-1',
-                        kind: 'template_selection',
-                        stage: '自动选模板',
+                        job_id: 'job-probe-1',
+                        kind: 'capability_probe',
+                        stage: '能力探测',
                         progress: 20,
                         cancellable: true,
-                        navigation_target: 'auto_template',
+                        navigation_target: 'ai_settings',
                         started_at_unix: 110,
                     },
                 ]);
@@ -79,7 +79,7 @@ describe('ActiveAiJobStatusStrip', () => {
         });
         expect(container.querySelector('[data-testid="active-ai-job-status-strip"]')).toBeTruthy();
         expect(container.querySelector('[data-testid="active-ai-job-job-audit-1"]')).toBeTruthy();
-        expect(container.querySelector('[data-testid="active-ai-job-job-tpl-1"]')).toBeTruthy();
+        expect(container.querySelector('[data-testid="active-ai-job-job-probe-1"]')).toBeTruthy();
 
         await act(async () => {
             container
@@ -114,10 +114,10 @@ describe('ActiveAiJobStatusStrip', () => {
         });
         act(() => {
             container
-                .querySelector<HTMLButtonElement>('[data-testid="active-ai-job-nav-job-tpl-1"]')
+                .querySelector<HTMLButtonElement>('[data-testid="active-ai-job-nav-job-probe-1"]')
                 ?.click();
         });
-        expect(navigate).toHaveBeenCalledWith('auto_template');
+        expect(navigate).toHaveBeenCalledWith('ai_settings');
         window.removeEventListener('okpgui:navigate', onNavigate);
     });
 });

@@ -16,4 +16,3 @@ pub mod provider;
 mod provider_contract;
 pub mod recognition;
 pub mod redaction;
-pub mod template_seed;

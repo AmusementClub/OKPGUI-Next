@@ -9,12 +9,9 @@ import type {
     AiJob,
     AiModelDiscoveryResult,
     AiRecognizeRequest,
-    AiSelectTemplateRequest,
     AiSettings,
-    AutoTemplateSeedHandoff,
     CancelPendingAuditForPublishResult,
     CancelPreflightSessionResult,
-    ConsumedTemplateSeed,
     MediaInfoJobView,
     PlanPrepareResponse,
     PreflightSessionChangedPayload,
@@ -22,15 +19,10 @@ import type {
     PublishRequestPayload,
     RecognitionJobView,
     RecognitionResult,
-    ReviewTemplateRecommendationResult,
-    TemplateSeed,
-    TemplateSelectionJobView,
 } from '../types/ai';
 
 /** Tauri event name for atomic preflight cancel/reconcile convergence. */
 export const PREFLIGHT_SESSION_CHANGED_EVENT = 'preflight-session-changed';
-
-export const AUTO_TEMPLATE_SEED_STORAGE_KEY = 'okpgui:autoTemplateSeed';
 
 export const disabledAiSettings: AiSettings = {
     provider: 'open_ai',
@@ -317,55 +309,6 @@ export async function inspectPublishPlan(token: string): Promise<PublishPlan | n
     return result.plan ?? null;
 }
 
-/** Module-scoped so React StrictMode remounts reuse the same one-shot consume. */
-let autoTemplateSeedConsumeInFlight: Promise<ConsumedTemplateSeed | null> | null = null;
-
-/**
- * Start a backend-owned TemplateSelection job.
- * Never invents a catalog pick client-side; recommendation only after poll reports succeeded.
- */
-export async function startTemplateSelection(
-    request: AiSelectTemplateRequest,
-): Promise<TemplateSelectionJobView> {
-    return invoke<TemplateSelectionJobView>('ai_start_template_selection', { request });
-}
-
-/**
- * Poll TemplateSelection job. Returns null while queued/running; terminal view when finished.
- * Cancelled/stale/failed never include a recommendation or seed.
- */
-export async function pollTemplateSelection(
-    jobId: string,
-): Promise<TemplateSelectionJobView | null> {
-    return invoke<TemplateSelectionJobView | null>('ai_poll_template_selection', { jobId });
-}
-
-/**
- * Whether a terminal TemplateSelection view may show the recommendation review UI.
- * Does not mint or write a handoff seed.
- */
-export function isSuccessfulTemplateSelection(
-    view: TemplateSelectionJobView | null | undefined,
-): boolean {
-    return view?.state === 'succeeded'
-        && Boolean(
-            view.recommendation?.recommendation_id
-            && view.recommendation?.template_id,
-        );
-}
-
-/**
- * Explicit Review: revalidate recommendation and mint exactly one handoff seed.
- * Frontend writes opaque handoff only after a minted/already_minted response with seed.
- */
-export async function reviewTemplateRecommendation(
-    recommendationId: string,
-): Promise<ReviewTemplateRecommendationResult> {
-    return invoke<ReviewTemplateRecommendationResult>('ai_review_template_recommendation', {
-        recommendationId,
-    });
-}
-
 /** Sanitized active AI jobs for the global status strip (never full AiJob list). */
 export async function listActiveAiJobs(): Promise<ActiveAiJobSummary[]> {
     return invoke<ActiveAiJobSummary[]>('ai_list_active_jobs');
@@ -377,175 +320,4 @@ export async function listActiveAiJobs(): Promise<ActiveAiJobSummary[]> {
  */
 export async function cancelActiveAiJob(jobId: string): Promise<ActiveAiJobCancelResult> {
     return invoke<ActiveAiJobCancelResult>('ai_cancel_active_job', { jobId });
-}
-
-/** Persist only opaque token + public template identity for AutoTemplate → QuickPublish handoff. */
-export function writeAutoTemplateSeedHandoff(seed: Pick<TemplateSeed, 'token' | 'template_id'>): void {
-    // A new handoff supersedes any prior in-flight/settled consume cycle.
-    autoTemplateSeedConsumeInFlight = null;
-    const handoff: AutoTemplateSeedHandoff = {
-        token: seed.token,
-        template_id: seed.template_id,
-    };
-    window.localStorage.setItem(AUTO_TEMPLATE_SEED_STORAGE_KEY, JSON.stringify(handoff));
-}
-
-/**
- * Peek handoff without clearing — used to wait for catalog load before consume.
- * Any torrent path present in a legacy payload is discarded.
- */
-export function peekAutoTemplateSeedHandoff(): AutoTemplateSeedHandoff | null {
-    const raw = window.localStorage.getItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-    if (!raw) {
-        return null;
-    }
-    try {
-        const parsed = JSON.parse(raw) as Record<string, unknown>;
-        const token = typeof parsed.token === 'string' ? parsed.token.trim() : '';
-        const templateId = typeof parsed.template_id === 'string' ? parsed.template_id.trim() : '';
-        if (!token || !templateId) {
-            return null;
-        }
-        return { token, template_id: templateId };
-    } catch {
-        return null;
-    }
-}
-
-/**
- * Read-and-clear handoff. Only opaque token + public template identity are returned.
- * Any torrent path present in a legacy payload is discarded and never used for hydration.
- */
-export function takeAutoTemplateSeedHandoff(): AutoTemplateSeedHandoff | null {
-    const handoff = peekAutoTemplateSeedHandoff();
-    if (!handoff) {
-        window.localStorage.removeItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-        return null;
-    }
-    window.localStorage.removeItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-    return handoff;
-}
-
-/**
- * Explicit terminal backend consume rejections that may clear the opaque handoff.
- * Transport/IPC failures must not match so a remount can retry the same handoff.
- */
-function isTerminalTemplateSeedConsumeError(error: unknown): boolean {
-    const message = readFriendlyError(error, '').toLowerCase();
-    if (!message) {
-        return false;
-    }
-    return (
-        message.includes('missing')
-        || message.includes('expired')
-        || message.includes('already consumed')
-        || message.includes('stale')
-        || message.includes('replay')
-        || message.includes('mismatch')
-        || message.includes('revision')
-        || message.includes('no longer a regular')
-    );
-}
-
-/**
- * Consume a template seed exactly once via the backend (catalog + torrent gates).
- * Returns null on explicit missing/expired/replayed/stale/invalid payloads.
- * Rethrows transient invoke/transport errors so callers can leave the handoff recoverable.
- */
-export async function consumeTemplateSeed(token: string): Promise<ConsumedTemplateSeed | null> {
-    try {
-        const result = await invoke<Record<string, unknown> | null>('ai_consume_template_seed', { token });
-        if (!result || typeof result !== 'object') {
-            return null;
-        }
-
-        const templateId = typeof result.template_id === 'string' ? result.template_id.trim() : '';
-        const torrentPath = typeof result.torrent_path === 'string' ? result.torrent_path.trim() : '';
-        const templateRevision = typeof result.template_revision === 'number'
-            ? result.template_revision
-            : Number(result.template_revision);
-        const templateDigest = typeof result.template_digest === 'string'
-            ? result.template_digest.trim()
-            : '';
-
-        if (!templateId || !torrentPath || !templateDigest || !Number.isFinite(templateRevision)) {
-            return null;
-        }
-
-        return {
-            template_id: templateId,
-            template_revision: templateRevision,
-            template_digest: templateDigest,
-            torrent_path: torrentPath,
-            torrent_name: typeof result.torrent_name === 'string' ? result.torrent_name : undefined,
-        };
-    } catch (error) {
-        if (isTerminalTemplateSeedConsumeError(error)) {
-            return null;
-        }
-        throw error;
-    }
-}
-
-/**
- * Peek the browser handoff (if any) and consume the backend seed exactly once.
- * Handoff remains in storage until consume succeeds so a mid-flight failure/crash
- * stays recoverable. Explicit terminal consume rejection clears the handoff;
- * transport failures leave it in place and clear the in-flight latch so remount can retry.
- * Safe under StrictMode: concurrent callers share one in-flight promise.
- */
-export function takeAndConsumeAutoTemplateSeed(): Promise<ConsumedTemplateSeed | null> {
-    if (autoTemplateSeedConsumeInFlight) {
-        return autoTemplateSeedConsumeInFlight;
-    }
-
-    const handoff = peekAutoTemplateSeedHandoff();
-    if (!handoff) {
-        return Promise.resolve(null);
-    }
-
-    let consumePromise!: Promise<ConsumedTemplateSeed | null>;
-    consumePromise = consumeTemplateSeed(handoff.token)
-        .then((consumed) => {
-            if (!consumed) {
-                // Terminal backend rejection (missing/expired/replayed/stale/invalid): drop handoff.
-                window.localStorage.removeItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-                return null;
-            }
-            // Only clear handoff after a successful backend consume.
-            window.localStorage.removeItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-            return {
-                ...consumed,
-                // Prefer backend identity; fall back to public handoff id only if needed.
-                template_id: consumed.template_id || handoff.template_id,
-            };
-        })
-        .catch(() => {
-            // Transient invoke/transport failure: leave opaque handoff for remount retry.
-            // Drop the in-flight latch so a later attempt is not stuck on this rejection.
-            if (autoTemplateSeedConsumeInFlight === consumePromise) {
-                autoTemplateSeedConsumeInFlight = null;
-            }
-            // Resolve null without clearing storage; callers can peek handoff to distinguish.
-            return null;
-        });
-
-    autoTemplateSeedConsumeInFlight = consumePromise;
-    return consumePromise;
-}
-
-/** Mark the current seed cycle as fully applied so later page mounts do not re-hydrate it. */
-export function acknowledgeAutoTemplateSeedHydration(): void {
-    autoTemplateSeedConsumeInFlight = Promise.resolve(null);
-}
-
-/** Clear any in-flight consume so a failed hydration cannot be re-acked as success later. */
-export function clearAutoTemplateSeedHydrationCycle(): void {
-    autoTemplateSeedConsumeInFlight = Promise.resolve(null);
-    window.localStorage.removeItem(AUTO_TEMPLATE_SEED_STORAGE_KEY);
-}
-
-/** True while a one-shot consume promise is active (including StrictMode remounts). */
-export function hasAutoTemplateSeedConsumeInFlight(): boolean {
-    return autoTemplateSeedConsumeInFlight !== null;
 }

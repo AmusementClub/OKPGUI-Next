@@ -363,12 +363,6 @@ pub fn classify_and_validate_probe_response_for_capability(
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ReasoningMode {
-    Default,
-    Disabled,
-}
-
 /// Build a structured-output request with the provider's default reasoning behavior.
 #[allow(clippy::too_many_arguments)]
 pub fn build_structured_request_with_system(
@@ -383,38 +377,6 @@ pub fn build_structured_request_with_system(
     user_prompt: &str,
     output_capability: OutputCapability,
     max_tokens: u32,
-) -> Result<ProviderRequest, String> {
-    build_structured_request_with_system_and_reasoning(
-        provider,
-        mode,
-        endpoint,
-        model,
-        schema,
-        auth_mode,
-        schema_name,
-        system_prompt,
-        user_prompt,
-        output_capability,
-        max_tokens,
-        ReasoningMode::Default,
-    )
-}
-
-/// Build a structured-output request with explicit reasoning behavior.
-#[allow(clippy::too_many_arguments)]
-pub fn build_structured_request_with_system_and_reasoning(
-    provider: ProviderKind,
-    mode: ProviderMode,
-    endpoint: &str,
-    model: &str,
-    schema: &Value,
-    auth_mode: AuthMode,
-    schema_name: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-    output_capability: OutputCapability,
-    max_tokens: u32,
-    reasoning_mode: ReasoningMode,
 ) -> Result<ProviderRequest, String> {
     if model.trim().is_empty() {
         return Err("model is required".to_string());
@@ -507,21 +469,6 @@ pub fn build_structured_request_with_system_and_reasoning(
                 "system".to_string(),
                 Value::String(system_prompt.to_string()),
             );
-    }
-
-    if reasoning_mode == ReasoningMode::Disabled {
-        match (provider, resolved_mode) {
-            (ProviderKind::OpenAi, ProviderMode::Responses) => {
-                body["reasoning"] = json!({ "effort": "none" });
-            }
-            (ProviderKind::OpenAi, ProviderMode::Chat) => {
-                body["reasoning_effort"] = json!("none");
-            }
-            (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => {
-                // Anthropic thinking is opt-in. Omission keeps it disabled.
-            }
-            _ => {}
-        }
     }
 
     Ok(ProviderRequest {
@@ -1223,73 +1170,6 @@ fn extract_usage(value: &Value) -> Option<ProviderUsage> {
 mod tests {
     use super::*;
     use serde_json::json;
-
-    fn structured_request_with_reasoning(
-        provider: ProviderKind,
-        mode: ProviderMode,
-        reasoning_mode: ReasoningMode,
-    ) -> ProviderRequest {
-        build_structured_request_with_system_and_reasoning(
-            provider,
-            mode,
-            "https://example.test/v1",
-            "model",
-            &json!({"type": "object"}),
-            if provider == ProviderKind::Anthropic {
-                AuthMode::AnthropicApiKey
-            } else {
-                AuthMode::Bearer
-            },
-            "okpgui_template_selection",
-            "system",
-            "user",
-            OutputCapability::StrictSchema,
-            4096,
-            reasoning_mode,
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn template_selection_can_disable_reasoning_by_provider() {
-        let responses = structured_request_with_reasoning(
-            ProviderKind::OpenAi,
-            ProviderMode::Responses,
-            ReasoningMode::Disabled,
-        );
-        assert_eq!(
-            responses.body.pointer("/reasoning/effort"),
-            Some(&json!("none"))
-        );
-
-        let chat = structured_request_with_reasoning(
-            ProviderKind::OpenAi,
-            ProviderMode::Chat,
-            ReasoningMode::Disabled,
-        );
-        assert_eq!(chat.body.get("reasoning_effort"), Some(&json!("none")));
-
-        let anthropic = structured_request_with_reasoning(
-            ProviderKind::Anthropic,
-            ProviderMode::AnthropicMessages,
-            ReasoningMode::Disabled,
-        );
-        assert!(anthropic.body.get("thinking").is_none());
-    }
-
-    #[test]
-    fn default_structured_requests_do_not_override_reasoning() {
-        for (provider, mode) in [
-            (ProviderKind::OpenAi, ProviderMode::Responses),
-            (ProviderKind::OpenAi, ProviderMode::Chat),
-            (ProviderKind::Anthropic, ProviderMode::AnthropicMessages),
-        ] {
-            let request = structured_request_with_reasoning(provider, mode, ReasoningMode::Default);
-            assert!(request.body.get("reasoning").is_none());
-            assert!(request.body.get("reasoning_effort").is_none());
-            assert!(request.body.get("thinking").is_none());
-        }
-    }
 
     #[test]
     fn openai_responses_and_chat_have_distinct_strict_shapes() {
