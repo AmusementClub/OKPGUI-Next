@@ -436,6 +436,7 @@ struct FormalFindingEnvelope {
     evidence_path: Option<String>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn provider_schema_warning(detail: &str) -> Finding {
     Finding {
         code: "PROVIDER_WARNING".to_string(),
@@ -450,39 +451,41 @@ fn provider_schema_warning(detail: &str) -> Finding {
 /// Unknown top-level or finding fields, wrong types, or missing required keys produce a
 /// single redacted PROVIDER_WARNING. This path must never yield an empty finding list
 /// from malformed input (which would compute as GO).
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn parse_formal_audit_findings(value: &Value) -> Vec<Finding> {
-    let envelope: FormalAuditEnvelope = match serde_json::from_value(value.clone()) {
-        Ok(envelope) => envelope,
-        Err(error) => {
-            // Keep the detail short and free of raw payload dumps.
-            let detail: String = error.to_string().chars().take(160).collect();
-            return vec![provider_schema_warning(&detail)];
-        }
-    };
+    match try_parse_formal_audit_findings(value) {
+        Ok(findings) => findings,
+        Err(detail) => vec![provider_schema_warning(&detail)],
+    }
+}
+
+/// Strict validator used by the formal call loop so a schema-invalid first response can retry.
+/// The public wrapper above keeps the existing fail-closed warning behavior for all other callers.
+pub fn try_parse_formal_audit_findings(value: &Value) -> Result<Vec<Finding>, String> {
+    let envelope: FormalAuditEnvelope = serde_json::from_value(value.clone()).map_err(|error| {
+        // Keep the detail short and free of raw payload dumps.
+        error.to_string().chars().take(160).collect::<String>()
+    })?;
 
     let mut findings = Vec::with_capacity(envelope.findings.len());
     for item in envelope.findings {
         let code = item.code.trim().to_string();
         let message = item.message.trim().to_string();
         if code.is_empty() || message.is_empty() {
-            return vec![provider_schema_warning(
-                "finding code and message must be non-empty strings",
-            )];
+            return Err("finding code and message must be non-empty strings".to_string());
         }
         if !message
             .chars()
             .any(|character| ('\u{4e00}'..='\u{9fff}').contains(&character))
         {
-            return vec![provider_schema_warning(
-                "finding message must contain simplified Chinese text",
-            )];
+            return Err("finding message must contain simplified Chinese text".to_string());
         }
         match item.severity.trim().to_ascii_uppercase().as_str() {
             "CRITICAL" | "WARNING" => {}
             other => {
-                return vec![provider_schema_warning(&format!(
+                return Err(format!(
                     "finding severity must be WARNING or CRITICAL, got {other}"
-                ))];
+                ));
             }
         };
         let severity = authoritative_severity(&code).unwrap_or(FindingSeverity::Warning);
@@ -493,7 +496,7 @@ pub fn parse_formal_audit_findings(value: &Value) -> Vec<Finding> {
             evidence_path: item.evidence_path.filter(|path| !path.trim().is_empty()),
         });
     }
-    findings
+    Ok(findings)
 }
 
 /// Redact provider/transport error text before it reaches IPC or findings.

@@ -2353,6 +2353,7 @@ describe('HomePage publish content pipeline', () => {
                     enabled: true,
                     capability: {
                         state: 'ready',
+                        output_capability: 'strict_schema',
                         identity_digest: 'dig',
                         message: 'ready',
                         identity_matches: true,
@@ -2657,6 +2658,7 @@ describe('HomePage publish content pipeline', () => {
                     enabled: true,
                     capability: {
                         state: 'ready',
+                        output_capability: 'strict_schema',
                         identity_digest: 'dig',
                         message: 'ready',
                         identity_matches: true,
@@ -2851,6 +2853,7 @@ describe('HomePage publish content pipeline', () => {
                     enabled: true,
                     capability: {
                         state: 'ready',
+                        output_capability: 'strict_schema',
                         identity_digest: 'dig',
                         message: 'ready',
                         identity_matches: true,

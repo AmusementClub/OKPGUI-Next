@@ -937,6 +937,7 @@ describe('AI recognition advisory contracts', () => {
                         enabled: true,
                         capability: {
                             state: 'ready',
+                            output_capability: 'strict_schema',
                             identity_digest: 'dig',
                             message: 'ready',
                             identity_matches: true,
@@ -1117,6 +1118,7 @@ describe('AI recognition advisory contracts', () => {
                         enabled: true,
                         capability: {
                             state: 'ready',
+                            output_capability: 'strict_schema',
                             identity_digest: 'dig',
                             message: 'ready',
                             identity_matches: true,
@@ -1338,6 +1340,7 @@ describe('AI recognition advisory contracts', () => {
                         enabled: true,
                         capability: {
                             state: 'ready',
+                            output_capability: 'strict_schema',
                             identity_digest: 'dig',
                             message: 'ready',
                             identity_matches: true,
@@ -1565,6 +1568,7 @@ describe('AI recognition advisory contracts', () => {
                         enabled: true,
                         capability: {
                             state: 'ready',
+                            output_capability: 'strict_schema',
                             identity_digest: 'dig',
                             message: 'ready',
                             identity_matches: true,
@@ -1813,6 +1817,7 @@ describe('AI recognition advisory contracts', () => {
                         enabled: true,
                         capability: {
                             state: 'ready',
+                            output_capability: 'strict_schema',
                             identity_digest: 'dig',
                             message: 'ready',
                             identity_matches: true,

@@ -20,7 +20,7 @@ const readySettings = {
     custom_header_name: null,
     credential_ref: { id: 'cred-1', backend: 'keyring', label: 't' },
     enabled: true,
-    capability: { state: 'ready', identity_matches: true },
+    capability: { state: 'ready', output_capability: 'strict_schema', identity_matches: true },
     discovered_models: [],
     models_fetched_at_unix: null,
 };

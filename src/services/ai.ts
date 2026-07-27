@@ -53,11 +53,12 @@ export function isAiConfigured(settings: AiSettings | null | undefined): boolean
         && (settings?.auth_mode === 'none' || Boolean(settings?.credential_ref?.id));
 }
 
-/** Formal AI tasks require a Ready capability whose identity matches the stored connection. */
+/** Formal AI tasks require a Ready, identity-matched, explicitly tiered output capability. */
 export function isAiCapabilityReady(settings: AiSettings | null | undefined): boolean {
     return Boolean(settings?.capability)
         && settings?.capability?.state === 'ready'
-        && Boolean(settings?.capability?.identity_matches);
+        && Boolean(settings?.capability?.identity_matches)
+        && Boolean(settings?.capability?.output_capability);
 }
 
 export async function getAiSettings(): Promise<AiSettings> {
@@ -85,7 +86,7 @@ export async function listAiModels(settings: AiSettings, secret?: string): Promi
     });
 }
 
-/** Live backend-owned strict capability probe; persists non-secret Ready/Failed state. */
+/** Live backend-owned structured-output probe; persists the strict/JSON compatibility tier. */
 export async function runAiCapabilityProbe(): Promise<AiCapabilityStatus> {
     return invoke<AiCapabilityStatus>('ai_run_capability_probe');
 }

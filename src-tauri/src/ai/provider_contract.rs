@@ -12,8 +12,8 @@ use super::credentials::AuthMode;
 use super::provider::{
     build_models_list_request, build_probe_request, build_structured_request_with_system,
     classify_http_failure, classify_probe_response, extract_structured_json,
-    parse_models_list_response, CapabilityState, ProviderFailureKind, ProviderKind, ProviderMode,
-    ProviderRequest, ProviderUsage,
+    parse_models_list_response, CapabilityState, OutputCapability, ProviderFailureKind,
+    ProviderKind, ProviderMode, ProviderRequest, ProviderUsage,
 };
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -96,6 +96,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
+                OutputCapability::StrictSchema,
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Responses, request))
@@ -111,6 +112,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
+                OutputCapability::StrictSchema,
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Chat, request))
@@ -126,6 +128,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
+                OutputCapability::StrictSchema,
                 256,
             )?;
             Ok((
@@ -447,7 +450,7 @@ mod tests {
                 MockScenario::ChatRefusal
                 | MockScenario::ResponsesRefusal
                 | MockScenario::AnthropicRefusal => {
-                    assert_eq!(state, CapabilityState::Unsupported);
+                    assert_eq!(state, CapabilityState::Failed);
                     assert_eq!(failure, Some(ProviderFailureKind::Refusal));
                 }
                 MockScenario::MalformedJson => {

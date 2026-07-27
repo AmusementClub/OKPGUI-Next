@@ -204,6 +204,7 @@ describe('AiSettingsPage model discovery and capability probe', () => {
                             state: 'ready',
                             identity_digest: 'sha256:probe',
                             resolved_mode: 'chat',
+                            output_capability: 'strict_schema',
                             message: 'strict structured output is available',
                             identity_matches: true,
                             probed_at_unix: 123,
@@ -226,8 +227,30 @@ describe('AiSettingsPage model discovery and capability probe', () => {
 
         expect(invokeMock).toHaveBeenCalledWith('ai_run_capability_probe');
         expect(rendered.container.textContent).toContain('Ready');
+        expect(rendered.container.textContent).toContain('严格结构化输出');
         expect(rendered.container.textContent).toContain('正式审计与 AI 自动选模板已解锁');
         expect(rendered.container.textContent).not.toContain('sk-');
+    });
+
+    it('labels a ready json-object capability as compatibility mode', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') {
+                return baseSettings({
+                    capability: {
+                        state: 'ready',
+                        identity_digest: 'sha256:json-mode',
+                        resolved_mode: 'chat',
+                        output_capability: 'json_object',
+                        message: 'JSON compatibility mode is available',
+                        identity_matches: true,
+                    },
+                });
+            }
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        expect(rendered.container.textContent).toContain('JSON 兼容模式');
     });
 
     it('discovers models from an incomplete disabled draft without saving first', async () => {

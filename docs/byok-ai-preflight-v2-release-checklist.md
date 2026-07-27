@@ -35,12 +35,11 @@ Staged sidecar names (under `src-tauri/binaries/`):
 | Tauri `bundle.externalBin` | `binaries/mediainfo` |
 | Checked-in redistribution notice | `src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html` |
 | Tauri resource mapping | `resources/mediainfo/THIRD_PARTY_NOTICES.html` → `notices/mediainfo-THIRD_PARTY_NOTICES.html` |
-| Release-archive notice member | `mediainfo/THIRD_PARTY_NOTICES.html` |
+| Native bundle notice resource | `notices/mediainfo-THIRD_PARTY_NOTICES.html` |
 | Manifest / inventory source | `scripts/mediainfo-manifest.json` |
 | Staging (Unix) | `scripts/stage-mediainfo.sh <triple>` |
 | Staging (Windows) | `scripts/stage-mediainfo.ps1 -Target <triple>` |
 | Package inventory verifier | `scripts/verify-mediainfo-package.mjs` |
-| Archive membership verifier | `scripts/verify-release-archive.mjs` |
 
 ## Frontend capability boundary (no shell)
 
@@ -126,16 +125,6 @@ Stage and fully verify a sidecar only when intentionally packaging (requires net
 node scripts/verify-mediainfo-package.mjs --target x86_64-unknown-linux-gnu
 ```
 
-After building a draft-release archive, membership gate:
-
-```bash
-node scripts/verify-release-archive.mjs \
-  --archive <path-to.zip-or.tar.gz> \
-  --binary <okpgui-next|okpgui-next.exe> \
-  --sidecar <mediainfo-<triple>[.exe]> \
-  --notice mediainfo/THIRD_PARTY_NOTICES.html
-```
-
 ## CI wiring
 
 Both workflows invoke the offline BYOK release-gate verifier **before** build/package work and retain existing gates:
@@ -151,10 +140,10 @@ Retained gates include:
 4. Offline provider contract + UI integration inventory
 5. Frontend tests + production build
 6. Playwright browser/UI integration (**mocked Tauri IPC; not desktop E2E** — evidence class mocked UI)
-7. Backend tests + Tauri build
+7. Backend tests + one native Tauri package per platform: NSIS `.exe`, `.dmg`, or `.AppImage`
 8. **Host binary smoke (Windows/Linux)** — `run-desktop-e2e.mjs` → `host-binary-smoke` with `productionBinaryMarker: true` (WebDriver remains blocked side-evidence until executable WDIO specs)
 9. **macOS packaged smoke** — `run-macos-packaged-smoke.mjs` prefers `.app`; `productionBinaryMarker: true`, `productionIpcMarker: false`
-10. Draft release only: archive membership via `verify-release-archive.mjs`
+10. Draft release publishes the same native packages directly; no custom `.zip`/`.tar.gz` layer
 
 When a release binary exists, CI sets `DESKTOP_E2E_REQUIRE_PASS=1` for host/packaged binary smoke. Blocked WebDriver side-evidence is honest inventory, not a pass. Jobs fail if primary evidence JSON is missing on applicable runners.
 
@@ -162,7 +151,7 @@ When a release binary exists, CI sets `DESKTOP_E2E_REQUIRE_PASS=1` for host/pack
 
 - [ ] Offline release gates green (`verify-byok-release-gates`)
 - [ ] MediaInfo manifest + notice green (`--manifest-only`)
-- [ ] Four target triples present in manifest, staging scripts, and workflow matrices
+- [ ] Three target triples present in manifest, staging scripts, and workflow matrices
 - [ ] Tauri `externalBin` + notice resource mapping intact
 - [ ] Capability file still has **no shell** frontend permission
 - [ ] Mocked Playwright labeled **not desktop E2E** (`mocked-playwright-not-desktop`)

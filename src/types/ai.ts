@@ -6,6 +6,7 @@ export type AiAuthMode = 'bearer' | 'anthropic_api_key' | 'custom_header' | 'non
 export type AiDecision = 'GO' | 'WARNING' | 'NO_GO' | 'PENDING' | 'LOCAL_BLOCKED';
 export type FindingSeverity = 'WARNING' | 'CRITICAL';
 export type AiCapabilityState = 'unknown' | 'probing' | 'ready' | 'unsupported' | 'failed';
+export type AiOutputCapability = 'strict_schema' | 'json_object';
 
 /**
  * Frontend audit lifecycle, separate from the authoritative audit decision.
@@ -32,6 +33,7 @@ export interface AiCapabilityStatus {
     state: AiCapabilityState;
     identity_digest: string;
     resolved_mode?: AiMode | null;
+    output_capability?: AiOutputCapability | null;
     message: string;
     probed_at_unix?: number | null;
     /** True only when stored Ready digest matches the current stored connection. */

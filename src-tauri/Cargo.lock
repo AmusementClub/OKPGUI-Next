@@ -2118,6 +2118,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonrepair"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fbd084aab201d699b6da54bc10fbedf1ab92c984eeb306d40546fa675184ec06"
+dependencies = [
+ "memchr",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "keyboard-types"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2670,6 +2682,7 @@ dependencies = [
  "encoding_rs",
  "futures",
  "hex",
+ "jsonrepair",
  "keyring",
  "lava_torrent",
  "regex",

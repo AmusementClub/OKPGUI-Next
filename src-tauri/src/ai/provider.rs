@@ -5,6 +5,9 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::time::Duration;
 
+const MAX_STRUCTURED_TEXT_BYTES: usize = 256 * 1024;
+const MAX_STRUCTURED_JSON_DEPTH: usize = 128;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderKind {
@@ -30,6 +33,13 @@ pub enum CapabilityState {
     Ready,
     Unsupported,
     Failed,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputCapability {
+    StrictSchema,
+    JsonObject,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,6 +108,7 @@ pub struct CapabilityProbeResult {
     pub status: u16,
     pub message: String,
     pub usage: Option<ProviderUsage>,
+    pub output_capability: Option<OutputCapability>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -158,6 +169,27 @@ pub fn build_probe_request(
     schema: &Value,
     auth_mode: AuthMode,
 ) -> Result<ProviderRequest, String> {
+    build_probe_request_for_capability(
+        provider,
+        mode,
+        endpoint,
+        model,
+        schema,
+        auth_mode,
+        OutputCapability::StrictSchema,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_probe_request_for_capability(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    endpoint: &str,
+    model: &str,
+    schema: &Value,
+    auth_mode: AuthMode,
+    output_capability: OutputCapability,
+) -> Result<ProviderRequest, String> {
     build_structured_request_with_system(
         provider,
         mode,
@@ -168,6 +200,7 @@ pub fn build_probe_request(
         "okpgui_probe",
         "你正在验证当前模型是否支持严格结构化输出。只完成能力验证，不执行任何其他任务。JSON 字段名必须使用 schema 中定义的英文名称；需要程序判断的状态值必须使用 schema 定义的英文值；面向用户的说明性文本必须使用简体中文。",
         "请返回能力验证结果；将 ok 设置为 true。",
+        output_capability,
         4096,
     )
 }
@@ -286,11 +319,28 @@ pub fn classify_and_validate_probe_response(
     status: u16,
     body: &str,
 ) -> CapabilityProbeResult {
-    let mut result = classify_probe_response(provider, mode, status, body);
+    classify_and_validate_probe_response_for_capability(
+        provider,
+        mode,
+        status,
+        body,
+        OutputCapability::StrictSchema,
+    )
+}
+
+pub fn classify_and_validate_probe_response_for_capability(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    status: u16,
+    body: &str,
+    output_capability: OutputCapability,
+) -> CapabilityProbeResult {
+    let mut result =
+        classify_probe_response_for_capability(provider, mode, status, body, output_capability);
     if result.state != CapabilityState::Ready {
         return result;
     }
-    match extract_structured_json(provider, mode, body) {
+    match extract_provider_json(provider, mode, body, output_capability) {
         Ok(value) if validate_minimal_probe_object(&value) => result,
         Ok(_) => {
             result.state = CapabilityState::Unsupported;
@@ -303,8 +353,8 @@ pub fn classify_and_validate_probe_response(
             result.state = match failure.kind {
                 ProviderFailureKind::Unsupported
                 | ProviderFailureKind::Schema
-                | ProviderFailureKind::Malformed
-                | ProviderFailureKind::Refusal => CapabilityState::Unsupported,
+                | ProviderFailureKind::Malformed => CapabilityState::Unsupported,
+                ProviderFailureKind::Refusal => CapabilityState::Failed,
                 _ => CapabilityState::Failed,
             };
             result.message = failure.message;
@@ -325,6 +375,7 @@ pub fn build_structured_request_with_system(
     schema_name: &str,
     system_prompt: &str,
     user_prompt: &str,
+    output_capability: OutputCapability,
     max_tokens: u32,
 ) -> Result<ProviderRequest, String> {
     if model.trim().is_empty() {
@@ -336,44 +387,68 @@ pub fn build_structured_request_with_system(
 
     let base = endpoint.trim_end_matches('/');
     let resolved_mode = resolve_mode(provider, mode);
+    if provider == ProviderKind::Anthropic && output_capability == OutputCapability::JsonObject {
+        return Err(
+            "Anthropic Messages does not expose a weaker JSON-object output mode".to_string(),
+        );
+    }
+    let schema_prompt = if output_capability == OutputCapability::JsonObject {
+        let serialized_schema = serde_json::to_string(schema)
+            .map_err(|_| "structured output schema serialization failed".to_string())?;
+        format!(
+            "{system_prompt}\n输出必须是单一 JSON object，字段名和状态值必须严格符合以下结构约定：\n{serialized_schema}\n不要输出 Markdown 代码围栏或解释文字。"
+        )
+    } else {
+        system_prompt.to_string()
+    };
     let (url, mut body) = match (provider, resolved_mode) {
         (ProviderKind::OpenAi, ProviderMode::Responses) => {
             let mut input = Vec::new();
-            if !system_prompt.trim().is_empty() {
-                input.push(json!({"role": "system", "content": system_prompt}));
+            if !schema_prompt.trim().is_empty() {
+                input.push(json!({"role": "system", "content": schema_prompt}));
             }
             input.push(json!({
                 "role": "user",
                 "content": user_prompt
             }));
-            (
-                format!("{base}/responses"),
-                json!({
-                "model": model,
-                "input": input,
-                "max_output_tokens": max_tokens,
-                "text": {"format": {"type": "json_schema", "name": schema_name, "strict": true, "schema": schema}}
-                }),
-            )
+            (format!("{base}/responses"), {
+                let mut body = json!({
+                    "model": model,
+                    "input": input,
+                    "max_output_tokens": max_tokens
+                });
+                body["text"] = match output_capability {
+                    OutputCapability::StrictSchema => {
+                        json!({"format": {"type": "json_schema", "name": schema_name, "strict": true, "schema": schema}})
+                    }
+                    OutputCapability::JsonObject => json!({"format": {"type": "json_object"}}),
+                };
+                body
+            })
         }
         (ProviderKind::OpenAi, ProviderMode::Chat) => {
             let mut messages = Vec::new();
-            if !system_prompt.trim().is_empty() {
-                messages.push(json!({"role": "system", "content": system_prompt}));
+            if !schema_prompt.trim().is_empty() {
+                messages.push(json!({"role": "system", "content": schema_prompt}));
             }
             messages.push(json!({
                 "role": "user",
                 "content": user_prompt
             }));
-            (
-                format!("{base}/chat/completions"),
-                json!({
-                "model": model,
-                "messages": messages,
-                "max_completion_tokens": max_tokens,
-                "response_format": {"type": "json_schema", "json_schema": {"name": schema_name, "strict": true, "schema": schema}}
-                }),
-            )
+            (format!("{base}/chat/completions"), {
+                let mut body = json!({
+                    "model": model,
+                    "messages": messages,
+                    "max_completion_tokens": max_tokens
+                });
+                body["response_format"] = match output_capability {
+                    OutputCapability::StrictSchema => {
+                        json!({"type": "json_schema", "json_schema": {"name": schema_name, "strict": true, "schema": schema}})
+                    }
+                    OutputCapability::JsonObject => json!({"type": "json_object"}),
+                };
+                body
+            })
         }
         (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => (
             format!("{base}/messages"),
@@ -484,10 +559,20 @@ fn sanitize_transport_error(error: reqwest::Error) -> String {
 }
 
 /// Extract the strict structured JSON object from a successful provider response body.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn extract_structured_json(
     provider: ProviderKind,
     mode: ProviderMode,
     body: &str,
+) -> Result<Value, ProviderFailure> {
+    extract_provider_json(provider, mode, body, OutputCapability::StrictSchema)
+}
+
+pub fn extract_provider_json(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    body: &str,
+    output_capability: OutputCapability,
 ) -> Result<Value, ProviderFailure> {
     let resolved_mode = resolve_mode(provider, mode);
     let parsed: Value = serde_json::from_str(body).map_err(|_| ProviderFailure {
@@ -509,18 +594,22 @@ pub fn extract_structured_json(
             message: "provider refused the request".to_string(),
         });
     }
-    extract_structured_object(provider, resolved_mode, &parsed).ok_or_else(|| ProviderFailure {
-        kind: ProviderFailureKind::Schema,
-        status: None,
-        message: "provider returned JSON mode or an incompatible shape, not strict schema"
-            .to_string(),
-    })
+    reject_incomplete_completion(provider, resolved_mode, &parsed)?;
+    extract_structured_object(provider, resolved_mode, &parsed, output_capability).ok_or_else(
+        || ProviderFailure {
+            kind: ProviderFailureKind::Schema,
+            status: None,
+            message: "provider returned JSON mode or an incompatible shape, not strict schema"
+                .to_string(),
+        },
+    )
 }
 
 fn extract_structured_object(
     provider: ProviderKind,
     mode: ProviderMode,
     value: &Value,
+    output_capability: OutputCapability,
 ) -> Option<Value> {
     match (provider, mode) {
         (ProviderKind::OpenAi, ProviderMode::Responses) => {
@@ -531,7 +620,7 @@ fn extract_structured_object(
             if let Some(parsed) = value
                 .get("output_text")
                 .and_then(Value::as_str)
-                .and_then(parse_json_object_string)
+                .and_then(|text| parse_json_object_string(text, output_capability))
             {
                 return Some(parsed);
             }
@@ -545,7 +634,11 @@ fn extract_structured_object(
                         }
                         item.get("content")
                             .and_then(Value::as_array)
-                            .and_then(|content| content.iter().find_map(extract_json_content_value))
+                            .and_then(|content| {
+                                content.iter().find_map(|value| {
+                                    extract_json_content_value(value, output_capability)
+                                })
+                            })
                     })
                 })
         }
@@ -559,7 +652,7 @@ fn extract_structured_object(
                 return Some(parsed.clone());
             }
             match value.pointer("/choices/0/message/content") {
-                Some(Value::String(text)) => parse_json_object_string(text),
+                Some(Value::String(text)) => parse_json_object_string(text, output_capability),
                 Some(object) if object.is_object() => Some(object.clone()),
                 _ => None,
             }
@@ -567,20 +660,146 @@ fn extract_structured_object(
         (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => value
             .get("content")
             .and_then(Value::as_array)
-            .and_then(|items| items.iter().find_map(extract_json_content_value)),
+            .and_then(|items| {
+                items
+                    .iter()
+                    .find_map(|value| extract_json_content_value(value, output_capability))
+            }),
         _ => None,
     }
 }
 
 /// Parse a provider text payload only when it is a JSON object (not array/primitive/free text).
-fn parse_json_object_string(text: &str) -> Option<Value> {
+fn parse_json_object_string(text: &str, output_capability: OutputCapability) -> Option<Value> {
     let trimmed = text.trim();
-    if trimmed.is_empty() {
+    if trimmed.is_empty() || trimmed.len() > MAX_STRUCTURED_TEXT_BYTES {
         return None;
     }
-    serde_json::from_str::<Value>(trimmed)
+    if let Some(value) = serde_json::from_str::<Value>(trimmed)
         .ok()
         .filter(Value::is_object)
+        .filter(|value| json_depth(value) <= MAX_STRUCTURED_JSON_DEPTH)
+    {
+        return Some(value);
+    }
+    if output_capability != OutputCapability::JsonObject {
+        return None;
+    }
+    let candidate = extract_single_balanced_object(trimmed)?;
+    let options = jsonrepair::Options {
+        tolerate_hash_comments: false,
+        repair_undefined: false,
+        allow_python_keywords: false,
+        normalize_js_nonfinite: false,
+        fenced_code_blocks: false,
+        stream_ndjson_aggregate: false,
+        aggressive_truncation_fix: false,
+        number_tolerance_leading_dot: false,
+        number_tolerance_trailing_dot: false,
+        number_tolerance_incomplete_exponent: false,
+        number_quote_suspicious: false,
+        leading_zero_policy: jsonrepair::LeadingZeroPolicy::QuoteAsString,
+        ..jsonrepair::Options::default()
+    };
+    jsonrepair::repair_to_value(candidate, &options)
+        .ok()
+        .filter(Value::is_object)
+        .filter(|value| json_depth(value) <= MAX_STRUCTURED_JSON_DEPTH)
+}
+
+fn extract_single_balanced_object(text: &str) -> Option<&str> {
+    let mut start = None;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut found = None;
+
+    for (index, character) in text.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(character, '\"' | '\'') && start.is_some() {
+            quote = Some(character);
+            continue;
+        }
+        match character {
+            '[' | ']' if depth == 0 => return None,
+            '{' => {
+                if depth == 0 {
+                    if found.is_some() {
+                        return None;
+                    }
+                    start = Some(index);
+                }
+                depth = depth.checked_add(1)?;
+                if depth > MAX_STRUCTURED_JSON_DEPTH {
+                    return None;
+                }
+            }
+            '}' if depth > 0 => {
+                depth -= 1;
+                if depth == 0 {
+                    let begin = start.take()?;
+                    found = Some(&text[begin..index + character.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    if depth == 0 && quote.is_none() {
+        found
+    } else {
+        None
+    }
+}
+
+fn json_depth(value: &Value) -> usize {
+    match value {
+        Value::Array(items) => 1 + items.iter().map(json_depth).max().unwrap_or(0),
+        Value::Object(object) => 1 + object.values().map(json_depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+fn reject_incomplete_completion(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    value: &Value,
+) -> Result<(), ProviderFailure> {
+    let incomplete = match (provider, mode) {
+        (ProviderKind::OpenAi, ProviderMode::Chat) => {
+            value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                == Some("length")
+        }
+        (ProviderKind::OpenAi, ProviderMode::Responses) => {
+            value.get("status").and_then(Value::as_str) == Some("incomplete")
+                || value
+                    .get("incomplete_details")
+                    .is_some_and(|details| !details.is_null())
+        }
+        (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => {
+            value.get("stop_reason").and_then(Value::as_str) == Some("max_tokens")
+        }
+        _ => false,
+    };
+    if incomplete {
+        Err(ProviderFailure {
+            kind: ProviderFailureKind::Malformed,
+            status: None,
+            message: "provider output was incomplete".to_string(),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 /// Whether an HTTP status is an explicit unsupported-endpoint classification
@@ -598,6 +817,13 @@ pub fn formal_attempt_modes(provider: ProviderKind, mode: ProviderMode) -> Vec<P
             vec![ProviderMode::Responses, ProviderMode::Chat]
         }
         (provider, mode) => vec![resolve_mode(provider, mode)],
+    }
+}
+
+pub fn probe_output_capabilities(provider: ProviderKind) -> &'static [OutputCapability] {
+    match provider {
+        ProviderKind::OpenAi => &[OutputCapability::StrictSchema, OutputCapability::JsonObject],
+        ProviderKind::Anthropic => &[OutputCapability::StrictSchema],
     }
 }
 
@@ -641,7 +867,7 @@ pub fn auto_fallback_allowed(
 /// Accept provider-native structured objects (`parsed` / `json`) and real wire text
 /// that is a JSON object string (`output_text` / typed json text). Unvalidated free
 /// text and non-object JSON remain rejected.
-fn extract_json_content_value(value: &Value) -> Option<Value> {
+fn extract_json_content_value(value: &Value, output_capability: OutputCapability) -> Option<Value> {
     if let Some(parsed) = value.get("parsed").filter(|item| item.is_object()) {
         return Some(parsed.clone());
     }
@@ -667,7 +893,7 @@ fn extract_json_content_value(value: &Value) -> Option<Value> {
         if let Some(parsed) = value
             .get("text")
             .and_then(Value::as_str)
-            .and_then(parse_json_object_string)
+            .and_then(|text| parse_json_object_string(text, output_capability))
         {
             return Some(parsed);
         }
@@ -691,11 +917,28 @@ fn managed_auth_header(auth_mode: AuthMode) -> Option<String> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn classify_probe_response(
     provider: ProviderKind,
     mode: ProviderMode,
     status: u16,
     body: &str,
+) -> CapabilityProbeResult {
+    classify_probe_response_for_capability(
+        provider,
+        mode,
+        status,
+        body,
+        OutputCapability::StrictSchema,
+    )
+}
+
+pub fn classify_probe_response_for_capability(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    status: u16,
+    body: &str,
+    output_capability: OutputCapability,
 ) -> CapabilityProbeResult {
     let resolved_mode = resolve_mode(provider, mode);
     let parsed = serde_json::from_str::<Value>(body).ok();
@@ -712,7 +955,9 @@ pub fn classify_probe_response(
                 status: Some(status),
                 message: "provider did not return a valid strict-schema result".to_string(),
             })
-        } else if !has_structured_success(provider, resolved_mode, value) {
+        } else if reject_incomplete_completion(provider, resolved_mode, value).is_err()
+            || !has_structured_success(provider, resolved_mode, value, output_capability)
+        {
             Some(ProviderFailure {
                 kind: ProviderFailureKind::Schema,
                 status: Some(status),
@@ -735,10 +980,10 @@ pub fn classify_probe_response(
             state: match failure.kind {
                 ProviderFailureKind::Unsupported
                 | ProviderFailureKind::Schema
-                | ProviderFailureKind::Malformed
-                | ProviderFailureKind::Refusal => CapabilityState::Unsupported,
+                | ProviderFailureKind::Malformed => CapabilityState::Unsupported,
                 // Redirects and transport/auth failures are connection failures, not mode unsupported.
-                ProviderFailureKind::Redirect
+                ProviderFailureKind::Refusal
+                | ProviderFailureKind::Redirect
                 | ProviderFailureKind::Authentication
                 | ProviderFailureKind::RateLimited
                 | ProviderFailureKind::Server
@@ -749,14 +994,20 @@ pub fn classify_probe_response(
             status,
             message: failure.message,
             usage: parsed.as_ref().and_then(extract_usage),
+            output_capability: None,
         },
         None => CapabilityProbeResult {
             state: CapabilityState::Ready,
             provider,
             mode: resolved_mode,
             status,
-            message: "strict structured output is available".to_string(),
+            message: match output_capability {
+                OutputCapability::StrictSchema => "strict structured output is available",
+                OutputCapability::JsonObject => "JSON compatibility mode is available",
+            }
+            .to_string(),
             usage: parsed.as_ref().and_then(extract_usage),
+            output_capability: Some(output_capability),
         },
     }
 }
@@ -836,8 +1087,13 @@ fn anthropic_messages_has_refusal(value: &Value) -> bool {
     value.get("stop_reason").and_then(Value::as_str) == Some("refusal")
 }
 
-fn has_structured_success(provider: ProviderKind, mode: ProviderMode, value: &Value) -> bool {
-    extract_structured_object(provider, mode, value).is_some()
+fn has_structured_success(
+    provider: ProviderKind,
+    mode: ProviderMode,
+    value: &Value,
+    output_capability: OutputCapability,
+) -> bool {
+    extract_structured_object(provider, mode, value, output_capability).is_some()
 }
 
 /// Classify an HTTP failure by status only.
@@ -938,6 +1194,140 @@ mod tests {
         .unwrap();
         assert!(responses.body.get("text").is_some());
         assert!(chat.body.get("response_format").is_some());
+        assert_eq!(responses.body["max_output_tokens"], 4096);
+        assert_eq!(chat.body["max_completion_tokens"], 4096);
+        assert_eq!(responses.body["text"]["format"]["strict"], true);
+        assert_eq!(chat.body["response_format"]["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn openai_json_object_requests_include_schema_prompt_and_4096_limit() {
+        let schema = json!({
+            "type": "object",
+            "properties": {"ok": {"type": "boolean"}},
+            "required": ["ok"],
+            "additionalProperties": false
+        });
+        let responses = build_probe_request_for_capability(
+            ProviderKind::OpenAi,
+            ProviderMode::Responses,
+            "https://example.test/v1",
+            "model",
+            &schema,
+            AuthMode::Bearer,
+            OutputCapability::JsonObject,
+        )
+        .unwrap();
+        let chat = build_probe_request_for_capability(
+            ProviderKind::OpenAi,
+            ProviderMode::Chat,
+            "https://example.test/v1",
+            "model",
+            &schema,
+            AuthMode::Bearer,
+            OutputCapability::JsonObject,
+        )
+        .unwrap();
+
+        assert_eq!(
+            responses.body["text"]["format"],
+            json!({"type": "json_object"})
+        );
+        assert_eq!(chat.body["response_format"], json!({"type": "json_object"}));
+        assert_eq!(responses.body["max_output_tokens"], 4096);
+        assert_eq!(chat.body["max_completion_tokens"], 4096);
+        for prompt in [
+            responses
+                .body
+                .pointer("/input/0/content")
+                .and_then(Value::as_str),
+            chat.body
+                .pointer("/messages/0/content")
+                .and_then(Value::as_str),
+        ] {
+            let prompt = prompt.expect("JSON mode must carry a system prompt");
+            assert!(prompt.contains("单一 JSON object"));
+            assert!(prompt.contains("additionalProperties"));
+        }
+    }
+
+    #[test]
+    fn probe_output_capability_order_is_strict_then_json_for_openai() {
+        assert_eq!(
+            probe_output_capabilities(ProviderKind::OpenAi),
+            &[OutputCapability::StrictSchema, OutputCapability::JsonObject]
+        );
+        assert_eq!(
+            probe_output_capabilities(ProviderKind::Anthropic),
+            &[OutputCapability::StrictSchema]
+        );
+    }
+
+    #[test]
+    fn json_object_extraction_repairs_only_one_complete_object() {
+        fn chat_body(content: &str) -> String {
+            serde_json::to_string(&json!({
+                "choices": [{"finish_reason": "stop", "message": {"content": content}}]
+            }))
+            .unwrap()
+        }
+
+        for content in [
+            r#"{"ok":true}"#,
+            "```json\n{\"ok\":true}\n```",
+            "结果如下：{\"ok\":true}。",
+            "{'ok': true,}",
+        ] {
+            let value = extract_provider_json(
+                ProviderKind::OpenAi,
+                ProviderMode::Chat,
+                &chat_body(content),
+                OutputCapability::JsonObject,
+            )
+            .unwrap_or_else(|error| panic!("must parse {content:?}: {}", error.message));
+            assert_eq!(value, json!({"ok": true}));
+        }
+
+        for content in [
+            "{\"ok\":true} {\"extra\":false}",
+            "{\"ok\":true",
+            "[ {\"ok\":true} ]",
+            "true",
+        ] {
+            assert!(
+                extract_provider_json(
+                    ProviderKind::OpenAi,
+                    ProviderMode::Chat,
+                    &chat_body(content),
+                    OutputCapability::JsonObject,
+                )
+                .is_err(),
+                "must reject {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn incomplete_provider_completions_are_rejected_before_repair() {
+        let chat =
+            r#"{"choices":[{"finish_reason":"length","message":{"content":"{\"ok\":true}"}}]}"#;
+        let anthropic =
+            r#"{"stop_reason":"max_tokens","content":[{"type":"text","text":"{\"ok\":true}"}]}"#;
+        let responses = r#"{"status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output_text":"{\"ok\":true}"}"#;
+
+        for (provider, mode, body) in [
+            (ProviderKind::OpenAi, ProviderMode::Chat, chat),
+            (ProviderKind::OpenAi, ProviderMode::Responses, responses),
+            (
+                ProviderKind::Anthropic,
+                ProviderMode::AnthropicMessages,
+                anthropic,
+            ),
+        ] {
+            let failure = extract_provider_json(provider, mode, body, OutputCapability::JsonObject)
+                .expect_err("incomplete completion must fail closed");
+            assert_eq!(failure.kind, ProviderFailureKind::Malformed);
+        }
     }
 
     #[test]
@@ -953,6 +1343,7 @@ mod tests {
             "okpgui_audit",
             "system-prompt",
             "audit-prompt",
+            OutputCapability::StrictSchema,
             1024,
         )
         .unwrap();
@@ -1171,7 +1562,7 @@ mod tests {
         }"#;
         let chat_probe =
             classify_probe_response(ProviderKind::OpenAi, ProviderMode::Chat, 200, chat_refusal);
-        assert_eq!(chat_probe.state, CapabilityState::Unsupported);
+        assert_eq!(chat_probe.state, CapabilityState::Failed);
         let chat_err =
             extract_structured_json(ProviderKind::OpenAi, ProviderMode::Chat, chat_refusal)
                 .expect_err("non-empty Chat refusal must fail formal extraction");
@@ -1194,7 +1585,7 @@ mod tests {
             200,
             responses_refusal,
         );
-        assert_eq!(responses_probe.state, CapabilityState::Unsupported);
+        assert_eq!(responses_probe.state, CapabilityState::Failed);
         let responses_err = extract_structured_json(
             ProviderKind::OpenAi,
             ProviderMode::Responses,
@@ -1436,8 +1827,8 @@ mod tests {
         );
         assert_eq!(
             probe.state,
-            CapabilityState::Unsupported,
-            "stop_reason=refusal probe must be Unsupported"
+            CapabilityState::Failed,
+            "stop_reason=refusal probe must stop without compatibility fallback"
         );
         let err = extract_structured_json(
             ProviderKind::Anthropic,

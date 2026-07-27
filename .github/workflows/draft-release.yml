@@ -28,24 +28,21 @@ jobs:
           - name: Windows
             os: windows-latest
             slug: windows-x64
-            binary_name: okpgui-next.exe
             mediainfo_target: x86_64-pc-windows-msvc
-            mediainfo_staged: mediainfo-x86_64-pc-windows-msvc.exe
-            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-windows-x64.zip
+            bundle_target: nsis
+            asset_path: src-tauri/target/release/bundle/nsis/*.exe
           - name: macOS arm64
             os: macos-latest
             slug: macos-arm64
-            binary_name: okpgui-next
             mediainfo_target: aarch64-apple-darwin
-            mediainfo_staged: mediainfo-aarch64-apple-darwin
-            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-macos-arm64.tar.gz
+            bundle_target: dmg
+            asset_path: src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux
             os: ubuntu-22.04
             slug: linux-x64
-            binary_name: okpgui-next
             mediainfo_target: x86_64-unknown-linux-gnu
-            mediainfo_staged: mediainfo-x86_64-unknown-linux-gnu
-            archive_name: okpgui-next-${{ github.event.inputs.tag_name }}-linux-x64.tar.gz
+            bundle_target: appimage
+            asset_path: src-tauri/target/release/bundle/appimage/*.AppImage
 
     steps:
       - name: Checkout repository
@@ -133,8 +130,8 @@ jobs:
       - name: Run backend tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build Tauri application binary
-        run: pnpm tauri build --no-bundle
+      - name: Build native application package
+        run: pnpm tauri build --bundles ${{ matrix.platform.bundle_target }}
 
       # --- Evidence class: host-binary-smoke (Windows/Linux) ---
       # DESKTOP_E2E_ALLOW_BLOCKED is not used when binary exists (REQUIRE_PASS instead).
@@ -178,8 +175,7 @@ jobs:
           echo "::notice title=Host binary smoke::pass with productionBinaryMarker=true (not WebDriver)."
 
       # --- Evidence class: macos-packaged-smoke ---
-      # Draft release uses --no-bundle, so this is typically the raw release binary with
-      # harnessType macos-packaged-smoke (not .app). Full .app proof is on build-artifact.
+      # Mount the final DMG and execute its packaged .app.
       - name: macOS packaged production smoke
         if: runner.os == 'macOS'
         shell: bash
@@ -188,12 +184,34 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p tests/desktop-e2e/out
-          BINARY="src-tauri/target/release/okpgui-next"
-          if [[ ! -f "$BINARY" ]]; then
-            echo "::error title=macOS packaged smoke::Built binary not found"
+          shopt -s nullglob
+          dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
+          if [[ ${#dmgs[@]} -ne 1 ]]; then
+            echo "::error title=macOS packaged smoke::Expected exactly one DMG, found ${#dmgs[@]}"
             exit 1
           fi
-          export DESKTOP_E2E_BINARY="$BINARY"
+          mount_dir="$(mktemp -d "${RUNNER_TEMP}/okpgui-dmg.XXXXXX")"
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount_dir" "${dmgs[0]}" >/dev/null
+          trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" >/dev/null 2>&1 || true' EXIT
+          apps=("$mount_dir"/*.app)
+          if [[ ${#apps[@]} -ne 1 ]]; then
+            echo "::error title=macOS packaged smoke::Expected exactly one .app in DMG, found ${#apps[@]}"
+            exit 1
+          fi
+          app="${apps[0]}"
+          base="$(basename "$app" .app)"
+          for candidate in "$app/Contents/MacOS/okpgui-next" "$app/Contents/MacOS/$base"; do
+            if [[ -f "$candidate" ]]; then
+              export DESKTOP_E2E_BINARY="$candidate"
+              break
+            fi
+          done
+          if [[ -z "${DESKTOP_E2E_BINARY:-}" ]]; then
+            echo "::error title=macOS packaged smoke::Packaged .app executable not found in DMG"
+            exit 1
+          fi
+          export DESKTOP_E2E_PACKAGE="${dmgs[0]}"
+          export MACOS_PACKAGED_APP="$app"
           export DESKTOP_E2E_REQUIRE_PASS=1
           node scripts/run-macos-packaged-smoke.mjs
           shopt -s nullglob
@@ -223,49 +241,13 @@ jobs:
           path: |
             tests/desktop-e2e/out/evidence-*.json
 
-      - name: Package Windows asset
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $stagingDir = Join-Path $env:RUNNER_TEMP 'release-windows'
-          New-Item -ItemType Directory -Path $stagingDir -Force | Out-Null
-          Copy-Item "src-tauri/target/release/${{ matrix.platform.binary_name }}" (Join-Path $stagingDir '${{ matrix.platform.binary_name }}')
-          # Package sidecar + redistribution notice alongside the app binary.
-          Copy-Item "src-tauri/binaries/${{ matrix.platform.mediainfo_staged }}" (Join-Path $stagingDir '${{ matrix.platform.mediainfo_staged }}')
-          $noticeDir = Join-Path $stagingDir 'mediainfo'
-          New-Item -ItemType Directory -Path $noticeDir -Force | Out-Null
-          Copy-Item "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html" (Join-Path $noticeDir 'THIRD_PARTY_NOTICES.html')
-          Compress-Archive -Path (Join-Path $stagingDir '*') -DestinationPath "${{ matrix.platform.archive_name }}" -Force
-          # Fail-closed membership gate: app binary, target-named sidecar, notice.
-          node scripts/verify-release-archive.mjs `
-            --archive "${{ matrix.platform.archive_name }}" `
-            --binary "${{ matrix.platform.binary_name }}" `
-            --sidecar "${{ matrix.platform.mediainfo_staged }}" `
-            --notice "mediainfo/THIRD_PARTY_NOTICES.html"
-
-      - name: Package Unix asset
-        if: runner.os != 'Windows'
-        run: |
-          staging_dir="${RUNNER_TEMP}/release-${{ matrix.platform.slug }}"
-          mkdir -p "$staging_dir/mediainfo"
-          cp "src-tauri/target/release/${{ matrix.platform.binary_name }}" "$staging_dir/${{ matrix.platform.binary_name }}"
-          # Package sidecar + redistribution notice alongside the app binary.
-          cp "src-tauri/binaries/${{ matrix.platform.mediainfo_staged }}" "$staging_dir/${{ matrix.platform.mediainfo_staged }}"
-          cp "src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html" "$staging_dir/mediainfo/THIRD_PARTY_NOTICES.html"
-          tar -C "$staging_dir" -czf "${{ matrix.platform.archive_name }}" .
-          # Fail-closed membership gate: app binary, target-named sidecar, notice.
-          node scripts/verify-release-archive.mjs \
-            --archive "${{ matrix.platform.archive_name }}" \
-            --binary "${{ matrix.platform.binary_name }}" \
-            --sidecar "${{ matrix.platform.mediainfo_staged }}" \
-            --notice "mediainfo/THIRD_PARTY_NOTICES.html"
-
-      - name: Upload packaged asset
+      - name: Upload native release asset
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.slug }}-release-asset
           if-no-files-found: error
-          path: ${{ matrix.platform.archive_name }}
+          compression-level: 0
+          path: ${{ matrix.platform.asset_path }}
 
   release:
     name: Create draft GitHub release
@@ -275,6 +257,8 @@ jobs:
       - name: Download packaged assets
         uses: actions/download-artifact@v6
         with:
+          pattern: '*-release-asset'
+          merge-multiple: true
           path: release-assets
 
       - name: Create draft release
@@ -286,5 +270,6 @@ jobs:
           draft: true
           generate_release_notes: true
           files: |
-            release-assets/**/*.zip
-            release-assets/**/*.tar.gz
+            release-assets/**/*.exe
+            release-assets/**/*.dmg
+            release-assets/**/*.AppImage

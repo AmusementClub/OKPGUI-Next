@@ -70,7 +70,10 @@ function capabilityLabel(settings: AiSettings): string {
         return '未探测';
     }
     if (capability.state === 'ready' && capability.identity_matches) {
-        return `Ready（${capability.resolved_mode ?? settings.mode}）`;
+        const outputMode = capability.output_capability === 'json_object'
+            ? 'JSON 兼容模式'
+            : '严格结构化输出';
+        return `Ready（${capability.resolved_mode ?? settings.mode}，${outputMode}）`;
     }
     if (capability.state === 'ready' && !capability.identity_matches) {
         return '连接已变更，需重新探测';
@@ -79,7 +82,7 @@ function capabilityLabel(settings: AiSettings): string {
         return '探测中…';
     }
     if (capability.state === 'unsupported') {
-        return '不支持 strict 结构化输出';
+        return '不支持结构化 JSON 输出';
     }
     if (capability.state === 'failed') {
         return '探测失败';
@@ -179,8 +182,11 @@ export default function AiSettingsPage() {
             const capability = await runAiCapabilityProbe();
             const next = normalizeSettings(await getAiSettings());
             setSettings({ ...next, model: saved.model || next.model, capability });
-            if (capability.state === 'ready' && capability.identity_matches) {
-                setStatus(`能力探测通过（${capability.resolved_mode ?? saved.mode}）。正式 AI 任务已解锁。`);
+            if (capability.state === 'ready' && capability.identity_matches && capability.output_capability) {
+                const outputMode = capability.output_capability === 'json_object'
+                    ? 'JSON 兼容模式'
+                    : '严格结构化输出';
+                setStatus(`能力探测通过（${capability.resolved_mode ?? saved.mode}，${outputMode}）。正式 AI 任务已解锁。`);
             } else {
                 setStatus(capability.message || '能力探测未通过。');
             }

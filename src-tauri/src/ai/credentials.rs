@@ -1,4 +1,4 @@
-use crate::ai::provider::{CapabilityIdentity, ProviderKind, ProviderMode};
+use crate::ai::provider::{CapabilityIdentity, OutputCapability, ProviderKind, ProviderMode};
 use crate::atomic_file::write_text_file_atomically;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -31,6 +31,9 @@ pub struct PublicCapabilityStatus {
     /// Resolved mode that passed (may differ from configured Auto).
     #[serde(default)]
     pub resolved_mode: Option<ProviderMode>,
+    /// Output contract proven by the probe. Missing on legacy records, which require reprobe.
+    #[serde(default)]
+    pub output_capability: Option<OutputCapability>,
     #[serde(default)]
     pub message: String,
     #[serde(default)]
@@ -777,7 +780,8 @@ pub fn apply_public_identity_matches(
             .expect("capability presence checked above");
         (
             capability.identity_digest.clone(),
-            capability.state == crate::ai::provider::CapabilityState::Ready,
+            capability.state == crate::ai::provider::CapabilityState::Ready
+                && capability.output_capability.is_some(),
         )
     };
     let matches = ready && capability_identity_matches(&digest, connection, secret);
@@ -1384,6 +1388,7 @@ mod tests {
                 )
                 .digest,
                 resolved_mode: Some(ProviderMode::Chat),
+                output_capability: Some(OutputCapability::StrictSchema),
                 message: "stale ready".into(),
                 probed_at_unix: Some(1),
                 // Would be true if a secret were incorrectly read while disabled.

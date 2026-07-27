@@ -3,7 +3,7 @@
  * Offline BYOK AI Preflight V2 release-gate verifier.
  *
  * Cross-checks Tauri sidecar/resource mapping, the three required target triples,
- * MediaInfo staging/archive/notice script references, the no-shell frontend
+ * MediaInfo staging/native-bundle/notice references, the no-shell frontend
  * capability boundary, and the honest mocked-UI vs unrun desktop-E2E boundary.
  *
  * Fail-closed and offline-only: no network, credentials, archive downloads,
@@ -11,7 +11,6 @@
  *
  * Source of truth (not reimplemented here):
  *   - scripts/verify-mediainfo-package.mjs
- *   - scripts/verify-release-archive.mjs
  *   - src-tauri/tauri.conf.json
  *   - src-tauri/capabilities/default.json
  */
@@ -40,8 +39,6 @@ const EXTERNAL_BIN = 'binaries/mediainfo';
 const NOTICE_RESOURCE_SRC = 'resources/mediainfo/THIRD_PARTY_NOTICES.html';
 const NOTICE_RESOURCE_DEST = 'notices/mediainfo-THIRD_PARTY_NOTICES.html';
 const NOTICE_REPO_PATH = 'src-tauri/resources/mediainfo/THIRD_PARTY_NOTICES.html';
-const ARCHIVE_NOTICE_MEMBER = 'mediainfo/THIRD_PARTY_NOTICES.html';
-
 const errors = [];
 
 function rel(filePath) {
@@ -226,26 +223,6 @@ function checkMediaInfoPackageGate() {
 }
 
 /**
- * Release archive membership verifier must require binary + sidecar + notice.
- */
-function checkReleaseArchiveGate() {
-  requireIncludes(
-    'scripts/verify-release-archive.mjs',
-    [
-      ARCHIVE_NOTICE_MEMBER,
-      '--archive',
-      '--binary',
-      '--sidecar',
-      '--notice',
-      'MediaInfo sidecar',
-      'redistribution notice',
-      'Fail-closed',
-    ],
-    'release archive gate',
-  );
-}
-
-/**
  * Workflows must keep sidecar/provider/UI gates and honest desktop-E2E notice,
  * and must invoke this verifier before build/package work.
  */
@@ -278,17 +255,38 @@ function checkWorkflows() {
     );
   }
 
-  // Draft release must still call the archive membership verifier.
-  requireIncludes(
+  for (const workflow of [
+    '.github/workflows/build-artifact.yml',
     '.github/workflows/draft-release.yml',
-    [
-      'node scripts/verify-release-archive.mjs',
-      '--sidecar',
-      ARCHIVE_NOTICE_MEMBER,
-      'THIRD_PARTY_NOTICES.html',
-    ],
-    'draft-release archive membership',
-  );
+  ]) {
+    requireIncludes(
+      workflow,
+      [
+        'bundle_target: nsis',
+        'bundle_target: dmg',
+        'bundle_target: appimage',
+        'bundle/nsis/*.exe',
+        'bundle/dmg/*.dmg',
+        'bundle/appimage/*.AppImage',
+        'pnpm tauri build --bundles ${{ matrix.platform.bundle_target }}',
+        'compression-level: 0',
+        'hdiutil attach -nobrowse -readonly',
+        'DESKTOP_E2E_PACKAGE="${dmgs[0]}"',
+      ],
+      'single native package workflow',
+    );
+    requireAbsent(
+      workflow,
+      [
+        'Compress-Archive',
+        'tar -C',
+        'verify-release-archive.mjs',
+        'target/release/bundle/**',
+        'target/release/okpgui-next*',
+      ],
+      'duplicate or custom archive packaging',
+    );
+  }
 
   // Build artifact / draft-release: separate named evidence-class steps (Milestone 6).
   for (const workflow of [
@@ -678,7 +676,6 @@ function main() {
   checkTauriBundle();
   checkNoShellCapability();
   checkMediaInfoPackageGate();
-  checkReleaseArchiveGate();
   checkPackageJson();
   checkWorkflows();
   checkDesktopE2EHonesty();

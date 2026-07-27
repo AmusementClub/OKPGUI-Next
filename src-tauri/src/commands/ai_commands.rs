@@ -1,6 +1,6 @@
 use crate::ai::audit::{
     build_formal_audit_prompt, compute_decision, formal_audit_schema, formal_audit_system_prompt,
-    parse_formal_audit_findings, redact_provider_error, sanitize_audit_input,
+    redact_provider_error, sanitize_audit_input, try_parse_formal_audit_findings,
     validate_findings_against_projection, AuditDecision, AuditInput, Finding, FindingSeverity,
     ValidatedAudit,
 };
@@ -35,11 +35,13 @@ use crate::ai::media::{
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
-    build_probe_request, build_structured_request_with_system,
-    classify_and_validate_probe_response, classify_http_failure, extract_structured_json,
-    formal_attempt_modes, formal_attempt_modes_for_ready_capability, minimal_probe_schema,
-    parse_models_list_response, send_managed_provider_request, CapabilityIdentity,
-    CapabilityProbeResult, CapabilityState, ProviderFailure, ProviderKind, ProviderMode,
+    build_probe_request, build_probe_request_for_capability, build_structured_request_with_system,
+    classify_and_validate_probe_response, classify_and_validate_probe_response_for_capability,
+    classify_http_failure, extract_provider_json, formal_attempt_modes,
+    formal_attempt_modes_for_ready_capability, minimal_probe_schema, parse_models_list_response,
+    probe_output_capabilities, send_managed_provider_request, CapabilityIdentity,
+    CapabilityProbeResult, CapabilityState, OutputCapability, ProviderFailure, ProviderKind,
+    ProviderMode,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
@@ -70,7 +72,190 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
-const FORMAL_PROVIDER_MAX_TOKENS: u32 = 10_240;
+const FORMAL_PROVIDER_MAX_TOKENS: u32 = 4096;
+const FORMAL_PROVIDER_ATTEMPTS: usize = 2;
+
+fn validation_retry_prompt(original: &str) -> String {
+    format!(
+        "{original}\n\n上一次返回未通过 JSON 解析或结构校验。请重新生成完整的单一 JSON object，严格遵循既定 schema；不要输出 Markdown 代码围栏、解释文字或额外字段。"
+    )
+}
+
+fn retryable_structured_failure(failure: &ProviderFailure) -> bool {
+    matches!(
+        failure.kind,
+        crate::ai::provider::ProviderFailureKind::Schema
+            | crate::ai::provider::ProviderFailureKind::Malformed
+    )
+}
+
+fn formal_retry_remaining(request_attempt: usize) -> bool {
+    request_attempt + 1 < FORMAL_PROVIDER_ATTEMPTS
+}
+
+struct FormalValidationError {
+    message: String,
+    code: &'static str,
+    retryable: bool,
+}
+
+enum FormalProviderCallResult<T> {
+    Success(T),
+    Cancelled,
+    Failed {
+        failure: ProviderFailure,
+        formal_ran: bool,
+        error_code: &'static str,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_formal_provider_call<T, V, C>(
+    client: &reqwest::Client,
+    connection: &PublicConnectionConfig,
+    secret: Option<&SecretValue>,
+    schema: &Value,
+    schema_name: &str,
+    system_prompt: &str,
+    prompt: &str,
+    output_capability: OutputCapability,
+    is_cancelled: C,
+    mut validate: V,
+) -> FormalProviderCallResult<T>
+where
+    V: FnMut(&Value) -> Result<T, FormalValidationError>,
+    C: Fn() -> bool,
+{
+    let attempt_modes = formal_modes_for_connection(connection);
+    'modes: for attempted_mode in attempt_modes {
+        for request_attempt in 0..FORMAL_PROVIDER_ATTEMPTS {
+            if is_cancelled() {
+                return FormalProviderCallResult::Cancelled;
+            }
+            let retry_prompt;
+            let request_prompt = if request_attempt == 0 {
+                prompt
+            } else {
+                retry_prompt = validation_retry_prompt(prompt);
+                retry_prompt.as_str()
+            };
+            let provider_request = match build_structured_request_with_system(
+                connection.provider,
+                attempted_mode,
+                &connection.endpoint,
+                &connection.model,
+                schema,
+                connection.auth_mode,
+                schema_name,
+                system_prompt,
+                request_prompt,
+                output_capability,
+                FORMAL_PROVIDER_MAX_TOKENS,
+            ) {
+                Ok(request) => request,
+                Err(message) => {
+                    return FormalProviderCallResult::Failed {
+                        failure: ProviderFailure {
+                            kind: crate::ai::provider::ProviderFailureKind::Unsupported,
+                            status: None,
+                            message,
+                        },
+                        formal_ran: false,
+                        error_code: "PROVIDER_HTTP",
+                    };
+                }
+            };
+
+            let send_result = send_managed_provider_request(
+                client,
+                &provider_request,
+                connection.auth_mode,
+                connection.custom_header_name.as_deref(),
+                secret.map(SecretValue::expose),
+                connection.provider,
+            )
+            .await;
+            let (status, body) = match send_result {
+                Ok(response) => response,
+                Err(message) => {
+                    return FormalProviderCallResult::Failed {
+                        failure: ProviderFailure {
+                            kind: crate::ai::provider::ProviderFailureKind::Server,
+                            status: None,
+                            message,
+                        },
+                        formal_ran: true,
+                        error_code: "PROVIDER_HTTP",
+                    };
+                }
+            };
+            if !(200..300).contains(&status) {
+                let failure = classify_http_failure(status, &body);
+                if auto_fallback_allowed(
+                    connection.provider,
+                    connection.mode,
+                    attempted_mode,
+                    &failure,
+                ) {
+                    continue 'modes;
+                }
+                return FormalProviderCallResult::Failed {
+                    failure,
+                    formal_ran: true,
+                    error_code: "PROVIDER_HTTP",
+                };
+            }
+
+            let structured = match extract_provider_json(
+                connection.provider,
+                attempted_mode,
+                &body,
+                output_capability,
+            ) {
+                Ok(value) => value,
+                Err(failure)
+                    if formal_retry_remaining(request_attempt)
+                        && retryable_structured_failure(&failure) =>
+                {
+                    continue;
+                }
+                Err(failure) => {
+                    return FormalProviderCallResult::Failed {
+                        failure,
+                        formal_ran: true,
+                        error_code: "PROVIDER_HTTP",
+                    };
+                }
+            };
+
+            match validate(&structured) {
+                Ok(value) => return FormalProviderCallResult::Success(value),
+                Err(error) if error.retryable && formal_retry_remaining(request_attempt) => {}
+                Err(error) => {
+                    return FormalProviderCallResult::Failed {
+                        failure: ProviderFailure {
+                            kind: crate::ai::provider::ProviderFailureKind::Schema,
+                            status: None,
+                            message: error.message,
+                        },
+                        formal_ran: true,
+                        error_code: error.code,
+                    };
+                }
+            }
+        }
+    }
+
+    FormalProviderCallResult::Failed {
+        failure: ProviderFailure {
+            kind: crate::ai::provider::ProviderFailureKind::Malformed,
+            status: None,
+            message: "provider formal request did not complete".to_string(),
+        },
+        formal_ran: false,
+        error_code: "PROVIDER_HTTP",
+    }
+}
 
 fn jobs() -> &'static Mutex<AiJobManager> {
     static JOBS: OnceLock<Mutex<AiJobManager>> = OnceLock::new();
@@ -416,6 +601,7 @@ fn public_capability_from_config(
         state: parse_capability_state(&capability.state),
         identity_digest: capability.identity_digest.clone(),
         resolved_mode: parse_provider_mode_opt(&capability.resolved_mode),
+        output_capability: parse_output_capability_opt(&capability.output_capability),
         message: capability.message.clone(),
         probed_at_unix: capability.probed_at_unix,
         identity_matches: false,
@@ -439,6 +625,22 @@ fn capability_state_to_config(state: CapabilityState) -> String {
         CapabilityState::Ready => "ready",
         CapabilityState::Unsupported => "unsupported",
         CapabilityState::Failed => "failed",
+    }
+    .to_string()
+}
+
+fn parse_output_capability_opt(value: &str) -> Option<OutputCapability> {
+    match value.to_ascii_lowercase().as_str() {
+        "strict_schema" => Some(OutputCapability::StrictSchema),
+        "json_object" => Some(OutputCapability::JsonObject),
+        _ => None,
+    }
+}
+
+fn output_capability_to_config(capability: OutputCapability) -> String {
+    match capability {
+        OutputCapability::StrictSchema => "strict_schema",
+        OutputCapability::JsonObject => "json_object",
     }
     .to_string()
 }
@@ -477,7 +679,7 @@ fn resolve_stored_secret(
 
 /// Actionable gate failure when formal tasks need a Ready capability identity.
 fn capability_gate_error() -> String {
-    "strict capability probe is not Ready for the current connection; open AI settings, refresh models if needed, and run the capability probe".to_string()
+    "structured output capability probe is not Ready for the current connection; open AI settings, refresh models if needed, and run the capability probe".to_string()
 }
 
 #[tauri::command]
@@ -2170,6 +2372,8 @@ async fn run_template_selection_worker(
 
     let prompt = build_template_selection_prompt(&safe_torrent_name, &catalog);
     let schema = template_selection_schema();
+    let output_capability = ready_output_capability(&connection)
+        .expect("formal capability gate must provide an output tier");
 
     if template_selection_is_cancelled(&job_id, &cancel_flag) {
         finish_template_selection_cancelled(
@@ -2198,12 +2402,41 @@ async fn run_template_selection_worker(
 
     update_template_job_progress(&job_id, 35, "requesting provider selection");
 
-    let attempt_modes = formal_modes_for_connection(&connection);
-    let mut last_failure: Option<ProviderFailure> = None;
-    let mut structured: Option<Value> = None;
+    let outcome = run_formal_provider_call(
+        &client,
+        &connection,
+        secret.as_ref(),
+        &schema,
+        "okpgui_template_selection",
+        TEMPLATE_SELECTION_SYSTEM_PROMPT,
+        &prompt,
+        output_capability,
+        || template_selection_is_cancelled(&job_id, &cancel_flag),
+        |structured| {
+            let live_catalog = load_eligible_catalog(&app);
+            if live_catalog.is_empty() {
+                return Err(FormalValidationError {
+                    message: "没有可用于自动选择的发布模板。".to_string(),
+                    code: "CATALOG_EMPTY",
+                    retryable: false,
+                });
+            }
+            match parse_template_selection(structured, &live_catalog) {
+                Ok(selected) => Ok((selected, live_catalog)),
+                Err(message) => Err(FormalValidationError {
+                    retryable: message.contains("schema validation"),
+                    message,
+                    code: "SELECTION_INVALID",
+                }),
+            }
+        },
+    )
+    .await;
 
-    for attempted_mode in attempt_modes {
-        if template_selection_is_cancelled(&job_id, &cancel_flag) {
+    update_template_job_progress(&job_id, 75, "validating catalog selection");
+    let (selected, final_catalog) = match outcome {
+        FormalProviderCallResult::Success(value) => value,
+        FormalProviderCallResult::Cancelled => {
             finish_template_selection_cancelled(
                 &job_id,
                 0,
@@ -2212,134 +2445,17 @@ async fn run_template_selection_worker(
             );
             return;
         }
-
-        let provider_request = match build_structured_request_with_system(
-            connection.provider,
-            attempted_mode,
-            &connection.endpoint,
-            &connection.model,
-            &schema,
-            connection.auth_mode,
-            "okpgui_template_selection",
-            TEMPLATE_SELECTION_SYSTEM_PROMPT,
-            &prompt,
-            FORMAL_PROVIDER_MAX_TOKENS,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Unsupported,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        let send_result = send_managed_provider_request(
-            &client,
-            &provider_request,
-            connection.auth_mode,
-            connection.custom_header_name.as_deref(),
-            secret.as_ref().map(SecretValue::expose),
-            connection.provider,
-        )
-        .await;
-
-        let (status, body) = match send_result {
-            Ok(pair) => pair,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Server,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        if !(200..300).contains(&status) {
-            let failure = classify_http_failure(status, &body);
-            if auto_fallback_allowed(
-                connection.provider,
-                connection.mode,
-                attempted_mode,
-                &failure,
-            ) {
-                last_failure = Some(failure);
-                continue;
-            }
-            last_failure = Some(failure);
-            break;
-        }
-
-        match extract_structured_json(connection.provider, attempted_mode, &body) {
-            Ok(value) => {
-                structured = Some(value);
-                last_failure = None;
-                break;
-            }
-            Err(failure) => {
-                last_failure = Some(failure);
-                break;
-            }
-        }
-    }
-
-    if template_selection_is_cancelled(&job_id, &cancel_flag) {
-        finish_template_selection_cancelled(
-            &job_id,
-            0,
-            &catalog_hash,
-            "template selection cancelled",
-        );
-        return;
-    }
-
-    update_template_job_progress(&job_id, 75, "validating catalog selection");
-
-    // Re-load catalog after the provider round-trip so revision drift fails closed.
-    let catalog = load_eligible_catalog(&app);
-    if catalog.is_empty() {
-        finish_template_selection_failure(
-            &job_id,
-            0,
-            &catalog_hash,
-            Some("CATALOG_EMPTY".to_string()),
-            "没有可用于自动选择的发布模板。",
-        );
-        return;
-    }
-
-    let structured = match structured {
-        Some(value) => value,
-        None => {
-            let failure = last_failure.unwrap_or(ProviderFailure {
-                kind: crate::ai::provider::ProviderFailureKind::Malformed,
-                status: None,
-                message: "provider template selection failed".to_string(),
-            });
+        FormalProviderCallResult::Failed {
+            failure,
+            error_code,
+            ..
+        } => {
             let message = redact_provider_error(&failure.message, &policy);
             finish_template_selection_failure(
                 &job_id,
                 0,
                 &catalog_hash,
-                Some("PROVIDER_HTTP".to_string()),
-                message,
-            );
-            return;
-        }
-    };
-
-    let selected = match parse_template_selection(&structured, &catalog) {
-        Ok(entry) => entry,
-        Err(error) => {
-            let message = redact_provider_error(&error, &policy);
-            finish_template_selection_failure(
-                &job_id,
-                0,
-                &catalog_hash,
-                Some("SELECTION_INVALID".to_string()),
+                Some(error_code.to_string()),
                 message,
             );
             return;
@@ -2357,7 +2473,7 @@ async fn run_template_selection_worker(
         &selected.digest,
         &selected.name,
         &selected.summary,
-        &catalog,
+        &final_catalog,
         torrent_name,
         torrent_path,
         &cancel_flag,
@@ -2895,6 +3011,8 @@ async fn run_recognition_worker(
         &title_pattern,
     );
     let schema = recognition_schema();
+    let output_capability = ready_output_capability(&connection)
+        .expect("formal capability gate must provide an output tier");
 
     if recognition_is_cancelled(&job_id, &cancel_flag) {
         finish_recognition_cancelled(
@@ -2923,12 +3041,32 @@ async fn run_recognition_worker(
 
     update_recognition_job_progress(&job_id, 35, "requesting provider recognition");
 
-    let attempt_modes = formal_modes_for_connection(&connection);
-    let mut last_failure: Option<ProviderFailure> = None;
-    let mut structured: Option<Value> = None;
+    let outcome = run_formal_provider_call(
+        &client,
+        &connection,
+        secret.as_ref(),
+        &schema,
+        "okpgui_recognition",
+        RECOGNITION_SYSTEM_PROMPT,
+        &prompt,
+        output_capability,
+        || recognition_is_cancelled(&job_id, &cancel_flag),
+        |structured| {
+            recognition_from_provider_outcome(Some(structured), None).map_err(|message| {
+                FormalValidationError {
+                    message,
+                    code: "RECOGNITION_INVALID",
+                    retryable: true,
+                }
+            })
+        },
+    )
+    .await;
 
-    for attempted_mode in attempt_modes {
-        if recognition_is_cancelled(&job_id, &cancel_flag) {
+    update_recognition_job_progress(&job_id, 75, "validating recognition output");
+    let output = match outcome {
+        FormalProviderCallResult::Success(value) => value,
+        FormalProviderCallResult::Cancelled => {
             finish_recognition_cancelled(
                 &job_id,
                 request_generation,
@@ -2937,121 +3075,17 @@ async fn run_recognition_worker(
             );
             return;
         }
-
-        let provider_request = match build_structured_request_with_system(
-            connection.provider,
-            attempted_mode,
-            &connection.endpoint,
-            &connection.model,
-            &schema,
-            connection.auth_mode,
-            "okpgui_recognition",
-            RECOGNITION_SYSTEM_PROMPT,
-            &prompt,
-            FORMAL_PROVIDER_MAX_TOKENS,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Unsupported,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        let send_result = send_managed_provider_request(
-            &client,
-            &provider_request,
-            connection.auth_mode,
-            connection.custom_header_name.as_deref(),
-            secret.as_ref().map(SecretValue::expose),
-            connection.provider,
-        )
-        .await;
-
-        let (status, body) = match send_result {
-            Ok(pair) => pair,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Server,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        if !(200..300).contains(&status) {
-            let failure = classify_http_failure(status, &body);
-            if auto_fallback_allowed(
-                connection.provider,
-                connection.mode,
-                attempted_mode,
-                &failure,
-            ) {
-                last_failure = Some(failure);
-                continue;
-            }
-            last_failure = Some(failure);
-            break;
-        }
-
-        match extract_structured_json(connection.provider, attempted_mode, &body) {
-            Ok(value) => {
-                structured = Some(value);
-                last_failure = None;
-                break;
-            }
-            Err(failure) => {
-                last_failure = Some(failure);
-                break;
-            }
-        }
-    }
-
-    if recognition_is_cancelled(&job_id, &cancel_flag) {
-        finish_recognition_cancelled(
-            &job_id,
-            request_generation,
-            &snapshot_hash,
-            "recognition cancelled",
-        );
-        return;
-    }
-
-    update_recognition_job_progress(&job_id, 75, "validating recognition output");
-
-    let structured = match structured {
-        Some(value) => value,
-        None => {
-            let failure = last_failure.unwrap_or(ProviderFailure {
-                kind: crate::ai::provider::ProviderFailureKind::Malformed,
-                status: None,
-                message: "provider recognition failed".to_string(),
-            });
+        FormalProviderCallResult::Failed {
+            failure,
+            error_code,
+            ..
+        } => {
             let message = redact_provider_error(&failure.message, &policy);
             finish_recognition_failure(
                 &job_id,
                 request_generation,
                 &snapshot_hash,
-                Some("PROVIDER_HTTP".to_string()),
-                message,
-            );
-            return;
-        }
-    };
-
-    let output = match recognition_from_provider_outcome(Some(&structured), None) {
-        Ok(output) => output,
-        Err(error) => {
-            let message = redact_provider_error(&error, &policy);
-            finish_recognition_failure(
-                &job_id,
-                request_generation,
-                &snapshot_hash,
-                Some("RECOGNITION_INVALID".to_string()),
+                Some(error_code.to_string()),
                 message,
             );
             return;
@@ -3089,7 +3123,7 @@ async fn run_recognition_worker(
 
 /// Provider-backed one-shot release recognition (backward-compatible).
 ///
-/// Capability-gated (Ready identity), JobKind::Recognition lifecycle, strict structured
+/// Capability-gated (Ready identity + output tier), JobKind::Recognition lifecycle, structured
 /// schema validation. Provider failures and missing structured JSON never become a
 /// successful empty result. Valid all-null candidates are a successful empty result.
 /// Prefer `ai_start_recognition` + `ai_poll_recognition` for cancellable UI flows.
@@ -3686,11 +3720,20 @@ fn require_ready_capability_identity(
         return Err(capability_gate_error());
     };
     if capability.state != CapabilityState::Ready
+        || capability.output_capability.is_none()
         || !capability_identity_matches(&capability.identity_digest, connection, secret)
     {
         return Err(capability_gate_error());
     }
     Ok(identity)
+}
+
+fn ready_output_capability(connection: &PublicConnectionConfig) -> Option<OutputCapability> {
+    connection
+        .capability
+        .as_ref()
+        .filter(|capability| capability.state == CapabilityState::Ready)
+        .and_then(|capability| capability.output_capability)
 }
 
 /// Map a context projection failure to a public finding code (no truncation, no HTTP).
@@ -3829,6 +3872,8 @@ async fn run_provider_formal_audit(
         }
     };
     let schema = formal_audit_schema();
+    let output_capability = ready_output_capability(&connection)
+        .expect("formal capability gate must provide an output tier");
 
     let client = match build_no_redirect_client() {
         Ok(client) => client,
@@ -3859,143 +3904,84 @@ async fn run_provider_formal_audit(
         }
     };
 
-    let attempt_modes = formal_modes_for_connection(&connection);
-    let mut last_failure: Option<ProviderFailure> = None;
-    let mut formal_ran = false;
-    let mut structured: Option<Value> = None;
-
-    for attempted_mode in attempt_modes {
-        let system_prompt = formal_audit_system_prompt();
-        let provider_request = match build_structured_request_with_system(
-            connection.provider,
-            attempted_mode,
-            &connection.endpoint,
-            &connection.model,
-            &schema,
-            connection.auth_mode,
-            "okpgui_audit",
-            &system_prompt,
-            &prompt,
-            FORMAL_PROVIDER_MAX_TOKENS,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Unsupported,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        let send_result = send_managed_provider_request(
-            &client,
-            &provider_request,
-            connection.auth_mode,
-            connection.custom_header_name.as_deref(),
-            secret.as_ref().map(SecretValue::expose),
-            connection.provider,
-        )
-        .await;
-        formal_ran = true;
-
-        let (status, body) = match send_result {
-            Ok(pair) => pair,
-            Err(error) => {
-                last_failure = Some(ProviderFailure {
-                    kind: crate::ai::provider::ProviderFailureKind::Server,
-                    status: None,
-                    message: error,
-                });
-                break;
-            }
-        };
-
-        if !(200..300).contains(&status) {
-            let failure = classify_http_failure(status, &body);
-            if auto_fallback_allowed(
-                connection.provider,
-                connection.mode,
-                attempted_mode,
-                &failure,
-            ) {
-                last_failure = Some(failure);
-                continue;
-            }
-            last_failure = Some(failure);
-            break;
-        }
-
-        match extract_structured_json(connection.provider, attempted_mode, &body) {
-            Ok(value) => {
-                structured = Some(value);
-                last_failure = None;
-                break;
-            }
-            Err(failure) => {
-                last_failure = Some(failure);
-                break;
-            }
-        }
-    }
-
-    if let Some(structured) = structured {
-        // Keep parse_formal_audit_findings pure for unit callers; bind evidence to projection here.
-        let findings = parse_formal_audit_findings(&structured);
-        let findings = validate_findings_against_projection(findings, &projection);
-        let result = local_audit_result(
-            plan_token,
-            snapshot_hash,
-            request_generation,
-            local_blockers,
-            findings,
-            true,
-            Some(job_id.clone()),
-            &policy,
-        );
-        let summary = format!(
-            "formal audit decision={} findings={}",
-            match result.decision {
-                AuditDecision::Go => "GO",
-                AuditDecision::Warning => "WARNING",
-                AuditDecision::NoGo => "NO_GO",
-                AuditDecision::Pending => "PENDING",
-                AuditDecision::LocalBlocked => "LOCAL_BLOCKED",
-            },
-            result.findings.len()
-        );
-        return complete_and_bind_formal_audit(&job_id, true, None, summary, result);
-    }
-
-    let failure = last_failure.unwrap_or(ProviderFailure {
-        kind: crate::ai::provider::ProviderFailureKind::Malformed,
-        status: None,
-        message: "provider formal audit failed".to_string(),
-    });
-    let message = redact_provider_error(&failure.message, &policy);
-    let result = local_audit_result(
-        plan_token,
-        snapshot_hash,
-        request_generation,
-        local_blockers,
-        vec![Finding {
-            code: "PROVIDER_WARNING".to_string(),
-            severity: FindingSeverity::Warning,
-            message: message.clone(),
-            evidence_path: None,
-        }],
-        formal_ran,
-        Some(job_id.clone()),
-        &policy,
-    );
-    complete_and_bind_formal_audit(
-        &job_id,
-        false,
-        Some("PROVIDER_HTTP".to_string()),
-        message,
-        result,
+    let system_prompt = formal_audit_system_prompt();
+    let outcome = run_formal_provider_call(
+        &client,
+        &connection,
+        secret.as_ref(),
+        &schema,
+        "okpgui_audit",
+        &system_prompt,
+        &prompt,
+        output_capability,
+        || false,
+        |structured| {
+            try_parse_formal_audit_findings(structured).map_err(|message| FormalValidationError {
+                message,
+                code: "PROVIDER_SCHEMA",
+                retryable: true,
+            })
+        },
     )
+    .await;
+
+    match outcome {
+        FormalProviderCallResult::Success(findings) => {
+            let findings = validate_findings_against_projection(findings, &projection);
+            let result = local_audit_result(
+                plan_token,
+                snapshot_hash,
+                request_generation,
+                local_blockers,
+                findings,
+                true,
+                Some(job_id.clone()),
+                &policy,
+            );
+            let summary = format!(
+                "formal audit decision={} findings={}",
+                match result.decision {
+                    AuditDecision::Go => "GO",
+                    AuditDecision::Warning => "WARNING",
+                    AuditDecision::NoGo => "NO_GO",
+                    AuditDecision::Pending => "PENDING",
+                    AuditDecision::LocalBlocked => "LOCAL_BLOCKED",
+                },
+                result.findings.len()
+            );
+            complete_and_bind_formal_audit(&job_id, true, None, summary, result)
+        }
+        FormalProviderCallResult::Failed {
+            failure,
+            formal_ran,
+            error_code,
+        } => {
+            let message = redact_provider_error(&failure.message, &policy);
+            let result = local_audit_result(
+                plan_token,
+                snapshot_hash,
+                request_generation,
+                local_blockers,
+                vec![Finding {
+                    code: "PROVIDER_WARNING".to_string(),
+                    severity: FindingSeverity::Warning,
+                    message: message.clone(),
+                    evidence_path: None,
+                }],
+                formal_ran,
+                Some(job_id.clone()),
+                &policy,
+            );
+            complete_and_bind_formal_audit(
+                &job_id,
+                false,
+                Some(error_code.to_string()),
+                message,
+                result,
+            )
+        }
+        FormalProviderCallResult::Cancelled => unreachable!("formal audit has no cancel hook"),
+    }
 }
 
 /// Start formal audit for a prepared plan.
@@ -5293,7 +5279,7 @@ pub async fn ai_list_models(
     }
 }
 
-/// Live backend-owned strict capability probe using stored credentials (never webview secrets).
+/// Live backend-owned structured-output capability probe using stored credentials.
 /// Persists non-secret capability state/identity metadata on completion.
 #[tauri::command]
 pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityStatus, String> {
@@ -5339,6 +5325,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
             state: capability_state_to_config(CapabilityState::Probing),
             identity_digest: identity.digest.clone(),
             resolved_mode: provider_mode_to_config(connection.mode),
+            output_capability: String::new(),
             message: "capability probe in progress".to_string(),
             probed_at_unix: Some(now_unix()),
         }),
@@ -5353,6 +5340,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
                 &identity,
                 CapabilityState::Failed,
                 connection.mode,
+                None,
                 message.clone(),
             );
             let _ =
@@ -5364,93 +5352,99 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
     let attempt_modes = formal_attempt_modes(connection.provider, connection.mode);
     let mut last_result: Option<CapabilityProbeResult> = None;
 
-    for attempted_mode in attempt_modes {
-        let provider_request = match build_probe_request(
-            connection.provider,
-            attempted_mode,
-            &connection.endpoint,
-            &connection.model,
-            &schema,
-            connection.auth_mode,
-        ) {
-            Ok(value) => value,
-            Err(error) => {
-                last_result = Some(CapabilityProbeResult {
+    'modes: for attempted_mode in attempt_modes {
+        for output_capability in probe_output_capabilities(connection.provider)
+            .iter()
+            .copied()
+        {
+            let provider_request = match build_probe_request_for_capability(
+                connection.provider,
+                attempted_mode,
+                &connection.endpoint,
+                &connection.model,
+                &schema,
+                connection.auth_mode,
+                output_capability,
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    last_result = Some(CapabilityProbeResult {
+                        state: CapabilityState::Failed,
+                        provider: connection.provider,
+                        mode: attempted_mode,
+                        status: 0,
+                        message: redact_provider_error(&error, &policy),
+                        usage: None,
+                        output_capability: None,
+                    });
+                    break 'modes;
+                }
+            };
+
+            let send_result = send_managed_provider_request(
+                &client,
+                &provider_request,
+                connection.auth_mode,
+                connection.custom_header_name.as_deref(),
+                secret.as_ref().map(SecretValue::expose),
+                connection.provider,
+            )
+            .await;
+
+            let probe = match send_result {
+                Ok((status, body)) => {
+                    let mut classified = classify_and_validate_probe_response_for_capability(
+                        connection.provider,
+                        attempted_mode,
+                        status,
+                        &body,
+                        output_capability,
+                    );
+                    classified.message = redact_provider_error(&classified.message, &policy);
+                    classified
+                }
+                Err(error) => CapabilityProbeResult {
                     state: CapabilityState::Failed,
                     provider: connection.provider,
                     mode: attempted_mode,
                     status: 0,
                     message: redact_provider_error(&error, &policy),
                     usage: None,
-                });
-                break;
+                    output_capability: None,
+                },
+            };
+
+            if probe.state == CapabilityState::Ready {
+                last_result = Some(probe);
+                break 'modes;
             }
-        };
 
-        let send_result = send_managed_provider_request(
-            &client,
-            &provider_request,
-            connection.auth_mode,
-            connection.custom_header_name.as_deref(),
-            secret.as_ref().map(SecretValue::expose),
-            connection.provider,
-        )
-        .await;
-
-        let probe = match send_result {
-            Ok((status, body)) => {
-                let mut classified = classify_and_validate_probe_response(
-                    connection.provider,
-                    attempted_mode,
-                    status,
-                    &body,
-                );
-                // Classification messages may echo provider bodies — redact before terminal use.
-                classified.message = redact_provider_error(&classified.message, &policy);
-                classified
-            }
-            Err(error) => CapabilityProbeResult {
-                state: CapabilityState::Failed,
-                provider: connection.provider,
-                mode: attempted_mode,
-                status: 0,
-                message: redact_provider_error(&error, &policy),
-                usage: None,
-            },
-        };
-
-        if probe.state == CapabilityState::Ready {
+            let failure = ProviderFailure {
+                kind: match probe.state {
+                    CapabilityState::Unsupported => {
+                        crate::ai::provider::ProviderFailureKind::Unsupported
+                    }
+                    _ => crate::ai::provider::ProviderFailureKind::Server,
+                },
+                status: (probe.status != 0).then_some(probe.status),
+                message: probe.message.clone(),
+            };
+            let endpoint_fallback = auto_fallback_allowed(
+                connection.provider,
+                connection.mode,
+                attempted_mode,
+                &failure,
+            );
+            let failed = probe.state != CapabilityState::Unsupported;
             last_result = Some(probe);
-            break;
+            if endpoint_fallback {
+                continue 'modes;
+            }
+            if failed {
+                break 'modes;
+            }
         }
 
-        let failure = ProviderFailure {
-            kind: match probe.state {
-                CapabilityState::Unsupported => {
-                    crate::ai::provider::ProviderFailureKind::Unsupported
-                }
-                _ => crate::ai::provider::ProviderFailureKind::Server,
-            },
-            status: if probe.status == 0 {
-                None
-            } else {
-                Some(probe.status)
-            },
-            message: probe.message.clone(),
-        };
-
-        // Narrow Auto fallback: only OpenAI Auto Responses→Chat on explicit 404 unsupported.
-        if auto_fallback_allowed(
-            connection.provider,
-            connection.mode,
-            attempted_mode,
-            &failure,
-        ) {
-            last_result = Some(probe);
-            continue;
-        }
-
-        last_result = Some(probe);
         break;
     }
 
@@ -5461,6 +5455,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
         status: 0,
         message: "capability probe did not complete".to_string(),
         usage: None,
+        output_capability: None,
     });
 
     // Final secret-aware pass before config + job terminal summary retention.
@@ -5471,6 +5466,7 @@ pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityS
         &identity,
         result.state,
         result.mode,
+        result.output_capability,
         terminal_message.clone(),
     );
 
@@ -5497,6 +5493,7 @@ fn persist_probe_outcome(
     identity: &CapabilityIdentity,
     state: CapabilityState,
     resolved_mode: ProviderMode,
+    output_capability: Option<OutputCapability>,
     message: String,
 ) -> PublicCapabilityStatus {
     let probed_at_unix = Some(now_unix());
@@ -5509,6 +5506,9 @@ fn persist_probe_outcome(
             identity.digest.clone()
         },
         resolved_mode: provider_mode_to_config(resolved_mode),
+        output_capability: output_capability
+            .map(output_capability_to_config)
+            .unwrap_or_default(),
         message: message.clone(),
         probed_at_unix,
     };
@@ -5517,6 +5517,7 @@ fn persist_probe_outcome(
         state,
         identity_digest: identity.digest.clone(),
         resolved_mode: Some(resolved_mode),
+        output_capability,
         message,
         probed_at_unix,
         identity_matches: state == CapabilityState::Ready,
@@ -5531,6 +5532,7 @@ pub fn ai_get_capability_status(app: AppHandle) -> PublicCapabilityStatus {
         state: CapabilityState::Unknown,
         identity_digest: String::new(),
         resolved_mode: None,
+        output_capability: None,
         message: "no capability probe has been run".to_string(),
         probed_at_unix: None,
         identity_matches: false,
@@ -6329,6 +6331,17 @@ mod capability_gate_tests {
     }
 
     #[test]
+    fn formal_validation_retry_is_exactly_one_additional_attempt() {
+        assert_eq!(FORMAL_PROVIDER_MAX_TOKENS, 4096);
+        assert_eq!(FORMAL_PROVIDER_ATTEMPTS, 2);
+        assert!(formal_retry_remaining(0));
+        assert!(!formal_retry_remaining(1));
+        let prompt = validation_retry_prompt("可信原始输入");
+        assert!(prompt.contains("可信原始输入"));
+        assert!(prompt.contains("上一次返回未通过"));
+    }
+
+    #[test]
     fn formal_gate_rejects_missing_or_mismatched_capability() {
         let secret = SecretValue::new("sk-test");
         let mut connection = configured_connection();
@@ -6340,6 +6353,7 @@ mod capability_gate_tests {
             state: CapabilityState::Failed,
             identity_digest: identity.digest.clone(),
             resolved_mode: Some(ProviderMode::Chat),
+            output_capability: None,
             message: "failed".into(),
             probed_at_unix: Some(1),
             identity_matches: false,
@@ -6350,6 +6364,7 @@ mod capability_gate_tests {
             state: CapabilityState::Ready,
             identity_digest: "sha256:other".into(),
             resolved_mode: Some(ProviderMode::Chat),
+            output_capability: Some(OutputCapability::StrictSchema),
             message: "ready".into(),
             probed_at_unix: Some(1),
             identity_matches: false,
@@ -6360,6 +6375,7 @@ mod capability_gate_tests {
             state: CapabilityState::Ready,
             identity_digest: identity.digest,
             resolved_mode: Some(ProviderMode::Chat),
+            output_capability: Some(OutputCapability::StrictSchema),
             message: "ready".into(),
             probed_at_unix: Some(1),
             identity_matches: true,
@@ -6376,6 +6392,7 @@ mod capability_gate_tests {
             state: CapabilityState::Ready,
             identity_digest: identity.digest,
             resolved_mode: Some(ProviderMode::Responses),
+            output_capability: Some(OutputCapability::StrictSchema),
             message: "ready".into(),
             probed_at_unix: Some(1),
             identity_matches: true,
@@ -6383,6 +6400,25 @@ mod capability_gate_tests {
         let new_secret = SecretValue::new("new-secret");
         let err = require_ready_capability_identity(&connection, Some(&new_secret)).unwrap_err();
         assert!(err.contains("capability probe"), "{err}");
+    }
+
+    #[test]
+    fn formal_gate_rejects_legacy_ready_record_without_output_tier() {
+        let secret = SecretValue::new("sk-test");
+        let mut connection = configured_connection();
+        let identity = capability_identity(&connection, Some(&secret));
+        connection.capability = Some(PublicCapabilityStatus {
+            state: CapabilityState::Ready,
+            identity_digest: identity.digest,
+            resolved_mode: Some(ProviderMode::Chat),
+            output_capability: None,
+            message: "legacy ready".into(),
+            probed_at_unix: Some(1),
+            identity_matches: true,
+        });
+        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_err());
+        apply_public_identity_matches(&mut connection, Some(&secret));
+        assert!(!connection.capability.unwrap().identity_matches);
     }
 
     #[test]
@@ -6398,11 +6434,13 @@ mod capability_gate_tests {
             state: "ready".into(),
             identity_digest: "sha256:abc".into(),
             resolved_mode: "chat".into(),
+            output_capability: "json_object".into(),
             message: "ok".into(),
             probed_at_unix: Some(42),
         });
         assert_eq!(status.state, CapabilityState::Ready);
         assert_eq!(status.resolved_mode, Some(ProviderMode::Chat));
+        assert_eq!(status.output_capability, Some(OutputCapability::JsonObject));
         assert_eq!(status.identity_digest, "sha256:abc");
         assert!(!status.identity_matches);
     }
@@ -6417,6 +6455,7 @@ mod capability_gate_tests {
             state: CapabilityState::Ready,
             identity_digest: identity.digest,
             resolved_mode: Some(ProviderMode::Chat),
+            output_capability: Some(OutputCapability::JsonObject),
             message: "ready via chat".into(),
             probed_at_unix: Some(1),
             identity_matches: true,
@@ -6450,6 +6489,7 @@ mod capability_gate_tests {
             state: CapabilityState::Ready,
             identity_digest: "sha256:stale".into(),
             resolved_mode: Some(ProviderMode::Chat),
+            output_capability: Some(OutputCapability::StrictSchema),
             message: "stale".into(),
             probed_at_unix: Some(1),
             identity_matches: true,
@@ -6505,6 +6545,7 @@ mod recognition_command_tests {
             state: CapabilityState::Ready,
             identity_digest: identity.digest,
             resolved_mode: Some(ProviderMode::Responses),
+            output_capability: Some(OutputCapability::JsonObject),
             message: "ready".into(),
             probed_at_unix: Some(1),
             identity_matches: true,

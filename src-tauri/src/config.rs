@@ -371,6 +371,9 @@ pub struct AiCapabilityConfig {
     /// Resolved provider mode that passed the probe (e.g. `chat` after Auto fallback).
     #[serde(default)]
     pub resolved_mode: String,
+    /// `strict_schema` | `json_object`; missing Ready records must be reprobed.
+    #[serde(default)]
+    pub output_capability: String,
     /// Sanitized user-facing message; never a provider body or secret.
     #[serde(default)]
     pub message: String,
@@ -2192,6 +2195,7 @@ mod tests {
                 state: "ready".into(),
                 identity_digest: "sha256:abc".into(),
                 resolved_mode: "chat".into(),
+                output_capability: "strict_schema".into(),
                 message: "ok".into(),
                 probed_at_unix: Some(1),
             }),
