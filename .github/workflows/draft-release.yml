@@ -29,19 +29,19 @@ jobs:
             os: windows-latest
             slug: windows-x64
             mediainfo_target: x86_64-pc-windows-msvc
-            bundle_target: nsis
-            asset_path: src-tauri/target/release/bundle/nsis/*.exe
+            build_args: --no-bundle
+            asset_path: src-tauri/target/release/okpgui-next.exe
           - name: macOS arm64
             os: macos-latest
             slug: macos-arm64
             mediainfo_target: aarch64-apple-darwin
-            bundle_target: dmg
+            build_args: --bundles dmg
             asset_path: src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux
             os: ubuntu-22.04
             slug: linux-x64
             mediainfo_target: x86_64-unknown-linux-gnu
-            bundle_target: appimage
+            build_args: --bundles appimage
             asset_path: src-tauri/target/release/bundle/appimage/*.AppImage
 
     steps:
@@ -130,8 +130,8 @@ jobs:
       - name: Run backend tests
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
-      - name: Build native application package
-        run: pnpm tauri build --bundles ${{ matrix.platform.bundle_target }}
+      - name: Build native application output
+        run: pnpm tauri build ${{ matrix.platform.build_args }}
 
       # --- Evidence class: host-binary-smoke (Windows/Linux) ---
       # DESKTOP_E2E_ALLOW_BLOCKED is not used when binary exists (REQUIRE_PASS instead).
@@ -241,7 +241,7 @@ jobs:
           path: |
             tests/desktop-e2e/out/evidence-*.json
 
-      - name: Upload native release asset
+      - name: Upload native application output
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.slug }}-release-asset

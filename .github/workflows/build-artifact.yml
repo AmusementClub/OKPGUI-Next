@@ -19,21 +19,21 @@ jobs:
         platform:
           - name: Windows
             os: windows-latest
-            artifact_name: okpgui-next-windows-nsis
+            artifact_name: okpgui-next-windows-exe
             mediainfo_target: x86_64-pc-windows-msvc
-            bundle_target: nsis
-            artifact_path: src-tauri/target/release/bundle/nsis/*.exe
+            build_args: --no-bundle
+            artifact_path: src-tauri/target/release/okpgui-next.exe
           - name: macOS arm64
             os: macos-latest
             artifact_name: okpgui-next-macos-arm64-dmg
             mediainfo_target: aarch64-apple-darwin
-            bundle_target: dmg
+            build_args: --bundles dmg
             artifact_path: src-tauri/target/release/bundle/dmg/*.dmg
           - name: Linux
             os: ubuntu-22.04
             artifact_name: okpgui-next-linux-appimage
             mediainfo_target: x86_64-unknown-linux-gnu
-            bundle_target: appimage
+            build_args: --bundles appimage
             artifact_path: src-tauri/target/release/bundle/appimage/*.AppImage
 
     steps:
@@ -125,7 +125,7 @@ jobs:
         run: cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build Tauri application
-        run: pnpm tauri build --bundles ${{ matrix.platform.bundle_target }}
+        run: pnpm tauri build ${{ matrix.platform.build_args }}
 
       # --- Evidence class: host-binary-smoke (Windows/Linux only) ---
       # Production Rust in built binary. productionBinaryMarker=true; productionIpcMarker must stay false.
@@ -243,7 +243,7 @@ jobs:
           path: |
             tests/desktop-e2e/out/evidence-*.json
 
-      - name: Upload native application package
+      - name: Upload native application output
         uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.platform.artifact_name }}

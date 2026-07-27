@@ -262,18 +262,18 @@ function checkWorkflows() {
     requireIncludes(
       workflow,
       [
-        'bundle_target: nsis',
-        'bundle_target: dmg',
-        'bundle_target: appimage',
-        'bundle/nsis/*.exe',
+        'build_args: --no-bundle',
+        'build_args: --bundles dmg',
+        'build_args: --bundles appimage',
+        'target/release/okpgui-next.exe',
         'bundle/dmg/*.dmg',
         'bundle/appimage/*.AppImage',
-        'pnpm tauri build --bundles ${{ matrix.platform.bundle_target }}',
+        'pnpm tauri build ${{ matrix.platform.build_args }}',
         'compression-level: 0',
         'hdiutil attach -nobrowse -readonly',
         'DESKTOP_E2E_PACKAGE="${dmgs[0]}"',
       ],
-      'single native package workflow',
+      'native output workflow',
     );
     requireAbsent(
       workflow,
@@ -282,7 +282,8 @@ function checkWorkflows() {
         'tar -C',
         'verify-release-archive.mjs',
         'target/release/bundle/**',
-        'target/release/okpgui-next*',
+        'bundle_target: nsis',
+        'bundle/nsis/',
       ],
       'duplicate or custom archive packaging',
     );
