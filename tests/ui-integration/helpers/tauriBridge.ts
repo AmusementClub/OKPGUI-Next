@@ -26,6 +26,7 @@ export interface MockAiSettings {
     message: string;
     identity_matches: boolean;
     resolved_mode?: string | null;
+    output_capability?: 'strict_schema' | 'json_object' | null;
   } | null;
   discovered_models: string[];
   models_fetched_at_unix: number | null;
@@ -74,6 +75,7 @@ export function defaultReadySettings(): MockAiSettings {
       message: 'strict structured output is available',
       identity_matches: true,
       resolved_mode: 'chat',
+      output_capability: 'strict_schema',
     },
     discovered_models: ['mock-gpt-contract', 'mock-gpt-mini'],
     models_fetched_at_unix: 1,
@@ -180,6 +182,7 @@ export function tauriMockInitScript(initial: BridgeState): string {
             message: 'strict structured output is available',
             identity_matches: true,
             resolved_mode: state.settings.mode === 'auto' ? 'chat' : state.settings.mode,
+            output_capability: 'strict_schema',
           };
           return state.settings.capability;
         case 'ai_get_capability_status':

@@ -41,6 +41,7 @@ test.describe('UI integration · settings/capability', () => {
     expect(commands).toContain('ai_get_settings');
     expect(commands).toContain('ai_run_capability_probe');
     expect(commands).not.toContain('publish_prepared_plan');
+    expect(bridge.settings.capability?.output_capability).toBe('strict_schema');
     // Secret fields must never appear in the mock settings snapshot.
     expect(JSON.stringify(bridge.settings)).not.toContain('sk-');
   });
