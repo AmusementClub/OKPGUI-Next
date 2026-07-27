@@ -4,7 +4,7 @@
 
 | `harnessType` | What it proves | `productionIpcMarker` | Pass signal |
 | --- | --- | --- | --- |
-| `host-binary-smoke` | Production Rust modules inside the **built binary** (prepare/cancel/vision/keyring policy; MediaInfo spawn when present) | **must be `false`** | `result: "pass"` + `productionBinaryMarker: true` |
+| `host-binary-smoke` | Production Rust modules inside the **built binary** (prepare/cancel/keyring policy; MediaInfo spawn when present) | **must be `false`** | `result: "pass"` + `productionBinaryMarker: true` |
 | `macos-packaged-smoke` | Prefer packaged **`.app`** layout + same binary probes; hard MediaInfo spawn inside `.app` | **must be `false`** until WebView IPC exists | `result: "pass"` + `productionBinaryMarker: true` |
 | `desktop-webdriver` | Real Tauri WebDriver / WebView IPC on Windows/Linux | **must be `true`** | `result: "pass"` + `productionIpcMarker: true` |
 
@@ -48,7 +48,7 @@ https://v2.tauri.app/develop/tests/webdriver/
 | --- | --- | --- |
 | **Windows** (`x86_64-pc-windows-msvc`) | `host-binary-smoke` (+ blocked `desktop-webdriver` side file) | Built binary host smoke; WDIO blocked until executable specs |
 | **Linux** (`x86_64-unknown-linux-gnu`) | same | same |
-| **macOS** (`x86_64-apple-darwin`, `aarch64-apple-darwin`) | `macos-packaged-smoke` | Prefer `bundle/macos/*.app` over raw `target/release` binary |
+| **macOS** (`aarch64-apple-darwin`) | `macos-packaged-smoke` | Apple Silicon only; prefer `bundle/macos/*.app` over raw `target/release` binary |
 
 ### Windows / Linux critical flows
 
@@ -59,7 +59,6 @@ Named flows (catalog: `suite/critical-flows.mjs`, specs: `specs/`):
 | `home-prepare-observe-ack-publish` | Home prepare → observe IPC state → ack when needed → publish frozen token (requires desktop-webdriver) |
 | `quick-publish-prepare-observe-ack-publish` | Quick Publish same path (requires desktop-webdriver) |
 | `cancellation-and-failed-poll-recovery` | Cancel + failed-poll recovery (backend proven in host smoke) |
-| `vision-disclosure-consent` | Vision disclosure consent for any non-empty candidates |
 
 Host/packaged binary smoke **skips** dual-entry UI names and proves a single shared backend contract instead (`shared-backend-prepare-observe-ack-publish`). That is intentional honesty — not dual-pass mapping.
 

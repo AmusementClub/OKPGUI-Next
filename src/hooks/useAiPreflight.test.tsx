@@ -15,8 +15,8 @@ const {
     cancelPreflightSessionMock,
     cancelAiJobMock,
     invalidatePublishPlanMock,
-    listPlanVisionCandidatesMock,
-    bindPlanVisionMock,
+    startPlanMediaInfoMock,
+    pollPlanMediaInfoMock,
     setPlanAcknowledgementsMock,
     subscribePreflightSessionChangedMock,
 } = vi.hoisted(() => ({
@@ -27,8 +27,8 @@ const {
     cancelPreflightSessionMock: vi.fn(),
     cancelAiJobMock: vi.fn(),
     invalidatePublishPlanMock: vi.fn(),
-    listPlanVisionCandidatesMock: vi.fn(),
-    bindPlanVisionMock: vi.fn(),
+    startPlanMediaInfoMock: vi.fn(),
+    pollPlanMediaInfoMock: vi.fn(),
     setPlanAcknowledgementsMock: vi.fn(),
     subscribePreflightSessionChangedMock: vi.fn(),
 }));
@@ -44,8 +44,8 @@ vi.mock('../services/ai', async () => {
         cancelPreflightSession: cancelPreflightSessionMock,
         cancelAiJob: cancelAiJobMock,
         invalidatePublishPlan: invalidatePublishPlanMock,
-        listPlanVisionCandidates: listPlanVisionCandidatesMock,
-        bindPlanVision: bindPlanVisionMock,
+        startPlanMediaInfo: startPlanMediaInfoMock,
+        pollPlanMediaInfo: pollPlanMediaInfoMock,
         setPlanAcknowledgements: setPlanAcknowledgementsMock,
         subscribePreflightSessionChanged: subscribePreflightSessionChangedMock,
     };
@@ -194,22 +194,17 @@ describe('useAiPreflight', () => {
             progress: 100,
         });
         invalidatePublishPlanMock.mockResolvedValue(undefined);
-        listPlanVisionCandidatesMock.mockResolvedValue({
+        startPlanMediaInfoMock.mockResolvedValue({
+            job_id: 'job-media-1',
             plan_token: 'plan-token-1',
-            snapshot_hash: 'sha256:snap',
+            state: 'succeeded',
             request_generation: 1,
-            candidates: [],
-            requires_selection: false,
-            max_images: 5,
+            snapshot_hash: 'sha256:media',
+            progress: 100,
+            error_code: null,
+            results: [],
         });
-        bindPlanVisionMock.mockResolvedValue({
-            plan_token: 'plan-token-1',
-            snapshot_hash: 'sha256:snap',
-            request_generation: 1,
-            batch_hash: 'sha256:batch',
-            images: [],
-            warnings: [],
-        });
+        pollPlanMediaInfoMock.mockResolvedValue(null);
         setPlanAcknowledgementsMock.mockResolvedValue(undefined);
         subscribePreflightSessionChangedMock.mockResolvedValue(() => undefined);
     });
@@ -476,67 +471,13 @@ describe('useAiPreflight', () => {
         hook.unmount();
     });
 
-    function visionCandidates(count: number, requiresSelection = count > 5) {
-        return {
-            plan_token: 'plan-token-1',
-            snapshot_hash: 'sha256:snap',
-            request_generation: 1,
-            candidates: Array.from({ length: count }, (_, index) => ({
-                url: `https://cdn.example.test/img-${index}.jpg`,
-                source: index % 2 === 0 ? 'poster' : 'markdown',
-            })),
-            requires_selection: requiresSelection,
-            max_images: 5,
-        };
-    }
-
-    it('under-cap candidates require consent and never auto-bind', async () => {
-        listPlanVisionCandidatesMock.mockResolvedValueOnce(visionCandidates(3, false));
-        const hook = renderHook();
-        await act(async () => {
-            await Promise.resolve();
-        });
-
-        await act(async () => {
-            await hook.result.prepare(sampleRequest);
-        });
-
-        expect(hook.result.state.lifecycle).toBe('awaiting_vision');
-        expect(hook.result.state.vision.status).toBe('needs_selection');
-        expect(hook.result.state.vision.candidates).toHaveLength(3);
-        expect(hook.result.state.vision.selectedUrls).toEqual([]);
-        expect(bindPlanVisionMock).not.toHaveBeenCalled();
-        expect(startFormalAuditMock).not.toHaveBeenCalled();
-        expect(hook.result.canConfirm).toBe(false);
-        hook.unmount();
-    });
-
-    it('select all then confirm binds only the selected URLs', async () => {
-        listPlanVisionCandidatesMock.mockResolvedValueOnce(visionCandidates(3, false));
-        bindPlanVisionMock.mockResolvedValueOnce({
-            plan_token: 'plan-token-1',
-            snapshot_hash: 'sha256:post-vision',
-            request_generation: 1,
-            batch_hash: 'sha256:batch',
-            images: [
-                {
-                    source: 'poster',
-                    content_hash: 'sha256:a',
-                    mime_type: 'image/jpeg',
-                    normalized_bytes: 10,
-                    width: 1,
-                    height: 1,
-                },
-            ],
-            warnings: [],
-        });
+    it('runs all-torrent MediaInfo before formal audit and uses the rolled snapshot', async () => {
         startFormalAuditMock.mockResolvedValueOnce(pendingAudit({
             decision: 'GO',
             formal_ran: true,
             job_id: null,
-            snapshot_hash: 'sha256:post-vision',
+            snapshot_hash: 'sha256:media',
         }));
-
         const hook = renderHook();
         await act(async () => {
             await Promise.resolve();
@@ -544,95 +485,13 @@ describe('useAiPreflight', () => {
         await act(async () => {
             await hook.result.prepare(sampleRequest);
         });
-        expect(bindPlanVisionMock).not.toHaveBeenCalled();
 
-        await act(async () => {
-            hook.result.selectAllVisionCandidates();
-        });
-        expect(hook.result.state.vision.selectedUrls).toHaveLength(3);
-
-        await act(async () => {
-            await hook.result.confirmVisionSelection();
-        });
-
-        expect(bindPlanVisionMock).toHaveBeenCalledTimes(1);
-        expect(bindPlanVisionMock).toHaveBeenCalledWith({
-            plan_token: 'plan-token-1',
-            selected_urls: [
-                'https://cdn.example.test/img-0.jpg',
-                'https://cdn.example.test/img-1.jpg',
-                'https://cdn.example.test/img-2.jpg',
-            ],
-        });
-        expect(startFormalAuditMock).toHaveBeenCalledTimes(1);
-        expect(hook.result.state.vision.status).toBe('bound');
-        expect(hook.result.state.lifecycle).toBe('terminal');
-        hook.unmount();
-    });
-
-    it('text-only continues formal audit without bind and records skipped vision', async () => {
-        listPlanVisionCandidatesMock.mockResolvedValueOnce(visionCandidates(2, false));
-        startFormalAuditMock.mockResolvedValueOnce(pendingAudit({
-            decision: 'GO',
-            formal_ran: true,
-            job_id: null,
-        }));
-
-        const hook = renderHook();
-        await act(async () => {
-            await Promise.resolve();
-        });
-        await act(async () => {
-            await hook.result.prepare(sampleRequest);
-        });
-        expect(hook.result.state.vision.status).toBe('needs_selection');
-
-        await act(async () => {
-            await hook.result.continueTextOnlyVision();
-        });
-
-        expect(bindPlanVisionMock).not.toHaveBeenCalled();
-        expect(startFormalAuditMock).toHaveBeenCalledTimes(1);
+        expect(startPlanMediaInfoMock).toHaveBeenCalledWith('plan-token-1');
+        expect(startPlanMediaInfoMock.mock.invocationCallOrder[0])
+            .toBeLessThan(startFormalAuditMock.mock.invocationCallOrder[0]);
         expect(startFormalAuditMock).toHaveBeenCalledWith({ plan_token: 'plan-token-1' });
-        expect(hook.result.state.vision.status).toBe('skipped');
-        expect(hook.result.state.vision.boundImages).toEqual([]);
-        expect(hook.result.state.vision.selectedUrls).toEqual([]);
-        expect(hook.result.state.vision.warnings.some((item) => item.includes('仅文本'))).toBe(true);
+        expect(hook.result.state.snapshot_hash).toBe('sha256:media');
         expect(hook.result.state.lifecycle).toBe('terminal');
-        hook.unmount();
-    });
-
-    it('over-cap candidates still require selection of at most max images', async () => {
-        listPlanVisionCandidatesMock.mockResolvedValueOnce(visionCandidates(6, true));
-        const hook = renderHook();
-        await act(async () => {
-            await Promise.resolve();
-        });
-        await act(async () => {
-            await hook.result.prepare(sampleRequest);
-        });
-
-        expect(hook.result.state.vision.status).toBe('needs_selection');
-        expect(hook.result.state.vision.candidates).toHaveLength(6);
-        expect(bindPlanVisionMock).not.toHaveBeenCalled();
-        expect(startFormalAuditMock).not.toHaveBeenCalled();
-
-        await act(async () => {
-            hook.result.selectAllVisionCandidates();
-        });
-        expect(hook.result.state.vision.selectedUrls).toHaveLength(5);
-        expect(hook.result.state.vision.selectedUrls).not.toContain(
-            'https://cdn.example.test/img-5.jpg',
-        );
-
-        // Sixth toggle must not exceed the cap.
-        await act(async () => {
-            hook.result.toggleVisionSelection('https://cdn.example.test/img-5.jpg');
-        });
-        expect(hook.result.state.vision.selectedUrls).toHaveLength(5);
-        expect(hook.result.state.vision.selectedUrls).not.toContain(
-            'https://cdn.example.test/img-5.jpg',
-        );
         hook.unmount();
     });
 });

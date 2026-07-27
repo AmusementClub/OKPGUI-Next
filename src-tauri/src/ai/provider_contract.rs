@@ -3,18 +3,17 @@
 //! These helpers and tests never call live or paid providers. They validate the
 //! strict Models / Responses / Chat / Anthropic Messages request shapes, refusal
 //! envelope rules, malformed/schema classification, usage extraction, timeout and
-//! redirect errors, and Vision request assembly against localhost mock fixtures
-//! or pure in-memory bodies. No credentials or binary image fixtures are stored.
+//! redirect errors, and text-only request assembly against localhost mock fixtures
+//! or pure in-memory bodies. No credentials are stored.
 //!
 //! Run focused: `cargo test --manifest-path src-tauri/Cargo.toml provider_contract`
 
 use super::credentials::AuthMode;
 use super::provider::{
     build_models_list_request, build_probe_request, build_structured_request_with_system,
-    build_structured_request_with_vision_and_system, classify_http_failure,
-    classify_probe_response, extract_structured_json, parse_models_list_response, CapabilityState,
-    ProviderFailureKind, ProviderKind, ProviderMode, ProviderRequest, ProviderUsage,
-    VisionRequestImage,
+    classify_http_failure, classify_probe_response, extract_structured_json,
+    parse_models_list_response, CapabilityState, ProviderFailureKind, ProviderKind, ProviderMode,
+    ProviderRequest, ProviderUsage,
 };
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -46,9 +45,6 @@ pub enum MockScenario {
     TimeoutHttp,
     AuthFailure,
     Redirect,
-    VisionResponses,
-    VisionChat,
-    VisionAnthropic,
 }
 
 /// Build the strict structured request body for a formal scenario without network I/O.
@@ -131,70 +127,6 @@ pub fn build_contract_request(
                 "contract-system-prompt",
                 "contract-audit-prompt",
                 256,
-            )?;
-            Ok((
-                ProviderKind::Anthropic,
-                ProviderMode::AnthropicMessages,
-                request,
-            ))
-        }
-        MockScenario::VisionResponses => {
-            let images = [VisionRequestImage {
-                mime_type: "image/jpeg".into(),
-                bytes: b"mock-jpeg".to_vec(),
-            }];
-            let request = build_structured_request_with_vision_and_system(
-                ProviderKind::OpenAi,
-                ProviderMode::Responses,
-                endpoint,
-                FIXTURE_MODEL_OPENAI,
-                &schema,
-                AuthMode::Bearer,
-                "okpgui_audit",
-                "contract-system-prompt",
-                "vision-audit-prompt",
-                256,
-                &images,
-            )?;
-            Ok((ProviderKind::OpenAi, ProviderMode::Responses, request))
-        }
-        MockScenario::VisionChat => {
-            let images = [VisionRequestImage {
-                mime_type: "image/png".into(),
-                bytes: b"mock-png".to_vec(),
-            }];
-            let request = build_structured_request_with_vision_and_system(
-                ProviderKind::OpenAi,
-                ProviderMode::Chat,
-                endpoint,
-                FIXTURE_MODEL_OPENAI,
-                &schema,
-                AuthMode::Bearer,
-                "okpgui_audit",
-                "contract-system-prompt",
-                "vision-audit-prompt",
-                256,
-                &images,
-            )?;
-            Ok((ProviderKind::OpenAi, ProviderMode::Chat, request))
-        }
-        MockScenario::VisionAnthropic => {
-            let images = [VisionRequestImage {
-                mime_type: "image/webp".into(),
-                bytes: b"mock-webp".to_vec(),
-            }];
-            let request = build_structured_request_with_vision_and_system(
-                ProviderKind::Anthropic,
-                ProviderMode::AnthropicMessages,
-                endpoint,
-                FIXTURE_MODEL_ANTHROPIC,
-                &schema,
-                AuthMode::AnthropicApiKey,
-                "okpgui_audit",
-                "contract-system-prompt",
-                "vision-audit-prompt",
-                256,
-                &images,
             )?;
             Ok((
                 ProviderKind::Anthropic,
@@ -323,11 +255,6 @@ pub fn fixture_body(scenario: MockScenario) -> &'static str {
         MockScenario::Redirect => {
             r#"Location: https://evil.example/steal?token=sk-canary-offline-secret-never-log"#
         }
-        MockScenario::VisionResponses => r#"{"output_parsed":{"findings":[]}}"#,
-        MockScenario::VisionChat => r#"{"choices":[{"message":{"content":"{\"findings\":[]}"}}]}"#,
-        MockScenario::VisionAnthropic => {
-            r#"{"stop_reason":"end_turn","content":[{"type":"text","text":"{\"findings\":[]}"}]}"#
-        }
     }
 }
 
@@ -438,8 +365,7 @@ pub fn classify_fixture(
         MockScenario::ResponsesStrictOk
         | MockScenario::ResponsesRefusal
         | MockScenario::UsageNormalized
-        | MockScenario::MalformedJson
-        | MockScenario::VisionResponses => {
+        | MockScenario::MalformedJson => {
             let mode = ProviderMode::Responses;
             let probe = classify_probe_response(
                 ProviderKind::OpenAi,
@@ -453,9 +379,7 @@ pub fn classify_fixture(
                     .map(|f| f.kind);
             (probe.state, failure, probe.usage)
         }
-        MockScenario::AnthropicMessagesStrictOk
-        | MockScenario::AnthropicRefusal
-        | MockScenario::VisionAnthropic => {
+        MockScenario::AnthropicMessagesStrictOk | MockScenario::AnthropicRefusal => {
             let mode = ProviderMode::AnthropicMessages;
             let probe = classify_probe_response(
                 ProviderKind::Anthropic,
@@ -469,16 +393,6 @@ pub fn classify_fixture(
                     .map(|f| f.kind);
             (probe.state, failure, probe.usage)
         }
-        MockScenario::VisionChat => {
-            let mode = ProviderMode::Chat;
-            let probe = classify_probe_response(
-                ProviderKind::OpenAi,
-                mode,
-                200,
-                r#"{"choices":[{"message":{"content":"{\"findings\":[]}"}}]}"#,
-            );
-            (probe.state, None, probe.usage)
-        }
     }
 }
 
@@ -487,8 +401,8 @@ mod tests {
     use super::*;
     use crate::ai::audit::parse_formal_audit_findings;
     use crate::ai::provider::{
-        build_no_redirect_client, classify_and_validate_probe_response, encode_base64,
-        formal_attempt_modes, minimal_probe_schema, send_managed_provider_request,
+        build_no_redirect_client, classify_and_validate_probe_response, formal_attempt_modes,
+        minimal_probe_schema, send_managed_provider_request,
     };
     use crate::ai::recognition::parse_recognition;
     use crate::ai::template_seed::{parse_template_selection, EligibleTemplateCatalogEntry};
@@ -510,9 +424,6 @@ mod tests {
             MockScenario::TimeoutHttp,
             MockScenario::AuthFailure,
             MockScenario::Redirect,
-            MockScenario::VisionResponses,
-            MockScenario::VisionChat,
-            MockScenario::VisionAnthropic,
         ];
         for scenario in scenarios {
             let (state, failure, usage) = classify_fixture(scenario);
@@ -522,10 +433,7 @@ mod tests {
                 | MockScenario::ResponsesStrictOk
                 | MockScenario::ChatStrictOk
                 | MockScenario::AnthropicMessagesStrictOk
-                | MockScenario::UsageNormalized
-                | MockScenario::VisionResponses
-                | MockScenario::VisionChat
-                | MockScenario::VisionAnthropic => {
+                | MockScenario::UsageNormalized => {
                     assert_eq!(
                         state,
                         CapabilityState::Ready,
@@ -606,6 +514,10 @@ mod tests {
         .unwrap();
         assert_eq!(responses.method, "POST");
         assert!(responses.url.ends_with("/responses"));
+        assert_eq!(
+            responses.body.pointer("/max_output_tokens"),
+            Some(&json!(4096))
+        );
         assert!(responses.body.pointer("/text/format/type").is_some());
         assert_eq!(
             responses
@@ -635,6 +547,10 @@ mod tests {
         .unwrap();
         assert!(chat.url.ends_with("/chat/completions"));
         assert_eq!(
+            chat.body.pointer("/max_completion_tokens"),
+            Some(&json!(4096))
+        );
+        assert_eq!(
             chat.body
                 .pointer("/response_format/type")
                 .and_then(Value::as_str),
@@ -657,6 +573,7 @@ mod tests {
         )
         .unwrap();
         assert!(anthropic.url.ends_with("/messages"));
+        assert_eq!(anthropic.body.pointer("/max_tokens"), Some(&json!(4096)));
         assert_eq!(
             anthropic
                 .body
@@ -682,11 +599,11 @@ mod tests {
     }
 
     #[test]
-    fn chinese_structured_outputs_cross_provider_envelopes_and_business_parsers() {
+    fn english_keys_and_chinese_descriptions_cross_provider_envelopes_and_business_parsers() {
         let recognition = json!({
-            "集数": {"值": "01", "置信度": 0.95, "依据": "种子名称包含 E01"},
-            "分辨率": null,
-            "建议标题": null
+            "episode": {"value": "01", "confidence": 0.95, "evidence": "种子名称包含 E01"},
+            "resolution": null,
+            "suggested_title": null
         });
         let recognition_text = serde_json::to_string(&recognition).unwrap();
         let envelopes = [
@@ -711,7 +628,7 @@ mod tests {
             let structured = extract_structured_json(provider, mode, &body)
                 .expect("provider envelope extracts structured object");
             let parsed = parse_recognition(&structured)
-                .expect("Chinese recognition object maps to internal DTO");
+                .expect("English recognition keys and Chinese evidence map to internal DTO");
             assert_eq!(parsed.episode.expect("episode").value, "01");
         }
 
@@ -724,6 +641,46 @@ mod tests {
         }];
         let selected = parse_template_selection(
             &json!({
+                "matched": true,
+                "template_id": "tpl-a",
+                "template_revision": 3,
+                "template_digest": "sha256:abc"
+            }),
+            &catalog,
+        )
+        .expect("English selection object maps to catalog entry");
+        assert_eq!(selected.id, "tpl-a");
+
+        let findings = parse_formal_audit_findings(&json!({
+            "findings": [{
+                "code": "PROVIDER_WARNING",
+                "severity": "WARNING",
+                "message": "需要人工复核",
+                "evidence_path": null
+            }]
+        }));
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].message, "需要人工复核");
+    }
+
+    #[test]
+    fn legacy_chinese_output_keys_are_rejected_by_business_parsers() {
+        assert!(parse_recognition(&json!({
+            "集数": null,
+            "分辨率": null,
+            "建议标题": null
+        }))
+        .is_err());
+
+        let catalog = vec![EligibleTemplateCatalogEntry {
+            id: "tpl-a".into(),
+            name: "模板 A".into(),
+            revision: 3,
+            digest: "sha256:abc".into(),
+            summary: "测试模板".into(),
+        }];
+        assert!(parse_template_selection(
+            &json!({
                 "已匹配": true,
                 "模板ID": "tpl-a",
                 "模板修订号": 3,
@@ -731,8 +688,7 @@ mod tests {
             }),
             &catalog,
         )
-        .expect("Chinese selection object maps to catalog entry");
-        assert_eq!(selected.id, "tpl-a");
+        .is_err());
 
         let findings = parse_formal_audit_findings(&json!({
             "问题": [{
@@ -743,26 +699,27 @@ mod tests {
             }]
         }));
         assert_eq!(findings.len(), 1);
-        assert_eq!(findings[0].message, "需要人工复核");
+        assert_eq!(findings[0].code, "PROVIDER_WARNING");
+        assert!(findings[0].message.contains("schema validation"));
     }
 
     #[test]
-    fn chinese_probe_payload_is_ready_for_every_provider_mode() {
+    fn english_probe_payload_is_ready_for_every_provider_mode() {
         let cases = [
             (
                 ProviderKind::OpenAi,
                 ProviderMode::Responses,
-                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"正常\":true}"}]}]}"#,
+                r#"{"output":[{"type":"message","content":[{"type":"output_text","text":"{\"ok\":true}"}]}]}"#,
             ),
             (
                 ProviderKind::OpenAi,
                 ProviderMode::Chat,
-                r#"{"choices":[{"message":{"content":"{\"正常\":true}"}}]}"#,
+                r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#,
             ),
             (
                 ProviderKind::Anthropic,
                 ProviderMode::AnthropicMessages,
-                r#"{"content":[{"type":"text","text":"{\"正常\":true}"}]}"#,
+                r#"{"content":[{"type":"text","text":"{\"ok\":true}"}]}"#,
             ),
         ];
         for (provider, mode, body) in cases {
@@ -773,35 +730,6 @@ mod tests {
                 "{provider:?} {mode:?}"
             );
         }
-    }
-
-    #[test]
-    fn vision_request_shapes_are_provider_specific_without_persisting_bytes() {
-        for scenario in [
-            MockScenario::VisionResponses,
-            MockScenario::VisionChat,
-            MockScenario::VisionAnthropic,
-        ] {
-            let (_provider, mode, request) =
-                build_contract_request(scenario, "https://example.test/v1").unwrap();
-            let body = request.body.to_string();
-            // Ephemeral base64 may exist in the request body, but not as a canary secret.
-            assert!(!body.contains(CANARY_SECRET));
-            match mode {
-                ProviderMode::Responses => {
-                    assert!(body.contains("input_image") || body.contains("input_text"));
-                }
-                ProviderMode::Chat => {
-                    assert!(body.contains("image_url") || body.contains("\"type\":\"text\""));
-                }
-                ProviderMode::AnthropicMessages => {
-                    assert!(body.contains("\"type\":\"image\"") || body.contains("base64"));
-                }
-                ProviderMode::Auto => panic!("vision contract must resolve a concrete mode"),
-            }
-        }
-        // encode_base64 is for ephemeral request assembly only.
-        assert_eq!(encode_base64(b"mock"), "bW9jaw==");
     }
 
     #[test]
@@ -838,14 +766,14 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"正常\":true,\"额外\":1}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"ok\":true,\"extra\":1}"}}]}"#,
         );
         assert_eq!(wrong.state, CapabilityState::Unsupported);
         let ready = classify_and_validate_probe_response(
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"正常\":true}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#,
         );
         assert_eq!(ready.state, CapabilityState::Ready);
     }

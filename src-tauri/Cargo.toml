@@ -36,7 +36,6 @@ semver = "1"
 time = { version = "0.3", features = ["formatting", "macros"] }
 sha2 = { version = "0.10", features = ["std"] }
 hex = "0.4"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }

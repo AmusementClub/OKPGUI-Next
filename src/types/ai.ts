@@ -14,7 +14,6 @@ export type AiCapabilityState = 'unknown' | 'probing' | 'ready' | 'unsupported' 
 export type AiPreflightLifecycle =
     | 'idle'
     | 'preparing'
-    | 'awaiting_vision'
     | 'auditing'
     | 'reconciling'
     | 'terminal'
@@ -101,73 +100,6 @@ export interface AiFormalAuditRequest {
     local_blockers?: string[];
 }
 
-/** One plan-derived Vision candidate (URL + source only; never trusted as hash authority). */
-export interface PlanVisionCandidate {
-    url: string;
-    source: string;
-}
-
-/** Public list of Vision candidates for a prepared plan token. */
-export interface PlanVisionCandidatesResponse {
-    plan_token: string;
-    snapshot_hash: string;
-    request_generation: number;
-    candidates: PlanVisionCandidate[];
-    /**
-     * True when more than max_images unique candidates exist.
-     * Frontend always requires explicit consent for any non-empty set (never auto-binds).
-     */
-    requires_selection: boolean;
-    max_images: number;
-}
-
-/** Request to bind selected Vision images to a prepared plan (backend fetches/normalizes). */
-export interface PlanVisionBindRequest {
-    plan_token: string;
-    /** Empty means all candidates only when count ≤ max_images. */
-    selected_urls?: string[];
-}
-
-/** Public bound Vision image metadata (no URL, no bytes). */
-export interface PublicPlanVisionImage {
-    source: string;
-    content_hash: string;
-    mime_type: string;
-    normalized_bytes: number;
-    width: number;
-    height: number;
-}
-
-/** Public result after Vision bind + plan hash rollover. */
-export interface PlanVisionBindResponse {
-    plan_token: string;
-    snapshot_hash: string;
-    request_generation: number;
-    batch_hash: string;
-    images: PublicPlanVisionImage[];
-    warnings: string[];
-}
-
-/** Frontend disclosure state for the shared plan-token Vision flow. */
-export type VisionPreflightStatus =
-    | 'idle'
-    | 'skipped'
-    | 'listing'
-    | 'needs_selection'
-    | 'binding'
-    | 'bound'
-    | 'failed';
-
-export interface VisionPreflightState {
-    status: VisionPreflightStatus;
-    candidates: PlanVisionCandidate[];
-    selectedUrls: string[];
-    maxImages: number;
-    boundImages: PublicPlanVisionImage[];
-    warnings: string[];
-    error: string | null;
-}
-
 export interface AiAuditResult {
     decision: AiDecision;
     findings: AiFinding[];
@@ -234,9 +166,50 @@ export interface PlanPrepareResponse {
     has_blockers: boolean;
 }
 
+export type MediaProbeState =
+    | 'measured'
+    | 'missing_sidecar'
+    | 'start_failed'
+    | 'non_zero_exit'
+    | 'malformed_json'
+    | 'oversized_output'
+    | 'timed_out'
+    | 'cancelled'
+    | 'missing_file'
+    | 'ambiguous_match'
+    | 'size_mismatch';
+
+export interface MediaInfoSummary {
+    duration_ms?: number | null;
+    width?: number | null;
+    height?: number | null;
+    video_codec?: string | null;
+    audio_codecs: string[];
+    subtitle_languages: string[];
+    scan_type?: string | null;
+}
+
+export interface MediaProbeResult {
+    relative_name: string;
+    state: MediaProbeState;
+    summary?: MediaInfoSummary | null;
+    message?: string | null;
+}
+
+export interface MediaInfoJobView {
+    job_id: string;
+    plan_token: string;
+    state: AiJob['state'];
+    request_generation: number;
+    snapshot_hash: string;
+    progress: number;
+    error_code?: string | null;
+    results: MediaProbeResult[];
+}
+
 export interface AiJob {
     id: string;
-    kind: 'capability_probe' | 'recognition' | 'template_selection' | 'media_info' | 'vision' | 'audit';
+    kind: 'capability_probe' | 'recognition' | 'template_selection' | 'media_info' | 'audit';
     state: 'queued' | 'running' | 'succeeded' | 'failed' | 'cancelled' | 'stale';
     request_generation: number;
     snapshot_hash: string;

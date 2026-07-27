@@ -1,5 +1,8 @@
 use crate::ai::redaction::RedactionPolicy;
-use crate::domain::publish_plan::{PlanMediaEvidence, PlanMediaStatus, PlanMediaSummary};
+use crate::domain::publish_plan::{
+    PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary,
+};
+use crate::torrent::project_safe_torrent_context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashSet;
@@ -59,7 +62,7 @@ pub struct ResolvedMediaBatch {
     pub pre_results: Vec<MediaProbeResult>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MediaProbeState {
     Measured,
@@ -124,6 +127,81 @@ pub fn build_plan_media_evidence(
         request_generation,
         status,
         summaries,
+        results: redacted_plan_media_results(results, policy),
+    }
+}
+
+/// Preserve one safe, bounded outcome for every torrent media file considered by MediaInfo.
+pub fn redacted_plan_media_results(
+    results: &[MediaProbeResult],
+    policy: &RedactionPolicy,
+) -> Vec<PlanMediaFileResult> {
+    results
+        .iter()
+        .filter_map(|item| {
+            let relative_name = safe_relative_name(&item.relative_name);
+            if relative_name == "[invalid]" {
+                return None;
+            }
+            let relative_name = policy.redact_secret_substrings(&relative_name);
+            if !is_safe_relative_name(&relative_name) {
+                return None;
+            }
+            let summary = item.summary.as_ref().map(|summary| PlanMediaSummary {
+                relative_name: relative_name.clone(),
+                duration_ms: summary.duration_ms,
+                width: summary.width,
+                height: summary.height,
+                video_codec: summary
+                    .video_codec
+                    .as_deref()
+                    .map(|value| policy.redact_text(value)),
+                audio_codecs: summary
+                    .audio_codecs
+                    .iter()
+                    .map(|value| policy.redact_text(value))
+                    .collect(),
+                subtitle_languages: summary
+                    .subtitle_languages
+                    .iter()
+                    .map(|value| policy.redact_text(value))
+                    .collect(),
+                scan_type: summary
+                    .scan_type
+                    .as_deref()
+                    .map(|value| policy.redact_text(value)),
+            });
+            let message = item.message.as_deref().and_then(|message| {
+                let redacted = policy.redact_text(message);
+                let bounded = redacted
+                    .chars()
+                    .take(MESSAGE_CHAR_LIMIT)
+                    .collect::<String>();
+                (!bounded.trim().is_empty()).then_some(bounded)
+            });
+            Some(PlanMediaFileResult {
+                relative_name,
+                state: media_probe_state_label(item.state).to_string(),
+                summary,
+                message,
+            })
+        })
+        .collect()
+}
+
+fn media_probe_state_label(state: MediaProbeState) -> &'static str {
+    match state {
+        MediaProbeState::Measured => "measured",
+        MediaProbeState::MissingSidecar => "missing_sidecar",
+        MediaProbeState::StartFailed => "start_failed",
+        MediaProbeState::NonZeroExit => "non_zero_exit",
+        MediaProbeState::MalformedJson => "malformed_json",
+        MediaProbeState::OversizedOutput => "oversized_output",
+        MediaProbeState::TimedOut => "timed_out",
+        MediaProbeState::Cancelled => "cancelled",
+        MediaProbeState::MissingFile => "missing_file",
+        MediaProbeState::AmbiguousMatch => "ambiguous_match",
+        MediaProbeState::SizeMismatch => "size_mismatch",
     }
 }
 
@@ -488,6 +566,30 @@ pub fn resolve_media_relative_entries(
             "too many relative media entries (max {MAX_MEDIA_RELATIVE_ENTRIES})"
         ));
     }
+    resolve_media_relative_entries_impl(torrent_path, entries, content_root)
+}
+
+/// Resolve every media file declared by the bound torrent, preserving torrent sizes.
+/// This backend-owned path is not subject to the explicit IPC batch cap.
+pub fn resolve_all_torrent_media_entries(torrent_path: &str) -> Result<ResolvedMediaBatch, String> {
+    let torrent = project_safe_torrent_context(torrent_path)?;
+    let entries = torrent
+        .files
+        .into_iter()
+        .filter(|file| is_video_file(Path::new(&file.relative_path)))
+        .map(|file| MediaRelativeEntry {
+            relative_name: file.relative_path,
+            expected_size: Some(file.size),
+        })
+        .collect::<Vec<_>>();
+    resolve_media_relative_entries_impl(torrent_path, &entries, None)
+}
+
+fn resolve_media_relative_entries_impl(
+    torrent_path: &str,
+    entries: &[MediaRelativeEntry],
+    content_root: Option<&str>,
+) -> Result<ResolvedMediaBatch, String> {
     let roots = allowed_media_content_roots(torrent_path, content_root)?;
     // Defense in depth: never resolve relative labels under a filesystem/drive root.
     let roots: Vec<PathBuf> = roots
@@ -596,52 +698,6 @@ fn is_path_within_root(path: &Path, root: &Path) -> bool {
     path.starts_with(&canonical_root)
 }
 
-/// Discover video files under allowed roots and return internal probe requests.
-/// Relative labels only ever leave this helper via [`MediaProbeRequest::relative_name`].
-pub fn discover_media_probe_requests(
-    torrent_path: &str,
-    content_root: Option<&str>,
-) -> Result<Vec<MediaProbeRequest>, String> {
-    let roots = allowed_media_content_roots(torrent_path, content_root)?;
-    let roots: Vec<PathBuf> = roots
-        .into_iter()
-        .filter(|root| !is_filesystem_or_drive_root(root))
-        .collect();
-    if roots.is_empty() {
-        return Err("no allowed content roots available".to_string());
-    }
-    let torrent = Path::new(torrent_path.trim());
-    let torrent_parent = torrent
-        .parent()
-        .ok_or_else(|| "torrent has no parent directory".to_string())?;
-    let display_root_raw = torrent_parent.parent().unwrap_or(torrent_parent);
-    let display_root = display_root_raw
-        .canonicalize()
-        .unwrap_or_else(|_| display_root_raw.to_path_buf());
-
-    let mut paths = Vec::new();
-    let mut seen = HashSet::new();
-    let mut used_names = HashSet::new();
-    for root in &roots {
-        collect_video_files(
-            root,
-            0,
-            &display_root,
-            &mut paths,
-            &mut seen,
-            &mut used_names,
-        );
-    }
-    paths.sort_by(|left, right| left.0.cmp(&right.0));
-    Ok(paths
-        .into_iter()
-        .map(|(relative_name, _size, path)| MediaProbeRequest {
-            relative_name,
-            path,
-        })
-        .collect())
-}
-
 /// Map a Rust/Tauri target triple to the staged `externalBin` filename.
 /// Returns `None` for unknown targets (fail closed for packaging maps).
 #[allow(dead_code)]
@@ -649,7 +705,6 @@ pub fn mediainfo_staged_name_for_target(target: &str) -> Option<&'static str> {
     match target {
         "x86_64-pc-windows-msvc" => Some("mediainfo-x86_64-pc-windows-msvc.exe"),
         "x86_64-unknown-linux-gnu" => Some("mediainfo-x86_64-unknown-linux-gnu"),
-        "x86_64-apple-darwin" => Some("mediainfo-x86_64-apple-darwin"),
         "aarch64-apple-darwin" => Some("mediainfo-aarch64-apple-darwin"),
         _ => None,
     }
@@ -666,10 +721,6 @@ pub fn packaged_mediainfo_host_target_triple() -> Option<&'static str> {
     {
         Some("x86_64-unknown-linux-gnu")
     }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        Some("x86_64-apple-darwin")
-    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         Some("aarch64-apple-darwin")
@@ -677,7 +728,6 @@ pub fn packaged_mediainfo_host_target_triple() -> Option<&'static str> {
     #[cfg(not(any(
         all(target_os = "windows", target_arch = "x86_64"),
         all(target_os = "linux", target_arch = "x86_64"),
-        all(target_os = "macos", target_arch = "x86_64"),
         all(target_os = "macos", target_arch = "aarch64"),
     )))]
     {
@@ -704,10 +754,6 @@ fn packaged_mediainfo_file_names() -> &'static [&'static str] {
             "MediaInfo",
         ]
     }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        &["mediainfo-x86_64-apple-darwin", "mediainfo", "MediaInfo"]
-    }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     {
         &["mediainfo-aarch64-apple-darwin", "mediainfo", "MediaInfo"]
@@ -719,7 +765,6 @@ fn packaged_mediainfo_file_names() -> &'static [&'static str] {
     #[cfg(all(
         not(target_os = "windows"),
         not(all(target_os = "linux", target_arch = "x86_64")),
-        not(all(target_os = "macos", target_arch = "x86_64")),
         not(all(target_os = "macos", target_arch = "aarch64")),
     ))]
     {
@@ -1300,6 +1345,11 @@ mod tests {
         let evidence = build_plan_media_evidence("job-1", "sha256:snap", 3, &results, &policy);
         assert_eq!(evidence.status, PlanMediaStatus::Tested);
         assert_eq!(evidence.summaries.len(), 1);
+        assert_eq!(evidence.results.len(), 3);
+        assert_eq!(evidence.results[0].state, "measured");
+        assert_eq!(evidence.results[1].state, "timed_out");
+        assert_eq!(evidence.results[2].state, "missing_file");
+        assert!(evidence.results[0].summary.is_some());
         assert_eq!(evidence.summaries[0].relative_name, "show/ep01.mkv");
         assert!(!evidence.summaries[0]
             .video_codec
@@ -1324,6 +1374,8 @@ mod tests {
         );
         assert_eq!(empty.status, PlanMediaStatus::CheckFailed);
         assert!(empty.summaries.is_empty());
+        assert_eq!(empty.results.len(), 1);
+        assert_eq!(empty.results[0].relative_name, "gone.mkv");
     }
 
     #[test]
@@ -1480,7 +1532,7 @@ mod tests {
         );
         assert_eq!(
             mediainfo_staged_name_for_target("x86_64-apple-darwin"),
-            Some("mediainfo-x86_64-apple-darwin")
+            None
         );
         assert_eq!(
             mediainfo_staged_name_for_target("aarch64-apple-darwin"),

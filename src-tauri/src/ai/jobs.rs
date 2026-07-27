@@ -24,7 +24,6 @@ pub enum JobKind {
     Recognition,
     TemplateSelection,
     MediaInfo,
-    Vision,
     Audit,
 }
 
@@ -140,7 +139,6 @@ fn sanitized_stage_for_job(job: &AiJob) -> String {
             JobKind::Recognition => "识别中".to_string(),
             JobKind::TemplateSelection => "自动选模板".to_string(),
             JobKind::MediaInfo => "媒体信息".to_string(),
-            JobKind::Vision => "视觉处理".to_string(),
             JobKind::Audit => "发布前检查".to_string(),
         },
         _ => "处理中".to_string(),
@@ -151,7 +149,7 @@ fn navigation_target_for_kind(kind: JobKind) -> Option<String> {
     match kind {
         JobKind::TemplateSelection => Some("auto_template".to_string()),
         JobKind::CapabilityProbe => Some("ai_settings".to_string()),
-        // Audit / recognition / media / vision live on the current publish entry.
+        // Audit / recognition / media live on the current publish entry.
         _ => None,
     }
 }
@@ -1073,7 +1071,7 @@ mod tests {
     #[test]
     fn cancellation_is_idempotent_and_late_completion_cannot_resurrect_job() {
         let mut manager = AiJobManager::default();
-        let id = manager.start(JobKind::Vision, 1, "a", None);
+        let id = manager.start(JobKind::Audit, 1, "a", None);
         manager.cancel(&id).unwrap();
         manager.cancel(&id).unwrap();
         let result = manager.complete(&id, true, None, "late", None).unwrap();
@@ -1261,13 +1259,11 @@ mod tests {
     #[test]
     fn debug_records_clear_and_list_are_non_secret_metadata_only() {
         let mut manager = AiJobManager::default();
-        let id = manager.start(JobKind::Vision, 1, "snap", None);
-        manager
-            .complete(&id, true, None, "vision ok", None)
-            .unwrap();
+        let id = manager.start(JobKind::Audit, 1, "snap", None);
+        manager.complete(&id, true, None, "media ok", None).unwrap();
         let listed = manager.list_debug_records();
         assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].summary, "vision ok");
+        assert_eq!(listed[0].summary, "media ok");
         assert_eq!(listed[0].job_id, id);
         // No raw provider body fields exist on DebugRecord (compile-time shape + empty usage).
         assert!(listed[0].usage.is_none());
@@ -1354,7 +1350,7 @@ mod tests {
         assert!(isolated, "corrupt file must be isolated via rename");
 
         // Subsequent terminal writes recreate a valid store at the active path.
-        let job_id = manager.start(JobKind::Vision, 1, "sha256:after-corrupt", None);
+        let job_id = manager.start(JobKind::Audit, 1, "sha256:after-corrupt", None);
         manager
             .complete(&job_id, true, None, "recovered", None)
             .unwrap();
@@ -1647,11 +1643,11 @@ mod tests {
             "JSON-escaped single backslash must not fail canary"
         );
         assert!(!debug_bundle_fails_canary_scan(
-            r#"{"version":1,"records":[{"summary":"vision ok","usage":null}]}"#
+            r#"{"version":1,"records":[{"summary":"media ok","usage":null}]}"#
         ));
         // Raw (non-JSON) inputs still honor path/UNC rules on the text as-is.
         assert!(debug_bundle_fails_canary_scan(r"leak \\server\share"));
-        assert!(!debug_bundle_fails_canary_scan("vision ok with code \\x1b"));
+        assert!(!debug_bundle_fails_canary_scan("media ok with code \\x1b"));
     }
 
     #[test]
@@ -1784,7 +1780,7 @@ mod tests {
             "read failed file:///var/folders/zz/T/persist-canary",
         ];
         for (index, summary) in secrets.iter().enumerate() {
-            let id = manager.start(JobKind::Vision, index as u64, format!("snap-{index}"), None);
+            let id = manager.start(JobKind::Audit, index as u64, format!("snap-{index}"), None);
             manager
                 .complete(&id, false, Some("X".into()), *summary, None)
                 .unwrap();
@@ -1880,7 +1876,7 @@ mod tests {
         let mut manager = AiJobManager::default();
         manager.init_debug_store(&dir);
 
-        let id = manager.start(JobKind::Vision, 1, "sha256:dedupe", None);
+        let id = manager.start(JobKind::Audit, 1, "sha256:dedupe", None);
         manager.cancel(&id).unwrap();
         // Late completion must not mint a second debug record.
         let late = manager
@@ -1960,7 +1956,7 @@ mod tests {
         std::fs::write(&blocker, b"file").expect("blocker file");
         manager.debug_store_path = Some(blocker.join(DEBUG_STORE_FILE_NAME));
 
-        let id = manager.start(JobKind::Vision, 2, "sha256:rollback", None);
+        let id = manager.start(JobKind::Audit, 2, "sha256:rollback", None);
         let result = manager.complete(&id, true, None, "must not stick after persist fail", None);
         assert!(result.is_ok(), "terminal job result must stay non-fatal");
         assert_eq!(result.unwrap().state, AiJobState::Succeeded);
@@ -2022,7 +2018,7 @@ mod tests {
                 {
                     "id": "debug-1700000000-2",
                     "job_id": "job-1700000000-1",
-                    "kind": "vision",
+                    "kind": "audit",
                     "state": "failed",
                     "created_at_unix": created_at + 10,
                     "completed_at_unix": created_at + 11,

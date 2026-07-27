@@ -1491,7 +1491,6 @@ export default function HomePage() {
             || Boolean(preflight.state.job_id)
             || lifecycle === 'reconciling'
             || lifecycle === 'auditing'
-            || lifecycle === 'awaiting_vision'
             || lifecycle === 'preparing';
         if (needsReconcile) {
             const ok = await preflight.cancel();
@@ -2109,10 +2108,6 @@ export default function HomePage() {
                         configured={preflight.isConfigured}
                         canConfirm={preflight.canConfirm}
                         onAcknowledgementChange={preflight.setAcknowledgement}
-                        onToggleVisionSelection={preflight.toggleVisionSelection}
-                        onSelectAllVision={preflight.selectAllVisionCandidates}
-                        onConfirmVisionSelection={() => { void preflight.confirmVisionSelection(); }}
-                        onContinueTextOnlyVision={() => { void preflight.continueTextOnlyVision(); }}
                         onCancel={() => { void preflight.cancel(); }}
                         onRetry={() => { void preflight.retry(); }}
                         onRetryReconciliation={() => { void preflight.retryReconciliation(); }}

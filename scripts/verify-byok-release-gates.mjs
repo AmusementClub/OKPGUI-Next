@@ -317,51 +317,6 @@ function checkWorkflows() {
 }
 
 /**
- * Milestone 4: legacy Vision IPC must stay unregistered and off the frontend service API.
- * Plan-token Vision commands remain the only public surface.
- */
-function checkLegacyVisionIpcRetired() {
-  const libRs = readText('src-tauri/src/lib.rs');
-  if (libRs !== null) {
-    // Only the invoke_handler registration block (not prose comments alone).
-    const handlerStart = libRs.indexOf('tauri::generate_handler!');
-    const handlerSlice =
-      handlerStart >= 0 ? libRs.slice(handlerStart, handlerStart + 8000) : libRs;
-    for (const name of ['ai_extract_vision_images', 'ai_normalize_vision_image']) {
-      // Match registration-style references: commands::...::name or bare name as path segment.
-      const registration = new RegExp(
-        `(?:commands::ai_commands::|::)${name}\\b|\\b${name}\\s*,`,
-      );
-      if (registration.test(handlerSlice)) {
-        fail(
-          `src-tauri/src/lib.rs: legacy Vision command ${JSON.stringify(name)} must not be registered in invoke_handler`,
-        );
-      }
-    }
-    // Positive baseline: plan-token Vision remains.
-    for (const name of ['ai_list_plan_vision_candidates', 'ai_bind_plan_vision']) {
-      if (!handlerSlice.includes(name)) {
-        fail(
-          `src-tauri/src/lib.rs: plan-token Vision command ${JSON.stringify(name)} must remain registered`,
-        );
-      }
-    }
-  }
-
-  // Frontend service public API must not reintroduce legacy Vision invokes.
-  requireAbsent(
-    'src/services/ai.ts',
-    ["'ai_extract_vision_images'", '"ai_extract_vision_images"', "'ai_normalize_vision_image'", '"ai_normalize_vision_image"'],
-    'legacy Vision service API',
-  );
-  requireIncludes(
-    'src/services/ai.ts',
-    ["'ai_list_plan_vision_candidates'", "'ai_bind_plan_vision'"],
-    'plan-token Vision service API',
-  );
-}
-
-/**
  * package.json must expose the offline verifier and inventory scripts.
  */
 function checkPackageJson() {
@@ -409,7 +364,6 @@ function checkDesktopHarnessInventory() {
     'tests/desktop-e2e/specs/home-prepare-observe-ack-publish.md',
     'tests/desktop-e2e/specs/quick-publish-prepare-observe-ack-publish.md',
     'tests/desktop-e2e/specs/cancellation-and-failed-poll-recovery.md',
-    'tests/desktop-e2e/specs/vision-disclosure-consent.md',
     'scripts/run-desktop-e2e.mjs',
     'scripts/run-macos-packaged-smoke.mjs',
   ];
@@ -435,7 +389,6 @@ function checkDesktopHarnessInventory() {
       'home-prepare-observe-ack-publish',
       'quick-publish-prepare-observe-ack-publish',
       'cancellation-and-failed-poll-recovery',
-      'vision-disclosure-consent',
     ],
     'desktop harness README',
   );
@@ -518,7 +471,6 @@ function checkDesktopHarnessInventory() {
       'home-prepare-observe-ack-publish',
       'quick-publish-prepare-observe-ack-publish',
       'cancellation-and-failed-poll-recovery',
-      'vision-disclosure-consent',
       'production-binary-probe',
       'sidecar-mediainfo-probe',
       'keyring-session-only-probe',
@@ -534,7 +486,6 @@ function checkDesktopHarnessInventory() {
       'formalAuditGo',
       'formalAuditWarning',
       'transportError',
-      'visionCandidates',
       'prepare_plan',
       'publish_prepared_plan',
       'productionIpcMarkerRule',
@@ -728,7 +679,6 @@ function main() {
   checkNoShellCapability();
   checkMediaInfoPackageGate();
   checkReleaseArchiveGate();
-  checkLegacyVisionIpcRetired();
   checkPackageJson();
   checkWorkflows();
   checkDesktopE2EHonesty();
@@ -747,7 +697,6 @@ function main() {
   console.log(`  externalBin: ${EXTERNAL_BIN}`);
   console.log(`  notice: ${NOTICE_REPO_PATH}`);
   console.log('  capability: no frontend shell permission');
-  console.log('  legacy Vision IPC: retired (plan-token only)');
   // Separately named evidence inventory (Milestone 6).
   console.log(
     '  evidence class [mocked UI]: Playwright browser integration (mocked-playwright-not-desktop; not desktop E2E)',

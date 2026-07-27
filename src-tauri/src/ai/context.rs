@@ -1,6 +1,6 @@
 use crate::ai::redaction::RedactionPolicy;
 use crate::config::Template;
-use crate::domain::publish_plan::LocalExecutionBinding;
+use crate::domain::publish_plan::{LocalExecutionBinding, PlanMediaFileResult};
 use crate::torrent::{project_safe_torrent_context, SafeTorrentProjection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -27,6 +27,8 @@ pub struct ContextProjectionInput {
     pub shared_content: Vec<Value>,
     #[serde(default)]
     pub files: Vec<ContextFile>,
+    #[serde(default)]
+    pub media_info: Vec<PlanMediaFileResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +39,7 @@ pub struct ContextProjection {
     pub templates: Vec<Value>,
     pub shared_content: Vec<Value>,
     pub files: Vec<ContextFile>,
+    pub media_info: Vec<PlanMediaFileResult>,
     pub bytes: usize,
 }
 
@@ -105,6 +108,16 @@ pub fn project_context_from_binding(
     policy: &RedactionPolicy,
     ceiling: usize,
 ) -> Result<ContextProjection, ContextError> {
+    project_context_from_binding_with_media(binding, &[], policy, ceiling)
+}
+
+/// Project backend-owned torrent/template context plus identity-matched MediaInfo outcomes.
+pub fn project_context_from_binding_with_media(
+    binding: &LocalExecutionBinding,
+    media_info: &[PlanMediaFileResult],
+    policy: &RedactionPolicy,
+    ceiling: usize,
+) -> Result<ContextProjection, ContextError> {
     let torrent_path = binding.request().torrent_path.as_str();
     let safe_torrent = project_safe_torrent_context(torrent_path).map_err(ContextError::Torrent)?;
 
@@ -113,8 +126,9 @@ pub fn project_context_from_binding(
         return Err(ContextError::IdentityDrift(failures.join("；")));
     }
 
-    let input =
+    let mut input =
         build_projection_input_from_bound_sources(&safe_torrent, &binding.request().template);
+    input.media_info = media_info.to_vec();
     project_context(input, policy, ceiling)
 }
 
@@ -141,6 +155,7 @@ fn build_projection_input_from_bound_sources(
         templates: vec![allowlisted_template(template)],
         shared_content: Vec::new(),
         files,
+        media_info: Vec::new(),
     }
 }
 
@@ -216,6 +231,7 @@ pub fn project_context(
         templates: deduplicate_values(input.templates, policy),
         shared_content: deduplicate_values(input.shared_content, policy),
         files,
+        media_info: sanitize_media_info(input.media_info, policy),
         bytes: 0,
     };
 
@@ -227,6 +243,45 @@ pub fn project_context(
     }
     projection.bytes = bytes;
     Ok(projection)
+}
+
+fn sanitize_media_info(
+    results: Vec<PlanMediaFileResult>,
+    policy: &RedactionPolicy,
+) -> Vec<PlanMediaFileResult> {
+    results
+        .into_iter()
+        .filter_map(|mut result| {
+            result.relative_name = policy.redact_secret_substrings(&result.relative_name);
+            if !is_safe_relative_path(&result.relative_name) {
+                return None;
+            }
+            result.state = policy.redact_text(&result.state);
+            result.message = result.message.map(|message| policy.redact_text(&message));
+            if let Some(summary) = result.summary.as_mut() {
+                summary.relative_name = result.relative_name.clone();
+                summary.video_codec = summary
+                    .video_codec
+                    .take()
+                    .map(|value| policy.redact_text(&value));
+                summary.audio_codecs = summary
+                    .audio_codecs
+                    .drain(..)
+                    .map(|value| policy.redact_text(&value))
+                    .collect();
+                summary.subtitle_languages = summary
+                    .subtitle_languages
+                    .drain(..)
+                    .map(|value| policy.redact_text(&value))
+                    .collect();
+                summary.scan_type = summary
+                    .scan_type
+                    .take()
+                    .map(|value| policy.redact_text(&value));
+            }
+            Some(result)
+        })
+        .collect()
 }
 
 /// Redact torrent-tree / path metadata with secret-substring replacement only.
@@ -348,6 +403,7 @@ mod tests {
                 relative_path: "dir/video.mkv".into(),
                 content: "正文".into(),
             }],
+            media_info: vec![],
         };
         let result =
             project_context(input, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING).unwrap();
@@ -452,6 +508,7 @@ mod tests {
                 relative_path: "a.txt".into(),
                 content: format!("body {secret}"),
             }],
+            media_info: vec![],
         };
         let result = project_context(input, &policy, DEFAULT_CONTEXT_CEILING).unwrap();
         let serialized = serde_json::to_string(&result).unwrap();
@@ -704,6 +761,7 @@ mod tests {
                     content: format!(r#"{{"size":50,"hint":"{secret}"}}"#),
                 },
             ],
+            media_info: vec![],
         };
 
         let result = project_context(input, &policy, DEFAULT_CONTEXT_CEILING).unwrap();
@@ -777,6 +835,7 @@ mod tests {
             }],
             templates: vec![json!({"title": "t"})],
             shared_content: vec![],
+            media_info: vec![],
         };
 
         let ok = project_context(

@@ -7,10 +7,6 @@ interface AiPreflightPanelProps {
     configured: boolean;
     canConfirm: boolean;
     onAcknowledgementChange: (key: 'warning' | 'critical' | 'pending', checked: boolean) => void;
-    onToggleVisionSelection?: (url: string) => void;
-    onSelectAllVision?: () => void;
-    onConfirmVisionSelection?: () => void;
-    onContinueTextOnlyVision?: () => void;
     onCancel?: () => void;
     onRetry?: () => void;
     onRetryReconciliation?: () => void;
@@ -31,8 +27,6 @@ function lifecycleLabel(lifecycle: AiPreflightLifecycle): string | null {
     switch (lifecycle) {
         case 'preparing':
             return '正在准备发布前检查…';
-        case 'awaiting_vision':
-            return '等待图片选择或绑定…';
         case 'auditing':
             return '正在审核冻结草稿…';
         case 'reconciling':
@@ -48,7 +42,6 @@ function lifecycleLabel(lifecycle: AiPreflightLifecycle): string | null {
 
 function isActiveCheck(lifecycle: AiPreflightLifecycle): boolean {
     return lifecycle === 'preparing'
-        || lifecycle === 'awaiting_vision'
         || lifecycle === 'auditing';
 }
 
@@ -57,24 +50,18 @@ export default function AiPreflightPanel({
     configured,
     canConfirm,
     onAcknowledgementChange,
-    onToggleVisionSelection,
-    onSelectAllVision,
-    onConfirmVisionSelection,
-    onContinueTextOnlyVision,
     onCancel,
     onRetry,
     onRetryReconciliation,
 }: AiPreflightPanelProps) {
     const decision = state.decision;
     const lifecycle = state.lifecycle;
-    const vision = state.vision;
-    const needsVisionSelection = vision.status === 'needs_selection';
     const reconciling = lifecycle === 'reconciling';
     const terminalFailure = lifecycle === 'unavailable' || lifecycle === 'cancelled';
     const showLivePending = decision === 'PENDING'
         && !reconciling
         && !terminalFailure
-        && (lifecycle === 'auditing' || lifecycle === 'preparing' || lifecycle === 'awaiting_vision');
+        && (lifecycle === 'auditing' || lifecycle === 'preparing');
 
     const tone = reconciling || terminalFailure
         ? 'border-rose-400/30 bg-rose-500/5'
@@ -87,9 +74,7 @@ export default function AiPreflightPanel({
     const statusLine = lifecycleLabel(lifecycle)
         ?? (!configured
             ? 'AI 未启用，发布沿用本地校验。'
-            : needsVisionSelection
-              ? `发现 ${vision.candidates.length} 张候选图片（最多可选 ${vision.maxImages} 张），请确认是否发送后再继续。`
-              : state.checking || showLivePending
+            : state.checking || showLivePending
                 ? '正在检查当前冻结草稿。'
                 : '检查结果只对应当前冻结草稿。');
 
@@ -98,8 +83,6 @@ export default function AiPreflightPanel({
         && (terminalFailure || (Boolean(state.error) && lifecycle === 'idle'))
         && !reconciling;
     const showRetryReconciliation = Boolean(onRetryReconciliation) && reconciling;
-    const canSelectAll = vision.candidates.length > 0
-        && vision.selectedUrls.length < Math.min(vision.candidates.length, vision.maxImages);
 
     return (
         <section className={`rounded-xl border px-4 py-3 ${tone}`} data-testid="ai-preflight-panel">
@@ -131,104 +114,6 @@ export default function AiPreflightPanel({
                 AI 检查结果仅供参考。本地校验与您确认的冻结草稿共同决定是否发布；AI 不能单独授权发布。
             </p>
 
-            {needsVisionSelection && !reconciling && !terminalFailure ? (
-                <div className="mt-3 space-y-2 border-t border-slate-700/60 pt-3" data-testid="ai-vision-selection">
-                    <div className="space-y-1 text-xs text-slate-400" data-testid="ai-preflight-vision-disclosure">
-                        <p>
-                            候选图片 {vision.candidates.length} 张，本次最多可选 {vision.maxImages} 张。
-                            不会自动选取或发送图片。
-                        </p>
-                        <p>
-                            确认后，所选图片将由本机规范化，并随本轮审核发送至已配置的 AI 服务商；
-                            未选中的图片不会发送。
-                        </p>
-                        <p>
-                            已选 {vision.selectedUrls.length}/{vision.maxImages}
-                        </p>
-                    </div>
-                    <ul className="max-h-40 space-y-1 overflow-y-auto text-xs text-slate-300">
-                        {vision.candidates.map((candidate) => {
-                            const checked = vision.selectedUrls.includes(candidate.url);
-                            const atCap = !checked && vision.selectedUrls.length >= vision.maxImages;
-                            return (
-                                <li key={candidate.url}>
-                                    <label className={`flex items-start gap-2 ${atCap ? 'opacity-50' : ''}`}>
-                                        <input
-                                            type="checkbox"
-                                            checked={checked}
-                                            disabled={atCap || reconciling}
-                                            data-testid="ai-vision-candidate"
-                                            data-url={candidate.url}
-                                            onChange={() => onToggleVisionSelection?.(candidate.url)}
-                                        />
-                                        <span className="min-w-0 break-all">
-                                            <span className="text-slate-500">[{candidate.source}] </span>
-                                            {candidate.url}
-                                        </span>
-                                    </label>
-                                </li>
-                            );
-                        })}
-                    </ul>
-                    <div className="flex flex-wrap gap-2">
-                        <button
-                            type="button"
-                            className="rounded-md border border-slate-600 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-40"
-                            data-testid="ai-preflight-vision-select-all"
-                            aria-label="全选候选图片"
-                            disabled={!canSelectAll || !onSelectAllVision || reconciling}
-                            onClick={() => onSelectAllVision?.()}
-                        >
-                            全选{vision.candidates.length > vision.maxImages
-                                ? `（最多 ${vision.maxImages} 张）`
-                                : ''}
-                        </button>
-                        <button
-                            type="button"
-                            className="rounded-md border border-slate-600 px-2 py-1 text-xs text-slate-200 hover:bg-slate-800 disabled:opacity-40"
-                            data-testid="ai-preflight-vision-use-selected"
-                            aria-label="使用所选图片继续检查"
-                            disabled={
-                                vision.selectedUrls.length === 0
-                                || vision.selectedUrls.length > vision.maxImages
-                                || !onConfirmVisionSelection
-                                || reconciling
-                            }
-                            onClick={() => onConfirmVisionSelection?.()}
-                        >
-                            使用所选图片
-                        </button>
-                        <button
-                            type="button"
-                            className="rounded-md border border-slate-600 px-2 py-1 text-xs text-slate-300 hover:bg-slate-800 disabled:opacity-40"
-                            data-testid="ai-preflight-vision-text-only"
-                            aria-label="仅文本继续检查"
-                            disabled={!onContinueTextOnlyVision || reconciling}
-                            onClick={() => onContinueTextOnlyVision?.()}
-                        >
-                            仅文本继续
-                        </button>
-                    </div>
-                    {vision.error ? <div className="text-xs text-rose-300" data-testid="ai-vision-error">{vision.error}</div> : null}
-                </div>
-            ) : null}
-
-            {vision.warnings.length > 0 ? (
-                <div className="mt-2 space-y-1 text-xs text-amber-200/90" data-testid="ai-vision-warnings">
-                    {vision.warnings.map((warning) => (
-                        <div key={warning}>{warning}</div>
-                    ))}
-                </div>
-            ) : null}
-            {vision.status === 'failed' && vision.error ? (
-                <div className="mt-2 text-xs text-amber-200/90">{vision.error}</div>
-            ) : null}
-            {vision.boundImages.length > 0 ? (
-                <div className="mt-2 text-[11px] text-slate-500" data-testid="ai-vision-bound-count">
-                    已绑定 {vision.boundImages.length} 张规范化图片参与审核。
-                </div>
-            ) : null}
-
             {!reconciling && !terminalFailure && state.audit?.findings.map((finding) => (
                 <div key={`${finding.code}-${finding.message}`} className="mt-2 flex gap-2 text-xs text-slate-300">
                     {finding.severity === 'CRITICAL' ? <ShieldAlert size={14} className="mt-0.5 shrink-0 text-rose-300" /> : <AlertTriangle size={14} className="mt-0.5 shrink-0 text-amber-300" />}
@@ -241,7 +126,7 @@ export default function AiPreflightPanel({
                 </div>
             ) : null}
 
-            {!needsVisionSelection && !reconciling && !terminalFailure && (decision === 'WARNING' || decision === 'NO_GO' || (decision === 'PENDING' && showLivePending)) ? (
+            {!reconciling && !terminalFailure && (decision === 'WARNING' || decision === 'NO_GO' || (decision === 'PENDING' && showLivePending)) ? (
                 <div className="mt-3 space-y-2 border-t border-slate-700/60 pt-3 text-xs text-slate-300" data-testid="ai-preflight-acknowledgements">
                     {decision === 'WARNING' ? (
                         <label className="flex items-start gap-2"><input type="checkbox" checked={state.acknowledgements.warning} onChange={(event) => onAcknowledgementChange('warning', event.target.checked)} /><span>我已阅读提醒，仍要发布。</span></label>
@@ -269,7 +154,7 @@ export default function AiPreflightPanel({
             {!canConfirm && decision !== 'IDLE' && decision !== 'LOCAL_BLOCKED' && !reconciling && !terminalFailure ? (
                 <div className="mt-2 flex items-center gap-1.5 text-[11px] text-slate-500">
                     <CircleDot size={12} />
-                    {needsVisionSelection ? '请先明确选择图片。' : '完成对应确认后才能发布。'}
+                    完成对应确认后才能发布。
                 </div>
             ) : null}
 

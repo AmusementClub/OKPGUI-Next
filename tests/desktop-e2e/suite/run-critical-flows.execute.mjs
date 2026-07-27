@@ -3,7 +3,7 @@
  * Executable host / packaged binary smoke harness.
  *
  * Launches the **built** application binary with OKPGUI_DESKTOP_SMOKE_OUT so Rust runs
- * production prepare_plan / cancel / vision / keyring-policy / MediaInfo spawn paths
+ * production prepare_plan / cancel / keyring-policy / MediaInfo spawn paths
  * inside that process.
  *
  * Honesty:
@@ -65,7 +65,11 @@ function writeEvidence(evidence) {
 function resolveTargetTriple() {
   if (process.env.DESKTOP_E2E_TARGET) return process.env.DESKTOP_E2E_TARGET;
   if (process.platform === 'darwin') {
-    return process.arch === 'arm64' ? 'aarch64-apple-darwin' : 'x86_64-apple-darwin';
+    if (process.arch !== 'arm64') {
+      console.error('[execute] Intel macOS is not a supported build target');
+      process.exit(2);
+    }
+    return 'aarch64-apple-darwin';
   }
   if (process.platform === 'win32') return 'x86_64-pc-windows-msvc';
   if (process.platform === 'linux') return 'x86_64-unknown-linux-gnu';
@@ -264,7 +268,7 @@ function main() {
     timestamps: { startedAt, finishedAt: nowIso() },
     artifactPaths: [binaryPath, reportPath, FIXTURE_PROFILE_REL],
     notes: smokeOk
-      ? `${harnessType}: production Rust paths in built binary (prepare_plan, publish-safe cancel, session cancel, vision, keyring policy; MediaInfo when present). NOT desktop-webdriver, NOT webview IPC (productionIpcMarker=false), NOT mocked Playwright. Dual-entry UI flows are skipped here.`
+      ? `${harnessType}: production Rust paths in built binary (prepare_plan, publish-safe cancel, session cancel, keyring policy; MediaInfo when present). NOT desktop-webdriver, NOT webview IPC (productionIpcMarker=false), NOT mocked Playwright. Dual-entry UI flows are skipped here.`
       : `${harnessType} failed. See namedTests. Not WebDriver / not mocked Playwright. productionIpcMarker remains false.`,
   };
 

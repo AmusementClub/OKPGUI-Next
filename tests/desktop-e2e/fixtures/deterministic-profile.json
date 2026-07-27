@@ -28,15 +28,6 @@
       "transportError": {
         "mode": "drop-connection",
         "purpose": "failed-poll recovery without backend terminal evidence"
-      },
-      "visionCandidates": {
-        "candidateCount": 3,
-        "maxImages": 5,
-        "urls": [
-          "http://127.0.0.1:18765/fixture/vision/a.jpg",
-          "http://127.0.0.1:18765/fixture/vision/b.jpg",
-          "http://127.0.0.1:18765/fixture/vision/c.jpg"
-        ]
       }
     }
   },
@@ -61,10 +52,6 @@
     "preflightRetry": "[data-testid=\"ai-preflight-retry\"]",
     "preflightRetryReconciliation": "[data-testid=\"ai-preflight-retry-reconciliation\"]",
     "preflightError": "[data-testid=\"ai-preflight-error\"]",
-    "visionDisclosure": "[data-testid=\"ai-preflight-vision-disclosure\"]",
-    "visionSelectAll": "[data-testid=\"ai-preflight-vision-select-all\"]",
-    "visionUseSelected": "[data-testid=\"ai-preflight-vision-use-selected\"]",
-    "visionTextOnly": "[data-testid=\"ai-preflight-vision-text-only\"]",
     "advisoryDisclaimer": "[data-testid=\"ai-preflight-advisory-disclaimer\"]"
   },
   "ipc": {
@@ -79,8 +66,8 @@
       "publish_prepared_plan",
       "ai_cancel_preflight_session",
       "ai_poll_formal_audit",
-      "ai_list_plan_vision_candidates",
-      "ai_bind_plan_vision"
+      "ai_start_media_info",
+      "ai_poll_media_info"
     ],
     "productionIpcMarkerRule": "true only for desktop-webdriver after real WebView Tauri IPC; host-binary-smoke and macos-packaged-smoke must keep productionIpcMarker false and use productionBinaryMarker",
     "productionBinaryMarkerRule": "true when host/packaged binary smoke hard probes pass inside the built binary"

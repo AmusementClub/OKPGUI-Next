@@ -47,14 +47,6 @@ export const CRITICAL_FLOWS = [
     summary:
       'Cancel mid-prepare/audit and force poll transport failure; require reconciling → UNAVAILABLE, no silent PENDING, Retry starts fresh generation.',
   },
-  {
-    id: 'vision-disclosure-consent',
-    title: 'Vision disclosure consent (any candidates)',
-    entry: 'Shared',
-    specRelPath: 'tests/desktop-e2e/specs/vision-disclosure-consent.md',
-    summary:
-      'Any non-empty Vision candidate set requires explicit consent (select/text-only); no auto-bind; disclosure shows count/max/provider send.',
-  },
 ];
 
 /** macOS packaged-smoke named probes (not full UI WebDriver). */

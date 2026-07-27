@@ -4,7 +4,7 @@
  *
  * Validates that the Rust contract module and fixture inventory cover the V2
  * strict Models / Responses / Chat / Anthropic Messages / refusal / malformed /
- * usage / timeout / redirect / Vision scenarios. This is a static inventory +
+ * usage / timeout / redirect scenarios. This is a static inventory +
  * shape check; behavioral assertions live in `cargo test` under
  * `ai::provider_contract`.
  */
@@ -39,9 +39,6 @@ const REQUIRED_SCENARIOS = [
   'TimeoutHttp',
   'AuthFailure',
   'Redirect',
-  'VisionResponses',
-  'VisionChat',
-  'VisionAnthropic',
 ];
 
 const REQUIRED_MARKERS = [

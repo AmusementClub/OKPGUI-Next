@@ -78,7 +78,6 @@ Critical desktop WebDriver flows (named evidence tests; require `desktop-webdriv
 - `home-prepare-observe-ack-publish`
 - `quick-publish-prepare-observe-ack-publish`
 - `cancellation-and-failed-poll-recovery`
-- `vision-disclosure-consent`
 
 macOS packaged smoke probes: `packaged-app-layout`, `production-binary-probe`, `sidecar-mediainfo-probe` (spawn), `keyring-session-only-probe`, `minimal-backend-roundtrip`.
 `production-ipc-probe` / `event-delivery-probe` / `minimal-ipc-roundtrip` are **skipped** until WebView IPC is proven.

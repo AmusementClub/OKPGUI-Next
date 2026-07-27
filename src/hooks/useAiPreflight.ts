@@ -8,10 +8,8 @@ import type {
     CancelPreflightSessionResult,
     PreflightSessionChangedPayload,
     PublishRequestPayload,
-    VisionPreflightState,
 } from '../types/ai';
 import {
-    bindPlanVision,
     canPublishAudit,
     cancelAiJob,
     cancelPendingAuditForPublish as cancelPendingAuditForPublishIpc,
@@ -20,24 +18,15 @@ import {
     getAiSettings,
     invalidatePublishPlan,
     isAiConfigured,
-    listPlanVisionCandidates,
     pollFormalAudit,
+    pollPlanMediaInfo,
     preparePublishPlan,
     readFriendlyError,
     setPlanAcknowledgements,
     startFormalAudit,
+    startPlanMediaInfo,
     subscribePreflightSessionChanged,
 } from '../services/ai';
-
-const idleVisionState: VisionPreflightState = {
-    status: 'idle',
-    candidates: [],
-    selectedUrls: [],
-    maxImages: 5,
-    boundImages: [],
-    warnings: [],
-    error: null,
-};
 
 export interface AiPreflightState {
     settings: AiSettings;
@@ -62,8 +51,6 @@ export interface AiPreflightState {
     /** Backend formal-audit job id while PENDING; null for local/terminal decisions. */
     job_id: string | null;
     error: string | null;
-    /** Shared plan-token Vision disclosure state (HomePage + QuickPublish). */
-    vision: VisionPreflightState;
 }
 
 export interface AiPreflightPrepareResult {
@@ -122,7 +109,6 @@ const initialState: AiPreflightState = {
     snapshot_hash: null,
     job_id: null,
     error: null,
-    vision: { ...idleVisionState },
 };
 
 const FORMAL_POLL_INTERVAL_MS = 400;
@@ -135,8 +121,6 @@ function clearTokenSideEffects(token: string | null) {
 
 export function useAiPreflight() {
     const [state, setState] = useState<AiPreflightState>(initialState);
-    const stateRef = useRef<AiPreflightState>(initialState);
-    stateRef.current = state;
     const generationRef = useRef(0);
     const tokenRef = useRef<string | null>(null);
     const jobIdRef = useRef<string | null>(null);
@@ -199,7 +183,6 @@ export function useAiPreflight() {
                 snapshot_hash: null,
                 job_id: null,
                 error: errorMessage,
-                vision: { ...idleVisionState },
             }));
             return {
                 job_state: null,
@@ -232,7 +215,6 @@ export function useAiPreflight() {
                     snapshot_hash: null,
                     job_id: null,
                     error: errorMessage,
-                    vision: { ...idleVisionState },
                 }));
             } else {
                 setState((current) => ({
@@ -348,7 +330,6 @@ export function useAiPreflight() {
                     error: lifecycle === 'cancelled'
                         ? '发布前检查已取消。'
                         : (current.error ?? '发布前检查会话已不可用。'),
-                    vision: { ...idleVisionState },
                 }));
             } else {
                 reconcilingRef.current = true;
@@ -469,7 +450,6 @@ export function useAiPreflight() {
             snapshot_hash: null,
             job_id: null,
             error: '检查状态同步失败，正在对账会话…',
-            vision: { ...idleVisionState },
         }));
         void reconcileSession(
             token,
@@ -567,7 +547,6 @@ export function useAiPreflight() {
             snapshot_hash: null,
             job_id: null,
             error: null,
-            vision: { ...idleVisionState },
         }));
     }, [stopPolling]);
 
@@ -601,7 +580,6 @@ export function useAiPreflight() {
             snapshot_hash: null,
             job_id: null,
             error: null,
-            vision: { ...idleVisionState },
         }));
         const result = await reconcileSession(
             token,
@@ -618,7 +596,6 @@ export function useAiPreflight() {
         auditBase: AiAuditResult,
         fallbackSnapshotHash: string,
         localBlockers: string[],
-        vision: VisionPreflightState,
     ): AiPreflightPrepareResult => {
         const audit: AiAuditResult = {
             ...auditBase,
@@ -646,7 +623,6 @@ export function useAiPreflight() {
             job_id: jobIdRef.current,
             acknowledgements: { ...idleAcknowledgements },
             acknowledgementsBound: audit.decision === 'GO',
-            vision,
         }));
 
         if (audit.decision === 'PENDING' && jobIdRef.current) {
@@ -666,12 +642,11 @@ export function useAiPreflight() {
         };
     }, [startFormalPolling]);
 
-    const runFormalAfterVision = useCallback(async (
+    const runFormalAudit = useCallback(async (
         token: string,
         requestGeneration: number,
         snapshotHash: string,
         localBlockers: string[],
-        vision: VisionPreflightState,
     ): Promise<AiPreflightPrepareResult> => {
         const auditBase = await startFormalAudit({
             plan_token: token,
@@ -688,9 +663,45 @@ export function useAiPreflight() {
             auditBase,
             auditBase.snapshot_hash ?? snapshotHash,
             localBlockers,
-            vision,
         );
     }, [commitFormalAudit]);
+
+    const runPlanMediaInfo = useCallback(async (
+        token: string,
+        requestGeneration: number,
+        snapshotHash: string,
+    ): Promise<string> => {
+        let started;
+        try {
+            started = await startPlanMediaInfo(token);
+        } catch {
+            // Formal audit will truthfully add MEDIA_NOT_TESTED when local probing cannot start.
+            return snapshotHash;
+        }
+        if (!started?.job_id) {
+            return snapshotHash;
+        }
+
+        const jobId = started.job_id;
+        let terminal = started.state === 'queued' || started.state === 'running'
+            ? null
+            : started;
+        while (!terminal) {
+            if (requestGeneration !== generationRef.current) {
+                void cancelAiJob(jobId).catch(() => undefined);
+                throw createSupersededError();
+            }
+            await new Promise((resolve) => setTimeout(resolve, FORMAL_POLL_INTERVAL_MS));
+            terminal = await pollPlanMediaInfo(jobId);
+        }
+        if (requestGeneration !== generationRef.current) {
+            void cancelAiJob(jobId).catch(() => undefined);
+            throw createSupersededError();
+        }
+        return terminal.state === 'succeeded' && terminal.snapshot_hash.trim()
+            ? terminal.snapshot_hash
+            : snapshotHash;
+    }, []);
 
     const prepare = useCallback(async (
         request: PublishRequestPayload,
@@ -757,7 +768,6 @@ export function useAiPreflight() {
             job_id: null,
             acknowledgements: { ...idleAcknowledgements },
             acknowledgementsBound: true,
-            vision: { ...idleVisionState, status: 'listing' },
         }));
 
         // Track the prepared token so any failure / non-commit path can invalidate it.
@@ -784,7 +794,6 @@ export function useAiPreflight() {
             // returns local_blockers (plan-token blockers are authoritative).
             void localBlockers;
 
-            // AI-disabled / unconfigured: skip Vision entirely (zero image/network side effects).
             const settings = await getAiSettings();
             if (requestGeneration !== generationRef.current) {
                 clearTokenSideEffects(token);
@@ -792,94 +801,30 @@ export function useAiPreflight() {
                 throw createSupersededError();
             }
 
-            let vision: VisionPreflightState = {
-                ...idleVisionState,
-                status: 'skipped',
-            };
-
             if (isAiConfigured(settings)) {
-                // Plan-token Vision: list candidates from bound final content only.
-                let listed;
-                try {
-                    listed = await listPlanVisionCandidates(token);
-                } catch {
-                    // Listing failure must not invent images; continue text-only formal audit.
-                    listed = null;
-                }
-                if (requestGeneration !== generationRef.current) {
-                    clearTokenSideEffects(token);
-                    preparedToken = null;
-                    throw createSupersededError();
-                }
-
-                // Any non-empty candidate set requires explicit disclosure/consent — never auto-bind.
-                const candidates = listed?.candidates ?? [];
-                if (candidates.length > 0) {
-                    preparedToken = null;
-                    tokenRef.current = token;
-                    vision = {
-                        status: 'needs_selection',
-                        candidates,
-                        selectedUrls: [],
-                        maxImages: listed?.max_images ?? 5,
-                        boundImages: [],
-                        warnings: [],
-                        error: null,
-                    };
-                    setState((current) => ({
-                        ...current,
-                        checking: false,
-                        error: null,
-                        audit: null,
-                        decision: 'PENDING',
-                        lifecycle: 'awaiting_vision',
-                        token,
-                        snapshot_hash: listed?.snapshot_hash || nextSnapshotHash,
-                        job_id: null,
-                        acknowledgements: { ...idleAcknowledgements },
-                        acknowledgementsBound: false,
-                        vision,
-                    }));
-                    return {
-                        token,
-                        snapshotHash: listed?.snapshot_hash || nextSnapshotHash,
-                        audit: {
-                            decision: 'PENDING',
-                            findings: [],
-                            unknown_codes: [],
-                            local_blockers: prepared.local_blockers,
-                            formal_ran: false,
-                            job_id: null,
-                            plan_token: token,
-                            snapshot_hash: listed?.snapshot_hash || nextSnapshotHash,
-                            request_generation: requestGeneration,
-                        },
-                        requestGeneration,
-                    };
-                }
-
-                vision = {
-                    ...idleVisionState,
-                    status: 'bound',
-                    candidates: [],
-                    maxImages: listed?.max_images ?? 5,
-                };
+                // Empty relative_entries instructs Rust to resolve and probe every media
+                // file declared by the bound torrent. Successful per-file outcomes roll
+                // the plan hash and become part of the formal audit context.
+                nextSnapshotHash = await runPlanMediaInfo(
+                    token,
+                    requestGeneration,
+                    nextSnapshotHash,
+                );
             }
 
-            // Start formal audit with plan_token only after Vision bind (or skip).
+            // Start formal audit only after the automatic MediaInfo pass has settled.
             // Keep the token armed until the audit has committed so a start failure
             // still invalidates the prepared plan in the catch path.
             setState((current) => (
-                current.lifecycle === 'preparing' || current.lifecycle === 'awaiting_vision'
+                current.lifecycle === 'preparing'
                     ? { ...current, lifecycle: 'auditing' }
                     : current
             ));
-            const result = await runFormalAfterVision(
+            const result = await runFormalAudit(
                 token,
                 requestGeneration,
                 nextSnapshotHash,
                 prepared.local_blockers,
-                vision,
             );
             preparedToken = null;
             return result;
@@ -906,12 +851,11 @@ export function useAiPreflight() {
                     acknowledgements: { ...idleAcknowledgements },
                     acknowledgementsBound: true,
                     error: readFriendlyError(error, '无法准备发布前检查。'),
-                    vision: { ...idleVisionState },
                 }));
             }
             throw error;
         }
-    }, [reconcileSession, runFormalAfterVision, stopPolling]);
+    }, [reconcileSession, runFormalAudit, runPlanMediaInfo, stopPolling]);
 
     /**
      * Retry: refuse while reconciling unknown; reconcile any retained session, then
@@ -936,271 +880,6 @@ export function useAiPreflight() {
         // prepare() already runs the retained-session guard.
         return prepare(draft.request, draft.localBlockers);
     }, [prepare]);
-
-    /**
-     * Toggle a Vision candidate URL for explicit selection.
-     * Never auto-fills beyond maxImages; user must choose up to the cap.
-     */
-    const toggleVisionSelection = useCallback((url: string) => {
-        setState((current) => {
-            if (current.vision.status !== 'needs_selection') {
-                return current;
-            }
-            const exists = current.vision.selectedUrls.includes(url);
-            let selectedUrls: string[];
-            if (exists) {
-                selectedUrls = current.vision.selectedUrls.filter((item) => item !== url);
-            } else if (current.vision.selectedUrls.length >= current.vision.maxImages) {
-                // Do not silently replace or exceed the cap.
-                return current;
-            } else {
-                selectedUrls = [...current.vision.selectedUrls, url];
-            }
-            return {
-                ...current,
-                vision: {
-                    ...current.vision,
-                    selectedUrls,
-                    error: null,
-                },
-            };
-        });
-    }, []);
-
-    /**
-     * Select all candidates up to maxImages (≤5 selects every candidate; over-cap caps at max).
-     * Never binds — user must still confirm or choose text-only.
-     */
-    const selectAllVisionCandidates = useCallback(() => {
-        setState((current) => {
-            if (current.vision.status !== 'needs_selection') {
-                return current;
-            }
-            const selectedUrls = current.vision.candidates
-                .slice(0, current.vision.maxImages)
-                .map((item) => item.url);
-            return {
-                ...current,
-                vision: {
-                    ...current.vision,
-                    selectedUrls,
-                    error: null,
-                },
-            };
-        });
-    }, []);
-
-    /**
-     * Continue with exactly one formal text-only audit: no bind, no later silent Vision attach.
-     * Records truthful skipped Vision state for this generation.
-     */
-    const continueTextOnlyVision = useCallback(async (): Promise<void> => {
-        const requestGeneration = generationRef.current;
-        const token = tokenRef.current;
-        const current = stateRef.current;
-        if (
-            !token
-            || current.vision.status !== 'needs_selection'
-            || !current.token
-            || current.token !== token
-            || current.lifecycle === 'reconciling'
-        ) {
-            return;
-        }
-        const fallbackHash = current.snapshot_hash ?? '';
-        const candidates = current.vision.candidates;
-        const maxImages = current.vision.maxImages;
-        setState((latest) => {
-            if (
-                latest.vision.status !== 'needs_selection'
-                || !latest.token
-                || latest.token !== token
-            ) {
-                return latest;
-            }
-            return {
-                ...latest,
-                checking: true,
-                lifecycle: 'auditing',
-                vision: {
-                    status: 'skipped',
-                    candidates,
-                    selectedUrls: [],
-                    maxImages,
-                    boundImages: [],
-                    warnings: ['已选择仅文本审核；本次检查未绑定图片，也不会在后台自动附加图片。'],
-                    error: null,
-                },
-            };
-        });
-        try {
-            const vision: VisionPreflightState = {
-                status: 'skipped',
-                candidates,
-                selectedUrls: [],
-                maxImages,
-                boundImages: [],
-                warnings: ['已选择仅文本审核；本次检查未绑定图片，也不会在后台自动附加图片。'],
-                error: null,
-            };
-            await runFormalAfterVision(
-                token,
-                requestGeneration,
-                fallbackHash,
-                [],
-                vision,
-            );
-        } catch (error) {
-            if (isPrepareSupersededError(error)) {
-                return;
-            }
-            if (requestGeneration !== generationRef.current || tokenRef.current !== token) {
-                return;
-            }
-            setState((latest) => (
-                latest.token === token
-                    ? {
-                        ...latest,
-                        checking: false,
-                        lifecycle: 'awaiting_vision',
-                        vision: {
-                            status: 'needs_selection',
-                            candidates,
-                            selectedUrls: [],
-                            maxImages,
-                            boundImages: [],
-                            warnings: [],
-                            error: readFriendlyError(error, '无法启动仅文本审核，请重试。'),
-                        },
-                    }
-                    : latest
-            ));
-        }
-    }, [runFormalAfterVision]);
-
-    /**
-     * After the user picks ≤ maxImages images, bind them to the plan token and start formal audit.
-     * Generation-guarded so stale selections cannot publish a drifted plan.
-     */
-    const confirmVisionSelection = useCallback(async (): Promise<void> => {
-        const requestGeneration = generationRef.current;
-        const token = tokenRef.current;
-
-        const current = stateRef.current;
-        if (
-            !token
-            || current.vision.status !== 'needs_selection'
-            || !current.token
-            || current.token !== token
-            || current.lifecycle === 'reconciling'
-        ) {
-            return;
-        }
-        const selection: {
-            urls: string[];
-            maxImages: number;
-            candidates: VisionPreflightState['candidates'];
-            fallbackHash: string;
-        } = {
-            urls: [...current.vision.selectedUrls],
-            maxImages: current.vision.maxImages,
-            candidates: current.vision.candidates,
-            fallbackHash: current.snapshot_hash ?? '',
-        };
-        setState((latest) => {
-            if (
-                latest.vision.status !== 'needs_selection'
-                || !latest.token
-                || latest.token !== token
-            ) {
-                return latest;
-            }
-            return {
-                ...latest,
-                checking: true,
-                lifecycle: 'awaiting_vision',
-                vision: {
-                    ...latest.vision,
-                    status: 'binding',
-                    error: null,
-                },
-            };
-        });
-
-        if (!token || !selection) {
-            return;
-        }
-        const { urls, maxImages, candidates, fallbackHash } = selection;
-
-        if (urls.length === 0 || urls.length > maxImages) {
-            setState((latest) => (
-                latest.token === token
-                    ? {
-                        ...latest,
-                        checking: false,
-                        lifecycle: 'awaiting_vision',
-                        vision: {
-                            ...latest.vision,
-                            status: 'needs_selection',
-                            error: `请明确选择 1–${maxImages} 张图片后再继续。`,
-                        },
-                    }
-                    : latest
-            ));
-            return;
-        }
-
-        try {
-            const bound = await bindPlanVision({
-                plan_token: token,
-                selected_urls: urls,
-            });
-            if (
-                requestGeneration !== generationRef.current
-                || tokenRef.current !== token
-            ) {
-                clearTokenSideEffects(token);
-                throw createSupersededError();
-            }
-            const vision: VisionPreflightState = {
-                status: 'bound',
-                candidates,
-                selectedUrls: urls,
-                maxImages,
-                boundImages: bound.images ?? [],
-                warnings: bound.warnings ?? [],
-                error: null,
-            };
-            await runFormalAfterVision(
-                token,
-                requestGeneration,
-                bound.snapshot_hash || fallbackHash,
-                [],
-                vision,
-            );
-        } catch (error) {
-            if (isPrepareSupersededError(error)) {
-                return;
-            }
-            if (requestGeneration !== generationRef.current || tokenRef.current !== token) {
-                return;
-            }
-            setState((latest) => (
-                latest.token === token
-                    ? {
-                        ...latest,
-                        checking: false,
-                        lifecycle: 'awaiting_vision',
-                        vision: {
-                            ...latest.vision,
-                            status: 'needs_selection',
-                            error: readFriendlyError(error, '无法绑定所选图片，请重试。'),
-                        },
-                    }
-                    : latest
-            ));
-        }
-    }, [runFormalAfterVision]);
 
     /**
      * When confirm is clicked while formal audit is still PENDING and pending ack is bound,
@@ -1286,21 +965,15 @@ export function useAiPreflight() {
     const needsBoundAcks = decision === 'WARNING'
         || decision === 'NO_GO'
         || decision === 'PENDING';
-    const visionBlocksConfirm = state.vision.status === 'needs_selection'
-        || state.vision.status === 'binding'
-        || state.vision.status === 'listing';
     const lifecycleBlocksConfirm = lifecycle === 'reconciling'
         || lifecycle === 'unavailable'
         || lifecycle === 'cancelled'
         || lifecycle === 'idle'
-        || lifecycle === 'preparing'
-        || lifecycle === 'awaiting_vision';
+        || lifecycle === 'preparing';
     // checking is only true during prepare/start — PENDING background audit still allows confirm.
-    // Vision over-cap selection must complete before confirm (no silent first-five).
     // Unavailable/cancelled cannot inherit pending ack or older terminal.
     const canConfirm = !state.checking
         && !state.error
-        && !visionBlocksConfirm
         && !lifecycleBlocksConfirm
         && Boolean(state.token)
         && Boolean(state.snapshot_hash)
@@ -1320,10 +993,6 @@ export function useAiPreflight() {
         retryReconciliation,
         setAcknowledgement,
         cancelPendingAuditForPublish,
-        toggleVisionSelection,
-        selectAllVisionCandidates,
-        confirmVisionSelection,
-        continueTextOnlyVision,
         canConfirm,
     };
 }

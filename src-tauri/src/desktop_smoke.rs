@@ -2,7 +2,7 @@
 //!
 //! When launched with `OKPGUI_DESKTOP_SMOKE_OUT=<path>`, the process runs production
 //! domain paths (prepare plan, acknowledgements, publish-safe audit cancel, session
-//! cancel, vision consent, MediaInfo resolve+spawn, keyring session-only policy) and
+//! cancel, MediaInfo resolve+spawn, keyring session-only policy) and
 //! writes a JSON report for the Node evidence harness.
 //!
 //! Honesty contract:
@@ -18,7 +18,6 @@ use crate::ai::audit::{Acknowledgements, AuditDecision};
 use crate::ai::credentials::{decide_session_only_cold_start, SessionOnlyColdStartAction};
 use crate::ai::jobs::{AiJobState, JobKind};
 use crate::ai::media::{packaged_mediainfo_candidates, resolve_packaged_mediainfo};
-use crate::ai::vision::{resolve_selected_vision_inputs, VisionError, VisionImageInput};
 use crate::commands::ai_commands::{
     ai_cancel_job, ai_get_job, cancel_pending_audit_for_publish_core,
     cancel_preflight_session_core, start_job_backend,
@@ -286,33 +285,6 @@ pub fn run_and_write(out_path: &Path) -> i32 {
     );
     all_ok &= schema_ok;
 
-    // Vision consent: empty selection never auto-binds under cap.
-    let vision_ok = {
-        let candidates = (0..3)
-            .map(|i| VisionImageInput {
-                url: format!("https://example.test/smoke/{i}.jpg"),
-                source: "markdown".to_string(),
-            })
-            .collect::<Vec<_>>();
-        let empty_err = resolve_selected_vision_inputs(&candidates, &[]);
-        let selected: Vec<String> = candidates.iter().map(|c| c.url.clone()).collect();
-        let selected_ok = resolve_selected_vision_inputs(&candidates, &selected)
-            .map(|v| v.len() == 3)
-            .unwrap_or(false);
-        matches!(empty_err, Err(VisionError::TooManyImages(3))) && selected_ok
-    };
-    push_ok(
-        &mut named,
-        "vision-disclosure-consent",
-        vision_ok,
-        if vision_ok {
-            "Empty selection rejected; explicit URLs required under cap".to_string()
-        } else {
-            "Vision consent resolver failed".to_string()
-        },
-    );
-    all_ok &= vision_ok;
-
     let torrent = write_temp_torrent();
 
     // Shared backend prepare + PENDING ack + publish-safe cancel (token must stay live).
@@ -549,7 +521,7 @@ pub fn run_and_write(out_path: &Path) -> i32 {
         "production-binary-probe",
         all_ok,
         if all_ok {
-            "Production prepare_plan / cancel / vision / keyring-policy paths exercised in built binary (not WebView IPC)"
+            "Production prepare_plan / cancel / MediaInfo / keyring-policy paths exercised in built binary (not WebView IPC)"
                 .to_string()
         } else {
             "One or more hard production binary probes failed".to_string()

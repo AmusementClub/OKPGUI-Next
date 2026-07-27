@@ -130,15 +130,15 @@ pub fn build_no_redirect_client() -> Result<Client, String> {
         .map_err(|error| format!("provider client build failed: {error}"))
 }
 
-/// V2 minimal strict probe schema. Local validation requires `{"正常": true}`.
+/// V2 minimal strict probe schema. Local validation requires `{"ok": true}`.
 pub fn minimal_probe_schema() -> Value {
     json!({
         "type": "object",
         "description": "Strict 结构化输出能力验证结果。",
         "properties": {
-            "正常": { "type": "boolean", "description": "固定为 true，表示模型能够按严格 schema 返回结果。" }
+            "ok": { "type": "boolean", "description": "固定为 true，表示模型能够按严格 schema 返回结果。" }
         },
-        "required": ["正常"],
+        "required": ["ok"],
         "additionalProperties": false
     })
 }
@@ -146,7 +146,7 @@ pub fn minimal_probe_schema() -> Value {
 /// True only when the structured object is the exact V2 probe payload.
 pub fn validate_minimal_probe_object(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
-        object.len() == 1 && object.get("正常").and_then(Value::as_bool) == Some(true)
+        object.len() == 1 && object.get("ok").and_then(Value::as_bool) == Some(true)
     })
 }
 
@@ -166,9 +166,9 @@ pub fn build_probe_request(
         schema,
         auth_mode,
         "okpgui_probe",
-        "你正在验证当前模型是否支持严格结构化输出。只完成能力验证，不执行任何其他任务。输出内容必须使用简体中文协议字段。",
-        "请返回能力验证结果；将“正常”设置为 true。",
-        128,
+        "你正在验证当前模型是否支持严格结构化输出。只完成能力验证，不执行任何其他任务。JSON 字段名必须使用 schema 中定义的英文名称；需要程序判断的状态值必须使用 schema 定义的英文值；面向用户的说明性文本必须使用简体中文。",
+        "请返回能力验证结果；将 ok 设置为 true。",
+        4096,
     )
 }
 
@@ -313,14 +313,6 @@ pub fn classify_and_validate_probe_response(
     }
 }
 
-/// One in-memory Vision part for provider request assembly only.
-/// Bytes exist solely while building the request body; never log or persist them.
-#[derive(Debug, Clone)]
-pub struct VisionRequestImage {
-    pub mime_type: String,
-    pub bytes: Vec<u8>,
-}
-
 /// Build a strict structured-output request with distinct system and user messages.
 #[allow(clippy::too_many_arguments)]
 pub fn build_structured_request_with_system(
@@ -334,36 +326,6 @@ pub fn build_structured_request_with_system(
     system_prompt: &str,
     user_prompt: &str,
     max_tokens: u32,
-) -> Result<ProviderRequest, String> {
-    build_structured_request_with_vision_and_system(
-        provider,
-        mode,
-        endpoint,
-        model,
-        schema,
-        auth_mode,
-        schema_name,
-        system_prompt,
-        user_prompt,
-        max_tokens,
-        &[],
-    )
-}
-
-/// Same request contract with optional bound Vision images.
-#[allow(clippy::too_many_arguments)]
-pub fn build_structured_request_with_vision_and_system(
-    provider: ProviderKind,
-    mode: ProviderMode,
-    endpoint: &str,
-    model: &str,
-    schema: &Value,
-    auth_mode: AuthMode,
-    schema_name: &str,
-    system_prompt: &str,
-    user_prompt: &str,
-    max_tokens: u32,
-    vision_images: &[VisionRequestImage],
 ) -> Result<ProviderRequest, String> {
     if model.trim().is_empty() {
         return Err("model is required".to_string());
@@ -382,13 +344,14 @@ pub fn build_structured_request_with_vision_and_system(
             }
             input.push(json!({
                 "role": "user",
-                "content": openai_responses_content(user_prompt, vision_images)
+                "content": user_prompt
             }));
             (
                 format!("{base}/responses"),
                 json!({
                 "model": model,
                 "input": input,
+                "max_output_tokens": max_tokens,
                 "text": {"format": {"type": "json_schema", "name": schema_name, "strict": true, "schema": schema}}
                 }),
             )
@@ -400,13 +363,14 @@ pub fn build_structured_request_with_vision_and_system(
             }
             messages.push(json!({
                 "role": "user",
-                "content": openai_chat_content(user_prompt, vision_images)
+                "content": user_prompt
             }));
             (
                 format!("{base}/chat/completions"),
                 json!({
                 "model": model,
                 "messages": messages,
+                "max_completion_tokens": max_tokens,
                 "response_format": {"type": "json_schema", "json_schema": {"name": schema_name, "strict": true, "schema": schema}}
                 }),
             )
@@ -416,7 +380,7 @@ pub fn build_structured_request_with_vision_and_system(
             json!({
                 "model": model,
                 "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": anthropic_messages_content(user_prompt, vision_images)}],
+                "messages": [{"role": "user", "content": user_prompt}],
                 "output_config": {"format": {"type": "json_schema", "schema": schema}}
             }),
         ),
@@ -438,100 +402,6 @@ pub fn build_structured_request_with_vision_and_system(
         body,
         managed_auth_header: managed_auth_header(auth_mode),
     })
-}
-
-/// OpenAI Responses multimodal content parts (`input_text` + `input_image`).
-fn openai_responses_content(user_prompt: &str, vision_images: &[VisionRequestImage]) -> Value {
-    let mut parts = vec![json!({"type": "input_text", "text": user_prompt})];
-    for image in vision_images {
-        let data_url = data_image_url(&image.mime_type, &image.bytes);
-        parts.push(json!({
-            "type": "input_image",
-            "image_url": data_url,
-        }));
-    }
-    Value::Array(parts)
-}
-
-/// OpenAI Chat multimodal content: plain string when text-only; part array when Vision is bound.
-fn openai_chat_content(user_prompt: &str, vision_images: &[VisionRequestImage]) -> Value {
-    if vision_images.is_empty() {
-        return Value::String(user_prompt.to_string());
-    }
-    let mut parts = vec![json!({"type": "text", "text": user_prompt})];
-    for image in vision_images {
-        let data_url = data_image_url(&image.mime_type, &image.bytes);
-        parts.push(json!({
-            "type": "image_url",
-            "image_url": {"url": data_url},
-        }));
-    }
-    Value::Array(parts)
-}
-
-/// Anthropic Messages multimodal content parts (`text` + `image` base64 source).
-fn anthropic_messages_content(user_prompt: &str, vision_images: &[VisionRequestImage]) -> Value {
-    if vision_images.is_empty() {
-        return Value::String(user_prompt.to_string());
-    }
-    let mut parts = vec![json!({"type": "text", "text": user_prompt})];
-    for image in vision_images {
-        let media_type = if image.mime_type.trim().is_empty() {
-            "image/jpeg"
-        } else {
-            image.mime_type.as_str()
-        };
-        parts.push(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": media_type,
-                "data": encode_base64(&image.bytes),
-            }
-        }));
-    }
-    Value::Array(parts)
-}
-
-fn data_image_url(mime_type: &str, bytes: &[u8]) -> String {
-    let mime = if mime_type.trim().is_empty() {
-        "image/jpeg"
-    } else {
-        mime_type
-    };
-    format!("data:{mime};base64,{}", encode_base64(bytes))
-}
-
-/// Minimal base64 encoder (no extra dependency). Used only for ephemeral provider bodies.
-pub fn encode_base64(bytes: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().saturating_add(2) / 3 * 4);
-    let mut index = 0;
-    while index + 3 <= bytes.len() {
-        let n = ((bytes[index] as u32) << 16)
-            | ((bytes[index + 1] as u32) << 8)
-            | (bytes[index + 2] as u32);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push(TABLE[(n & 0x3f) as usize] as char);
-        index += 3;
-    }
-    let rem = bytes.len() - index;
-    if rem == 1 {
-        let n = (bytes[index] as u32) << 16;
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let n = ((bytes[index] as u32) << 16) | ((bytes[index + 1] as u32) << 8);
-        out.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
-        out.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
-        out.push('=');
-    }
-    out
 }
 
 /// Execute a provider request with managed authorization. Never logs secrets.
@@ -1071,82 +941,9 @@ mod tests {
     }
 
     #[test]
-    fn vision_content_parts_are_provider_specific() {
+    fn structured_requests_are_text_only() {
         let schema = json!({"type": "object", "properties": {}});
-        let images = [VisionRequestImage {
-            mime_type: "image/jpeg".into(),
-            bytes: b"jpeg-bytes".to_vec(),
-        }];
-        let encoded = encode_base64(b"jpeg-bytes");
-
-        let responses = build_structured_request_with_vision_and_system(
-            ProviderKind::OpenAi,
-            ProviderMode::Responses,
-            "https://example.test/v1",
-            "model",
-            &schema,
-            AuthMode::Bearer,
-            "okpgui_audit",
-            "system-prompt",
-            "audit-prompt",
-            1024,
-            &images,
-        )
-        .unwrap();
-        let content = responses.body.pointer("/input/1/content").unwrap();
-        assert_eq!(content[0]["type"], "input_text");
-        assert_eq!(content[1]["type"], "input_image");
-        assert_eq!(
-            content[1]["image_url"],
-            format!("data:image/jpeg;base64,{encoded}")
-        );
-
-        let chat = build_structured_request_with_vision_and_system(
-            ProviderKind::OpenAi,
-            ProviderMode::Chat,
-            "https://example.test/v1",
-            "model",
-            &schema,
-            AuthMode::Bearer,
-            "okpgui_audit",
-            "system-prompt",
-            "audit-prompt",
-            1024,
-            &images,
-        )
-        .unwrap();
-        let chat_content = chat.body.pointer("/messages/1/content").unwrap();
-        assert!(chat_content.is_array());
-        assert_eq!(chat_content[0]["type"], "text");
-        assert_eq!(chat_content[1]["type"], "image_url");
-        assert_eq!(
-            chat_content[1]["image_url"]["url"],
-            format!("data:image/jpeg;base64,{encoded}")
-        );
-
-        let anthropic = build_structured_request_with_vision_and_system(
-            ProviderKind::Anthropic,
-            ProviderMode::AnthropicMessages,
-            "https://example.test/v1",
-            "model",
-            &schema,
-            AuthMode::AnthropicApiKey,
-            "okpgui_audit",
-            "system-prompt",
-            "audit-prompt",
-            1024,
-            &images,
-        )
-        .unwrap();
-        let anth_content = anthropic.body.pointer("/messages/0/content").unwrap();
-        assert_eq!(anth_content[0]["type"], "text");
-        assert_eq!(anth_content[1]["type"], "image");
-        assert_eq!(anth_content[1]["source"]["type"], "base64");
-        assert_eq!(anth_content[1]["source"]["media_type"], "image/jpeg");
-        assert_eq!(anth_content[1]["source"]["data"], encoded);
-
-        // Text-only requests keep the historical Chat/Anthropic string content shape.
-        let text_only = build_structured_request_with_system(
+        let request = build_structured_request_with_system(
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             "https://example.test/v1",
@@ -1160,20 +957,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            text_only.body.pointer("/messages/1/content").unwrap(),
+            request.body.pointer("/messages/1/content").unwrap(),
             "audit-prompt"
         );
-    }
-
-    #[test]
-    fn encode_base64_is_rfc4648_compatible() {
-        assert_eq!(encode_base64(b""), "");
-        assert_eq!(encode_base64(b"f"), "Zg==");
-        assert_eq!(encode_base64(b"fo"), "Zm8=");
-        assert_eq!(encode_base64(b"foo"), "Zm9v");
-        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
-        assert_eq!(encode_base64(b"fooba"), "Zm9vYmE=");
-        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+        let serialized = serde_json::to_string(&request.body).unwrap();
+        assert!(!serialized.contains("input_image"));
+        assert!(!serialized.contains("image_url"));
+        assert!(!serialized.contains("base64"));
     }
 
     #[test]
@@ -2237,19 +2027,19 @@ mod tests {
     }
 
     #[test]
-    fn probe_validation_requires_exact_chinese_ok_true_object() {
-        assert!(validate_minimal_probe_object(&json!({"正常": true})));
-        assert!(!validate_minimal_probe_object(&json!({"正常": false})));
+    fn probe_validation_requires_exact_english_ok_true_object() {
+        assert!(validate_minimal_probe_object(&json!({"ok": true})));
+        assert!(!validate_minimal_probe_object(&json!({"ok": false})));
         assert!(!validate_minimal_probe_object(
-            &json!({"正常": true, "额外": 1})
+            &json!({"ok": true, "extra": 1})
         ));
-        assert!(!validate_minimal_probe_object(&json!({"ok": true})));
+        assert!(!validate_minimal_probe_object(&json!({"正常": true})));
 
         let ready = classify_and_validate_probe_response(
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"parsed":{"正常":true}}}]}"#,
+            r#"{"choices":[{"message":{"parsed":{"ok":true}}}]}"#,
         );
         assert_eq!(ready.state, CapabilityState::Ready);
 
@@ -2257,7 +2047,7 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"正常\":true}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#,
         );
         assert_eq!(content_ready.state, CapabilityState::Ready);
 
@@ -2265,7 +2055,7 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"parsed":{"正常":false}}}]}"#,
+            r#"{"choices":[{"message":{"parsed":{"ok":false}}}]}"#,
         );
         assert_eq!(wrong_object.state, CapabilityState::Unsupported);
 
@@ -2274,7 +2064,7 @@ mod tests {
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             200,
-            r#"{"choices":[{"message":{"content":"{\"正常\":true,\"额外\":1}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"ok\":true,\"extra\":1}"}}]}"#,
         );
         assert_eq!(wrong_content_shape.state, CapabilityState::Unsupported);
 
@@ -2311,6 +2101,6 @@ mod tests {
         assert!(schema
             .get("required")
             .and_then(Value::as_array)
-            .is_some_and(|required| required.iter().any(|item| item.as_str() == Some("正常"))));
+            .is_some_and(|required| required.iter().any(|item| item.as_str() == Some("ok"))));
     }
 }

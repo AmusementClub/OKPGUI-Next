@@ -15,10 +15,8 @@ import type {
     CancelPendingAuditForPublishResult,
     CancelPreflightSessionResult,
     ConsumedTemplateSeed,
+    MediaInfoJobView,
     PlanPrepareResponse,
-    PlanVisionBindRequest,
-    PlanVisionBindResponse,
-    PlanVisionCandidatesResponse,
     PreflightSessionChangedPayload,
     PublishPlan,
     PublishRequestPayload,
@@ -213,27 +211,19 @@ export async function startFormalAudit(request: AiFormalAuditRequest): Promise<A
     return invoke<AiAuditResult>('ai_start_formal_audit', { request });
 }
 
-/**
- * List Vision image candidates derived only from the prepared plan's final content.
- * Zero network; does not mutate the plan. Callers must not invent snapshot hashes.
- */
-export async function listPlanVisionCandidates(
-    planToken: string,
-): Promise<PlanVisionCandidatesResponse> {
-    return invoke<PlanVisionCandidatesResponse>('ai_list_plan_vision_candidates', {
-        planToken,
+/** Start a plan-bound MediaInfo pass over every media entry declared by the torrent. */
+export async function startPlanMediaInfo(planToken: string): Promise<MediaInfoJobView> {
+    return invoke<MediaInfoJobView>('ai_start_media_info', {
+        request: {
+            plan_token: planToken,
+            relative_entries: [],
+        },
     });
 }
 
-/**
- * Bind selected Vision images to a prepared plan token.
- * Backend fetches/normalizes, rolls the plan hash, and invalidates prior audit evidence.
- * Never accepts client-supplied image bytes, hashes, or decisions as authority.
- */
-export async function bindPlanVision(
-    request: PlanVisionBindRequest,
-): Promise<PlanVisionBindResponse> {
-    return invoke<PlanVisionBindResponse>('ai_bind_plan_vision', { request });
+/** Poll a MediaInfo task; null means the job is still queued or running. */
+export async function pollPlanMediaInfo(jobId: string): Promise<MediaInfoJobView | null> {
+    return invoke<MediaInfoJobView | null>('ai_poll_media_info', { jobId });
 }
 
 /**

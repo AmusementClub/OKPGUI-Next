@@ -8,7 +8,6 @@ These are **not** Playwright UI-integration tests and must never be labeled mock
 | `home-prepare-observe-ack-publish` | [home-prepare-observe-ack-publish.md](./home-prepare-observe-ack-publish.md) |
 | `quick-publish-prepare-observe-ack-publish` | [quick-publish-prepare-observe-ack-publish.md](./quick-publish-prepare-observe-ack-publish.md) |
 | `cancellation-and-failed-poll-recovery` | [cancellation-and-failed-poll-recovery.md](./cancellation-and-failed-poll-recovery.md) |
-| `vision-disclosure-consent` | [vision-disclosure-consent.md](./vision-disclosure-consent.md) |
 
 Catalog source of truth for runners: `tests/desktop-e2e/suite/critical-flows.mjs`.
 

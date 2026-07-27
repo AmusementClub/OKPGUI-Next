@@ -21,8 +21,6 @@ function kindLabel(kind: ActiveAiJobSummary['kind']): string {
             return '自动选模板';
         case 'media_info':
             return '媒体信息';
-        case 'vision':
-            return '视觉';
         case 'capability_probe':
             return '能力探测';
         default:

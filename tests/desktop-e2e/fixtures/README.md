@@ -18,7 +18,6 @@ Desktop critical flows must hit a **local mock provider** (loopback), never paid
 
 - Mock HTTP server (or in-process Rust mock) implementing the BYOK provider contract
 - Controlled GO / WARNING / FAIL / transport error bodies
-- Vision candidates on loopback only
 - No credentials and no outbound network beyond loopback
 
 See [mock-provider.md](./mock-provider.md).

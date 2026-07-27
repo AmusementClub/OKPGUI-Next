@@ -77,12 +77,6 @@ pub fn run() {
             commands::ai_commands::ai_start_media_info,
             commands::ai_commands::ai_poll_media_info,
             commands::ai_commands::ai_get_media_info_result,
-            // Legacy Vision IPC retired: ai_extract_vision_images / ai_normalize_vision_image
-            // are no longer registered. Plan-token Vision is the only public surface.
-            // Plan-token Vision: list candidates from bound final content, bind after
-            // explicit over-cap selection, then formal audit attaches provider image parts.
-            commands::ai_commands::ai_list_plan_vision_candidates,
-            commands::ai_commands::ai_bind_plan_vision,
             // TemplateSelection is a backend-owned AiJob: start / poll; cancel via ai_cancel_job.
             // Seed mint only on Succeeded; cancel/stale/late completion never hand off a seed.
             commands::ai_commands::ai_start_template_selection,

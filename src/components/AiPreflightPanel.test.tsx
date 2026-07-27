@@ -26,15 +26,6 @@ function baseState(overrides: Partial<AiPreflightState> = {}): AiPreflightState 
         snapshot_hash: 'sha256:x',
         job_id: 'job-1',
         error: null,
-        vision: {
-            status: 'idle',
-            candidates: [],
-            selectedUrls: [],
-            maxImages: 5,
-            boundImages: [],
-            warnings: [],
-            error: null,
-        },
         ...overrides,
     };
 }
@@ -45,10 +36,6 @@ function renderPanel(props: {
     onCancel?: () => void;
     onRetry?: () => void;
     onRetryReconciliation?: () => void;
-    onToggleVisionSelection?: (url: string) => void;
-    onSelectAllVision?: () => void;
-    onConfirmVisionSelection?: () => void;
-    onContinueTextOnlyVision?: () => void;
 }) {
     const container = document.createElement('div');
     document.body.appendChild(container);
@@ -60,10 +47,6 @@ function renderPanel(props: {
                 configured
                 canConfirm={props.canConfirm ?? false}
                 onAcknowledgementChange={() => undefined}
-                onToggleVisionSelection={props.onToggleVisionSelection}
-                onSelectAllVision={props.onSelectAllVision}
-                onConfirmVisionSelection={props.onConfirmVisionSelection}
-                onContinueTextOnlyVision={props.onContinueTextOnlyVision}
                 onCancel={props.onCancel}
                 onRetry={props.onRetry}
                 onRetryReconciliation={props.onRetryReconciliation}
@@ -159,63 +142,4 @@ describe('AiPreflightPanel', () => {
         unmount();
     });
 
-    it('vision disclosure shows select-all, use-selected, and text-only actions', () => {
-        const onSelectAllVision = vi.fn();
-        const onConfirmVisionSelection = vi.fn();
-        const onContinueTextOnlyVision = vi.fn();
-        const onToggleVisionSelection = vi.fn();
-        const { container, unmount } = renderPanel({
-            state: baseState({
-                lifecycle: 'awaiting_vision',
-                decision: 'PENDING',
-                job_id: null,
-                vision: {
-                    status: 'needs_selection',
-                    candidates: [
-                        { url: 'https://cdn.example.test/a.jpg', source: 'poster' },
-                        { url: 'https://cdn.example.test/b.jpg', source: 'markdown' },
-                    ],
-                    selectedUrls: ['https://cdn.example.test/a.jpg'],
-                    maxImages: 5,
-                    boundImages: [],
-                    warnings: [],
-                    error: null,
-                },
-            }),
-            onSelectAllVision,
-            onConfirmVisionSelection,
-            onContinueTextOnlyVision,
-            onToggleVisionSelection,
-            onCancel: vi.fn(),
-        });
-
-        const disclosure = container.querySelector('[data-testid="ai-preflight-vision-disclosure"]');
-        expect(disclosure?.textContent).toMatch(/候选图片 2 张/);
-        expect(disclosure?.textContent).toMatch(/最多可选 5 张/);
-        expect(disclosure?.textContent).toMatch(/AI 服务商/);
-
-        const selectAll = container.querySelector(
-            '[data-testid="ai-preflight-vision-select-all"]',
-        ) as HTMLButtonElement;
-        const useSelected = container.querySelector(
-            '[data-testid="ai-preflight-vision-use-selected"]',
-        ) as HTMLButtonElement;
-        const textOnly = container.querySelector(
-            '[data-testid="ai-preflight-vision-text-only"]',
-        ) as HTMLButtonElement;
-        expect(selectAll).toBeTruthy();
-        expect(useSelected).toBeTruthy();
-        expect(textOnly).toBeTruthy();
-        expect(useSelected.disabled).toBe(false);
-
-        act(() => {
-            selectAll.click();
-            useSelected.click();
-            textOnly.click();
-        });
-        expect(onSelectAllVision).toHaveBeenCalled();
-        expect(onConfirmVisionSelection).toHaveBeenCalled();
-        expect(onContinueTextOnlyVision).toHaveBeenCalled();
-        unmount();
-    });
 });
