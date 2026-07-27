@@ -40,7 +40,7 @@ import {
     getSiteLoginStateBadgeClass,
 } from '../utils/siteStatus';
 import { createLatestValuePersistQueue } from '../utils/lastUsedPersistQueue';
-import { extractDroppedFilePath } from '../utils/drop';
+import { extractDroppedFilePath, extractFirstDroppedPath } from '../utils/drop';
 import {
     buildSortedTemplateSelectOptions,
     getLatestPublishTimestamp,
@@ -209,6 +209,7 @@ export default function QuickPublishPage() {
         selectRuntimeTemplate,
         parseTorrent,
         selectTorrentFile,
+        selectContentRoot,
         generateTitle,
         resolvePublishRuntimeDraft,
         switchRuntimeContentTemplate,
@@ -293,6 +294,11 @@ export default function QuickPublishPage() {
         await selectTorrentFile();
     }, [invalidatePreparedOnCoveredEdit, selectTorrentFile]);
 
+    const selectContentRootCovered = useCallback(async (path?: string) => {
+        invalidatePreparedOnCoveredEdit();
+        await selectContentRoot(path);
+    }, [invalidatePreparedOnCoveredEdit, selectContentRoot]);
+
     const generateTitleCovered = useCallback(async () => {
         invalidatePreparedOnCoveredEdit();
         await generateTitle(activeTemplate, draft, true);
@@ -352,6 +358,12 @@ export default function QuickPublishPage() {
 
                 if (droppedTorrentPath) {
                     void parseTorrentCovered(droppedTorrentPath);
+                    return;
+                }
+
+                const droppedContentRoot = extractFirstDroppedPath(event.payload.paths);
+                if (droppedContentRoot) {
+                    void selectContentRootCovered(droppedContentRoot);
                 }
             });
 
@@ -369,7 +381,7 @@ export default function QuickPublishPage() {
             disposed = true;
             unlisten?.();
         };
-    }, [parseTorrentCovered]);
+    }, [parseTorrentCovered, selectContentRootCovered]);
 
     // AutoTemplate seed hydration: wait for catalog load, validate backend metadata
     // against the currently loaded catalog, then mutate the runtime draft only on success.
@@ -638,6 +650,7 @@ export default function QuickPublishPage() {
         return {
             publish_id: publishId,
             torrent_path: draftToPublish.torrent_path,
+            content_root: draftToPublish.content_root,
             profile_name: draftToPublish.profile,
             template: publishTemplatePayload,
         };
@@ -1143,7 +1156,7 @@ export default function QuickPublishPage() {
                         <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
                             <div>
                                 <h2 className="text-sm font-medium text-slate-200">发布准备</h2>
-                                <p className="mt-1 text-xs text-slate-500">支持文件选择和拖拽导入 .torrent。</p>
+                                <p className="mt-1 text-xs text-slate-500">支持选择或拖入种子与实际媒体文件夹。</p>
                             </div>
                             <button
                                 type="button"
@@ -1169,6 +1182,26 @@ export default function QuickPublishPage() {
                                 {torrentInfo ? `种子名称：${torrentInfo.name}` : '选择后会自动解析文件树。'}
                             </div>
                         </div>
+
+                        <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-800 pt-4">
+                            <div className="min-w-0 flex-1">
+                                <div className="text-xs text-slate-500">实际媒体文件夹</div>
+                                <div className="mt-1 break-all text-sm text-slate-200">
+                                    {draft.content_root || '未选择，MediaInfo 将仅尝试种子附近的安全目录。'}
+                                </div>
+                            </div>
+                            <button
+                                type="button"
+                                onClick={() => {
+                                    void selectContentRootCovered();
+                                }}
+                                className="inline-flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-800 px-4 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700"
+                            >
+                                <FolderOpen size={16} />
+                                选择实际文件夹
+                            </button>
+                        </div>
+                        <p className="mt-2 text-xs text-slate-500">该目录会绑定到本次发布计划，用于按种子文件路径匹配并读取 MediaInfo。</p>
 
                         <div className="mt-4">
                             <FileTree root={torrentInfo?.file_tree ?? null} totalSize={torrentInfo?.total_size} />

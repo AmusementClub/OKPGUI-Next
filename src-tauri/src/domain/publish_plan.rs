@@ -210,6 +210,7 @@ pub struct CanonicalSnapshot {
 #[derive(Debug, Clone)]
 pub(crate) struct LocalExecutionBinding {
     request: PublishRequest,
+    content_root: String,
     torrent_digest: String,
     torrent_len: u64,
     /// Private fingerprint over path + digest + profile/template/site inputs.
@@ -406,11 +407,33 @@ impl PublishPlan {
     /// `okp_identity` is the selected OKP executable identity captured at prepare
     /// time (canonical path, launch mode, file-byte SHA-256). It is private Rust
     /// data and never appears in public plan responses.
+    #[cfg(test)]
     pub fn from_publish_request(
         request_generation: u64,
         request: PublishRequest,
         okp_identity: Option<OkpExecutableIdentity>,
     ) -> Result<Self, String> {
+        Self::from_publish_request_with_content_root(
+            request_generation,
+            request,
+            String::new(),
+            okp_identity,
+        )
+    }
+
+    pub fn from_publish_request_with_content_root(
+        request_generation: u64,
+        request: PublishRequest,
+        content_root: String,
+        okp_identity: Option<OkpExecutableIdentity>,
+    ) -> Result<Self, String> {
+        let content_root = if content_root.trim().is_empty() {
+            String::new()
+        } else {
+            crate::ai::media::validate_media_content_root(&content_root)?
+                .to_string_lossy()
+                .into_owned()
+        };
         let torrent_identity = read_torrent_identity(&request.torrent_path)?;
         let sites = selected_site_codes(&request.template.sites);
         let template_digest = digest_template(&request.template);
@@ -425,6 +448,7 @@ impl PublishPlan {
         );
         let binding_fingerprint = compute_binding_fingerprint(
             &request,
+            &content_root,
             &torrent_identity.digest,
             torrent_identity.len,
             &template_digest,
@@ -443,6 +467,7 @@ impl PublishPlan {
         });
         plan.set_local_binding(LocalExecutionBinding {
             request,
+            content_root,
             torrent_digest: torrent_identity.digest,
             torrent_len: torrent_identity.len,
             binding_fingerprint,
@@ -515,6 +540,10 @@ impl LocalExecutionBinding {
         &self.request
     }
 
+    pub(crate) fn content_root(&self) -> &str {
+        &self.content_root
+    }
+
     #[allow(dead_code)]
     pub(crate) fn torrent_digest(&self) -> &str {
         &self.torrent_digest
@@ -553,11 +582,18 @@ impl LocalExecutionBinding {
         if torrent_identity.len != self.torrent_len {
             failures.push("种子文件大小已变化，请重新执行发布前检查。".to_string());
         }
+        if !self.content_root.is_empty() {
+            match crate::ai::media::validate_media_content_root(&self.content_root) {
+                Ok(current) if current == std::path::Path::new(&self.content_root) => {}
+                _ => failures.push("实际媒体文件夹已变化，请重新执行发布前检查。".to_string()),
+            }
+        }
 
         let sites = selected_site_codes(&self.request.template.sites);
         let template_digest = digest_template(&self.request.template);
         let fingerprint = compute_binding_fingerprint(
             &self.request,
+            &self.content_root,
             &torrent_identity.digest,
             torrent_identity.len,
             &template_digest,
@@ -724,6 +760,7 @@ fn compute_canonical_snapshot_hash(
 /// Private execution binding fingerprint over path + identity + inputs.
 fn compute_binding_fingerprint(
     request: &PublishRequest,
+    content_root: &str,
     torrent_digest: &str,
     torrent_len: u64,
     template_digest: &str,
@@ -733,6 +770,7 @@ fn compute_binding_fingerprint(
     struct BindingPayload<'a> {
         publish_id: &'a str,
         torrent_path: &'a str,
+        content_root: &'a str,
         torrent_digest: &'a str,
         torrent_len: u64,
         profile_name: &'a str,
@@ -742,6 +780,7 @@ fn compute_binding_fingerprint(
     let payload = BindingPayload {
         publish_id: &request.publish_id,
         torrent_path: &request.torrent_path,
+        content_root,
         torrent_digest,
         torrent_len,
         profile_name: &request.profile_name,
@@ -903,8 +942,31 @@ impl PlanRegistry {
         ai_enabled_and_configured: bool,
         okp_identity: Option<OkpExecutableIdentity>,
     ) -> Result<PreparedPlanResponse, String> {
-        let mut plan =
-            PublishPlan::from_publish_request(request_generation, request, okp_identity)?;
+        self.prepare_plan_with_request_blockers_and_content_root(
+            request_generation,
+            request,
+            String::new(),
+            local_blockers,
+            ai_enabled_and_configured,
+            okp_identity,
+        )
+    }
+
+    pub fn prepare_plan_with_request_blockers_and_content_root(
+        &mut self,
+        request_generation: u64,
+        request: PublishRequest,
+        content_root: String,
+        local_blockers: Vec<String>,
+        ai_enabled_and_configured: bool,
+        okp_identity: Option<OkpExecutableIdentity>,
+    ) -> Result<PreparedPlanResponse, String> {
+        let mut plan = PublishPlan::from_publish_request_with_content_root(
+            request_generation,
+            request,
+            content_root,
+            okp_identity,
+        )?;
         for blocker in local_blockers {
             plan.add_local_blocker(blocker);
         }
@@ -1560,6 +1622,56 @@ mod tests {
         assert!(!binding.binding_fingerprint().is_empty());
         assert!(binding.torrent_digest().starts_with("sha256:"));
         let _ = std::fs::remove_file(&torrent_path);
+    }
+
+    #[test]
+    fn content_root_is_private_and_changes_the_execution_binding() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(torrent_path.clone());
+        let base = std::env::temp_dir().join(format!(
+            "okpgui-plan-content-root-{}-{}",
+            std::process::id(),
+            TOKEN_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let first_root = base.join("one");
+        let second_root = base.join("two");
+        std::fs::create_dir_all(&first_root).unwrap();
+        std::fs::create_dir_all(&second_root).unwrap();
+
+        let first = PublishPlan::from_publish_request_with_content_root(
+            7,
+            request.clone(),
+            first_root.display().to_string(),
+            None,
+        )
+        .expect("first plan");
+        let second = PublishPlan::from_publish_request_with_content_root(
+            7,
+            request,
+            second_root.display().to_string(),
+            None,
+        )
+        .expect("second plan");
+
+        let public = serde_json::to_string(&first).expect("serialize public plan");
+        assert!(!public.contains(first_root.to_string_lossy().as_ref()));
+        assert_ne!(
+            first.get_local_binding().unwrap().binding_fingerprint(),
+            second.get_local_binding().unwrap().binding_fingerprint()
+        );
+
+        std::fs::remove_dir_all(&first_root).unwrap();
+        let failures = first
+            .get_local_binding()
+            .unwrap()
+            .revalidate()
+            .expect_err("removed content root must invalidate the binding");
+        assert!(failures
+            .iter()
+            .any(|message| message.contains("实际媒体文件夹")));
+
+        let _ = std::fs::remove_file(&torrent_path);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

@@ -29,19 +29,19 @@ use crate::ai::jobs::{
 };
 use crate::ai::media::{
     build_plan_media_evidence, clamp_media_probe_timeout_ms, discover_media_files,
-    probe_media_files_with_progress, resolve_all_torrent_media_entries,
+    probe_media_files_with_progress, resolve_all_torrent_media_entries_with_root,
     resolve_media_relative_entries, resolve_packaged_mediainfo, MediaCandidate, MediaProbeRequest,
     MediaProbeResult, MediaProbeState, MediaRelativeEntry, MAX_MEDIA_RELATIVE_ENTRIES,
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
-    build_probe_request, build_probe_request_for_capability, build_structured_request_with_system,
-    classify_and_validate_probe_response, classify_and_validate_probe_response_for_capability,
-    classify_http_failure, extract_provider_json, formal_attempt_modes,
-    formal_attempt_modes_for_ready_capability, minimal_probe_schema, parse_models_list_response,
-    probe_output_capabilities, send_managed_provider_request, CapabilityIdentity,
-    CapabilityProbeResult, CapabilityState, OutputCapability, ProviderFailure, ProviderKind,
-    ProviderMode,
+    build_probe_request, build_probe_request_for_capability,
+    build_structured_request_with_system_and_reasoning, classify_and_validate_probe_response,
+    classify_and_validate_probe_response_for_capability, classify_http_failure,
+    extract_provider_json, formal_attempt_modes, formal_attempt_modes_for_ready_capability,
+    minimal_probe_schema, parse_models_list_response, probe_output_capabilities,
+    send_managed_provider_request, CapabilityIdentity, CapabilityProbeResult, CapabilityState,
+    OutputCapability, ProviderFailure, ProviderKind, ProviderMode, ReasoningMode,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
@@ -119,6 +119,7 @@ async fn run_formal_provider_call<T, V, C>(
     system_prompt: &str,
     prompt: &str,
     output_capability: OutputCapability,
+    reasoning_mode: ReasoningMode,
     is_cancelled: C,
     mut validate: V,
 ) -> FormalProviderCallResult<T>
@@ -139,7 +140,7 @@ where
                 retry_prompt = validation_retry_prompt(prompt);
                 retry_prompt.as_str()
             };
-            let provider_request = match build_structured_request_with_system(
+            let provider_request = match build_structured_request_with_system_and_reasoning(
                 connection.provider,
                 attempted_mode,
                 &connection.endpoint,
@@ -151,6 +152,7 @@ where
                 request_prompt,
                 output_capability,
                 FORMAL_PROVIDER_MAX_TOKENS,
+                reasoning_mode,
             ) {
                 Ok(request) => request,
                 Err(message) => {
@@ -1034,6 +1036,7 @@ pub fn ai_start_media_info(
     };
     // Private binding path only; never echo absolute paths on the public IPC path.
     let torrent_path = binding.request().torrent_path.clone();
+    let content_root = binding.content_root().trim().to_string();
     if torrent_path.trim().is_empty() {
         return Err("prepared plan has no bound torrent path".to_string());
     }
@@ -1044,14 +1047,20 @@ pub fn ai_start_media_info(
         ));
     }
 
-    // Resolve relative entries under binding-derived roots only. Client content_root
-    // and torrent_path are ignored so they cannot expand probe authority or plan identity.
+    // Resolve only under the prepared binding. Start-request paths remain ignored so
+    // they cannot expand probe authority after plan creation.
     let (probe_requests, mut pre_results) = if request.relative_entries.is_empty() {
-        let batch = resolve_all_torrent_media_entries(torrent_path.as_str())?;
+        let batch = resolve_all_torrent_media_entries_with_root(
+            torrent_path.as_str(),
+            (!content_root.is_empty()).then_some(content_root.as_str()),
+        )?;
         (batch.requests, batch.pre_results)
     } else {
-        let batch =
-            resolve_media_relative_entries(torrent_path.as_str(), &request.relative_entries, None)?;
+        let batch = resolve_media_relative_entries(
+            torrent_path.as_str(),
+            &request.relative_entries,
+            (!content_root.is_empty()).then_some(content_root.as_str()),
+        )?;
         (batch.requests, batch.pre_results)
     };
 
@@ -2411,6 +2420,7 @@ async fn run_template_selection_worker(
         TEMPLATE_SELECTION_SYSTEM_PROMPT,
         &prompt,
         output_capability,
+        ReasoningMode::Disabled,
         || template_selection_is_cancelled(&job_id, &cancel_flag),
         |structured| {
             let live_catalog = load_eligible_catalog(&app);
@@ -3050,6 +3060,7 @@ async fn run_recognition_worker(
         RECOGNITION_SYSTEM_PROMPT,
         &prompt,
         output_capability,
+        ReasoningMode::Default,
         || recognition_is_cancelled(&job_id, &cancel_flag),
         |structured| {
             recognition_from_provider_outcome(Some(structured), None).map_err(|message| {
@@ -3914,6 +3925,7 @@ async fn run_provider_formal_audit(
         &system_prompt,
         &prompt,
         output_capability,
+        ReasoningMode::Default,
         || false,
         |structured| {
             try_parse_formal_audit_findings(structured).map_err(|message| FormalValidationError {

@@ -31,6 +31,7 @@ interface RuntimeTemplateSelectionOptions {
     templates?: Record<string, QuickPublishTemplate>;
     contentTemplates?: Record<string, ContentTemplate>;
     currentTorrentPath?: string;
+    currentContentRoot?: string;
 }
 
 interface UseQuickPublishRuntimeDraftOptions {
@@ -219,6 +220,7 @@ export function useQuickPublishRuntimeDraft({
                 templates: nextQuickPublishTemplates,
                 contentTemplates: nextContentTemplates,
                 currentTorrentPath: draftRef.current.torrent_path,
+                currentContentRoot: draftRef.current.content_root,
             });
         } catch (error) {
             onError?.(toErrorMessage(error, '加载快速发布配置失败。'));
@@ -385,6 +387,7 @@ export function useQuickPublishRuntimeDraft({
             const nextDraft = {
                 ...buildRuntimeDraftFromTemplate(template, contentTemplate),
                 torrent_path: options.currentTorrentPath ?? draftRef.current.torrent_path,
+                content_root: options.currentContentRoot ?? draftRef.current.content_root,
             };
 
             setSelectedTemplateId(templateId);
@@ -462,6 +465,31 @@ export function useQuickPublishRuntimeDraft({
         }
     }, [parseTorrent]);
 
+    const selectContentRoot = useCallback(async (path?: string) => {
+        try {
+            const selected = path ?? await open({
+                directory: true,
+                multiple: false,
+                title: '选择实际媒体文件夹',
+            });
+            const selectedPath = Array.isArray(selected) ? selected[0] : selected;
+            if (!selectedPath) {
+                return;
+            }
+
+            const validatedPath = await invoke<string>('validate_media_content_root', {
+                path: selectedPath,
+            });
+            setDraftState((current) => ({
+                ...current,
+                content_root: validatedPath,
+            }));
+            onClearError?.();
+        } catch (error) {
+            onError?.(toErrorMessage(error, '选择实际媒体文件夹失败。'));
+        }
+    }, [onClearError, onError]);
+
     const switchRuntimeContentTemplate = useCallback(
         (contentTemplateId: string) => {
             const template = activeTemplateRef.current;
@@ -502,6 +530,7 @@ export function useQuickPublishRuntimeDraft({
         const nextDraft = {
             ...buildRuntimeDraftFromTemplate(template, contentTemplate),
             torrent_path: draftRef.current.torrent_path,
+            content_root: draftRef.current.content_root,
         };
         setDraftState(nextDraft);
 
@@ -600,6 +629,7 @@ export function useQuickPublishRuntimeDraft({
         selectRuntimeTemplate,
         parseTorrent,
         selectTorrentFile,
+        selectContentRoot,
         generateTitle,
         resolvePublishRuntimeDraft,
         switchRuntimeContentTemplate,

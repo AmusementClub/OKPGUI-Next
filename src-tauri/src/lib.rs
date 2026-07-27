@@ -62,6 +62,7 @@ pub fn run() {
             // Raw PublishRequest publish IPC retired: use prepare_plan + publish_prepared_plan only.
             // publish::publish / publish_legacy remain internal helpers (unregistered).
             commands::publish_commands::prepare_plan,
+            commands::publish_commands::validate_media_content_root,
             commands::publish_commands::inspect_plan,
             commands::publish_commands::invalidate_plan,
             commands::publish_commands::set_plan_acknowledgements,

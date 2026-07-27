@@ -124,6 +124,8 @@ export interface AiAcknowledgements {
 export interface PublishRequestPayload {
     publish_id: string;
     torrent_path: string;
+    /** Private prepare-time input; stripped before serializing the Rust PublishRequest. */
+    content_root?: string;
     profile_name: string;
     template: LegacyPublishTemplatePayload;
 }

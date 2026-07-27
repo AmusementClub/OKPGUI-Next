@@ -123,10 +123,12 @@ export async function preparePublishPlan(
     const requestGeneration = typeof generationOrIgnoredHash === 'number'
         ? generationOrIgnoredHash
         : (maybeGeneration ?? 0);
+    const { content_root = '', ...publishRequest } = request;
     return invoke<PlanPrepareResponse>('prepare_plan', {
         request: {
             request_generation: requestGeneration,
-            request,
+            content_root,
+            request: publishRequest,
         },
     });
 }

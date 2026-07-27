@@ -460,24 +460,30 @@ pub fn allowed_media_content_roots(
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let manual_path = PathBuf::from(manual);
-        if !manual_path.is_dir() {
-            return Err("content root is not a directory".to_string());
-        }
-        let canonical_manual = manual_path
-            .canonicalize()
-            .unwrap_or_else(|_| manual_path.clone());
-        if is_filesystem_or_drive_root(&manual_path)
-            || is_filesystem_or_drive_root(&canonical_manual)
-        {
-            return Err("content root must not be a filesystem or drive root".to_string());
-        }
+        let manual_path = validate_media_content_root(manual)?;
         push_canonical_dir(&manual_path, &mut roots);
     }
     if roots.is_empty() {
         return Err("no allowed content roots available".to_string());
     }
     Ok(roots)
+}
+
+/// Validate a user-selected media directory before it enters a private plan binding.
+pub fn validate_media_content_root(content_root: &str) -> Result<PathBuf, String> {
+    let trimmed = content_root.trim();
+    if trimmed.is_empty() {
+        return Err("content root is required".to_string());
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_dir() {
+        return Err("content root is not a directory".to_string());
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+    if is_filesystem_or_drive_root(&path) || is_filesystem_or_drive_root(&canonical) {
+        return Err("content root must not be a filesystem or drive root".to_string());
+    }
+    Ok(canonical)
 }
 
 /// True when `path` is the Unix filesystem root or a Windows drive root.
@@ -571,7 +577,11 @@ pub fn resolve_media_relative_entries(
 
 /// Resolve every media file declared by the bound torrent, preserving torrent sizes.
 /// This backend-owned path is not subject to the explicit IPC batch cap.
-pub fn resolve_all_torrent_media_entries(torrent_path: &str) -> Result<ResolvedMediaBatch, String> {
+/// Resolve every torrent media file using an optional plan-bound content directory.
+pub fn resolve_all_torrent_media_entries_with_root(
+    torrent_path: &str,
+    content_root: Option<&str>,
+) -> Result<ResolvedMediaBatch, String> {
     let torrent = project_safe_torrent_context(torrent_path)?;
     let entries = torrent
         .files
@@ -582,7 +592,7 @@ pub fn resolve_all_torrent_media_entries(torrent_path: &str) -> Result<ResolvedM
             expected_size: Some(file.size),
         })
         .collect::<Vec<_>>();
-    resolve_media_relative_entries_impl(torrent_path, &entries, None)
+    resolve_media_relative_entries_impl(torrent_path, &entries, content_root)
 }
 
 fn resolve_media_relative_entries_impl(
@@ -2021,6 +2031,37 @@ mod tests {
         assert!(missing.requests.is_empty());
         assert_eq!(missing.pre_results[0].state, MediaProbeState::MissingFile);
 
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn selected_content_root_is_validated_and_used_for_resolution() {
+        let root =
+            std::env::temp_dir().join(format!("okpgui_media_selected_root_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let torrent_dir = root.join("torrent");
+        let content_dir = root.join("actual-media");
+        std::fs::create_dir_all(&torrent_dir).unwrap();
+        std::fs::create_dir_all(&content_dir).unwrap();
+        let torrent_path = torrent_dir.join("release.torrent");
+        std::fs::write(&torrent_path, b"d4:infod4:name7:releaseee").unwrap();
+        std::fs::write(content_dir.join("episode.mkv"), b"12345").unwrap();
+
+        let validated = validate_media_content_root(content_dir.to_string_lossy().as_ref())
+            .expect("selected directory");
+        let batch = resolve_media_relative_entries(
+            torrent_path.to_string_lossy().as_ref(),
+            &[MediaRelativeEntry {
+                relative_name: "episode.mkv".into(),
+                expected_size: Some(5),
+            }],
+            Some(validated.to_string_lossy().as_ref()),
+        )
+        .expect("resolve under selected directory");
+        assert_eq!(batch.requests.len(), 1);
+        assert!(batch.requests[0].path.starts_with(&validated));
+
+        assert!(validate_media_content_root(torrent_path.to_string_lossy().as_ref()).is_err());
         let _ = std::fs::remove_dir_all(&root);
     }
 

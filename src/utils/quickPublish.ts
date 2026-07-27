@@ -58,6 +58,7 @@ export interface QuickPublishTemplate {
 export interface QuickPublishRuntimeDraft {
     template_id: string | null;
     torrent_path: string;
+    content_root: string;
     title: string;
     profile: string;
     sites: SiteSelection;
@@ -181,6 +182,7 @@ export function createDefaultQuickPublishRuntimeDraft(): QuickPublishRuntimeDraf
     return {
         template_id: null,
         torrent_path: '',
+        content_root: '',
         title: '',
         profile: '',
         sites: createDefaultSiteSelection(),

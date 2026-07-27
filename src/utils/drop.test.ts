@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
     extractDroppedFilePath,
+    extractFirstDroppedPath,
     normalizeDroppedFilePath,
 } from './drop';
 
@@ -25,6 +26,16 @@ describe('normalizeDroppedFilePath', () => {
     it('falls back to the undecoded path on malformed percent-escapes', () => {
         expect(normalizeDroppedFilePath('file:///home/u/100%.torrent')).toBe('/home/u/100%.torrent');
         expect(normalizeDroppedFilePath('file:///C:/a%zz.torrent')).toBe('C:/a%zz.torrent');
+    });
+});
+
+describe('extractFirstDroppedPath', () => {
+    it('normalizes the first non-empty path', () => {
+        expect(extractFirstDroppedPath([' ', 'file:///C:/Media%20Files'])).toBe('C:/Media Files');
+    });
+
+    it('returns null for an empty drop', () => {
+        expect(extractFirstDroppedPath(['', '   '])).toBeNull();
     });
 });
 

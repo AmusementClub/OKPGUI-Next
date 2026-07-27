@@ -38,3 +38,9 @@ export function extractDroppedFilePath(
     const match = paths.find((path) => path.toLowerCase().endsWith(normalizedExtension));
     return match ? normalizeDroppedFilePath(match) : null;
 }
+
+/** Returns the first non-empty dropped path, normalized for backend IPC. */
+export function extractFirstDroppedPath(paths: readonly string[]): string | null {
+    const match = paths.find((path) => path.trim().length > 0);
+    return match ? normalizeDroppedFilePath(match) : null;
+}

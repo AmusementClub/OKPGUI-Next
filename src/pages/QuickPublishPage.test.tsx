@@ -122,6 +122,30 @@ describe('QuickPublishPage drag-drop listener', () => {
 
         await rendered.unmount();
     });
+
+    it('validates a dropped directory when no torrent is present', async () => {
+        invokeMock.mockImplementation((command: string) => {
+            if (command === 'validate_media_content_root') {
+                return Promise.resolve('/canonical/media/release');
+            }
+            return routeInvoke(command);
+        });
+        const rendered = await renderElement(<QuickPublishPage />);
+        await flushAsync();
+
+        const handler = onDragDropEventMock.mock.calls[0][0] as DragDropHandler;
+        await act(async () => {
+            handler({ payload: { type: 'drop', paths: ['/media/release'] } });
+        });
+        await flushAsync();
+
+        expect(invokeMock.mock.calls.filter(([command]) => command === 'parse_torrent')).toHaveLength(0);
+        expect(invokeMock.mock.calls.filter(([command]) => command === 'validate_media_content_root'))
+            .toEqual([['validate_media_content_root', { path: '/media/release' }]]);
+        expect(rendered.container.textContent).toContain('/canonical/media/release');
+
+        await rendered.unmount();
+    });
 });
 describe('QuickPublishPage publish content validation', () => {
     beforeEach(() => {

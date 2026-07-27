@@ -2,6 +2,7 @@ import { act } from 'react';
 import { createRoot } from 'react-dom/client';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { invoke } from '@tauri-apps/api/core';
+import { open } from '@tauri-apps/plugin-dialog';
 import type { TorrentInfo } from '../types/torrent';
 import type { ParsedTitleDetails } from '../utils/publishTitleMetadata';
 import {
@@ -21,6 +22,7 @@ vi.mock('@tauri-apps/plugin-dialog', () => ({
 (globalThis as Record<string, unknown>).IS_REACT_ACT_ENVIRONMENT = true;
 
 const invokeMock = vi.mocked(invoke);
+const openMock = vi.mocked(open);
 
 type RuntimeDraftHook = ReturnType<typeof useQuickPublishRuntimeDraft>;
 
@@ -135,6 +137,35 @@ async function mountAndLoad(options: Parameters<typeof useQuickPublishRuntimeDra
 describe('useQuickPublishRuntimeDraft stale-async guards', () => {
     beforeEach(() => {
         invokeMock.mockReset();
+        openMock.mockReset();
+    });
+
+    it('validates and preserves the selected media directory across template switches', async () => {
+        installInvokeMock({});
+        invokeMock.mockImplementation((command, args) => {
+            if (command === 'validate_media_content_root') {
+                expect(args).toEqual({ path: '/media/release' });
+                return Promise.resolve('/canonical/media/release');
+            }
+            if (command === 'get_config') return Promise.resolve(buildConfigPayload());
+            if (command === 'get_profile_list') return Promise.resolve([]);
+            if (command === 'get_profiles') return Promise.resolve({ profiles: {} });
+            return Promise.resolve(null);
+        });
+        openMock.mockResolvedValue('/media/release');
+        const harness = await mountAndLoad();
+
+        await act(async () => {
+            await harness.result.selectContentRoot();
+        });
+        expect(harness.result.draft.content_root).toBe('/canonical/media/release');
+
+        act(() => {
+            harness.result.selectRuntimeTemplate('tpl-2');
+        });
+        expect(harness.result.draft.content_root).toBe('/canonical/media/release');
+
+        harness.unmount();
     });
 
     afterEach(() => {

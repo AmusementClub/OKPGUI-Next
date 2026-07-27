@@ -16,6 +16,8 @@ use std::sync::Mutex;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlanPrepareRequest {
     pub request_generation: u64,
+    #[serde(default)]
+    pub content_root: String,
     pub request: PublishRequest,
 }
 
@@ -27,6 +29,12 @@ pub struct PlanInspectResponse {
 
 fn registry() -> &'static Mutex<PlanRegistry> {
     get_or_create_registry()
+}
+
+#[tauri::command]
+pub fn validate_media_content_root(path: String) -> Result<String, String> {
+    crate::ai::media::validate_media_content_root(&path)
+        .map(|validated| validated.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -46,9 +54,10 @@ pub async fn prepare_plan(
     let ai_enabled_and_configured =
         crate::commands::ai_commands::ai_connection_is_configured_for_app(&app);
     let mut guard = registry().lock().unwrap_or_else(|error| error.into_inner());
-    guard.prepare_plan_with_request_and_blockers(
+    guard.prepare_plan_with_request_blockers_and_content_root(
         request.request_generation,
         request.request,
+        request.content_root,
         local_blockers,
         ai_enabled_and_configured,
         okp_identity,
