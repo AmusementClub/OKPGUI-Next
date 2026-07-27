@@ -28,8 +28,23 @@ dist-ssr
 *.sln
 *.sw?
 
-.omc/*
-src-tauri/.omc/*
+# Local AI/agent harness control state and instruction files.
+# These are machine/session-owned and must never enter the repository.
+.agents/
+.claude/
+.codex/
+.continue/
+.cursor/
+.omc/
+.omx/
+.roo/
+.windsurf/
+.aider*
+AGENTS.md
+CLAUDE.md
+GEMINI.md
+.github/copilot-instructions.md
+.github/instructions/
 
 # Staged MediaInfo sidecars (scripts/stage-mediainfo.*); keep directory via .gitkeep.
 src-tauri/binaries/*
