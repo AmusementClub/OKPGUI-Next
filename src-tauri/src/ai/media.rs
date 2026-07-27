@@ -5,10 +5,16 @@ use crate::domain::publish_plan::{
 use crate::torrent::project_safe_torrent_context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::io::Read;
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,6 +36,21 @@ pub const MAX_MEDIA_PROBE_TIMEOUT_MS: u64 = 300_000;
 pub const MAX_MEDIA_RELATIVE_ENTRIES: usize = 256;
 /// Concurrent MediaInfo child processes per batch (V2 safety constant).
 pub const MEDIA_PROBE_CONCURRENCY: usize = 2;
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+static EMBEDDED_TOOL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EMBEDDED_MEDIAINFO: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/binaries/mediainfo-x86_64-pc-windows-msvc.exe"
+));
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+const EMBEDDED_MEDIAINFO_NOTICE: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/resources/mediainfo/THIRD_PARTY_NOTICES.html"
+));
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MediaCandidate {
@@ -842,8 +863,130 @@ pub fn resolve_packaged_mediainfo(resource_dir: &Path) -> Result<PathBuf, String
     Err("MediaInfo sidecar is unavailable".to_string())
 }
 
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        std::fs::File::open(path).map_err(|error| format!("无法读取 MediaInfo 缓存: {error}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("无法校验 MediaInfo 缓存: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
+fn materialize_hash_bound_file(
+    app_local_data_dir: &Path,
+    bundle_hash: &str,
+    file_name: &str,
+    embedded: &[u8],
+) -> Result<PathBuf, String> {
+    let expected_hash = sha256_bytes(embedded);
+    let destination_dir = app_local_data_dir.join("mediainfo").join(bundle_hash);
+    let destination = destination_dir.join(file_name);
+
+    if destination.is_file()
+        && sha256_file(&destination)
+            .map(|actual| actual == expected_hash)
+            .unwrap_or(false)
+    {
+        return Ok(destination);
+    }
+
+    std::fs::create_dir_all(&destination_dir)
+        .map_err(|error| format!("无法创建 MediaInfo 缓存目录: {error}"))?;
+    let sequence = EMBEDDED_TOOL_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temp = destination_dir.join(format!(
+        ".{file_name}.{}.{}.tmp",
+        std::process::id(),
+        sequence
+    ));
+    let write_result = (|| -> Result<(), String> {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temp)
+            .map_err(|error| format!("无法创建 MediaInfo 临时文件: {error}"))?;
+        file.write_all(embedded)
+            .map_err(|error| format!("无法释放 MediaInfo: {error}"))?;
+        file.sync_all()
+            .map_err(|error| format!("无法同步 MediaInfo 文件: {error}"))?;
+        crate::atomic_file::replace_file_atomically(&temp, &destination)
+            .map_err(|error| format!("无法提交 MediaInfo 文件: {error}"))
+    })();
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+        if destination.is_file()
+            && sha256_file(&destination)
+                .map(|actual| actual == expected_hash)
+                .unwrap_or(false)
+        {
+            return Ok(destination);
+        }
+        write_result?;
+    }
+
+    if sha256_file(&destination)? != expected_hash {
+        return Err("MediaInfo 缓存校验失败".to_string());
+    }
+    Ok(destination)
+}
+
+/// Prefer the normal packaged sidecar. Windows x64 single-file builds fall back
+/// to a compile-time embedded, hash-bound copy released under app-local data.
+pub fn resolve_or_release_packaged_mediainfo(
+    resource_dir: &Path,
+    _app_local_data_dir: Option<&Path>,
+) -> Result<PathBuf, String> {
+    #[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+    {
+        match resolve_packaged_mediainfo(resource_dir) {
+            Ok(path) => Ok(path),
+            Err(_) => {
+                let release_root = _app_local_data_dir.ok_or_else(|| {
+                    "MediaInfo sidecar is unavailable and app data is inaccessible".to_string()
+                })?;
+                let bundle_hash = sha256_bytes(EMBEDDED_MEDIAINFO);
+                let executable = materialize_hash_bound_file(
+                    release_root,
+                    &bundle_hash,
+                    "mediainfo.exe",
+                    EMBEDDED_MEDIAINFO,
+                )?;
+                materialize_hash_bound_file(
+                    release_root,
+                    &bundle_hash,
+                    "THIRD_PARTY_NOTICES.html",
+                    EMBEDDED_MEDIAINFO_NOTICE,
+                )?;
+                Ok(executable)
+            }
+        }
+    }
+
+    #[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+    {
+        let _ = _app_local_data_dir;
+        resolve_packaged_mediainfo(resource_dir)
+    }
+}
+
 /// Low-level probe helper. Callers that accept IPC input must resolve `sidecar`
-/// via [`resolve_packaged_mediainfo`]; tests may pass fixture Paths.
+/// via [`resolve_or_release_packaged_mediainfo`]; tests may pass fixture Paths.
 ///
 /// Concurrency is capped at [`MEDIA_PROBE_CONCURRENCY`]. Cancellation is checked
 /// between chunks and inside each child waiter so kill reaches the probe process.
@@ -1526,6 +1669,46 @@ mod tests {
             outsider,
             "outsider must not be selected"
         );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn embedded_tool_materialization_reuses_and_repairs_hash_bound_cache() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_embedded_tool_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ));
+        let bytes = b"verified embedded executable fixture";
+
+        let bundle_hash = sha256_bytes(bytes);
+        let first = materialize_hash_bound_file(&root, &bundle_hash, "mediainfo.exe", bytes)
+            .expect("materialize embedded tool");
+        assert_eq!(std::fs::read(&first).unwrap(), bytes);
+        assert!(first.starts_with(root.join("mediainfo")));
+        let notice = materialize_hash_bound_file(
+            &root,
+            &bundle_hash,
+            "THIRD_PARTY_NOTICES.html",
+            b"license notice fixture",
+        )
+        .expect("materialize bundled notice");
+        assert_eq!(notice.parent(), first.parent());
+        assert_eq!(std::fs::read(notice).unwrap(), b"license notice fixture");
+
+        let second = materialize_hash_bound_file(&root, &bundle_hash, "mediainfo.exe", bytes)
+            .expect("reuse verified embedded tool");
+        assert_eq!(second, first);
+
+        std::fs::write(&first, b"tampered").unwrap();
+        let repaired = materialize_hash_bound_file(&root, &bundle_hash, "mediainfo.exe", bytes)
+            .expect("repair tampered cache");
+        assert_eq!(repaired, first);
+        assert_eq!(std::fs::read(&repaired).unwrap(), bytes);
 
         let _ = std::fs::remove_dir_all(&root);
     }

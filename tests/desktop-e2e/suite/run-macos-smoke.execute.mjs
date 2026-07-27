@@ -183,6 +183,7 @@ function main() {
     }
     // Packaged .app: require real MediaInfo resolve+spawn.
     env.OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR = '1';
+    env.OKPGUI_SMOKE_PACKAGED_ONLY = '1';
     // Resource root: Contents/MacOS (sidecar sibling) and Contents/Resources.
     const macosDir = path.join(resolved.appBundlePath, 'Contents', 'MacOS');
     const resourcesDir = path.join(resolved.appBundlePath, 'Contents', 'Resources');

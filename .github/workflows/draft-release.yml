@@ -133,7 +133,18 @@ jobs:
       - name: Build native application output
         run: pnpm tauri build ${{ matrix.platform.build_args }}
 
-      # --- Evidence class: host-binary-smoke (Windows/Linux) ---
+      - name: Force Windows single-EXE embedded MediaInfo smoke path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staged = 'src-tauri/binaries/mediainfo-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $staged -PathType Leaf)) {
+            throw "Embedded MediaInfo source was not staged before compilation: $staged"
+          }
+          Remove-Item -LiteralPath $staged -Force
+          Write-Host 'Removed the build-time sidecar so host smoke must release MediaInfo from okpgui-next.exe.'
+
+      # --- Evidence class: Windows EXE / Linux AppImage production smoke ---
       # DESKTOP_E2E_ALLOW_BLOCKED is not used when binary exists (REQUIRE_PASS instead).
       # desktop-webdriver side-evidence may be blocked (WDIO specs still stubs).
       - name: Desktop production critical flows (Windows/Linux)
@@ -141,13 +152,27 @@ jobs:
         shell: bash
         env:
           DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR: 1
+          OKPGUI_SMOKE_PACKAGED_ONLY: 1
         run: |
           set -euo pipefail
           mkdir -p tests/desktop-e2e/out
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             BINARY="src-tauri/target/release/okpgui-next.exe"
+            EXPECTED_HARNESS="host-binary-smoke"
           else
-            BINARY="src-tauri/target/release/okpgui-next"
+            shopt -s nullglob
+            appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+            if [[ ${#appimages[@]} -ne 1 ]]; then
+              echo "::error title=Linux AppImage smoke::Expected exactly one AppImage, found ${#appimages[@]}"
+              exit 1
+            fi
+            BINARY="${appimages[0]}"
+            chmod +x "$BINARY"
+            export DESKTOP_E2E_PACKAGE="$BINARY"
+            export DESKTOP_E2E_HARNESS_TYPE="linux-appimage-smoke"
+            EXPECTED_HARNESS="linux-appimage-smoke"
           fi
           if [[ ! -f "$BINARY" ]]; then
             echo "::error title=Desktop production smoke::Built binary not found at $BINARY"
@@ -166,13 +191,13 @@ jobs:
             esac
           done
           if [[ ${#primary[@]} -eq 0 ]]; then
-            echo "::error title=Desktop production smoke::Required host-binary-smoke evidence JSON missing"
+            echo "::error title=Desktop production smoke::Required $EXPECTED_HARNESS evidence JSON missing"
             exit 1
           fi
           for f in "${primary[@]}"; do
-            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(e.result!=="pass"||e.harnessType!=="host-binary-smoke"||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(process.argv[1],e);process.exit(1);}' "$f"
+            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const expected=process.argv[2];if(e.result!=="pass"||e.harnessType!==expected||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(process.argv[1],expected,e);process.exit(1);}' "$f" "$EXPECTED_HARNESS"
           done
-          echo "::notice title=Host binary smoke::pass with productionBinaryMarker=true (not WebDriver)."
+          echo "::notice title=Production artifact smoke::$EXPECTED_HARNESS passed with productionBinaryMarker=true (not WebDriver)."
 
       # --- Evidence class: macos-packaged-smoke ---
       # Mount the final DMG and execute its packaged .app.

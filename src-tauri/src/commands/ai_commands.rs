@@ -28,8 +28,9 @@ use crate::ai::jobs::{
 use crate::ai::media::{
     build_plan_media_evidence, clamp_media_probe_timeout_ms, discover_media_files,
     probe_media_files_with_progress, resolve_all_torrent_media_entries_with_root,
-    resolve_media_relative_entries, resolve_packaged_mediainfo, MediaCandidate, MediaProbeRequest,
-    MediaProbeResult, MediaProbeState, MediaRelativeEntry, MAX_MEDIA_RELATIVE_ENTRIES,
+    resolve_media_relative_entries, resolve_or_release_packaged_mediainfo, MediaCandidate,
+    MediaProbeRequest, MediaProbeResult, MediaProbeState, MediaRelativeEntry,
+    MAX_MEDIA_RELATIVE_ENTRIES,
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
@@ -1013,27 +1014,29 @@ pub fn ai_start_media_info(
             return Ok(view);
         }
     };
-    let sidecar = match resolve_packaged_mediainfo(&resource_dir) {
-        Ok(path) => path,
-        Err(error) => {
-            let view = finish_media_info_job(
-                &job_id,
-                &plan_token,
-                request_generation,
-                &snapshot_hash,
-                false,
-                Some("MISSING_SIDECAR".to_string()),
-                error.clone(),
-                merge_media_results(
-                    pre_results,
-                    Vec::new(),
-                    MediaProbeState::MissingSidecar,
-                    &error,
-                ),
-            );
-            return Ok(view);
-        }
-    };
+    let app_local_data_dir = app.path().app_local_data_dir().ok();
+    let sidecar =
+        match resolve_or_release_packaged_mediainfo(&resource_dir, app_local_data_dir.as_deref()) {
+            Ok(path) => path,
+            Err(error) => {
+                let view = finish_media_info_job(
+                    &job_id,
+                    &plan_token,
+                    request_generation,
+                    &snapshot_hash,
+                    false,
+                    Some("MISSING_SIDECAR".to_string()),
+                    error.clone(),
+                    merge_media_results(
+                        pre_results,
+                        Vec::new(),
+                        MediaProbeState::MissingSidecar,
+                        &error,
+                    ),
+                );
+                return Ok(view);
+            }
+        };
 
     // Nothing to probe: complete immediately with pre-results only (still a terminal job).
     // Empty discovery is a successful "nothing measured" outcome (not a crash).

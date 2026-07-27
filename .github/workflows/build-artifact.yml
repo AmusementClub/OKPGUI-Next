@@ -127,8 +127,19 @@ jobs:
       - name: Build Tauri application
         run: pnpm tauri build ${{ matrix.platform.build_args }}
 
-      # --- Evidence class: host-binary-smoke (Windows/Linux only) ---
-      # Production Rust in built binary. productionBinaryMarker=true; productionIpcMarker must stay false.
+      - name: Force Windows single-EXE embedded MediaInfo smoke path
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $staged = 'src-tauri/binaries/mediainfo-x86_64-pc-windows-msvc.exe'
+          if (-not (Test-Path -LiteralPath $staged -PathType Leaf)) {
+            throw "Embedded MediaInfo source was not staged before compilation: $staged"
+          }
+          Remove-Item -LiteralPath $staged -Force
+          Write-Host 'Removed the build-time sidecar so host smoke must release MediaInfo from okpgui-next.exe.'
+
+      # --- Evidence class: Windows EXE / Linux AppImage production smoke ---
+      # Production Rust in the final download. productionBinaryMarker=true; productionIpcMarker must stay false.
       # desktop-webdriver is recorded as blocked side-evidence until executable WDIO specs land.
       # When the release binary exists, REQUIRE_PASS=1 — blocked is not accepted as green for host smoke.
       - name: Desktop production critical flows (Windows/Linux)
@@ -136,13 +147,27 @@ jobs:
         shell: bash
         env:
           DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
+          APPIMAGE_EXTRACT_AND_RUN: 1
+          OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR: 1
+          OKPGUI_SMOKE_PACKAGED_ONLY: 1
         run: |
           set -euo pipefail
           mkdir -p tests/desktop-e2e/out
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             BINARY="src-tauri/target/release/okpgui-next.exe"
+            EXPECTED_HARNESS="host-binary-smoke"
           else
-            BINARY="src-tauri/target/release/okpgui-next"
+            shopt -s nullglob
+            appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
+            if [[ ${#appimages[@]} -ne 1 ]]; then
+              echo "::error title=Linux AppImage smoke::Expected exactly one AppImage, found ${#appimages[@]}"
+              exit 1
+            fi
+            BINARY="${appimages[0]}"
+            chmod +x "$BINARY"
+            export DESKTOP_E2E_PACKAGE="$BINARY"
+            export DESKTOP_E2E_HARNESS_TYPE="linux-appimage-smoke"
+            EXPECTED_HARNESS="linux-appimage-smoke"
           fi
           if [[ -f "$BINARY" ]]; then
             export DESKTOP_E2E_BINARY="$BINARY"
@@ -156,7 +181,7 @@ jobs:
           fi
           node scripts/run-desktop-e2e.mjs
           shopt -s nullglob
-          # Primary pass evidence is host-binary-smoke (ignore webdriver-blocked side files).
+          # Primary pass evidence is Windows host EXE or the final Linux AppImage.
           evidence_files=(tests/desktop-e2e/out/evidence-*.json)
           primary=()
           for f in "${evidence_files[@]}"; do
@@ -166,14 +191,14 @@ jobs:
             esac
           done
           if [[ ${#primary[@]} -eq 0 ]]; then
-            echo "::error title=Desktop production smoke::Required host-binary-smoke evidence JSON missing"
+            echo "::error title=Desktop production smoke::Required $EXPECTED_HARNESS evidence JSON missing"
             exit 1
           fi
           for f in "${primary[@]}"; do
             echo "Evidence: $f"
-            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(e.result!=="pass"||e.harnessType!=="host-binary-smoke"||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error("Evidence not a host-binary-smoke pass:",process.argv[1],e);process.exit(1);}' "$f"
+            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const expected=process.argv[2];if(e.result!=="pass"||e.harnessType!==expected||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(`Evidence not a ${expected} pass:`,process.argv[1],e);process.exit(1);}' "$f" "$EXPECTED_HARNESS"
           done
-          echo "::notice title=Host binary smoke::pass with productionBinaryMarker=true (not WebDriver, productionIpcMarker=false)."
+          echo "::notice title=Production artifact smoke::$EXPECTED_HARNESS passed with productionBinaryMarker=true (not WebDriver, productionIpcMarker=false)."
 
       # --- Evidence class: macos-packaged-smoke (macOS only) ---
       # Mount the final DMG and execute its packaged .app. Not full UI WebDriver.

@@ -17,7 +17,7 @@
 use crate::ai::audit::{Acknowledgements, AuditDecision};
 use crate::ai::credentials::{decide_session_only_cold_start, SessionOnlyColdStartAction};
 use crate::ai::jobs::{AiJobState, JobKind};
-use crate::ai::media::{packaged_mediainfo_candidates, resolve_packaged_mediainfo};
+use crate::ai::media::{packaged_mediainfo_candidates, resolve_or_release_packaged_mediainfo};
 use crate::commands::ai_commands::{
     ai_cancel_job, ai_get_job, cancel_pending_audit_for_publish_core,
     cancel_preflight_session_core, start_job_backend,
@@ -132,6 +132,9 @@ fn detect_packaged_app_layout() -> bool {
 /// Resource roots to search for the packaged MediaInfo sidecar.
 fn smoke_resource_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let packaged_only = std::env::var("OKPGUI_SMOKE_PACKAGED_ONLY")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     if let Ok(override_dir) = std::env::var("OKPGUI_SMOKE_RESOURCE_DIR") {
         if !override_dir.is_empty() {
             roots.push(PathBuf::from(override_dir));
@@ -149,26 +152,30 @@ fn smoke_resource_roots() -> Vec<PathBuf> {
                     roots.push(app_root.to_path_buf());
                 }
             }
-            // Dev/CI: repo-layout binaries next to target/{debug,release}
-            if let Some(target_dir) = exe_dir.parent() {
-                // .../target/release → .../src-tauri/binaries
-                if let Some(src_tauri) = target_dir.parent() {
-                    roots.push(src_tauri.join("binaries"));
-                }
-                // .../target/<triple>/release
-                if let Some(triple_dir) = target_dir.parent() {
-                    if let Some(target_root) = triple_dir.parent() {
-                        if let Some(src_tauri) = target_root.parent() {
-                            roots.push(src_tauri.join("binaries"));
+            // Dev/CI host smoke only: repo-layout binaries next to target/{debug,release}.
+            if !packaged_only {
+                if let Some(target_dir) = exe_dir.parent() {
+                    // .../target/release → .../src-tauri/binaries
+                    if let Some(src_tauri) = target_dir.parent() {
+                        roots.push(src_tauri.join("binaries"));
+                    }
+                    // .../target/<triple>/release
+                    if let Some(triple_dir) = target_dir.parent() {
+                        if let Some(target_root) = triple_dir.parent() {
+                            if let Some(src_tauri) = target_root.parent() {
+                                roots.push(src_tauri.join("binaries"));
+                            }
                         }
                     }
                 }
             }
         }
     }
-    // CWD fallbacks for local `cargo run` / harness launches from repo root.
-    roots.push(PathBuf::from("src-tauri/binaries"));
-    roots.push(PathBuf::from("binaries"));
+    if !packaged_only {
+        // CWD fallbacks for local `cargo run` / harness launches from repo root.
+        roots.push(PathBuf::from("src-tauri/binaries"));
+        roots.push(PathBuf::from("binaries"));
+    }
     roots
 }
 
@@ -176,9 +183,10 @@ fn smoke_resource_roots() -> Vec<PathBuf> {
 fn probe_mediainfo_sidecar() -> Result<String, String> {
     let mut last_err = "MediaInfo sidecar is unavailable".to_string();
     let mut tried = Vec::new();
+    let release_root = std::env::temp_dir().join("okpgui-next-desktop-smoke");
     for root in smoke_resource_roots() {
         tried.push(root.display().to_string());
-        match resolve_packaged_mediainfo(&root) {
+        match resolve_or_release_packaged_mediainfo(&root, Some(&release_root)) {
             Ok(path) => {
                 return spawn_mediainfo_version(&path);
             }

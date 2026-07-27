@@ -1,10 +1,11 @@
 # Desktop E2E harness (Tauri 2 WebDriver)
 
-**Status (Milestone 6 + honesty closure):** three separately named evidence classes.
+**Status (Milestone 6 + honesty closure):** separately named host, packaged, and WebDriver evidence classes.
 
 | `harnessType` | What it proves | `productionIpcMarker` | Pass signal |
 | --- | --- | --- | --- |
 | `host-binary-smoke` | Production Rust modules inside the **built binary** (prepare/cancel/keyring policy; MediaInfo spawn when present) | **must be `false`** | `result: "pass"` + `productionBinaryMarker: true` |
+| `linux-appimage-smoke` | Final **AppImage** launch with production Rust and packaged MediaInfo sidecar probes | **must be `false`** | `result: "pass"` + `productionBinaryMarker: true` |
 | `macos-packaged-smoke` | Prefer packaged **`.app`** layout + same binary probes; hard MediaInfo spawn inside `.app` | **must be `false`** until WebView IPC exists | `result: "pass"` + `productionBinaryMarker: true` |
 | `desktop-webdriver` | Real Tauri WebDriver / WebView IPC on Windows/Linux | **must be `true`** | `result: "pass"` + `productionIpcMarker: true` |
 
@@ -28,7 +29,8 @@ It is **not desktop E2E** and must never be labeled as such.
 | Class | `harnessType` | Runner | CI step |
 | --- | --- | --- | --- |
 | Mocked Playwright | `mocked-playwright-not-desktop` | `pnpm run test:ui-integration` | Playwright browser/UI integration |
-| Host binary smoke | `host-binary-smoke` | `pnpm run test:desktop-e2e` (Win/Linux) | Built binary production smoke |
+| Host binary smoke | `host-binary-smoke` | `pnpm run test:desktop-e2e` (Windows) | Final standalone EXE production smoke |
+| Linux packaged smoke | `linux-appimage-smoke` | same runner with final AppImage paths | AppImage + packaged MediaInfo production smoke |
 | Desktop WebDriver | `desktop-webdriver` | same runner (side evidence until WDIO specs land) | Reserved for real `tauri-driver` + WDIO |
 | macOS packaged smoke | `macos-packaged-smoke` | `pnpm run test:macos-packaged-smoke` | Prefer `.app`; binary + sidecar + keyring policy |
 
@@ -46,8 +48,8 @@ https://v2.tauri.app/develop/tests/webdriver/
 
 | Platform | Primary harness | What runs |
 | --- | --- | --- |
-| **Windows** (`x86_64-pc-windows-msvc`) | `host-binary-smoke` (+ blocked `desktop-webdriver` side file) | Built binary host smoke; WDIO blocked until executable specs |
-| **Linux** (`x86_64-unknown-linux-gnu`) | same | same |
+| **Windows** (`x86_64-pc-windows-msvc`) | `host-binary-smoke` (+ blocked `desktop-webdriver` side file) | Final standalone EXE; embedded MediaInfo release path |
+| **Linux** (`x86_64-unknown-linux-gnu`) | `linux-appimage-smoke` (+ blocked `desktop-webdriver` side file) | Final AppImage launched with `APPIMAGE_EXTRACT_AND_RUN=1`; packaged MediaInfo spawn |
 | **macOS** (`aarch64-apple-darwin`) | `macos-packaged-smoke` | Apple Silicon only; prefer `bundle/macos/*.app` over raw `target/release` binary |
 
 ### Windows / Linux critical flows
@@ -63,7 +65,7 @@ Named flows (catalog: `suite/critical-flows.mjs`, specs: `specs/`):
 Host/packaged binary smoke **skips** dual-entry UI names and proves a single shared backend contract instead (`shared-backend-prepare-observe-ack-publish`). That is intentional honesty — not dual-pass mapping.
 
 1. Build the app for the target (`cargo build` / `pnpm tauri build` / CI matrix job).
-2. Set `DESKTOP_E2E_BINARY` to the built executable (macOS: prefer `.app` Contents/MacOS path).
+2. Set `DESKTOP_E2E_BINARY` to the final EXE/AppImage (macOS: prefer `.app` Contents/MacOS path). For Linux, set `DESKTOP_E2E_PACKAGE` to the same AppImage.
 3. Run `pnpm run test:desktop-e2e` (Win/Linux) or `pnpm run test:macos-packaged-smoke` (macOS).
 4. The runner launches the binary with `OKPGUI_DESKTOP_SMOKE_OUT` — Rust `desktop_smoke` module writes a production report; Node maps it to evidence JSON.
 5. **Markers:**
@@ -77,6 +79,8 @@ Environment variables:
 | --- | --- |
 | `DESKTOP_E2E_BINARY` | Path to the built app binary (**required for pass**) |
 | `DESKTOP_E2E_PACKAGE` | Optional path to the installer/package/`.app` |
+| `DESKTOP_E2E_HARNESS_TYPE` | `linux-appimage-smoke` when the Linux binary/package paths identify the same final AppImage |
+| `APPIMAGE_EXTRACT_AND_RUN=1` | Let AppImage execute on CI hosts without FUSE while still running its packaged payload |
 | `DESKTOP_E2E_OUT` | Optional override for evidence output directory |
 | `DESKTOP_E2E_MOCK_PROVIDER_URL` | Loopback mock base URL (reserved for UI WebDriver extension) |
 | `DESKTOP_E2E_ALLOW_BLOCKED=1` | Exit 0 after writing blocked evidence when binary is absent only |
@@ -109,7 +113,7 @@ Resolution order: env `.app` / `bundle/macos/*.app` **before** raw `target/relea
 | File | Role |
 | --- | --- |
 | `evidence.schema.json` | JSON Schema for per-target evidence records |
-| `evidence.example.json` | Example fixture (`host-binary-smoke`, `productionIpcMarker: false`) |
+| `evidence.example.json` | Example final AppImage fixture (`linux-appimage-smoke`, `productionIpcMarker: false`) |
 | `out/evidence-<triple>.json` | Runner output when a harness executes |
 
 Required evidence fields:
@@ -128,6 +132,7 @@ Required evidence fields:
 | `harnessType` | `result: "pass"` requires |
 | --- | --- |
 | `host-binary-smoke` | `productionBinaryMarker === true` **and** `productionIpcMarker === false` |
+| `linux-appimage-smoke` | `productionBinaryMarker === true` **and** `productionIpcMarker === false` |
 | `macos-packaged-smoke` | `productionBinaryMarker === true` **and** `productionIpcMarker === false` |
 | `desktop-webdriver` | `productionIpcMarker === true` |
 | `mocked-playwright-not-desktop` | must never be used as desktop release pass |
@@ -171,7 +176,7 @@ pnpm run verify:byok-release-gates
 
 ## CI evidence production
 
-1. After `pnpm tauri build`, Windows/Linux jobs run `run-desktop-e2e.mjs` with `DESKTOP_E2E_BINARY` set when the binary exists.
+1. After `pnpm tauri build`, Windows runs the final EXE; Linux runs the unique final AppImage with `linux-appimage-smoke`.
 2. macOS jobs run `run-macos-packaged-smoke.mjs`, preferring `bundle/macos/*.app`.
 3. Both use `DESKTOP_E2E_REQUIRE_PASS=1` when a binary exists.
 4. Jobs **fail closed** if no `tests/desktop-e2e/out/evidence-*.json` is written on applicable runners.
@@ -183,5 +188,5 @@ pnpm run verify:byok-release-gates
 - Does not claim live Windows/Linux WebDriver has passed without `harnessType: desktop-webdriver` + `productionIpcMarker: true`
 - Does not treat Playwright mocked IPC as desktop E2E pass evidence
 - Does not call paid/live providers
-- Does not set `productionIpcMarker: true` for host-binary-smoke or macos-packaged-smoke
+- Does not set `productionIpcMarker: true` for host-binary-smoke, linux-appimage-smoke, or macos-packaged-smoke
 - Does not dual-pass Home and Quick Publish UI entries from a single backend check

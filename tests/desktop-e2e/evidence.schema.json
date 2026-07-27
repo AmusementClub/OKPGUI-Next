@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://okpgui-next.local/schemas/desktop-e2e-evidence.schema.json",
   "title": "BYOK desktop / package evidence (per target)",
-  "description": "Machine-readable evidence for real desktop WebDriver or macOS packaged smoke. Mocked Playwright must use harnessType mocked-playwright-not-desktop and must not claim production desktop pass.",
+  "description": "Machine-readable evidence for real desktop WebDriver or packaged AppImage/.app smoke. Mocked Playwright must use harnessType mocked-playwright-not-desktop and must not claim production desktop pass.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -35,11 +35,12 @@
       "type": "string",
       "enum": [
         "desktop-webdriver",
+        "linux-appimage-smoke",
         "macos-packaged-smoke",
         "host-binary-smoke",
         "mocked-playwright-not-desktop"
       ],
-      "description": "How the evidence was produced. host-binary-smoke exercises production Rust in the built binary without WebView IPC/WebDriver. desktop-webdriver is reserved for real WebDriver. mocked-playwright-not-desktop is never real desktop E2E."
+      "description": "How the evidence was produced. host-binary-smoke exercises the Windows EXE; linux-appimage-smoke and macos-packaged-smoke execute final packages without WebView IPC. desktop-webdriver is reserved for real WebDriver. mocked-playwright-not-desktop is never real desktop E2E."
     },
     "productionBinaryMarker": {
       "type": "boolean",
@@ -57,7 +58,7 @@
     },
     "productionIpcMarker": {
       "type": "boolean",
-      "description": "Must be true only when production Tauri WebView command/event IPC was exercised (desktop-webdriver). Must be false for host-binary-smoke, macos-packaged-smoke binary paths, blocked, and mocked runs."
+      "description": "Must be true only when production Tauri WebView command/event IPC was exercised (desktop-webdriver). Must be false for host-binary-smoke, linux-appimage-smoke, macos-packaged-smoke, blocked, and mocked runs."
     },
     "namedTests": {
       "type": "array",

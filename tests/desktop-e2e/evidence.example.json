@@ -1,7 +1,7 @@
 {
   "commitSha": "deadbeefcafebabe0123456789abcdef01234567",
   "targetTriple": "x86_64-unknown-linux-gnu",
-  "harnessType": "host-binary-smoke",
+  "harnessType": "linux-appimage-smoke",
   "binarySha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "packageSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "productionIpcMarker": false,
@@ -29,7 +29,7 @@
     "finishedAt": "2026-07-24T00:01:00.000Z"
   },
   "artifactPaths": [
-    "tests/desktop-e2e/out/example-artifacts/driver.log"
+    "src-tauri/target/release/bundle/appimage/OKPGUI-Next.AppImage"
   ],
-  "notes": "Example host-binary-smoke evidence: productionBinaryMarker true, productionIpcMarker false (not WebDriver)."
+  "notes": "Example linux-appimage-smoke evidence: final AppImage productionBinaryMarker true, productionIpcMarker false (not WebDriver)."
 }

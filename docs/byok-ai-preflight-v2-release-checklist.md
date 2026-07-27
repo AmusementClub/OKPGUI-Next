@@ -9,6 +9,7 @@ with the correct markers for that `harnessType`:
 | `harnessType` | Pass requires |
 | --- | --- |
 | `host-binary-smoke` | `productionBinaryMarker: true` **and** `productionIpcMarker: false` |
+| `linux-appimage-smoke` | `productionBinaryMarker: true` **and** `productionIpcMarker: false` |
 | `macos-packaged-smoke` | `productionBinaryMarker: true` **and** `productionIpcMarker: false` |
 | `desktop-webdriver` | `productionIpcMarker: true` (real WebView IPC only) |
 
@@ -55,7 +56,8 @@ Sidecar launch is backend-owned; the UI capability set stays limited (e.g. `core
 | Offline provider/security contract | — | Localhost / offline contract checks | Live paid provider calls |
 | MediaInfo manifest + notice gates | — | Offline inventory / checksum / license markers | Proof that binaries were downloaded in every local checkout |
 | Tauri `pnpm tauri build` artifact jobs | — | Produces platform bundles when CI stages sidecars | Automatic pass of WebDriver or packaged smoke |
-| **Host binary smoke** (Win/Linux) | `host-binary-smoke` | Production Rust in built binary (`OKPGUI_DESKTOP_SMOKE_OUT`) | WebView IPC / WebDriver UI |
+| **Host binary smoke** (Windows) | `host-binary-smoke` | Production Rust in the final standalone EXE (`OKPGUI_DESKTOP_SMOKE_OUT`) | WebView IPC / WebDriver UI |
+| **Linux AppImage smoke** | `linux-appimage-smoke` | Final AppImage payload + packaged MediaInfo spawn | Raw `target/release` binary or WebView IPC |
 | **Desktop WebDriver** (Win/Linux) | `desktop-webdriver` | Critical flows via `tauri-driver` + WDIO (stub until executable specs) | Mocked Playwright; host smoke alone |
 | **macOS packaged smoke** | `macos-packaged-smoke` | Prefer `.app` layout + binary probes + MediaInfo spawn + keyring policy | Full UI WebDriver E2E on Darwin |
 
@@ -68,7 +70,8 @@ Release evidence must use distinct `harnessType` values (see `tests/desktop-e2e/
 | Evidence class | `harnessType` | Runner | Real production IPC? |
 | --- | --- | --- | --- |
 | Mocked Playwright | `mocked-playwright-not-desktop` | `pnpm run test:ui-integration` | **No** — browser mock only |
-| Host binary smoke | `host-binary-smoke` | `pnpm run test:desktop-e2e` (Windows/Linux) | **No** — `productionIpcMarker` must stay `false`; use `productionBinaryMarker` |
+| Host binary smoke | `host-binary-smoke` | `pnpm run test:desktop-e2e` (Windows) | **No** — `productionIpcMarker` must stay `false`; use `productionBinaryMarker` |
+| Linux packaged smoke | `linux-appimage-smoke` | same runner with the final AppImage as binary and package | **No** — final AppImage production probe only |
 | Desktop WebDriver | `desktop-webdriver` | same runner when `tauri-driver` + executable WDIO specs exist | **Yes** only when `productionIpcMarker: true` |
 | macOS packaged smoke | `macos-packaged-smoke` | `pnpm run test:macos-packaged-smoke` | **No** WebView IPC yet; packaged binary + sidecar + keyring policy |
 
@@ -140,8 +143,8 @@ Retained gates include:
 4. Offline provider contract + UI integration inventory
 5. Frontend tests + production build
 6. Playwright browser/UI integration (**mocked Tauri IPC; not desktop E2E** — evidence class mocked UI)
-7. Backend tests + one native Tauri package per platform: NSIS `.exe`, `.dmg`, or `.AppImage`
-8. **Host binary smoke (Windows/Linux)** — `run-desktop-e2e.mjs` → `host-binary-smoke` with `productionBinaryMarker: true` (WebDriver remains blocked side-evidence until executable WDIO specs)
+7. Backend tests + one native output per platform: standalone `.exe`, `.dmg`, or `.AppImage`
+8. **Windows EXE smoke** — `run-desktop-e2e.mjs` → `host-binary-smoke`; **Linux AppImage smoke** → `linux-appimage-smoke`; both require `productionBinaryMarker: true`
 9. **macOS packaged smoke** — `run-macos-packaged-smoke.mjs` prefers `.app`; `productionBinaryMarker: true`, `productionIpcMarker: false`
 10. Draft release publishes the same native packages directly; no custom `.zip`/`.tar.gz` layer
 
@@ -156,7 +159,8 @@ When a release binary exists, CI sets `DESKTOP_E2E_REQUIRE_PASS=1` for host/pack
 - [ ] Capability file still has **no shell** frontend permission
 - [ ] Mocked Playwright labeled **not desktop E2E** (`mocked-playwright-not-desktop`)
 - [ ] Desktop harness inventory present (`tests/desktop-e2e/evidence.schema.json`, runners, critical-flow specs)
-- [ ] Per-target **host-binary-smoke** evidence for Windows/Linux (`productionBinaryMarker: true`, `productionIpcMarker: false`)
-- [ ] Per-target **macos-packaged-smoke** evidence for x64/arm64 (prefer `.app`; sidecar spawn hard inside `.app`)
+- [ ] Windows **host-binary-smoke** evidence from the standalone EXE (`productionBinaryMarker: true`, `productionIpcMarker: false`)
+- [ ] Linux **linux-appimage-smoke** evidence from the final AppImage, not `target/release/okpgui-next`
+- [ ] macOS **macos-packaged-smoke** evidence for arm64 (mounted DMG `.app`; sidecar spawn hard inside `.app`)
 - [ ] Desktop WebDriver **not** checked as passed unless `harnessType: desktop-webdriver` + `productionIpcMarker: true`
 - [ ] Dual-entry Home/Quick Publish UI not claimed from a single backend-only check

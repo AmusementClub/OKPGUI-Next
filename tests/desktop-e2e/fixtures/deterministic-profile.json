@@ -69,12 +69,13 @@
       "ai_start_media_info",
       "ai_poll_media_info"
     ],
-    "productionIpcMarkerRule": "true only for desktop-webdriver after real WebView Tauri IPC; host-binary-smoke and macos-packaged-smoke must keep productionIpcMarker false and use productionBinaryMarker",
+    "productionIpcMarkerRule": "true only for desktop-webdriver after real WebView Tauri IPC; host-binary-smoke, linux-appimage-smoke, and macos-packaged-smoke must keep productionIpcMarker false and use productionBinaryMarker",
     "productionBinaryMarkerRule": "true when host/packaged binary smoke hard probes pass inside the built binary"
   },
   "evidence": {
     "harnessTypes": {
-      "windowsLinuxPrimary": "host-binary-smoke",
+      "windowsPrimary": "host-binary-smoke",
+      "linuxPrimary": "linux-appimage-smoke",
       "windowsLinuxWebDriver": "desktop-webdriver",
       "macos": "macos-packaged-smoke"
     },

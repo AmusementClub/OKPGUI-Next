@@ -8,11 +8,11 @@
  *   - Enumerates named critical flows from tests/desktop-e2e/suite/critical-flows.mjs
  *   - NEVER labels mocked Playwright as desktop E2E
  *   - productionIpcMarker is true ONLY for real WebView WebDriver IPC (not host smoke)
- *   - Host binary smoke is a separate harnessType (host-binary-smoke)
+ *   - Host/AppImage binary smoke use distinct harness types
  *   - Does not install network packages or call paid providers
  *
  * Flow when binary is present on Windows/Linux:
- *   1. Always run host-binary-smoke execute suite (production Rust in built binary)
+ *   1. Run host-binary-smoke (Windows) or linux-appimage-smoke (packaged AppImage)
  *   2. If tauri-driver + WebdriverIO are present, also attempt desktop-webdriver
  *      (currently specs are documentation stubs — attempt records blocked/fail honestly)
  *
@@ -27,6 +27,7 @@
  *   DESKTOP_E2E_MOCK_PROVIDER_URL  Loopback mock base URL
  *   DESKTOP_E2E_ALLOW_BLOCKED=1    Exit 0 after writing blocked evidence (CI upload path)
  *   DESKTOP_E2E_REQUIRE_PASS=1     Exit non-zero unless result=pass
+ *   DESKTOP_E2E_HARNESS_TYPE       host-binary-smoke or linux-appimage-smoke
  *   DESKTOP_E2E_SKIP_HOST_SMOKE=1  Skip host binary smoke (WebDriver-only attempt)
  *   DESKTOP_E2E_ATTEMPT_WDIO=1     Force WDIO attempt even when tools missing (writes blocked)
  */
@@ -302,10 +303,13 @@ function writeWebdriverBlockedSideEvidence({
   return outPath;
 }
 
-/**
- * Run host production smoke (execute suite) — harnessType host-binary-smoke.
- */
-function runHostBinarySmoke({ binaryPath, packagePath, targetTriple }) {
+/** Run the selected production EXE/AppImage smoke suite. */
+function runProductionBinarySmoke({
+  binaryPath,
+  packagePath,
+  targetTriple,
+  harnessType,
+}) {
   const profile = loadFixtureProfile();
   const mockUrl =
     process.env.DESKTOP_E2E_MOCK_PROVIDER_URL ||
@@ -313,12 +317,12 @@ function runHostBinarySmoke({ binaryPath, packagePath, targetTriple }) {
       ? `http://${profile.mockProvider.bindHost}:${profile.mockProvider.preferredPort}`
       : '');
 
-  console.log('[desktop-e2e] running host-binary-smoke execute suite');
+  console.log(`[desktop-e2e] running ${harnessType} execute suite`);
   console.log(`[desktop-e2e] binary=${binaryPath}`);
   console.log(`[desktop-e2e] fixture=${FIXTURE_PROFILE_REL}`);
   console.log(`[desktop-e2e] mockProvider=${mockUrl || '(unset)'}`);
   console.log(
-    `[desktop-e2e] flows catalogued=${CRITICAL_FLOWS.map((f) => f.id).join(', ')} (UI entries skipped in host smoke)`,
+    `[desktop-e2e] flows catalogued=${CRITICAL_FLOWS.map((f) => f.id).join(', ')} (UI entries skipped in binary/package smoke)`,
   );
 
   const executableSuite = path.join(
@@ -334,7 +338,7 @@ function runHostBinarySmoke({ binaryPath, packagePath, targetTriple }) {
       'Executable suite missing: tests/desktop-e2e/suite/run-critical-flows.execute.mjs';
     const evidence = blockedEvidence({
       targetTriple,
-      harnessType: 'host-binary-smoke',
+      harnessType,
       notes,
       namedTests: skippedCriticalFlowTests(notes),
       binaryPath,
@@ -355,7 +359,7 @@ function runHostBinarySmoke({ binaryPath, packagePath, targetTriple }) {
       DESKTOP_E2E_TARGET: targetTriple,
       DESKTOP_E2E_MOCK_PROVIDER_URL: mockUrl,
       DESKTOP_E2E_OUT: outDir,
-      DESKTOP_E2E_HARNESS_TYPE: 'host-binary-smoke',
+      DESKTOP_E2E_HARNESS_TYPE: harnessType,
     },
   });
   if (result.stdout) process.stdout.write(result.stdout);
@@ -367,22 +371,64 @@ function runWinOrLinux() {
   const targetTriple = resolveTargetTriple();
   const binaryPath = process.env.DESKTOP_E2E_BINARY || '';
   const packagePath = process.env.DESKTOP_E2E_PACKAGE || '';
+  const requestedHarness =
+    process.env.DESKTOP_E2E_HARNESS_TYPE || 'host-binary-smoke';
+  const harnessType =
+    process.platform === 'linux' && requestedHarness === 'linux-appimage-smoke'
+      ? 'linux-appimage-smoke'
+      : 'host-binary-smoke';
+
+  if (requestedHarness !== harnessType) {
+    const notes = `Unsupported primary harness ${requestedHarness} on ${process.platform}`;
+    const evidence = blockedEvidence({
+      targetTriple,
+      harnessType,
+      notes,
+      namedTests: skippedCriticalFlowTests(notes),
+      binaryPath: binaryPath || undefined,
+      packagePath: packagePath || undefined,
+    });
+    const evidencePath = writeEvidence(evidence);
+    exitAfterEvidence(evidencePath, notes, 'blocked');
+    return;
+  }
+
+  if (
+    harnessType === 'linux-appimage-smoke' &&
+    (!packagePath ||
+      path.extname(binaryPath) !== '.AppImage' ||
+      path.resolve(binaryPath) !== path.resolve(packagePath))
+  ) {
+    const notes =
+      'linux-appimage-smoke requires DESKTOP_E2E_BINARY and DESKTOP_E2E_PACKAGE to identify the same .AppImage';
+    const evidence = blockedEvidence({
+      targetTriple,
+      harnessType,
+      notes,
+      namedTests: skippedCriticalFlowTests(notes),
+      binaryPath: binaryPath || undefined,
+      packagePath: packagePath || undefined,
+    });
+    const evidencePath = writeEvidence(evidence);
+    exitAfterEvidence(evidencePath, notes, 'blocked');
+    return;
+  }
 
   if (!binaryPath || !existsSync(binaryPath)) {
     const notes =
       'Built binary missing (set DESKTOP_E2E_BINARY). Vite/mocked invoke is forbidden. ' +
       `Critical flows inventoried: ${CRITICAL_FLOWS.map((f) => f.id).join(', ')}. ` +
       'Playwright mocked IPC is not a substitute. ' +
-      'Host binary smoke and desktop-webdriver are separate evidence classes.';
+      'Binary/package smoke and desktop-webdriver are separate evidence classes.';
     const evidence = blockedEvidence({
       targetTriple,
-      harnessType: 'host-binary-smoke',
+      harnessType,
       notes,
       namedTests: [
         {
           name: 'harness-prerequisites',
           result: 'skipped',
-          detail: 'built binary required for host production smoke',
+          detail: 'final EXE/AppImage required for production smoke',
         },
         ...skippedCriticalFlowTests('Blocked: built binary missing.'),
       ],
@@ -435,7 +481,12 @@ function runWinOrLinux() {
     return;
   }
 
-  const status = runHostBinarySmoke({ binaryPath, packagePath, targetTriple });
+  const status = runProductionBinarySmoke({
+    binaryPath,
+    packagePath,
+    targetTriple,
+    harnessType,
+  });
   process.exit(status);
 }
 
@@ -451,7 +502,7 @@ function main() {
     `[desktop-e2e] critical flows: ${CRITICAL_FLOWS.map((f) => f.id).join(', ')}`,
   );
   console.log(
-    '[desktop-e2e] host-binary-smoke ≠ desktop-webdriver; productionIpcMarker only for real WebView IPC',
+    '[desktop-e2e] binary/package smoke ≠ desktop-webdriver; productionIpcMarker only for real WebView IPC',
   );
 
   if (process.platform === 'darwin') {

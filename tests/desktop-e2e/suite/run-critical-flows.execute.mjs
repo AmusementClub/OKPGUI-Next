@@ -108,12 +108,16 @@ function main() {
     }
   }
 
-  // Prefer staged MediaInfo next to repo for non-packaged host smoke.
-  const resourceCandidates = [
-    process.env.OKPGUI_SMOKE_RESOURCE_DIR,
-    path.join(rootDir, 'src-tauri', 'binaries'),
-    path.dirname(binaryPath),
-  ].filter(Boolean);
+  // Packaged smoke must resolve MediaInfo from the package itself. Repository
+  // staging paths are allowed only for non-packaged host smoke.
+  const packagedOnly = process.env.OKPGUI_SMOKE_PACKAGED_ONLY === '1';
+  const resourceCandidates = packagedOnly
+    ? [process.env.OKPGUI_SMOKE_RESOURCE_DIR].filter(Boolean)
+    : [
+        process.env.OKPGUI_SMOKE_RESOURCE_DIR,
+        path.join(rootDir, 'src-tauri', 'binaries'),
+        path.dirname(binaryPath),
+      ].filter(Boolean);
 
   let resourceDir = '';
   for (const c of resourceCandidates) {

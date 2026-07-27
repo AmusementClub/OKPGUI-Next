@@ -91,6 +91,20 @@ function requireAbsent(relPath, markers, label) {
   }
 }
 
+function requireOrdered(relPath, markers, label) {
+  const text = readText(relPath);
+  if (text === null) return;
+  let previous = -1;
+  for (const marker of markers) {
+    const index = text.indexOf(marker, previous + 1);
+    if (index < 0) {
+      fail(`${relPath}: missing ordered ${label} marker ${JSON.stringify(marker)}`);
+      return;
+    }
+    previous = index;
+  }
+}
+
 /**
  * Tauri bundle: externalBin + redistribution notice resource mapping.
  * Source of truth: src-tauri/tauri.conf.json
@@ -220,6 +234,27 @@ function checkMediaInfoPackageGate() {
     ['x86_64-pc-windows-msvc', 'externalBin', 'mediainfo-manifest.json'],
     'Windows staging script',
   );
+
+  requireIncludes(
+    'src-tauri/src/ai/media.rs',
+    [
+      'include_bytes!',
+      'mediainfo-x86_64-pc-windows-msvc.exe',
+      'EMBEDDED_MEDIAINFO_NOTICE',
+      'materialize_hash_bound_file',
+      'resolve_or_release_packaged_mediainfo',
+    ],
+    'Windows single-EXE embedded MediaInfo contract',
+  );
+  requireIncludes(
+    'src-tauri/build.rs',
+    [
+      'CARGO_CFG_TARGET_OS',
+      'CARGO_CFG_TARGET_ARCH',
+      'mediainfo-x86_64-pc-windows-msvc.exe',
+    ],
+    'Windows embedded MediaInfo compile precondition',
+  );
 }
 
 /**
@@ -270,6 +305,12 @@ function checkWorkflows() {
         'bundle/appimage/*.AppImage',
         'pnpm tauri build ${{ matrix.platform.build_args }}',
         'compression-level: 0',
+        'Force Windows single-EXE embedded MediaInfo smoke path',
+        "Remove-Item -LiteralPath $staged -Force",
+        'linux-appimage-smoke',
+        'APPIMAGE_EXTRACT_AND_RUN: 1',
+        'OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR: 1',
+        'OKPGUI_SMOKE_PACKAGED_ONLY: 1',
         'hdiutil attach -nobrowse -readonly',
         'DESKTOP_E2E_PACKAGE="${dmgs[0]}"',
       ],
@@ -284,8 +325,20 @@ function checkWorkflows() {
         'target/release/bundle/**',
         'bundle_target: nsis',
         'bundle/nsis/',
+        'BINARY="src-tauri/target/release/okpgui-next"',
       ],
       'duplicate or custom archive packaging',
+    );
+    requireOrdered(
+      workflow,
+      [
+        'Stage MediaInfo sidecar (Windows)',
+        'Cargo clippy gate',
+        'pnpm tauri build ${{ matrix.platform.build_args }}',
+        'Force Windows single-EXE embedded MediaInfo smoke path',
+        'Desktop production critical flows (Windows/Linux)',
+      ],
+      'Windows embedded MediaInfo build/smoke sequence',
     );
   }
 
@@ -302,6 +355,7 @@ function checkWorkflows() {
         'Upload desktop / packaged evidence JSON',
         'desktop-webdriver',
         'macos-packaged-smoke',
+        'linux-appimage-smoke',
         'host-binary-smoke',
         'productionBinaryMarker',
         'DESKTOP_E2E_REQUIRE_PASS',
@@ -379,6 +433,7 @@ function checkDesktopHarnessInventory() {
       'WebdriverIO',
       'not desktop E2E',
       'macos-packaged-smoke',
+      'linux-appimage-smoke',
       'desktop-webdriver',
       'host-binary-smoke',
       'productionIpcMarker',
@@ -414,7 +469,13 @@ function checkDesktopHarnessInventory() {
 
   requireIncludes(
     'tests/desktop-e2e/evidence.example.json',
-    ['productionIpcMarker', 'host-binary-smoke', 'productionBinaryMarker', 'commitSha'],
+    [
+      'productionIpcMarker',
+      'linux-appimage-smoke',
+      'productionBinaryMarker',
+      'commitSha',
+      '.AppImage',
+    ],
     'desktop evidence example',
   );
 
@@ -431,6 +492,8 @@ function checkDesktopHarnessInventory() {
       'CRITICAL_FLOWS',
       'skippedCriticalFlowTests',
       'DESKTOP_E2E_ALLOW_BLOCKED',
+      'linux-appimage-smoke',
+      'DESKTOP_E2E_PACKAGE',
       'run-critical-flows.execute.mjs',
       'evidence-webdriver-blocked',
     ],
@@ -459,6 +522,7 @@ function checkDesktopHarnessInventory() {
       'productionIpcMarker',
       'OKPGUI_PRODUCTION_BINARY_V1',
       'productionBinaryMarker',
+      'OKPGUI_SMOKE_PACKAGED_ONLY',
       'CRITICAL_FLOWS',
     ],
     'desktop execute suite inventory',
@@ -488,6 +552,7 @@ function checkDesktopHarnessInventory() {
       'prepare_plan',
       'publish_prepared_plan',
       'productionIpcMarkerRule',
+      'linux-appimage-smoke',
     ],
     'deterministic fixture profile',
   );
@@ -539,6 +604,7 @@ function checkDesktopHarnessInventory() {
   const harnessTypes = new Set([
     'desktop-webdriver',
     'macos-packaged-smoke',
+    'linux-appimage-smoke',
     'host-binary-smoke',
     'mocked-playwright-not-desktop',
   ]);
@@ -578,6 +644,7 @@ function checkDesktopHarnessInventory() {
     if (
       data.result === 'pass' &&
       (data.harnessType === 'host-binary-smoke' ||
+        data.harnessType === 'linux-appimage-smoke' ||
         data.harnessType === 'macos-packaged-smoke')
     ) {
       if (data.productionBinaryMarker !== true) {
@@ -590,6 +657,15 @@ function checkDesktopHarnessInventory() {
           `${relPath}: ${data.harnessType} must not set productionIpcMarker true (not WebView IPC)`,
         );
       }
+    }
+    if (
+      data.result === 'pass' &&
+      data.targetTriple === 'x86_64-unknown-linux-gnu' &&
+      data.harnessType !== 'linux-appimage-smoke'
+    ) {
+      fail(
+        `${relPath}: Linux release pass requires linux-appimage-smoke from the final AppImage`,
+      );
     }
   }
 }
@@ -633,6 +709,7 @@ function checkDesktopE2EHonesty() {
       'platform-limited',
       'desktop-webdriver',
       'macos-packaged-smoke',
+      'linux-appimage-smoke',
       'mocked-playwright-not-desktop',
       'evidence.schema.json',
       'home-prepare-observe-ack-publish',
@@ -703,7 +780,7 @@ function main() {
     '  evidence class [desktop WebDriver]: Windows/Linux critical flows via run-desktop-e2e.mjs (desktop-webdriver)',
   );
   console.log(
-    '  evidence class [packaged smoke]: macOS IPC/event/sidecar/keyring via run-macos-packaged-smoke.mjs (macos-packaged-smoke)',
+    '  evidence class [packaged smoke]: Linux AppImage + macOS DMG/.app production binary and MediaInfo probes',
   );
   console.log(
     '  desktop harness: tests/desktop-e2e execute suite + evidence schema (empty out/ OK offline; binary required for pass)',
