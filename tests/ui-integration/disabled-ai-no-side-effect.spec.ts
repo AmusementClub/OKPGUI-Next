@@ -30,17 +30,16 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
     await expect(page.getByText('BYOK AI 连接')).toBeVisible();
     await expect(page.getByText('启用 AI 建议层')).toBeVisible();
 
-    // Formal probing remains disabled. Model discovery is an explicit setup action and may be
-    // used before enabling AI, but must not run until the user clicks it.
+    // Capability probing is removed. Model discovery remains an explicit setup action and must
+    // not run until the user clicks it.
     const probe = page.getByRole('button', { name: '运行探测' });
     const refresh = page.getByRole('button', { name: '刷新模型' });
-    await expect(probe).toBeDisabled();
+    await expect(probe).toHaveCount(0);
     await expect(refresh).toBeEnabled();
 
     const bridge = await readBridgeState(page);
     const commands = bridge.invokeLog.map((entry) => entry.command);
     expect(commands).toContain('ai_get_settings');
-    expect(commands).not.toContain('ai_run_capability_probe');
     expect(commands).not.toContain('ai_list_models');
     expect(commands).not.toContain('ai_start_formal_audit');
     expect(commands).not.toContain('publish_prepared_plan');
@@ -49,7 +48,7 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
     expect(bridge.settings.enabled).toBe(false);
   });
 
-  test('disabled AI path does not invent capability ready state', async ({ page }) => {
+  test('disabled AI path stays disabled without capability UI or provider side effects', async ({ page }) => {
     await installTauriMock(
       page,
       buildDefaultBridgeState({
@@ -59,7 +58,8 @@ test.describe('UI integration · disabled-AI no-side-effect', () => {
     await page.goto('/');
     await ensureTauriMockOnPage(page, buildDefaultBridgeState({         settings: defaultDisabledSettings(),       }));
     await navigateToPage(page, 'ai_settings');
-    await expect(page.getByTestId('capability-status')).toContainText(/未探测|未知/);
+    await expect(page.getByRole('checkbox', { name: '启用 AI 建议层' })).not.toBeChecked();
+    await expect(page.getByTestId('capability-status')).toHaveCount(0);
     const bridge = await readBridgeState(page);
     expect(bridge.settings.capability).toBeNull();
     // no-side-effect: opening Home must not start formal AI either.

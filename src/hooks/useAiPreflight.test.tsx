@@ -483,7 +483,7 @@ describe('useAiPreflight', () => {
             await Promise.resolve();
         });
         await act(async () => {
-            await hook.result.prepare(sampleRequest);
+            await hook.result.prepare({ ...sampleRequest, content_root: '/media/release' });
         });
 
         expect(startPlanMediaInfoMock).toHaveBeenCalledWith('plan-token-1');

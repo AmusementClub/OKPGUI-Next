@@ -56,12 +56,16 @@ import {
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
 import {
-    isAiCapabilityReady,
+    cancelAiJob,
+    isAiConfigured,
+    pollPlanMediaInfo,
     publishPreparedPlan,
     readFriendlyError,
+    startDefaultMediaInfo,
 } from '../services/ai';
 import {
     buildRecognitionLocalContextKey,
+    type MediaInfoJobView,
     type PublishRequestPayload,
 } from '../types/ai';
 import {
@@ -133,6 +137,12 @@ export default function QuickPublishPage() {
     const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
+    const [autoMediaInfo, setAutoMediaInfo] = useState<{
+        status: 'idle' | 'checking' | 'done' | 'failed';
+        results: MediaInfoJobView['results'];
+        message: string;
+    }>({ status: 'idle', results: [], message: '' });
+    const autoMediaInfoGenerationRef = useRef(0);
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
     /** Bumps on covered draft mutations so in-flight resolve/prepare cannot freeze stale data. */
@@ -185,6 +195,7 @@ export default function QuickPublishPage() {
         profileList,
         selectedProfileData,
         okpExecutablePath,
+        defaultMediaSearchFolder,
         selectedTemplateId,
         draft,
         setDraft,
@@ -319,6 +330,56 @@ export default function QuickPublishPage() {
         () => recommendLocalTemplate(torrentInfo?.name ?? '', quickPublishTemplates),
         [quickPublishTemplates, torrentInfo?.name],
     );
+
+    useEffect(() => {
+        const torrentPath = draft.torrent_path.trim();
+        if (!torrentPath || !defaultMediaSearchFolder.trim()) {
+            setAutoMediaInfo({ status: 'idle', results: [], message: '' });
+            return;
+        }
+
+        const generation = ++autoMediaInfoGenerationRef.current;
+        let disposed = false;
+        let jobId = '';
+        setAutoMediaInfo({ status: 'checking', results: [], message: '正在自动检查媒体信息...' });
+
+        const run = async () => {
+            try {
+                let terminal = await startDefaultMediaInfo(torrentPath);
+                jobId = terminal.job_id;
+                while (!terminal.state || !['succeeded', 'failed', 'cancelled', 'stale'].includes(terminal.state)) {
+                    await new Promise((resolve) => window.setTimeout(resolve, 250));
+                    if (disposed || generation !== autoMediaInfoGenerationRef.current) return;
+                    const polled = await pollPlanMediaInfo(jobId);
+                    if (polled) terminal = polled;
+                }
+                if (disposed || generation !== autoMediaInfoGenerationRef.current) return;
+                const measured = terminal.results.filter((result) => result.state === 'measured').length;
+                const unresolved = terminal.results.length - measured;
+                setAutoMediaInfo({
+                    status: terminal.state === 'succeeded' ? 'done' : 'failed',
+                    results: terminal.results,
+                    message: terminal.state === 'succeeded'
+                        ? `MediaInfo 已检查 ${terminal.results.length} 个文件：${measured} 个已识别，${unresolved} 个未识别。`
+                        : 'MediaInfo 自动检查未完成。',
+                });
+            } catch (error) {
+                if (!disposed && generation === autoMediaInfoGenerationRef.current) {
+                    setAutoMediaInfo({
+                        status: 'failed',
+                        results: [],
+                        message: readFriendlyError(error, 'MediaInfo 自动检查失败。'),
+                    });
+                }
+            }
+        };
+        void run();
+
+        return () => {
+            disposed = true;
+            if (jobId) void cancelAiJob(jobId);
+        };
+    }, [defaultMediaSearchFolder, draft.torrent_path]);
 
     const publishSitesList = useMemo(
         () => Object.values(publishSites).sort((left, right) => left.siteLabel.localeCompare(right.siteLabel, 'zh-CN')),
@@ -804,7 +865,7 @@ export default function QuickPublishPage() {
         }
         invalidateRecognitionIfDraftMismatch(recognitionLocalContextKey || null);
     }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionLocalContextKey]);
-    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
+    const recognitionReady = isAiConfigured(preflight.state.settings);
     const canRunRecognition = Boolean(
         torrentInfo?.name?.trim()
         && recognitionLocalContextKey
@@ -955,6 +1016,17 @@ export default function QuickPublishPage() {
                                 应用推荐
                             </button>
                         )}
+                    </div>
+                ) : null}
+                {autoMediaInfo.status !== 'idle' ? (
+                    <div
+                        data-testid="automatic-media-info-status"
+                        className="flex items-center gap-2 border-y border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-slate-300"
+                    >
+                        {autoMediaInfo.status === 'checking' ? <Loader2 size={15} className="animate-spin text-cyan-300" /> : null}
+                        <span className={autoMediaInfo.status === 'failed' ? 'text-amber-300' : 'text-cyan-200'}>
+                            {autoMediaInfo.message}
+                        </span>
                     </div>
                 ) : null}
 

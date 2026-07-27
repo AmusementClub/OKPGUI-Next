@@ -1,13 +1,13 @@
 import { invoke } from '@tauri-apps/api/core';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
-import { isAiCapabilityReady, preparePublishPlan } from './ai';
+import { isAiConfigured, preparePublishPlan } from './ai';
 import type { AiSettings, PublishRequestPayload } from '../types/ai';
 
 vi.mock('@tauri-apps/api/core', () => ({ invoke: vi.fn() }));
 
 const invokeMock = vi.mocked(invoke);
 
-function settingsWithCapability(capability: AiSettings['capability']): AiSettings {
+function configuredSettings(overrides: Partial<AiSettings> = {}): AiSettings {
     return {
         provider: 'open_ai',
         endpoint: 'https://example.test/v1',
@@ -16,28 +16,16 @@ function settingsWithCapability(capability: AiSettings['capability']): AiSetting
         auth_mode: 'bearer',
         credential_ref: { id: 'credential' },
         enabled: true,
-        capability,
+        capability: null,
+        ...overrides,
     };
 }
 
-describe('isAiCapabilityReady', () => {
-    it('requires an explicit persisted output tier', () => {
-        expect(isAiCapabilityReady(settingsWithCapability({
-            state: 'ready',
-            identity_digest: 'sha256:legacy',
-            identity_matches: true,
-            message: 'legacy ready record',
-        }))).toBe(false);
-
-        for (const output_capability of ['strict_schema', 'json_object'] as const) {
-            expect(isAiCapabilityReady(settingsWithCapability({
-                state: 'ready',
-                identity_digest: `sha256:${output_capability}`,
-                output_capability,
-                identity_matches: true,
-                message: 'ready',
-            }))).toBe(true);
-        }
+describe('isAiConfigured', () => {
+    it('allows configured AI without a capability probe', () => {
+        expect(isAiConfigured(configuredSettings())).toBe(true);
+        expect(isAiConfigured(configuredSettings({ model: '' }))).toBe(false);
+        expect(isAiConfigured(configuredSettings({ credential_ref: null }))).toBe(false);
     });
 });
 

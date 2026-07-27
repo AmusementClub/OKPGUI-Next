@@ -2462,7 +2462,7 @@ describe('HomePage publish content pipeline', () => {
         }
     });
 
-    it('disables recognition when capability is not Ready even with torrent + patterns', async () => {
+    it('allows recognition for a complete saved connection without a capability probe', async () => {
         mountWithTemplate(
             {
                 ep_pattern: 'E(\\d+)',
@@ -2505,9 +2505,7 @@ describe('HomePage publish content pipeline', () => {
                 '[data-testid="ai-recognize-button"]',
             );
             expect(recognizeButton).not.toBeNull();
-            expect(recognizeButton!.disabled).toBe(true);
-            expect(findInvokeArgs('ai_start_recognition')).toHaveLength(0);
-            expect(document.body.querySelector('[data-testid="ai-recognition-panel"]')).toBeNull();
+            expect(recognizeButton!.disabled).toBe(false);
         } finally {
             await rendered.unmount();
         }

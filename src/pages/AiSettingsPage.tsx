@@ -1,23 +1,21 @@
 import { useEffect, useState } from 'react';
-import { Activity, BrainCircuit, KeyRound, RefreshCw, Save } from 'lucide-react';
+import { BrainCircuit, KeyRound, RefreshCw, Save } from 'lucide-react';
 import ModelCombobox from '../components/ModelCombobox';
 import {
     getAiSettings,
-    isAiCapabilityReady,
     listAiModels,
     readFriendlyError,
-    runAiCapabilityProbe,
     saveAiSettings,
 } from '../services/ai';
 import type { AiAuthMode, AiMode, AiProvider, AiSettings } from '../types/ai';
 
 const MODE_OPTIONS: Record<AiProvider, ReadonlyArray<{ value: AiMode; label: string }>> = {
     open_ai: [
-        { value: 'responses', label: 'Responses strict' },
-        { value: 'chat', label: 'Chat strict' },
+        { value: 'responses', label: 'Responses JSON' },
+        { value: 'chat', label: 'Chat JSON' },
     ],
     anthropic: [
-        { value: 'anthropic_messages', label: 'Messages strict' },
+        { value: 'anthropic_messages', label: 'Messages JSON' },
     ],
 };
 
@@ -64,38 +62,13 @@ function normalizeSettings(settings: AiSettings): AiSettings {
     };
 }
 
-function capabilityLabel(settings: AiSettings): string {
-    const capability = settings.capability;
-    if (!capability) {
-        return '未探测';
-    }
-    if (capability.state === 'ready' && capability.identity_matches) {
-        const outputMode = capability.output_capability === 'json_object'
-            ? 'JSON 兼容模式'
-            : '严格结构化输出';
-        return `Ready（${capability.resolved_mode ?? settings.mode}，${outputMode}）`;
-    }
-    if (capability.state === 'ready' && !capability.identity_matches) {
-        return '连接已变更，需重新探测';
-    }
-    if (capability.state === 'probing') {
-        return '探测中…';
-    }
-    if (capability.state === 'unsupported') {
-        return '不支持结构化 JSON 输出';
-    }
-    if (capability.state === 'failed') {
-        return '探测失败';
-    }
-    return '未知';
-}
 export default function AiSettingsPage() {
     const [settings, setSettings] = useState<AiSettings | null>(null);
     const [secret, setSecret] = useState('');
     const [status, setStatus] = useState('');
     const [modelFeedback, setModelFeedback] = useState('');
     const [error, setError] = useState('');
-    const [busy, setBusy] = useState<'save' | 'models' | 'probe' | null>(null);
+    const [busy, setBusy] = useState<'save' | 'models' | null>(null);
 
     const load = async () => {
         setError('');
@@ -137,8 +110,8 @@ export default function AiSettingsPage() {
             setSecret('');
             setStatus(
                 saved.credential_session_only
-                    ? '连接设置已保存；密钥仅保存在本会话中（未写入系统密钥环），退出后需重新输入。相关变更会使能力探测失效。'
-                    : '连接设置已保存；密钥只保存在系统凭据存储中。相关变更会使能力探测失效。',
+                    ? '连接设置已保存；密钥仅保存在本会话中（未写入系统密钥环），退出后需重新输入。'
+                    : '连接设置已保存；密钥只保存在系统凭据存储中。',
             );
         } catch (saveError) {
             setError(readFriendlyError(saveError, '保存 AI 连接失败。'));
@@ -172,36 +145,9 @@ export default function AiSettingsPage() {
         }
     };
 
-    const runProbe = async () => {
-        if (!settings) return;
-        setError('');
-        setBusy('probe');
-        try {
-            const saved = await saveAiSettings(settings, secret);
-            setSecret('');
-            const capability = await runAiCapabilityProbe();
-            const next = normalizeSettings(await getAiSettings());
-            setSettings({ ...next, model: saved.model || next.model, capability });
-            if (capability.state === 'ready' && capability.identity_matches && capability.output_capability) {
-                const outputMode = capability.output_capability === 'json_object'
-                    ? 'JSON 兼容模式'
-                    : '严格结构化输出';
-                setStatus(`能力探测通过（${capability.resolved_mode ?? saved.mode}，${outputMode}）。正式 AI 任务已解锁。`);
-            } else {
-                setStatus(capability.message || '能力探测未通过。');
-            }
-        } catch (probeError) {
-            setError(readFriendlyError(probeError, '能力探测失败。'));
-        } finally {
-            setBusy(null);
-        }
-    };
-
     if (!settings) {
         return <div className="h-full overflow-y-auto p-6 text-sm text-slate-400">加载 AI 设置中...</div>;
     }
-
-    const ready = isAiCapabilityReady(settings);
 
     return (
         <div className="h-full overflow-y-auto">
@@ -213,7 +159,7 @@ export default function AiSettingsPage() {
                     </div>
                     <h2 className="mt-2 text-xl font-semibold text-slate-100">BYOK AI 连接</h2>
                     <p className="mt-1 text-sm text-slate-500">
-                        AI 只提供建议和检查证据，发布仍由本地冻结计划控制。正式审计/自动选模板需先完成 strict 能力探测。
+                        AI 只提供建议和检查证据，发布仍由本地冻结计划控制。保存完整连接后即可运行，返回按 JSON object 解析。
                     </p>
                 </header>
 
@@ -354,34 +300,6 @@ export default function AiSettingsPage() {
                             />
                         </label>
                     ) : null}
-
-                    <div className="rounded-lg border border-slate-700/80 bg-slate-900/60 px-3 py-3">
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                            <div>
-                                <p className="text-xs font-medium text-slate-300">Strict 能力探测</p>
-                                <p className="mt-1 text-sm text-slate-200" data-testid="capability-status">
-                                    {capabilityLabel(settings)}
-                                </p>
-                                {settings.capability?.message ? (
-                                    <p className="mt-1 text-[11px] text-slate-500">{settings.capability.message}</p>
-                                ) : null}
-                            </div>
-                            <button
-                                type="button"
-                                onClick={() => void runProbe()}
-                                disabled={busy !== null || !settings.enabled}
-                                className="inline-flex items-center gap-2 rounded-lg border border-emerald-700/60 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-200 hover:bg-emerald-500/20 disabled:opacity-50"
-                            >
-                                <Activity size={15} />
-                                运行探测
-                            </button>
-                        </div>
-                        <p className={`mt-2 text-[11px] ${ready ? 'text-emerald-300' : 'text-amber-300'}`}>
-                            {ready
-                                ? '正式审计与 AI 自动选模板已解锁。'
-                                : '正式 AI 任务在探测 Ready 且与当前连接一致前不会发起网络请求。'}
-                        </p>
-                    </div>
 
                     <div className="flex flex-wrap items-center gap-3 border-t border-slate-700 pt-4">
                         <button

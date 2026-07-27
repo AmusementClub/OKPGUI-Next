@@ -34,9 +34,10 @@ test.describe('UI integration · confirmation states and acknowledgement', () =>
     const body = page.locator('body');
     await expect(body).toBeVisible();
 
-    // Navigate-only smoke: AI settings capability remains Ready while Home loads.
+    // Navigate-only smoke: a complete saved connection needs no capability status/probe UI.
     await navigateToPage(page, 'ai_settings');
-    await expect(page.getByTestId('capability-status')).toBeVisible();
+    await expect(page.getByRole('button', { name: '保存连接' })).toBeVisible();
+    await expect(page.getByRole('button', { name: '运行探测' })).toHaveCount(0);
 
     // Simulate frozen-plan acknowledgement IPC the UI uses for WARNING.
     await page.evaluate(async () => {

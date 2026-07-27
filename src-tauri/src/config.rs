@@ -342,6 +342,8 @@ pub struct AppConfig {
     #[serde(default)]
     pub okp_executable_path: String,
     #[serde(default)]
+    pub default_media_search_folder: String,
+    #[serde(default)]
     pub templates: HashMap<String, Template>,
     #[serde(default)]
     pub quick_publish_templates: HashMap<String, QuickPublishTemplate>,
@@ -358,8 +360,8 @@ pub struct CredentialBundleRef {
     pub key_ref: Option<String>,
 }
 
-/// Non-secret persisted capability probe outcome for the active connection.
-/// Identity digest fingerprints endpoint/auth/model/mode/secret without storing secrets.
+/// Legacy capability-probe snapshot retained only for backward-compatible config reads.
+/// Runtime settings ignore it and the next connection save clears it.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct AiCapabilityConfig {
     /// `unknown` | `probing` | `ready` | `unsupported` | `failed`
@@ -371,7 +373,7 @@ pub struct AiCapabilityConfig {
     /// Resolved provider mode that passed the probe (e.g. `chat` after Auto fallback).
     #[serde(default)]
     pub resolved_mode: String,
-    /// `strict_schema` | `json_object`; missing Ready records must be reprobed.
+    /// Legacy output mode recorded by older releases.
     #[serde(default)]
     pub output_capability: String,
     /// Sanitized user-facing message; never a provider body or secret.
@@ -435,6 +437,7 @@ impl Default for AppConfig {
             last_used_quick_publish_template: None,
             proxy: ProxyConfig::default(),
             okp_executable_path: String::new(),
+            default_media_search_folder: String::new(),
             templates: HashMap::new(),
             quick_publish_templates: HashMap::new(),
             content_templates: HashMap::new(),
@@ -1050,18 +1053,8 @@ pub fn save_ai_config(app: AppHandle, ai: AIConfig) -> Result<(), String> {
     })
 }
 
-/// Persist non-secret capability probe metadata only (never secrets or response bodies).
-pub fn save_ai_capability(
-    app: &AppHandle,
-    capability: Option<AiCapabilityConfig>,
-) -> Result<(), String> {
-    mutate_config(app, |config| {
-        config.ai.capability = capability;
-        Ok(((), true))
-    })
-}
-
 /// Whether two AI connection snapshots differ in fields that key capability identity.
+#[cfg(test)]
 pub fn ai_connection_identity_fields_changed(before: &AIConfig, after: &AIConfig) -> bool {
     before.provider != after.provider
         || before.endpoint.trim_end_matches('/') != after.endpoint.trim_end_matches('/')
@@ -1130,6 +1123,22 @@ pub fn save_okp_executable_path(app: AppHandle, okp_executable_path: String) -> 
     mutate_config(&app, |config| {
         config.okp_executable_path = okp_executable_path;
         Ok(((), true))
+    })
+}
+
+#[tauri::command]
+pub fn save_default_media_search_folder(app: AppHandle, path: String) -> Result<String, String> {
+    let normalized = if path.trim().is_empty() {
+        String::new()
+    } else {
+        crate::ai::media::validate_media_content_root(&path)?
+            .to_string_lossy()
+            .into_owned()
+    };
+    mutate_config(&app, |config| {
+        let changed = config.default_media_search_folder != normalized;
+        config.default_media_search_folder = normalized.clone();
+        Ok((normalized.clone(), changed))
     })
 }
 

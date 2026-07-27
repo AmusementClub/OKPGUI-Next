@@ -79,7 +79,7 @@ import {
     SiteSelection,
 } from '../utils/quickPublish';
 import {
-    isAiCapabilityReady,
+    isAiConfigured,
     publishPreparedPlan,
     readFriendlyError,
 } from '../services/ai';
@@ -1107,7 +1107,7 @@ export default function HomePage() {
         }
         invalidateRecognitionIfDraftMismatch(recognitionLocalContextKey || null);
     }, [clearAdoptedHistory, invalidateRecognitionIfDraftMismatch, recognitionLocalContextKey]);
-    const recognitionReady = isAiCapabilityReady(preflight.state.settings);
+    const recognitionReady = isAiConfigured(preflight.state.settings);
     const canRunRecognition = Boolean(
         torrentInfo?.name?.trim()
         && recognitionLocalContextKey

@@ -1,7 +1,7 @@
 //! Offline provider/mock contract surface for BYOK AI Preflight V2.
 //!
 //! These helpers and tests never call live or paid providers. They validate the
-//! strict Models / Responses / Chat / Anthropic Messages request shapes, refusal
+//! Models / Responses / Chat / Anthropic Messages JSON request shapes, refusal
 //! envelope rules, malformed/schema classification, usage extraction, timeout and
 //! redirect errors, and text-only request assembly against localhost mock fixtures
 //! or pure in-memory bodies. No credentials are stored.
@@ -10,10 +10,10 @@
 
 use super::credentials::AuthMode;
 use super::provider::{
-    build_models_list_request, build_probe_request, build_structured_request_with_system,
-    classify_http_failure, classify_probe_response, extract_structured_json,
-    parse_models_list_response, CapabilityState, OutputCapability, ProviderFailureKind,
-    ProviderKind, ProviderMode, ProviderRequest, ProviderUsage,
+    build_models_list_request, build_structured_request_with_system, classify_http_failure,
+    classify_probe_response, extract_structured_json, parse_models_list_response, CapabilityState,
+    OutputCapability, ProviderFailureKind, ProviderKind, ProviderMode, ProviderRequest,
+    ProviderUsage,
 };
 use serde_json::{json, Value};
 use std::io::{Read, Write};
@@ -47,7 +47,7 @@ pub enum MockScenario {
     Redirect,
 }
 
-/// Build the strict structured request body for a formal scenario without network I/O.
+/// Build the JSON-object request body for a formal scenario without network I/O.
 pub fn build_contract_request(
     scenario: MockScenario,
     endpoint: &str,
@@ -96,7 +96,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
-                OutputCapability::StrictSchema,
+                OutputCapability::JsonObject,
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Responses, request))
@@ -112,7 +112,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
-                OutputCapability::StrictSchema,
+                OutputCapability::JsonObject,
                 256,
             )?;
             Ok((ProviderKind::OpenAi, ProviderMode::Chat, request))
@@ -128,7 +128,7 @@ pub fn build_contract_request(
                 "okpgui_audit",
                 "contract-system-prompt",
                 "contract-audit-prompt",
-                OutputCapability::StrictSchema,
+                OutputCapability::JsonObject,
                 256,
             )?;
             Ok((
@@ -501,17 +501,22 @@ mod tests {
     }
 
     #[test]
-    fn request_shapes_match_strict_provider_contracts() {
+    fn formal_request_shapes_use_json_object_without_strict_gating() {
         let endpoint = "https://example.test/v1";
         let schema = minimal_probe_schema();
 
-        let responses = build_probe_request(
+        let responses = build_structured_request_with_system(
             ProviderKind::OpenAi,
             ProviderMode::Responses,
             endpoint,
             FIXTURE_MODEL_OPENAI,
             &schema,
             AuthMode::Bearer,
+            "okpgui_audit",
+            "系统提示",
+            "用户输入",
+            OutputCapability::JsonObject,
+            4096,
         )
         .unwrap();
         assert_eq!(responses.method, "POST");
@@ -526,7 +531,7 @@ mod tests {
                 .body
                 .pointer("/text/format/type")
                 .and_then(Value::as_str),
-            Some("json_schema")
+            Some("json_object")
         );
         assert_eq!(
             responses.body.pointer("/input/0/role"),
@@ -538,13 +543,18 @@ mod tests {
         );
         assert_request_body_sanitary(&responses.body);
 
-        let chat = build_probe_request(
+        let chat = build_structured_request_with_system(
             ProviderKind::OpenAi,
             ProviderMode::Chat,
             endpoint,
             FIXTURE_MODEL_OPENAI,
             &schema,
             AuthMode::Bearer,
+            "okpgui_audit",
+            "系统提示",
+            "用户输入",
+            OutputCapability::JsonObject,
+            4096,
         )
         .unwrap();
         assert!(chat.url.ends_with("/chat/completions"));
@@ -556,7 +566,7 @@ mod tests {
             chat.body
                 .pointer("/response_format/type")
                 .and_then(Value::as_str),
-            Some("json_schema")
+            Some("json_object")
         );
         assert_eq!(
             chat.body.pointer("/messages/0/role"),
@@ -565,29 +575,30 @@ mod tests {
         assert_eq!(chat.body.pointer("/messages/1/role"), Some(&json!("user")));
         assert_request_body_sanitary(&chat.body);
 
-        let anthropic = build_probe_request(
+        let anthropic = build_structured_request_with_system(
             ProviderKind::Anthropic,
             ProviderMode::AnthropicMessages,
             endpoint,
             FIXTURE_MODEL_ANTHROPIC,
             &schema,
             AuthMode::AnthropicApiKey,
+            "okpgui_audit",
+            "系统提示",
+            "用户输入",
+            OutputCapability::JsonObject,
+            4096,
         )
         .unwrap();
         assert!(anthropic.url.ends_with("/messages"));
         assert_eq!(anthropic.body.pointer("/max_tokens"), Some(&json!(4096)));
-        assert_eq!(
-            anthropic
-                .body
-                .pointer("/output_config/format/type")
-                .and_then(Value::as_str),
-            Some("json_schema")
-        );
-        assert!(anthropic
+        assert!(anthropic.body.get("output_config").is_none());
+        let anthropic_system = anthropic
             .body
             .get("system")
             .and_then(Value::as_str)
-            .is_some());
+            .expect("Anthropic JSON mode needs a schema-bearing system prompt");
+        assert!(anthropic_system.contains("系统提示"));
+        assert!(anthropic_system.contains("单一 JSON object"));
         assert_eq!(
             anthropic.body.pointer("/messages/0/role"),
             Some(&json!("user"))

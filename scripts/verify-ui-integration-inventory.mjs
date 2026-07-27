@@ -41,8 +41,8 @@ const REQUIRED_MARKERS = {
   ],
   'tests/ui-integration/settings-capability.spec.ts': [
     'UI integration',
-    'capability',
-    'ai_run_capability_probe',
+    'JSON',
+    'ai_save_settings',
   ],
   'tests/ui-integration/confirmation-states.spec.ts': [
     'UI integration',

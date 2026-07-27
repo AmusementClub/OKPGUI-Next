@@ -93,6 +93,7 @@ export function useQuickPublishRuntimeDraft({
     const [profileList, setProfileList] = useState<string[]>([]);
     const [selectedProfileData, setSelectedProfileData] = useState<QuickPublishProfileData | null>(null);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
+    const [defaultMediaSearchFolder, setDefaultMediaSearchFolder] = useState('');
     const [selectedTemplateId, setSelectedTemplateId] = useState('');
     const [draft, setDraftState] = useState<QuickPublishRuntimeDraft>(createDefaultQuickPublishRuntimeDraft());
     const [torrentInfo, setTorrentInfo] = useState<TorrentInfo | null>(null);
@@ -200,6 +201,7 @@ export function useQuickPublishRuntimeDraft({
             setQuickPublishTemplates(nextQuickPublishTemplates);
             setContentTemplates(nextContentTemplates);
             setOkpExecutablePath(config.okp_executable_path ?? '');
+            setDefaultMediaSearchFolder(config.default_media_search_folder ?? '');
 
             const currentSelectedTemplateId = selectedTemplateIdRef.current;
             const resolvedTemplateId =
@@ -220,7 +222,9 @@ export function useQuickPublishRuntimeDraft({
                 templates: nextQuickPublishTemplates,
                 contentTemplates: nextContentTemplates,
                 currentTorrentPath: draftRef.current.torrent_path,
-                currentContentRoot: draftRef.current.content_root,
+                currentContentRoot: draftRef.current.content_root
+                    || config.default_media_search_folder
+                    || '',
             });
         } catch (error) {
             onError?.(toErrorMessage(error, '加载快速发布配置失败。'));
@@ -618,6 +622,7 @@ export function useQuickPublishRuntimeDraft({
         profileList,
         selectedProfileData,
         okpExecutablePath,
+        defaultMediaSearchFolder,
         selectedTemplateId,
         draft,
         setDraft,

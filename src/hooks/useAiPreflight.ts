@@ -794,14 +794,13 @@ export function useAiPreflight() {
             // returns local_blockers (plan-token blockers are authoritative).
             void localBlockers;
 
-            const settings = await getAiSettings();
             if (requestGeneration !== generationRef.current) {
                 clearTokenSideEffects(token);
                 preparedToken = null;
                 throw createSupersededError();
             }
 
-            if (isAiConfigured(settings)) {
+            if (request.content_root?.trim()) {
                 // Empty relative_entries instructs Rust to resolve and probe every media
                 // file declared by the bound torrent. Successful per-file outcomes roll
                 // the plan hash and become part of the formal audit context.

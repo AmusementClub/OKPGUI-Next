@@ -94,6 +94,7 @@ export interface QuickPublishConfigPayload {
     quick_publish_templates?: Record<string, Partial<QuickPublishTemplate>>;
     content_templates?: Record<string, Partial<ContentTemplate>>;
     okp_executable_path?: string;
+    default_media_search_folder?: string;
 }
 
 export const quickPublishSiteKeys: (keyof SiteSelection)[] = [

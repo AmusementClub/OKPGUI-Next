@@ -100,6 +100,7 @@ pub struct ProviderRequest {
     pub managed_auth_header: Option<String>,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CapabilityProbeResult {
     pub state: CapabilityState,
@@ -142,6 +143,7 @@ pub fn build_no_redirect_client() -> Result<Client, String> {
 }
 
 /// V2 minimal strict probe schema. Local validation requires `{"ok": true}`.
+#[cfg(test)]
 pub fn minimal_probe_schema() -> Value {
     json!({
         "type": "object",
@@ -155,12 +157,14 @@ pub fn minimal_probe_schema() -> Value {
 }
 
 /// True only when the structured object is the exact V2 probe payload.
+#[cfg(test)]
 pub fn validate_minimal_probe_object(value: &Value) -> bool {
     value.as_object().is_some_and(|object| {
         object.len() == 1 && object.get("ok").and_then(Value::as_bool) == Some(true)
     })
 }
 
+#[cfg(test)]
 pub fn build_probe_request(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -181,6 +185,7 @@ pub fn build_probe_request(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub fn build_probe_request_for_capability(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -313,6 +318,7 @@ fn parse_anthropic_model_ids(value: &Value) -> Vec<String> {
 
 /// Classify a probe HTTP response and require the V2 minimal `{"ok":true}` object.
 /// JSON-mode-only or wrong-shape payloads stay Unsupported; never echoes bodies.
+#[cfg(test)]
 pub fn classify_and_validate_probe_response(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -328,6 +334,7 @@ pub fn classify_and_validate_probe_response(
     )
 }
 
+#[cfg(test)]
 pub fn classify_and_validate_probe_response_for_capability(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -387,11 +394,6 @@ pub fn build_structured_request_with_system(
 
     let base = endpoint.trim_end_matches('/');
     let resolved_mode = resolve_mode(provider, mode);
-    if provider == ProviderKind::Anthropic && output_capability == OutputCapability::JsonObject {
-        return Err(
-            "Anthropic Messages does not expose a weaker JSON-object output mode".to_string(),
-        );
-    }
     let schema_prompt = if output_capability == OutputCapability::JsonObject {
         let serialized_schema = serde_json::to_string(schema)
             .map_err(|_| "structured output schema serialization failed".to_string())?;
@@ -450,25 +452,25 @@ pub fn build_structured_request_with_system(
                 body
             })
         }
-        (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => (
-            format!("{base}/messages"),
-            json!({
+        (ProviderKind::Anthropic, ProviderMode::AnthropicMessages) => {
+            let mut body = json!({
                 "model": model,
                 "max_tokens": max_tokens,
-                "messages": [{"role": "user", "content": user_prompt}],
-                "output_config": {"format": {"type": "json_schema", "schema": schema}}
-            }),
-        ),
+                "messages": [{"role": "user", "content": user_prompt}]
+            });
+            if output_capability == OutputCapability::StrictSchema {
+                body["output_config"] =
+                    json!({"format": {"type": "json_schema", "schema": schema}});
+            }
+            (format!("{base}/messages"), body)
+        }
         _ => return Err("provider and mode combination is unsupported".to_string()),
     };
 
-    if provider == ProviderKind::Anthropic && !system_prompt.trim().is_empty() {
+    if provider == ProviderKind::Anthropic && !schema_prompt.trim().is_empty() {
         body.as_object_mut()
             .expect("provider request body is always an object")
-            .insert(
-                "system".to_string(),
-                Value::String(system_prompt.to_string()),
-            );
+            .insert("system".to_string(), Value::String(schema_prompt));
     }
 
     Ok(ProviderRequest {
@@ -820,6 +822,7 @@ pub fn formal_attempt_modes(provider: ProviderKind, mode: ProviderMode) -> Vec<P
     }
 }
 
+#[cfg(test)]
 pub fn probe_output_capabilities(provider: ProviderKind) -> &'static [OutputCapability] {
     match provider {
         ProviderKind::OpenAi => &[OutputCapability::StrictSchema, OutputCapability::JsonObject],
@@ -833,6 +836,7 @@ pub fn probe_output_capabilities(provider: ProviderKind) -> &'static [OutputCapa
 /// stick to that mode so formal work does not reopen Responses. Explicit configured
 /// modes and narrow 404 Auto fallback semantics are preserved when no resolved mode
 /// is recorded yet.
+#[cfg(test)]
 pub fn formal_attempt_modes_for_ready_capability(
     provider: ProviderKind,
     configured_mode: ProviderMode,
@@ -917,7 +921,7 @@ fn managed_auth_header(auth_mode: AuthMode) -> Option<String> {
     }
 }
 
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg(test)]
 pub fn classify_probe_response(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -933,6 +937,7 @@ pub fn classify_probe_response(
     )
 }
 
+#[cfg(test)]
 pub fn classify_probe_response_for_capability(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -1087,6 +1092,7 @@ fn anthropic_messages_has_refusal(value: &Value) -> bool {
     value.get("stop_reason").and_then(Value::as_str) == Some("refusal")
 }
 
+#[cfg(test)]
 fn has_structured_success(
     provider: ProviderKind,
     mode: ProviderMode,
@@ -1144,6 +1150,7 @@ pub fn classify_http_failure(status: u16, body: &str) -> ProviderFailure {
     }
 }
 
+#[cfg(test)]
 fn extract_usage(value: &Value) -> Option<ProviderUsage> {
     let usage = value.get("usage")?;
     Some(ProviderUsage {

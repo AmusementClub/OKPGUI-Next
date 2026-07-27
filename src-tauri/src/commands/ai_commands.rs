@@ -9,17 +9,15 @@ use crate::ai::context::{
     ContextError, ContextProjection, DEFAULT_CONTEXT_CEILING,
 };
 use crate::ai::credentials::{
-    apply_credential_journal_recovery, apply_public_credential_session_flag,
-    apply_public_identity_matches, capability_identity, capability_identity_matches,
+    apply_credential_journal_recovery, apply_public_credential_session_flag, capability_identity,
     cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
     credential_write_plan_needs_journal, decide_session_only_cold_start, load_credential_journal,
-    may_read_credential_store_for_settings, plan_credential_secret_write,
-    reconcile_existing_credential_journal_before_new, rollback_candidate_or_retain_journal,
-    rollback_credential_candidate, validate_custom_header_name, write_credential_journal, AuthMode,
-    CredentialJournalPhase, CredentialJournalSettingsMetadata, CredentialMutationGate,
-    CredentialRef, CredentialRotationJournal, OsCredentialStore, PublicCapabilityStatus,
-    PublicConnectionConfig, SecretStore, SecretValue, SessionOnlyColdStartAction,
-    CREDENTIAL_JOURNAL_TTL_SECS,
+    plan_credential_secret_write, reconcile_existing_credential_journal_before_new,
+    rollback_candidate_or_retain_journal, rollback_credential_candidate,
+    validate_custom_header_name, write_credential_journal, AuthMode, CredentialJournalPhase,
+    CredentialJournalSettingsMetadata, CredentialMutationGate, CredentialRef,
+    CredentialRotationJournal, OsCredentialStore, PublicConnectionConfig, SecretStore, SecretValue,
+    SessionOnlyColdStartAction, CREDENTIAL_JOURNAL_TTL_SECS,
 };
 use crate::ai::jobs::{
     formal_audit_may_bind_terminal_evidence, media_info_may_bind_plan_evidence,
@@ -35,13 +33,9 @@ use crate::ai::media::{
 };
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
-    build_probe_request, build_probe_request_for_capability, build_structured_request_with_system,
-    classify_and_validate_probe_response, classify_and_validate_probe_response_for_capability,
-    classify_http_failure, extract_provider_json, formal_attempt_modes,
-    formal_attempt_modes_for_ready_capability, minimal_probe_schema, parse_models_list_response,
-    probe_output_capabilities, send_managed_provider_request, CapabilityIdentity,
-    CapabilityProbeResult, CapabilityState, OutputCapability, ProviderFailure, ProviderKind,
-    ProviderMode,
+    build_structured_request_with_system, classify_http_failure, extract_provider_json,
+    formal_attempt_modes, parse_models_list_response, send_managed_provider_request,
+    CapabilityIdentity, OutputCapability, ProviderFailure, ProviderKind, ProviderMode,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
@@ -112,7 +106,6 @@ async fn run_formal_provider_call<T, V, C>(
     schema_name: &str,
     system_prompt: &str,
     prompt: &str,
-    output_capability: OutputCapability,
     is_cancelled: C,
     mut validate: V,
 ) -> FormalProviderCallResult<T>
@@ -143,7 +136,7 @@ where
                 schema_name,
                 system_prompt,
                 request_prompt,
-                output_capability,
+                OutputCapability::JsonObject,
                 FORMAL_PROVIDER_MAX_TOKENS,
             ) {
                 Ok(request) => request,
@@ -204,7 +197,7 @@ where
                 connection.provider,
                 attempted_mode,
                 &body,
-                output_capability,
+                OutputCapability::JsonObject,
             ) {
                 Ok(value) => value,
                 Err(failure)
@@ -480,6 +473,11 @@ fn next_recognition_generation() -> u64 {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+fn next_media_info_generation() -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
 /// Bound process-global Recognition result/cancel/snapshot maps (active jobs are never pruned).
 const RECOGNITION_STATE_MAX_RECORDS: usize = 200;
 
@@ -492,27 +490,14 @@ pub fn ai_validate_custom_header(name: String) -> Result<String, String> {
 pub fn ai_get_settings(app: AppHandle) -> PublicConnectionConfig {
     let config = crate::config::load_config(&app);
     let mut connection = public_connection_from_ai_config(&config.ai);
-    // Disabled AI is a compatibility path: never touch the credential store even if a
-    // stale credential_ref remains. identity_matches stays false.
-    let secret = if may_read_credential_store_for_settings(&connection) {
-        resolve_stored_secret(&connection).ok().flatten()
-    } else {
-        None
-    };
-    apply_public_identity_matches(&mut connection, secret.as_ref());
     // Non-secret session-only indicator (never secret material or raw keyring errors).
     apply_public_credential_session_flag(&mut connection, credential_store());
     connection
 }
 
-/// Modes for formal provider work: prefer probe-resolved mode when Ready.
+/// Modes for formal provider work come directly from the saved connection.
 fn formal_modes_for_connection(connection: &PublicConnectionConfig) -> Vec<ProviderMode> {
-    let resolved = connection
-        .capability
-        .as_ref()
-        .filter(|capability| capability.state == CapabilityState::Ready)
-        .and_then(|capability| capability.resolved_mode);
-    formal_attempt_modes_for_ready_capability(connection.provider, connection.mode, resolved)
+    formal_attempt_modes(connection.provider, connection.mode)
 }
 
 fn public_connection_from_ai_config(ai: &crate::config::AIConfig) -> PublicConnectionConfig {
@@ -545,83 +530,13 @@ fn public_connection_from_ai_config(ai: &crate::config::AIConfig) -> PublicConne
             .and_then(|reference| reference.key_ref.clone())
             .map(|id| CredentialRef { id }),
         enabled: ai.enabled,
-        capability: ai.capability.as_ref().map(public_capability_from_config),
+        // Capability probes were removed. Legacy persisted snapshots are ignored.
+        capability: None,
         discovered_models: ai.discovered_models.clone(),
         models_fetched_at_unix: ai.models_fetched_at_unix,
         // Runtime-only; projected from the live store in ai_get_settings.
         credential_session_only: false,
     }
-}
-
-fn public_capability_from_config(
-    capability: &crate::config::AiCapabilityConfig,
-) -> PublicCapabilityStatus {
-    PublicCapabilityStatus {
-        state: parse_capability_state(&capability.state),
-        identity_digest: capability.identity_digest.clone(),
-        resolved_mode: parse_provider_mode_opt(&capability.resolved_mode),
-        output_capability: parse_output_capability_opt(&capability.output_capability),
-        message: capability.message.clone(),
-        probed_at_unix: capability.probed_at_unix,
-        identity_matches: false,
-    }
-}
-
-fn parse_capability_state(value: &str) -> CapabilityState {
-    match value.to_ascii_lowercase().as_str() {
-        "probing" => CapabilityState::Probing,
-        "ready" => CapabilityState::Ready,
-        "unsupported" => CapabilityState::Unsupported,
-        "failed" => CapabilityState::Failed,
-        _ => CapabilityState::Unknown,
-    }
-}
-
-fn capability_state_to_config(state: CapabilityState) -> String {
-    match state {
-        CapabilityState::Unknown => "unknown",
-        CapabilityState::Probing => "probing",
-        CapabilityState::Ready => "ready",
-        CapabilityState::Unsupported => "unsupported",
-        CapabilityState::Failed => "failed",
-    }
-    .to_string()
-}
-
-fn parse_output_capability_opt(value: &str) -> Option<OutputCapability> {
-    match value.to_ascii_lowercase().as_str() {
-        "strict_schema" => Some(OutputCapability::StrictSchema),
-        "json_object" => Some(OutputCapability::JsonObject),
-        _ => None,
-    }
-}
-
-fn output_capability_to_config(capability: OutputCapability) -> String {
-    match capability {
-        OutputCapability::StrictSchema => "strict_schema",
-        OutputCapability::JsonObject => "json_object",
-    }
-    .to_string()
-}
-
-fn parse_provider_mode_opt(value: &str) -> Option<ProviderMode> {
-    match value.to_ascii_lowercase().as_str() {
-        "responses" => Some(ProviderMode::Responses),
-        "chat" => Some(ProviderMode::Chat),
-        "anthropic_messages" | "messages" => Some(ProviderMode::AnthropicMessages),
-        "auto" => Some(ProviderMode::Auto),
-        _ => None,
-    }
-}
-
-fn provider_mode_to_config(mode: ProviderMode) -> String {
-    match mode {
-        ProviderMode::Auto => "auto",
-        ProviderMode::Responses => "responses",
-        ProviderMode::Chat => "chat",
-        ProviderMode::AnthropicMessages => "anthropic_messages",
-    }
-    .to_string()
 }
 
 fn resolve_stored_secret(
@@ -634,11 +549,6 @@ fn resolve_stored_secret(
         return Ok(None);
     };
     credential_store().get(&reference)
-}
-
-/// Actionable gate failure when formal tasks need a Ready capability identity.
-fn capability_gate_error() -> String {
-    "structured output capability probe is not Ready for the current connection; open AI settings, refresh models if needed, and run the capability probe".to_string()
 }
 
 #[tauri::command]
@@ -800,20 +710,13 @@ pub fn ai_save_settings(
         }
         .to_string(),
         custom_header_name: connection.custom_header_name.clone(),
-        // Preserve non-secret metadata unless identity-relevant fields change.
-        capability: current.ai.capability.clone(),
+        // Capability probes were removed; saving a connection clears legacy snapshots.
+        capability: None,
         discovered_models: current.ai.discovered_models.clone(),
         models_fetched_at_unix: current.ai.models_fetched_at_unix,
         credential_session_only: persisted_session_only,
     };
 
-    // Secret rotation or identity-field edits immediately invalidate Ready capability.
-    // AuthMode::None never writes a secret, so ignore a stray secret payload for invalidation
-    // only when a candidate was actually planned (secret_provided still invalidates identity).
-    let secret_changed = write_plan.rollback_candidate_id.is_some();
-    if secret_changed || crate::config::ai_connection_identity_fields_changed(&current.ai, &ai) {
-        ai.capability = None;
-    }
     // Provider/endpoint/auth drift also drops cached model lists (manual model still kept).
     if current.ai.provider != ai.provider
         || current.ai.endpoint.trim_end_matches('/') != ai.endpoint.trim_end_matches('/')
@@ -959,13 +862,12 @@ fn media_info_packaged_resource_base(resource_dir: Option<PathBuf>) -> Option<Pa
 
 /// Start a backend-owned MediaInfo job (queued/running immediately with job id).
 ///
-/// Requires an opaque `plan_token`. Backend resolves identity through `PlanRegistry`
-/// and reuses the plan's private `LocalExecutionBinding` + current snapshot/generation.
-/// Client snapshot_hash / request_generation / torrent_path / content_root are never
-/// plan identity. MediaInfo remains a local capability: AI must be enabled, but
-/// provider Ready is **not** required.
+/// With a `plan_token`, the backend resolves identity through `PlanRegistry` and
+/// reuses the plan's private binding. Without one, the dedicated automatic-import
+/// path accepts only a torrent path and resolves the root from saved app config.
+/// Client snapshot_hash / request_generation / content_root never expand authority.
+/// MediaInfo is local and does not depend on AI provider configuration.
 ///
-/// Disabled AI is a true zero-impact path: no sidecar spawn.
 /// Cancellation is cooperative and reaches the child MediaInfo process.
 #[tauri::command]
 pub fn ai_start_media_info(
@@ -973,27 +875,45 @@ pub fn ai_start_media_info(
     request: MediaInfoStartRequest,
 ) -> Result<MediaInfoJobView, String> {
     let plan_token = request.plan_token.trim().to_string();
-    if plan_token.is_empty() {
-        return Err("prepared plan token is required for media info".to_string());
-    }
-
-    let connection = ai_get_settings(app.clone());
-    // Disabled AI must not launch MediaInfo (zero behavioral impact).
-    // Local MediaInfo does not require provider Ready — only that AI is enabled.
-    if !connection.enabled {
-        return Err("AI is disabled; MediaInfo is not launched".to_string());
-    }
-
-    // Backend plan identity is authoritative — never trust client snapshot/generation/paths.
-    let (snapshot_hash, request_generation, binding) = {
-        let mut guard = get_or_create_registry()
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
-        guard.resolve_for_media_info(&plan_token)?
+    let (snapshot_hash, request_generation, torrent_path, content_root) = if plan_token.is_empty() {
+        let torrent_path = request
+            .torrent_path
+            .as_deref()
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if torrent_path.is_empty() {
+            return Err("torrent path is required for automatic media info".to_string());
+        }
+        let configured_root = crate::config::load_config(&app).default_media_search_folder;
+        if configured_root.trim().is_empty() {
+            return Err("default media search folder is not configured".to_string());
+        }
+        let content_root = crate::ai::media::validate_media_content_root(&configured_root)?
+            .to_string_lossy()
+            .into_owned();
+        let request_generation = next_media_info_generation();
+        (
+            format!("sha256:media-preview-{request_generation}"),
+            request_generation,
+            torrent_path,
+            content_root,
+        )
+    } else {
+        // Backend plan identity is authoritative — never trust client snapshot/generation/paths.
+        let (snapshot_hash, request_generation, binding) = {
+            let mut guard = get_or_create_registry()
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            guard.resolve_for_media_info(&plan_token)?
+        };
+        (
+            snapshot_hash,
+            request_generation,
+            binding.request().torrent_path.clone(),
+            binding.content_root().trim().to_string(),
+        )
     };
-    // Private binding path only; never echo absolute paths on the public IPC path.
-    let torrent_path = binding.request().torrent_path.clone();
-    let content_root = binding.content_root().trim().to_string();
     if torrent_path.trim().is_empty() {
         return Err("prepared plan has no bound torrent path".to_string());
     }
@@ -1158,6 +1078,25 @@ pub fn ai_start_media_info(
         .get(&job_id)
         .cloned()
         .ok_or_else(|| "media info job failed to register".to_string())
+}
+
+#[tauri::command]
+pub fn ai_start_default_media_info(
+    app: AppHandle,
+    torrent_path: String,
+) -> Result<MediaInfoJobView, String> {
+    ai_start_media_info(
+        app,
+        MediaInfoStartRequest {
+            plan_token: String::new(),
+            torrent_path: Some(torrent_path),
+            relative_entries: Vec::new(),
+            content_root: None,
+            request_generation: None,
+            snapshot_hash: None,
+            timeout_ms: None,
+        },
+    )
 }
 
 /// Register deferred MediaInfo work under the documented finite bound.
@@ -1545,18 +1484,19 @@ fn finish_media_info_job(
     // Bind plan-owned redacted media evidence only on Succeeded terminal jobs.
     // Cancel / timeout / nonzero / malformed / oversized / Failed never mutate the plan.
     // Identity mismatch or drift also leave plan media evidence unchanged.
-    let bound_snapshot_hash = if media_info_may_bind_plan_evidence(job.state) {
-        try_bind_media_evidence_to_plan(
-            plan_token,
-            job_id,
-            &job.snapshot_hash,
-            job.request_generation,
-            &results,
-        )
-        .unwrap_or_else(|_| job.snapshot_hash.clone())
-    } else {
-        job.snapshot_hash.clone()
-    };
+    let bound_snapshot_hash =
+        if !plan_token.is_empty() && media_info_may_bind_plan_evidence(job.state) {
+            try_bind_media_evidence_to_plan(
+                plan_token,
+                job_id,
+                &job.snapshot_hash,
+                job.request_generation,
+                &results,
+            )
+            .unwrap_or_else(|_| job.snapshot_hash.clone())
+        } else {
+            job.snapshot_hash.clone()
+        };
 
     let view = store_media_info_view(
         job_id,
@@ -1828,8 +1768,7 @@ pub async fn ai_start_recognition(
         )
     };
 
-    // Formal recognition requires an exact Ready capability identity match.
-    let identity = require_ready_capability_identity(&connection, secret.as_ref())?;
+    let identity = capability_identity(&connection, secret.as_ref());
 
     let mut redaction_secrets = Vec::new();
     if let Some(secret) = secret.as_ref() {
@@ -2285,9 +2224,6 @@ async fn run_recognition_worker(
         &title_pattern,
     );
     let schema = recognition_schema();
-    let output_capability = ready_output_capability(&connection)
-        .expect("formal capability gate must provide an output tier");
-
     if recognition_is_cancelled(&job_id, &cancel_flag) {
         finish_recognition_cancelled(
             &job_id,
@@ -2323,7 +2259,6 @@ async fn run_recognition_worker(
         "okpgui_recognition",
         RECOGNITION_SYSTEM_PROMPT,
         &prompt,
-        output_capability,
         || recognition_is_cancelled(&job_id, &cancel_flag),
         |structured| {
             recognition_from_provider_outcome(Some(structured), None).map_err(|message| {
@@ -2888,35 +2823,6 @@ fn resolve_local_formal_audit(
         }
     };
 
-    // Formal provider audit requires an exact Ready capability identity match (stored secret).
-    if require_ready_capability_identity(&connection, secret.as_ref()).is_err() {
-        let result = local_audit_result(
-            plan_token.clone(),
-            snapshot_hash.clone(),
-            request_generation,
-            local_blockers.clone(),
-            vec![Finding {
-                code: "PROVIDER_WARNING".to_string(),
-                severity: FindingSeverity::Warning,
-                message: capability_gate_error(),
-                evidence_path: None,
-            }],
-            false,
-            None,
-            &policy,
-        );
-        bind_audit_to_plan(&result)?;
-        return Ok((
-            plan_token,
-            snapshot_hash,
-            request_generation,
-            local_blockers,
-            connection,
-            None,
-            Some(result),
-        ));
-    }
-
     Ok((
         plan_token,
         snapshot_hash,
@@ -2926,32 +2832,6 @@ fn resolve_local_formal_audit(
         secret,
         None,
     ))
-}
-
-/// Gate formal provider tasks: stored capability must be Ready and match current stored identity.
-fn require_ready_capability_identity(
-    connection: &PublicConnectionConfig,
-    secret: Option<&SecretValue>,
-) -> Result<CapabilityIdentity, String> {
-    let identity = capability_identity(connection, secret);
-    let Some(capability) = connection.capability.as_ref() else {
-        return Err(capability_gate_error());
-    };
-    if capability.state != CapabilityState::Ready
-        || capability.output_capability.is_none()
-        || !capability_identity_matches(&capability.identity_digest, connection, secret)
-    {
-        return Err(capability_gate_error());
-    }
-    Ok(identity)
-}
-
-fn ready_output_capability(connection: &PublicConnectionConfig) -> Option<OutputCapability> {
-    connection
-        .capability
-        .as_ref()
-        .filter(|capability| capability.state == CapabilityState::Ready)
-        .and_then(|capability| capability.output_capability)
 }
 
 /// Map a context projection failure to a public finding code (no truncation, no HTTP).
@@ -3090,9 +2970,6 @@ async fn run_provider_formal_audit(
         }
     };
     let schema = formal_audit_schema();
-    let output_capability = ready_output_capability(&connection)
-        .expect("formal capability gate must provide an output tier");
-
     let client = match build_no_redirect_client() {
         Ok(client) => client,
         Err(error) => {
@@ -3131,7 +3008,6 @@ async fn run_provider_formal_audit(
         "okpgui_audit",
         &system_prompt,
         &prompt,
-        output_capability,
         || false,
         |structured| {
             try_parse_formal_audit_findings(structured).map_err(|message| FormalValidationError {
@@ -4178,28 +4054,6 @@ pub fn cancel_unfinished_ai_jobs_on_exit() {
         .cancel_unfinished();
 }
 
-#[tauri::command]
-pub fn ai_build_capability_probe(
-    provider: ProviderKind,
-    mode: ProviderMode,
-    endpoint: String,
-    model: String,
-    schema: Value,
-    auth_mode: AuthMode,
-) -> Result<crate::ai::provider::ProviderRequest, String> {
-    build_probe_request(provider, mode, &endpoint, &model, &schema, auth_mode)
-}
-
-#[tauri::command]
-pub fn ai_classify_capability_probe(
-    provider: ProviderKind,
-    mode: ProviderMode,
-    status: u16,
-    body: String,
-) -> CapabilityProbeResult {
-    classify_and_validate_probe_response(provider, mode, status, &body)
-}
-
 /// Non-secret model discovery result for the settings UI.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AiModelDiscoveryResult {
@@ -4423,266 +4277,6 @@ pub async fn ai_list_models(
             })
         }
     }
-}
-
-/// Live backend-owned structured-output capability probe using stored credentials.
-/// Persists non-secret capability state/identity metadata on completion.
-#[tauri::command]
-pub async fn ai_run_capability_probe(app: AppHandle) -> Result<PublicCapabilityStatus, String> {
-    let connection = ai_get_settings(app.clone());
-    if !connection.enabled {
-        return Err("AI is disabled; capability probe makes no network calls".to_string());
-    }
-    if !connection_is_configured(&connection) {
-        return Err("complete connection and model configuration before probing".to_string());
-    }
-
-    let secret = match resolve_stored_secret(&connection)? {
-        Some(value) => Some(value),
-        None if connection.auth_mode == AuthMode::None => None,
-        None => {
-            return Err("AI credential is missing from the secure store".to_string());
-        }
-    };
-
-    // Secret-aware policy for every terminal probe summary (request/build/transport/classify).
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
-
-    let identity = capability_identity(&connection, secret.as_ref());
-    let schema = minimal_probe_schema();
-    let job_id = {
-        let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
-        manager.start(
-            JobKind::CapabilityProbe,
-            0,
-            identity.digest.clone(),
-            Some(identity.clone()),
-        )
-    };
-
-    // Mark probing in config so UI can show status even if the process is interrupted.
-    let _ = crate::config::save_ai_capability(
-        &app,
-        Some(crate::config::AiCapabilityConfig {
-            state: capability_state_to_config(CapabilityState::Probing),
-            identity_digest: identity.digest.clone(),
-            resolved_mode: provider_mode_to_config(connection.mode),
-            output_capability: String::new(),
-            message: "capability probe in progress".to_string(),
-            probed_at_unix: Some(now_unix()),
-        }),
-    );
-
-    let client = match build_no_redirect_client() {
-        Ok(client) => client,
-        Err(error) => {
-            let message = redact_provider_error(&error, &policy);
-            let status = persist_probe_outcome(
-                &app,
-                &identity,
-                CapabilityState::Failed,
-                connection.mode,
-                None,
-                message.clone(),
-            );
-            let _ =
-                complete_job_backend(&job_id, false, Some("PROVIDER_CLIENT".to_string()), message);
-            return Ok(status);
-        }
-    };
-
-    let attempt_modes = formal_attempt_modes(connection.provider, connection.mode);
-    let mut last_result: Option<CapabilityProbeResult> = None;
-
-    'modes: for attempted_mode in attempt_modes {
-        for output_capability in probe_output_capabilities(connection.provider)
-            .iter()
-            .copied()
-        {
-            let provider_request = match build_probe_request_for_capability(
-                connection.provider,
-                attempted_mode,
-                &connection.endpoint,
-                &connection.model,
-                &schema,
-                connection.auth_mode,
-                output_capability,
-            ) {
-                Ok(value) => value,
-                Err(error) => {
-                    last_result = Some(CapabilityProbeResult {
-                        state: CapabilityState::Failed,
-                        provider: connection.provider,
-                        mode: attempted_mode,
-                        status: 0,
-                        message: redact_provider_error(&error, &policy),
-                        usage: None,
-                        output_capability: None,
-                    });
-                    break 'modes;
-                }
-            };
-
-            let send_result = send_managed_provider_request(
-                &client,
-                &provider_request,
-                connection.auth_mode,
-                connection.custom_header_name.as_deref(),
-                secret.as_ref().map(SecretValue::expose),
-                connection.provider,
-            )
-            .await;
-
-            let probe = match send_result {
-                Ok((status, body)) => {
-                    let mut classified = classify_and_validate_probe_response_for_capability(
-                        connection.provider,
-                        attempted_mode,
-                        status,
-                        &body,
-                        output_capability,
-                    );
-                    classified.message = redact_provider_error(&classified.message, &policy);
-                    classified
-                }
-                Err(error) => CapabilityProbeResult {
-                    state: CapabilityState::Failed,
-                    provider: connection.provider,
-                    mode: attempted_mode,
-                    status: 0,
-                    message: redact_provider_error(&error, &policy),
-                    usage: None,
-                    output_capability: None,
-                },
-            };
-
-            if probe.state == CapabilityState::Ready {
-                last_result = Some(probe);
-                break 'modes;
-            }
-
-            let failure = ProviderFailure {
-                kind: match probe.state {
-                    CapabilityState::Unsupported => {
-                        crate::ai::provider::ProviderFailureKind::Unsupported
-                    }
-                    _ => crate::ai::provider::ProviderFailureKind::Server,
-                },
-                status: (probe.status != 0).then_some(probe.status),
-                message: probe.message.clone(),
-            };
-            let endpoint_fallback = auto_fallback_allowed(
-                connection.provider,
-                connection.mode,
-                attempted_mode,
-                &failure,
-            );
-            let failed = probe.state != CapabilityState::Unsupported;
-            last_result = Some(probe);
-            if endpoint_fallback {
-                continue 'modes;
-            }
-            if failed {
-                break 'modes;
-            }
-        }
-
-        break;
-    }
-
-    let result = last_result.unwrap_or(CapabilityProbeResult {
-        state: CapabilityState::Failed,
-        provider: connection.provider,
-        mode: connection.mode,
-        status: 0,
-        message: "capability probe did not complete".to_string(),
-        usage: None,
-        output_capability: None,
-    });
-
-    // Final secret-aware pass before config + job terminal summary retention.
-    let terminal_message = redact_provider_error(&result.message, &policy);
-
-    let public = persist_probe_outcome(
-        &app,
-        &identity,
-        result.state,
-        result.mode,
-        result.output_capability,
-        terminal_message.clone(),
-    );
-
-    let success = result.state == CapabilityState::Ready;
-    let _ = complete_job_backend(
-        &job_id,
-        success,
-        if success {
-            None
-        } else {
-            Some(match result.state {
-                CapabilityState::Unsupported => "UNSUPPORTED".to_string(),
-                _ => "PROBE_FAILED".to_string(),
-            })
-        },
-        terminal_message,
-    );
-
-    Ok(public)
-}
-
-fn persist_probe_outcome(
-    app: &AppHandle,
-    identity: &CapabilityIdentity,
-    state: CapabilityState,
-    resolved_mode: ProviderMode,
-    output_capability: Option<OutputCapability>,
-    message: String,
-) -> PublicCapabilityStatus {
-    let probed_at_unix = Some(now_unix());
-    let config = crate::config::AiCapabilityConfig {
-        state: capability_state_to_config(state),
-        identity_digest: if state == CapabilityState::Ready {
-            identity.digest.clone()
-        } else {
-            // Keep the attempted identity so UI can explain mismatch after edits.
-            identity.digest.clone()
-        },
-        resolved_mode: provider_mode_to_config(resolved_mode),
-        output_capability: output_capability
-            .map(output_capability_to_config)
-            .unwrap_or_default(),
-        message: message.clone(),
-        probed_at_unix,
-    };
-    let _ = crate::config::save_ai_capability(app, Some(config));
-    PublicCapabilityStatus {
-        state,
-        identity_digest: identity.digest.clone(),
-        resolved_mode: Some(resolved_mode),
-        output_capability,
-        message,
-        probed_at_unix,
-        identity_matches: state == CapabilityState::Ready,
-    }
-}
-
-/// Read current non-secret capability status; identity_matches uses stored credentials only.
-#[tauri::command]
-pub fn ai_get_capability_status(app: AppHandle) -> PublicCapabilityStatus {
-    let connection = ai_get_settings(app);
-    connection.capability.unwrap_or(PublicCapabilityStatus {
-        state: CapabilityState::Unknown,
-        identity_digest: String::new(),
-        resolved_mode: None,
-        output_capability: None,
-        message: "no capability probe has been run".to_string(),
-        probed_at_unix: None,
-        identity_matches: false,
-    })
 }
 
 #[cfg(test)]
@@ -5452,10 +5046,8 @@ mod candidate_id_tests {
 }
 
 #[cfg(test)]
-mod capability_gate_tests {
+mod formal_configuration_tests {
     use super::*;
-    use crate::ai::credentials::PublicCapabilityStatus;
-    use crate::ai::provider::CapabilityState;
 
     fn configured_connection() -> PublicConnectionConfig {
         PublicConnectionConfig {
@@ -5488,86 +5080,6 @@ mod capability_gate_tests {
     }
 
     #[test]
-    fn formal_gate_rejects_missing_or_mismatched_capability() {
-        let secret = SecretValue::new("sk-test");
-        let mut connection = configured_connection();
-        let err = require_ready_capability_identity(&connection, Some(&secret)).unwrap_err();
-        assert!(err.contains("AI settings"), "{err}");
-
-        let identity = capability_identity(&connection, Some(&secret));
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Failed,
-            identity_digest: identity.digest.clone(),
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: None,
-            message: "failed".into(),
-            probed_at_unix: Some(1),
-            identity_matches: false,
-        });
-        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_err());
-
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: "sha256:other".into(),
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: Some(OutputCapability::StrictSchema),
-            message: "ready".into(),
-            probed_at_unix: Some(1),
-            identity_matches: false,
-        });
-        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_err());
-
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: identity.digest,
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: Some(OutputCapability::StrictSchema),
-            message: "ready".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_ok());
-    }
-
-    #[test]
-    fn formal_gate_rejects_when_secret_changes_without_reprobe() {
-        let mut connection = configured_connection();
-        let old_secret = SecretValue::new("old-secret");
-        let identity = capability_identity(&connection, Some(&old_secret));
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: identity.digest,
-            resolved_mode: Some(ProviderMode::Responses),
-            output_capability: Some(OutputCapability::StrictSchema),
-            message: "ready".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        let new_secret = SecretValue::new("new-secret");
-        let err = require_ready_capability_identity(&connection, Some(&new_secret)).unwrap_err();
-        assert!(err.contains("capability probe"), "{err}");
-    }
-
-    #[test]
-    fn formal_gate_rejects_legacy_ready_record_without_output_tier() {
-        let secret = SecretValue::new("sk-test");
-        let mut connection = configured_connection();
-        let identity = capability_identity(&connection, Some(&secret));
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: identity.digest,
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: None,
-            message: "legacy ready".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_err());
-        apply_public_identity_matches(&mut connection, Some(&secret));
-        assert!(!connection.capability.unwrap().identity_matches);
-    }
-
-    #[test]
     fn disabled_connection_is_not_configured_for_formal_provider_paths() {
         let mut connection = configured_connection();
         connection.enabled = false;
@@ -5575,46 +5087,9 @@ mod capability_gate_tests {
     }
 
     #[test]
-    fn public_capability_from_config_maps_ready_state() {
-        let status = public_capability_from_config(&crate::config::AiCapabilityConfig {
-            state: "ready".into(),
-            identity_digest: "sha256:abc".into(),
-            resolved_mode: "chat".into(),
-            output_capability: "json_object".into(),
-            message: "ok".into(),
-            probed_at_unix: Some(42),
-        });
-        assert_eq!(status.state, CapabilityState::Ready);
-        assert_eq!(status.resolved_mode, Some(ProviderMode::Chat));
-        assert_eq!(status.output_capability, Some(OutputCapability::JsonObject));
-        assert_eq!(status.identity_digest, "sha256:abc");
-        assert!(!status.identity_matches);
-    }
-
-    #[test]
-    fn formal_modes_prefer_ready_resolved_chat_over_auto_ladder() {
+    fn formal_modes_follow_the_saved_mode_without_probe_state() {
         let mut connection = configured_connection();
         connection.mode = ProviderMode::Auto;
-        let secret = SecretValue::new("sk-test");
-        let identity = capability_identity(&connection, Some(&secret));
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: identity.digest,
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: Some(OutputCapability::JsonObject),
-            message: "ready via chat".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        assert_eq!(
-            formal_modes_for_connection(&connection),
-            vec![ProviderMode::Chat],
-            "Auto that resolved to Chat must not reopen Responses for formal work"
-        );
-
-        // Explicit Responses remains Responses regardless of a stale resolved mode field
-        // only when capability is not Ready — missing Ready falls back to configured Auto ladder.
-        connection.capability = None;
         assert_eq!(
             formal_modes_for_connection(&connection),
             vec![ProviderMode::Responses, ProviderMode::Chat]
@@ -5626,82 +5101,16 @@ mod capability_gate_tests {
             vec![ProviderMode::Responses]
         );
     }
-
-    #[test]
-    fn disabled_public_connection_projection_skips_secret_gate() {
-        let mut connection = configured_connection();
-        connection.enabled = false;
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: "sha256:stale".into(),
-            resolved_mode: Some(ProviderMode::Chat),
-            output_capability: Some(OutputCapability::StrictSchema),
-            message: "stale".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        assert!(!may_read_credential_store_for_settings(&connection));
-        apply_public_identity_matches(&mut connection, None);
-        assert!(!connection.capability.unwrap().identity_matches);
-    }
 }
 
 #[cfg(test)]
 mod recognition_command_tests {
     use super::*;
-    use crate::ai::credentials::PublicCapabilityStatus;
-    use crate::ai::provider::CapabilityState;
     use crate::ai::recognition::{
         bind_recognition_result, recognition_from_provider_outcome, sanitize_recognition_context,
         RECOGNITION_SCHEMA_VERSION,
     };
     use serde_json::json;
-
-    fn configured_connection() -> PublicConnectionConfig {
-        PublicConnectionConfig {
-            provider: ProviderKind::OpenAi,
-            endpoint: "https://example.test/v1".into(),
-            model: "gpt-test".into(),
-            mode: ProviderMode::Auto,
-            auth_mode: AuthMode::Bearer,
-            custom_header_name: None,
-            credential_ref: Some(CredentialRef {
-                id: "cred-recog".into(),
-            }),
-            enabled: true,
-            capability: None,
-            discovered_models: Vec::new(),
-            models_fetched_at_unix: None,
-            credential_session_only: false,
-        }
-    }
-
-    #[test]
-    fn recognition_capability_gate_requires_ready_identity() {
-        let secret = SecretValue::new("sk-recog-test");
-        let mut connection = configured_connection();
-        let err = require_ready_capability_identity(&connection, Some(&secret)).unwrap_err();
-        assert!(
-            err.contains("capability probe") || err.contains("AI settings"),
-            "{err}"
-        );
-
-        let identity = capability_identity(&connection, Some(&secret));
-        connection.capability = Some(PublicCapabilityStatus {
-            state: CapabilityState::Ready,
-            identity_digest: identity.digest,
-            resolved_mode: Some(ProviderMode::Responses),
-            output_capability: Some(OutputCapability::JsonObject),
-            message: "ready".into(),
-            probed_at_unix: Some(1),
-            identity_matches: true,
-        });
-        assert!(require_ready_capability_identity(&connection, Some(&secret)).is_ok());
-
-        // Disabled / unconfigured connections are not formal-provider ready paths.
-        connection.enabled = false;
-        assert!(!connection_is_configured(&connection));
-    }
 
     #[test]
     fn recognition_provider_failure_is_not_empty_success() {

@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { Globe, Info, ExternalLink } from 'lucide-react';
+import { open } from '@tauri-apps/plugin-dialog';
+import { ExternalLink, FolderSearch, Globe, Info, X } from 'lucide-react';
 import { useAppVersion } from '../utils/appVersion';
 import { getStartupPagePreference, setStartupPagePreference, type StartupPage } from '../utils/appPreferences';
 
@@ -15,10 +16,13 @@ export default function MiscPage() {
     const [saved, setSaved] = useState(false);
     const [startupPage, setStartupPage] = useState<StartupPage>(() => getStartupPagePreference());
     const [startupPageSaved, setStartupPageSaved] = useState(false);
+    const [defaultMediaFolder, setDefaultMediaFolder] = useState('');
+    const [mediaFolderStatus, setMediaFolderStatus] = useState('');
     const appVersion = useAppVersion();
 
     useEffect(() => {
-        loadProxy();
+        void loadProxy();
+        void loadDefaultMediaFolder();
     }, []);
 
     const loadProxy = async () => {
@@ -28,6 +32,33 @@ export default function MiscPage() {
             setProxyHost(proxy.proxy_host);
         } catch (e) {
             console.error('加载代理设置失败:', e);
+        }
+    };
+
+    const loadDefaultMediaFolder = async () => {
+        try {
+            const config = await invoke<{ default_media_search_folder?: string }>('get_config');
+            setDefaultMediaFolder(config.default_media_search_folder ?? '');
+        } catch (e) {
+            console.error('加载默认媒体目录失败:', e);
+        }
+    };
+
+    const persistDefaultMediaFolder = async (path: string) => {
+        try {
+            const savedPath = await invoke<string>('save_default_media_search_folder', { path });
+            setDefaultMediaFolder(savedPath);
+            setMediaFolderStatus(savedPath ? '默认媒体目录已保存。' : '已关闭拖入种子后的自动 MediaInfo 检查。');
+        } catch (e) {
+            console.error('保存默认媒体目录失败:', e);
+            setMediaFolderStatus(typeof e === 'string' ? e : '保存默认媒体目录失败。');
+        }
+    };
+
+    const chooseDefaultMediaFolder = async () => {
+        const selected = await open({ directory: true, multiple: false });
+        if (typeof selected === 'string') {
+            await persistDefaultMediaFolder(selected);
         }
     };
 
@@ -80,6 +111,45 @@ export default function MiscPage() {
                         </div>
                         <p className="text-xs text-slate-500">
                             {startupPageSaved ? '启动页面已保存，下次打开时生效。' : '选择应用启动后默认进入的页面。'}
+                        </p>
+                    </div>
+                </section>
+
+                <section>
+                    <h2 className="text-sm font-medium text-slate-400 mb-3 flex items-center gap-2">
+                        <FolderSearch size={16} />
+                        媒体检查
+                    </h2>
+                    <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4 space-y-3">
+                        <label className="text-xs text-slate-500 block">默认媒体搜索文件夹</label>
+                        <div className="flex gap-2">
+                            <input
+                                value={defaultMediaFolder}
+                                readOnly
+                                placeholder="未设置（不会自动运行 MediaInfo）"
+                                className="min-w-0 flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200"
+                            />
+                            <button
+                                type="button"
+                                onClick={() => void chooseDefaultMediaFolder()}
+                                title="选择默认媒体搜索文件夹"
+                                className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-700"
+                            >
+                                <FolderSearch size={16} />
+                            </button>
+                            {defaultMediaFolder ? (
+                                <button
+                                    type="button"
+                                    onClick={() => void persistDefaultMediaFolder('')}
+                                    title="清除默认媒体搜索文件夹"
+                                    className="inline-flex h-10 w-10 shrink-0 items-center justify-center rounded-lg border border-slate-700 text-slate-300 hover:bg-slate-700"
+                                >
+                                    <X size={16} />
+                                </button>
+                            ) : null}
+                        </div>
+                        <p className="text-xs text-slate-500">
+                            {mediaFolderStatus || '设置后，拖入种子会在此目录中匹配媒体文件并自动运行 MediaInfo。'}
                         </p>
                     </div>
                 </section>

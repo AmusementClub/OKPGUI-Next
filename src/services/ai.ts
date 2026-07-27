@@ -4,7 +4,6 @@ import type {
     ActiveAiJobCancelResult,
     ActiveAiJobSummary,
     AiAuditResult,
-    AiCapabilityStatus,
     AiFormalAuditRequest,
     AiJob,
     AiModelDiscoveryResult,
@@ -45,14 +44,6 @@ export function isAiConfigured(settings: AiSettings | null | undefined): boolean
         && (settings?.auth_mode === 'none' || Boolean(settings?.credential_ref?.id));
 }
 
-/** Formal AI tasks require a Ready, identity-matched, explicitly tiered output capability. */
-export function isAiCapabilityReady(settings: AiSettings | null | undefined): boolean {
-    return Boolean(settings?.capability)
-        && settings?.capability?.state === 'ready'
-        && Boolean(settings?.capability?.identity_matches)
-        && Boolean(settings?.capability?.output_capability);
-}
-
 export async function getAiSettings(): Promise<AiSettings> {
     try {
         const settings = await invoke<AiSettings | null>('ai_get_settings');
@@ -76,16 +67,6 @@ export async function listAiModels(settings: AiSettings, secret?: string): Promi
         connection: settings,
         secret: secret || null,
     });
-}
-
-/** Live backend-owned structured-output probe; persists the strict/JSON compatibility tier. */
-export async function runAiCapabilityProbe(): Promise<AiCapabilityStatus> {
-    return invoke<AiCapabilityStatus>('ai_run_capability_probe');
-}
-
-/** Read current non-secret capability status (identity_matches uses stored credentials only). */
-export async function getAiCapabilityStatus(): Promise<AiCapabilityStatus> {
-    return invoke<AiCapabilityStatus>('ai_get_capability_status');
 }
 
 /**
@@ -167,7 +148,7 @@ export async function computeAiAudit(request: AiFormalAuditRequest): Promise<AiA
  * Start a backend-owned Recognition job (returns immediately with queued/running view).
  * Request is content-only (torrent name + patterns); Rust allocates context hash + generation.
  * Provider work runs in the background; poll via pollRecognition; cancel via cancelAiJob.
- * Never mutates publish drafts or decisions; capability-gated on the backend.
+ * Never mutates publish drafts or decisions; requires a complete saved connection.
  */
 export async function startRecognition(request: AiRecognizeRequest): Promise<RecognitionJobView> {
     return invoke<RecognitionJobView>('ai_start_recognition', { request });
@@ -191,7 +172,7 @@ export function isSuccessfulRecognitionResult(
 /**
  * Provider-backed one-shot release recognition (advisory only; backward-compatible).
  * Prefer startRecognition + pollRecognition for cancellable UI flows.
- * Never mutates publish drafts or decisions; capability-gated on the backend.
+ * Never mutates publish drafts or decisions; requires a complete saved connection.
  */
 export async function recognizeWithAi(request: AiRecognizeRequest): Promise<RecognitionResult> {
     return invoke<RecognitionResult>('ai_recognize', { request });
@@ -214,6 +195,11 @@ export async function startPlanMediaInfo(planToken: string): Promise<MediaInfoJo
             relative_entries: [],
         },
     });
+}
+
+/** Start a local MediaInfo pass using the optional backend-configured default media folder. */
+export async function startDefaultMediaInfo(torrentPath: string): Promise<MediaInfoJobView> {
+    return invoke<MediaInfoJobView>('ai_start_default_media_info', { torrentPath });
 }
 
 /** Poll a MediaInfo task; null means the job is still queued or running. */

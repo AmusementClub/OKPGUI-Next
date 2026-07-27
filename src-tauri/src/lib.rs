@@ -36,6 +36,7 @@ pub fn run() {
             config::save_proxy,
             config::get_proxy,
             config::save_okp_executable_path,
+            config::save_default_media_search_folder,
             config::save_quick_publish_template,
             config::delete_quick_publish_template,
             config::save_content_template,
@@ -76,6 +77,7 @@ pub fn run() {
             // MediaInfo is a backend-owned AiJob: start / poll / result; cancel via ai_cancel_job.
             // Absolute per-file probe paths are never accepted as IPC authority.
             commands::ai_commands::ai_start_media_info,
+            commands::ai_commands::ai_start_default_media_info,
             commands::ai_commands::ai_poll_media_info,
             commands::ai_commands::ai_get_media_info_result,
             // Recognition is a backend-owned AiJob: start / poll; cancel via ai_cancel_job.
@@ -110,11 +112,7 @@ pub fn run() {
             commands::ai_commands::ai_clear_debug_records,
             commands::ai_commands::ai_export_debug_records,
             commands::ai_commands::ai_open_debug_directory,
-            commands::ai_commands::ai_build_capability_probe,
-            commands::ai_commands::ai_classify_capability_probe,
             commands::ai_commands::ai_list_models,
-            commands::ai_commands::ai_run_capability_probe,
-            commands::ai_commands::ai_get_capability_status,
             commands::ai_commands::ai_connection_identity,
         ])
         .build(tauri::generate_context!())

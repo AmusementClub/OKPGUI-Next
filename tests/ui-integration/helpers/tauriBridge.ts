@@ -68,14 +68,7 @@ export function defaultReadySettings(): MockAiSettings {
     custom_header_name: null,
     credential_ref: { id: 'cred-mock-1' },
     enabled: true,
-    capability: {
-      state: 'ready',
-      identity_digest: 'sha256:mock-identity',
-      message: 'strict structured output is available',
-      identity_matches: true,
-      resolved_mode: 'chat',
-      output_capability: 'strict_schema',
-    },
+    capability: null,
     discovered_models: ['mock-gpt-contract', 'mock-gpt-mini'],
     models_fetched_at_unix: 1,
   };
@@ -172,23 +165,6 @@ export function tauriMockInitScript(initial: BridgeState): string {
             fetched_at_unix: 99,
             manual_fallback: false,
             message: 'ok',
-          };
-        case 'ai_run_capability_probe':
-          state.settings.capability = {
-            state: 'ready',
-            identity_digest: 'sha256:mock-identity',
-            message: 'strict structured output is available',
-            identity_matches: true,
-            resolved_mode: state.settings.mode === 'auto' ? 'chat' : state.settings.mode,
-            output_capability: 'strict_schema',
-          };
-          return state.settings.capability;
-        case 'ai_get_capability_status':
-          return state.settings.capability || {
-            state: 'unknown',
-            identity_digest: '',
-            message: 'no capability probe has been run',
-            identity_matches: false,
           };
         case 'get_config':
           return {

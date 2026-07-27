@@ -9,11 +9,11 @@ import {
 } from './helpers/tauriBridge';
 
 /**
- * UI integration: AI settings + capability probe against mocked Tauri IPC.
+ * UI integration: AI settings + JSON request mode against mocked Tauri IPC.
  * Not desktop E2E — no real keyring, provider network, or packaged WebView.
  */
-test.describe('UI integration · settings/capability', () => {
-  test('loads BYOK settings without secrets and runs capability probe via IPC mock', async ({
+test.describe('UI integration · settings/JSON', () => {
+  test('loads BYOK settings without secrets and saves without a capability probe', async ({
     page,
   }) => {
     const state = buildDefaultBridgeState({
@@ -25,23 +25,22 @@ test.describe('UI integration · settings/capability', () => {
 
     await navigateToPage(page, 'ai_settings');
     await expect(page.getByText('BYOK AI 连接')).toBeVisible();
-    await expect(page.getByTestId('capability-status')).toContainText(/Ready|ready|Chat|chat/i);
     await expect(page.locator('body')).not.toContainText('sk-');
     await expect(page.getByText('密钥已配置')).toBeVisible();
 
-    // Change model then re-probe through mocked IPC.
+    // A complete saved connection is immediately eligible for formal JSON requests.
     await page.getByRole('combobox', { name: '模型' }).fill('mock-gpt-mini');
-    await page.getByRole('button', { name: '运行探测' }).click();
-    await expect(page.getByText(/能力探测通过|正式 AI 任务已解锁/)).toBeVisible({
+    await page.getByRole('button', { name: '保存连接' }).click();
+    await expect(page.getByText(/连接设置已保存/)).toBeVisible({
       timeout: 15_000,
     });
 
     const bridge = await readBridgeState(page);
     const commands = bridge.invokeLog.map((entry) => entry.command);
     expect(commands).toContain('ai_get_settings');
-    expect(commands).toContain('ai_run_capability_probe');
+    expect(commands).toContain('ai_save_settings');
+    expect(commands).not.toContain('ai_run_capability_probe');
     expect(commands).not.toContain('publish_prepared_plan');
-    expect(bridge.settings.capability?.output_capability).toBe('strict_schema');
     // Secret fields must never appear in the mock settings snapshot.
     expect(JSON.stringify(bridge.settings)).not.toContain('sk-');
   });

@@ -166,6 +166,7 @@ describe('QuickPublishPage drag-drop listener', () => {
                     content_templates: {},
                     last_used_quick_publish_template: 'apothecary',
                     okp_executable_path: '',
+                    default_media_search_folder: '/media/library',
                 });
             }
             if (command === 'parse_torrent') {
@@ -182,6 +183,18 @@ describe('QuickPublishPage drag-drop listener', () => {
                     resolution: '1080p',
                 });
             }
+            if (command === 'ai_start_default_media_info') {
+                return Promise.resolve({
+                    job_id: 'job-media-auto',
+                    plan_token: '',
+                    state: 'succeeded',
+                    request_generation: 1,
+                    snapshot_hash: 'sha256:media-preview-1',
+                    progress: 100,
+                    error_code: null,
+                    results: [{ relative_path: 'episode.mkv', state: 'measured' }],
+                });
+            }
             return routeInvoke(command);
         });
         const rendered = await renderElement(<QuickPublishPage />);
@@ -196,6 +209,10 @@ describe('QuickPublishPage drag-drop listener', () => {
         const recommendation = rendered.container.querySelector('[data-testid="local-template-recommendation"]');
         expect(recommendation?.textContent).toContain('Sousou no Frieren');
         expect(invokeMock.mock.calls.some(([command]) => command === 'ai_start_template_selection')).toBe(false);
+        expect(invokeMock.mock.calls.filter(([command]) => command === 'ai_start_default_media_info'))
+            .toEqual([['ai_start_default_media_info', { torrentPath: '/tmp/frieren.torrent' }]]);
+        expect(rendered.container.querySelector('[data-testid="automatic-media-info-status"]')?.textContent)
+            .toContain('已检查 1 个文件');
 
         const applyButton = Array.from(rendered.container.querySelectorAll('button'))
             .find((button) => button.textContent?.includes('应用推荐'));
@@ -2076,7 +2093,7 @@ describe('AI recognition advisory contracts', () => {
         }
     });
 
-    it('recognition stays disabled when capability is not Ready even with torrent inputs', async () => {
+    it('recognition is enabled for a complete saved connection without a capability probe', async () => {
         const nyaaCookies = emptySiteCookies();
         nyaaCookies.nyaa.raw_text = 'https://nyaa.si/\tsession=value';
         const profile = {
@@ -2162,9 +2179,7 @@ describe('AI recognition advisory contracts', () => {
                 '[data-testid="ai-recognize-button"]',
             );
             expect(recognizeButton).not.toBeNull();
-            expect(recognizeButton!.disabled).toBe(true);
-            expect(invokeMock.mock.calls.filter(([command]) => command === 'ai_start_recognition')).toHaveLength(0);
-            expect(document.body.querySelector('[data-testid="ai-recognition-panel"]')).toBeNull();
+            expect(recognizeButton!.disabled).toBe(false);
         } finally {
             await rendered.unmount();
         }

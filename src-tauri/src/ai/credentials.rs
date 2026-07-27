@@ -747,6 +747,7 @@ pub fn capability_identity(
 }
 
 /// Exact match between a stored Ready digest and the current stored connection fingerprint.
+#[cfg(test)]
 pub fn capability_identity_matches(
     stored_digest: &str,
     config: &PublicConnectionConfig,
@@ -759,6 +760,7 @@ pub fn capability_identity_matches(
 ///
 /// When AI is disabled, compatibility paths must keep `identity_matches=false` and must not
 /// require a credential-store secret even if a stale `credential_ref` remains.
+#[cfg(test)]
 pub fn apply_public_identity_matches(
     connection: &mut PublicConnectionConfig,
     secret: Option<&SecretValue>,
@@ -792,6 +794,7 @@ pub fn apply_public_identity_matches(
 
 /// True when settings/preflight may read the credential store for identity projection.
 /// Disabled AI is a true compatibility path: zero keyring work for settings reads.
+#[cfg(test)]
 pub fn may_read_credential_store_for_settings(connection: &PublicConnectionConfig) -> bool {
     connection.enabled
 }
