@@ -200,13 +200,23 @@ export type MediaProbeState =
     | 'ambiguous_match'
     | 'size_mismatch';
 
+export interface SubtitleTrackSummary {
+    language?: string | null;
+    title?: string | null;
+    format?: string | null;
+    default?: string | null;
+    forced?: string | null;
+}
+
 export interface MediaInfoSummary {
     duration_ms?: number | null;
     width?: number | null;
     height?: number | null;
     video_codec?: string | null;
+    video_bit_depth?: number | null;
     audio_codecs: string[];
     subtitle_languages: string[];
+    subtitle_tracks: SubtitleTrackSummary[];
     scan_type?: string | null;
 }
 

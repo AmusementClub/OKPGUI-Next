@@ -595,6 +595,11 @@ mod tests {
             .expect("Anthropic JSON mode needs a business-result system prompt");
         assert!(anthropic_system.contains("系统提示"));
         assert!(anthropic_system.contains("业务结果 JSON object"));
+        assert!(anthropic_system.contains(
+            r#"{"description":"标题、种子文件信息与 MediaInfo 核对结果符合预期。","findings":[]}"#
+        ));
+        assert!(anthropic_system.contains("MEDIA_TITLE_CODEC_MISMATCH"));
+        assert!(anthropic_system.contains("示例只说明输出格式"));
         assert!(!anthropic_system.contains("additionalProperties"));
         assert_eq!(
             anthropic.body.pointer("/messages/0/role"),

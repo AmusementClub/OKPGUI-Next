@@ -172,7 +172,8 @@ describe('AiSettingsPage model discovery and direct JSON configuration', () => {
         const rendered = await renderElement(<AiSettingsPage />);
         expect(rendered.container.textContent).toContain('BYOK AI 连接');
         expect(rendered.container.textContent).toContain('密钥已配置');
-        expect(rendered.container.textContent).toContain('JSON object');
+        expect(rendered.container.textContent).toContain('Cerebras 等高速推理供应商');
+        expect(rendered.container.textContent).toContain('低延迟模型');
         expect(rendered.container.textContent).not.toContain('sk-');
         expect(invokeMock).toHaveBeenCalledWith('ai_get_settings');
     });

@@ -56,6 +56,15 @@ pub enum PlanMediaStatus {
 /// Relative, normalized media summary owned by a prepared plan.
 /// Absolute paths never appear; codec/language strings are free-text only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
+pub struct PlanSubtitleTrack {
+    pub language: Option<String>,
+    pub title: Option<String>,
+    pub format: Option<String>,
+    pub default: Option<String>,
+    pub forced: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct PlanMediaSummary {
     pub relative_name: String,
     pub duration_ms: Option<u64>,
@@ -67,6 +76,8 @@ pub struct PlanMediaSummary {
     pub audio_codecs: Vec<String>,
     #[serde(default)]
     pub subtitle_languages: Vec<String>,
+    #[serde(default)]
+    pub subtitle_tracks: Vec<PlanSubtitleTrack>,
     pub scan_type: Option<String>,
 }
 
@@ -2207,6 +2218,7 @@ mod tests {
                         video_bit_depth: Some(10),
                         audio_codecs: vec!["AAC".into()],
                         subtitle_languages: vec![],
+                        subtitle_tracks: vec![],
                         scan_type: None,
                     }],
                     results: vec![],

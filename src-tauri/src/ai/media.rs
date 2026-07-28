@@ -1,5 +1,5 @@
 use crate::domain::publish_plan::{
-    PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary,
+    PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary, PlanSubtitleTrack,
 };
 use crate::torrent::project_safe_torrent_context;
 use serde::{Deserialize, Serialize};
@@ -118,6 +118,8 @@ pub struct MediaInfoSummary {
     pub video_bit_depth: Option<u32>,
     pub audio_codecs: Vec<String>,
     pub subtitle_languages: Vec<String>,
+    #[serde(default)]
+    pub subtitle_tracks: Vec<PlanSubtitleTrack>,
     pub scan_type: Option<String>,
 }
 
@@ -169,6 +171,7 @@ pub fn plan_media_results(results: &[MediaProbeResult]) -> Vec<PlanMediaFileResu
                 video_bit_depth: summary.video_bit_depth,
                 audio_codecs: summary.audio_codecs.clone(),
                 subtitle_languages: summary.subtitle_languages.clone(),
+                subtitle_tracks: summary.subtitle_tracks.clone(),
                 scan_type: summary.scan_type.clone(),
             });
             let message = item.message.as_deref().and_then(|message| {
@@ -221,6 +224,7 @@ pub fn plan_media_summaries(results: &[MediaProbeResult]) -> Vec<PlanMediaSummar
                 video_bit_depth: summary.video_bit_depth,
                 audio_codecs: summary.audio_codecs.clone(),
                 subtitle_languages: summary.subtitle_languages.clone(),
+                subtitle_tracks: summary.subtitle_tracks.clone(),
                 scan_type: summary.scan_type.clone(),
             })
         })
@@ -1275,6 +1279,33 @@ fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
         .filter_map(Value::as_str)
         .map(ToString::to_string)
         .collect();
+    let subtitle_tracks = tracks
+        .iter()
+        .filter(|track| track.get("@type").and_then(Value::as_str) == Some("Text"))
+        .map(|track| PlanSubtitleTrack {
+            language: track
+                .get("Language")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            title: track
+                .get("Title")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            format: track
+                .get("Format")
+                .or_else(|| track.get("CodecID"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            default: track
+                .get("Default")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            forced: track
+                .get("Forced")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        })
+        .collect();
     Some(MediaInfoSummary {
         duration_ms,
         width: video
@@ -1292,6 +1323,7 @@ fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
             .and_then(parse_u32),
         audio_codecs,
         subtitle_languages,
+        subtitle_tracks,
         scan_type: video
             .and_then(|track| track.get("ScanType"))
             .and_then(Value::as_str)
@@ -1340,7 +1372,8 @@ mod tests {
                 {"@type": "General", "Duration": "1234.5", "CompleteName": "/private/video.mkv"},
                 {"@type": "Video", "Width": "1920", "Height": 1080, "Format": "AV1", "BitDepth": "10"},
                 {"@type": "Audio", "Format": "AAC", "Language": "jpn"},
-                {"@type": "Text", "Language": "chi"}
+                {"@type": "Text", "Language": "zh-Hans", "Title": "简体中文", "Format": "ASS", "Default": "Yes", "Forced": "No"},
+                {"@type": "Text", "Language": "zh-Hant", "Title": "繁體中文", "CodecID": "S_TEXT/ASS", "Default": "No", "Forced": "No"}
             ]}
         });
         let normalized = normalize_media_info(&value).unwrap();
@@ -1349,6 +1382,21 @@ mod tests {
         assert_eq!(normalized.width, Some(1920));
         assert_eq!(normalized.video_bit_depth, Some(10));
         assert_eq!(normalized.audio_codecs, vec!["AAC"]);
+        assert_eq!(normalized.subtitle_languages, vec!["zh-Hans", "zh-Hant"]);
+        assert_eq!(normalized.subtitle_tracks.len(), 2);
+        assert_eq!(
+            normalized.subtitle_tracks[0].title.as_deref(),
+            Some("简体中文")
+        );
+        assert_eq!(normalized.subtitle_tracks[0].format.as_deref(), Some("ASS"));
+        assert_eq!(
+            normalized.subtitle_tracks[0].default.as_deref(),
+            Some("Yes")
+        );
+        assert_eq!(
+            normalized.subtitle_tracks[1].format.as_deref(),
+            Some("S_TEXT/ASS")
+        );
         assert!(!serde_json::to_string(&normalized)
             .unwrap()
             .contains("/private"));
@@ -1368,6 +1416,13 @@ mod tests {
                     video_bit_depth: Some(10),
                     audio_codecs: vec!["AAC".into()],
                     subtitle_languages: vec![],
+                    subtitle_tracks: vec![PlanSubtitleTrack {
+                        language: Some("zh-Hans".into()),
+                        title: Some("简体中文".into()),
+                        format: Some("ASS".into()),
+                        default: Some("Yes".into()),
+                        forced: Some("No".into()),
+                    }],
                     scan_type: None,
                 }),
                 message: None,
@@ -1404,6 +1459,18 @@ mod tests {
         assert!(evidence.results[0].summary.is_some());
         assert_eq!(evidence.summaries[0].relative_name, "show/ep01.mkv");
         assert_eq!(evidence.summaries[0].video_bit_depth, Some(10));
+        assert_eq!(evidence.summaries[0].subtitle_tracks.len(), 1);
+        assert_eq!(
+            evidence.summaries[0].subtitle_tracks[0].title.as_deref(),
+            Some("简体中文")
+        );
+        assert_eq!(
+            evidence.results[0]
+                .summary
+                .as_ref()
+                .and_then(|summary| summary.subtitle_tracks[0].format.as_deref()),
+            Some("ASS")
+        );
         assert!(evidence.summaries[0]
             .video_codec
             .as_deref()

@@ -159,7 +159,7 @@ export default function AiSettingsPage() {
                     </div>
                     <h2 className="mt-2 text-xl font-semibold text-slate-100">BYOK AI 连接</h2>
                     <p className="mt-1 text-sm text-slate-500">
-                        AI 只提供建议和检查证据，发布仍由本地冻结计划控制。保存完整连接后即可运行，返回按 JSON object 解析。
+                        AI 只提供建议和检查证据，发布仍由本地冻结计划控制。推荐使用 Cerebras 等高速推理供应商及低延迟模型，以缩短发布前检查等待时间。
                     </p>
                 </header>
 

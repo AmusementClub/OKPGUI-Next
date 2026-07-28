@@ -80,6 +80,9 @@ const KNOWN_CODES: &[&str] = &[
     "MEDIA_TITLE_CODEC_MISMATCH",
     "MEDIA_TITLE_BIT_DEPTH_MISMATCH",
     "MEDIA_TITLE_AUDIO_CODEC_MISMATCH",
+    "MEDIA_FILENAME_SUBTITLE_MISMATCH",
+    "MEDIA_TITLE_SUBTITLE_MISMATCH",
+    "MEDIA_SUBTITLE_DETAILS_UNVERIFIABLE",
     "TITLE_TEXT_SUSPECTED_TYPO",
     "TEMPLATE_STALE",
     "TORRENT_STALE",
@@ -103,11 +106,14 @@ const CRITICAL_CODES: &[&str] = &[
     "MEDIA_TITLE_CODEC_MISMATCH",
     "MEDIA_TITLE_BIT_DEPTH_MISMATCH",
     "MEDIA_TITLE_AUDIO_CODEC_MISMATCH",
+    "MEDIA_FILENAME_SUBTITLE_MISMATCH",
+    "MEDIA_TITLE_SUBTITLE_MISMATCH",
 ];
 
 const WARNING_CODES: &[&str] = &[
     "MEDIA_NOT_TESTED",
     "MEDIA_CHECK_FAILED",
+    "MEDIA_SUBTITLE_DETAILS_UNVERIFIABLE",
     "TITLE_TEXT_SUSPECTED_TYPO",
     "PAYLOAD_TOO_LARGE",
     "PROVIDER_WARNING",
@@ -277,6 +283,64 @@ pub fn formal_audit_system_prompt() -> String {
 pub const UNTRUSTED_CONTEXT_BEGIN: &str = "-----不可信上下文开始-----";
 pub const UNTRUSTED_CONTEXT_END: &str = "-----不可信上下文结束-----";
 
+/// Keep provider input focused on fields used by the audit. The complete frozen
+/// projection remains backend-owned for identity and evidence validation.
+fn compact_audit_context(projection: &ContextProjection) -> Value {
+    let template = projection.templates.first().map(|template| {
+        let poster_present = template
+            .get("poster")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty());
+        let description_present = ["description", "description_html", "about"]
+            .iter()
+            .any(|key| {
+                template
+                    .get(key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|value| !value.trim().is_empty())
+            });
+        json!({
+            "title": template.get("title").cloned().unwrap_or(Value::Null),
+            "poster_present": poster_present,
+            "description_present": description_present,
+        })
+    });
+    let files = projection
+        .files
+        .iter()
+        .map(|file| json!({ "relative_path": file.relative_path }))
+        .collect::<Vec<_>>();
+    let media_info = projection
+        .media_info
+        .iter()
+        .map(|result| {
+            let summary = result.summary.as_ref().map(|summary| {
+                json!({
+                    "width": summary.width,
+                    "height": summary.height,
+                    "video_codec": summary.video_codec,
+                    "video_bit_depth": summary.video_bit_depth,
+                    "audio_codecs": summary.audio_codecs,
+                    "subtitle_count": summary.subtitle_tracks.len(),
+                    "subtitle_tracks": summary.subtitle_tracks,
+                })
+            });
+            json!({
+                "relative_name": result.relative_name,
+                "state": result.state,
+                "summary": summary,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "torrent_name": projection.torrent_name,
+        "templates": template.into_iter().collect::<Vec<_>>(),
+        "files": files,
+        "media_info": media_info,
+    })
+}
+
 /// Build a formal-audit provider prompt from plan-token [`ContextProjection`] only.
 ///
 /// The serialized projection is wrapped in explicit untrusted-data delimiters. Embedded
@@ -286,30 +350,18 @@ pub fn build_formal_audit_prompt(
     snapshot_hash: &str,
     projection: &ContextProjection,
 ) -> Result<String, String> {
-    let serialized = serde_json::to_string(projection)
+    let serialized = serde_json::to_string(&compact_audit_context(projection))
         .map_err(|error| format!("context serialization failed: {error}"))?;
     Ok(format!(
-        "请按以下顺序审计已冻结的发布上下文。\n\n\
-         输入字段说明：\n\
-         - torrent_name 是种子标题；torrent_tree 是种子内目录与文件大小结构。\n\
-         - templates[0] 是当前发布模板，其中 title 是待发布标题；templates 为空时不得假设存在标题。\n\
-         - files 是种子文件清单；files[].content 只是 JSON 字符串形式的大小元数据，不是媒体文件正文。\n\
-         - media_info 是逐文件探测结果；shared_content 是可选补充文本；version 和 bytes 仅为协议元数据，不参与内容判断。\n\n\
+        "审计以下已冻结发布上下文。torrent_name 是种子标题；templates[0].title 是发布标题；files 是完整种子文件名清单；media_info 是逐文件实测结果。\n\n\
          检查方法：\n\
-         1. 先确认上述字段中实际有哪些可用证据；缺失字段不得自行补全。\n\
-         2. 遍历 media_info 的每一项。每项对应一个种子内媒体文件，relative_name 是该文件的相对文件名。\n\
-         3. state 为 measured 时，以 summary.width、summary.height、summary.video_codec、summary.video_bit_depth、summary.audio_codecs 为技术事实；其他 state 不得臆测技术参数，并针对该文件使用 MEDIA_CHECK_FAILED 返回 WARNING。\n\
-         4. 对每个 measured 项，将实际宽高依次与 relative_name 文件名、torrent_name 种子标题、templates[0].title 发布标题中的 2160p、1080p、720p 或明确尺寸比较。文件名不符使用 MEDIA_FILENAME_RESOLUTION_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_RESOLUTION_MISMATCH。允许常见非标准有效高度，例如 1920x800 仍可表示 1080p 内容；必须结合宽度和常见画幅判断。\n\
-         5. 对每个 measured 项，将实际编码依次与 relative_name、torrent_name、templates[0].title 中的编码声明比较。HEVC、H.265、x265 属于同一编码家族；AVC、H.264、x264 属于同一编码家族。文件名不符使用 MEDIA_FILENAME_CODEC_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_CODEC_MISMATCH。\n\
-         6. 对每个 measured 项，将 summary.video_bit_depth 与文件名、种子标题、发布标题中的 8bit、8-bit、10bit、10-bit、12bit 等声明比较。文件名不符使用 MEDIA_FILENAME_BIT_DEPTH_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_BIT_DEPTH_MISMATCH。\n\
-         7. 对每个 measured 项，将文件名、种子标题、发布标题中明确声明的 AAC、FLAC、AC-3、E-AC-3、Opus、MP3 等音频编码与 summary.audio_codecs 实际集合比较；忽略大小写、空格和连字符差异。声明的编码不在实际集合中时才报告，未在标题中声明的额外音轨不得单独视为不一致。文件名不符使用 MEDIA_FILENAME_AUDIO_CODEC_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_AUDIO_CODEC_MISMATCH。\n\
-         8. 将 torrent_name、templates[0].title 与各 relative_name 中作品名、英文名、集数等非技术文本互相核对。只有某处词语与其他至少一处明确文本高度相似且仅有少量字符遗漏、重复、替换或换位时，才使用 TITLE_TEXT_SUSPECTED_TYPO 返回 WARNING，并指出两个实际拼写；作品别名、语言差异、发布组名、标点、空格、大小写和技术标签差异不得当作 typo。\n\
-         9. torrent_name 或 templates[0].title 中的分辨率、视频编码、位深、音频编码声明视为对所有主媒体文件的声明；逐文件检查并为每个不一致文件分别返回 finding。未声明某属性时，不要仅因缺少标签而报错。\n\
-         10. 汇总所有逐文件结果。只有完成上述所有可用检查且没有发现不一致时，findings 才能为空。\n\n\
-         证据与结果规则：\n\
-         11. evidence_path 必须为 null、下方上下文中的有效 JSON Pointer，或上下文中实际存在的相对文件路径。不得创建绝对路径或不存在的路径；无法确定时使用 null。\n\
-         12. description 必须面向用户总结本次实际执行的检查，不得包含问题代码、结构定义或未经上下文支持的断言。\n\
-         13. findings 为空时，description 应明确说明标题、种子文件信息与已取得的 MediaInfo 技术信息符合预期；findings 非空时应概述最重要的不一致及其影响。\n\n\
+         1. 只依据已有字段；缺失证据不得补全或猜测。\n\
+         2. 逐项检查 media_info。measured 项以 width、height、video_codec、video_bit_depth、audio_codecs、subtitle_count、subtitle_tracks 为事实；其他 state 使用 MEDIA_CHECK_FAILED。\n\
+         3. 将每个实测项与其 relative_name、torrent_name、发布标题中的声明比较：分辨率用 MEDIA_FILENAME_RESOLUTION_MISMATCH / MEDIA_TITLE_RESOLUTION_MISMATCH，视频编码用 MEDIA_FILENAME_CODEC_MISMATCH / MEDIA_TITLE_CODEC_MISMATCH，位深用 MEDIA_FILENAME_BIT_DEPTH_MISMATCH / MEDIA_TITLE_BIT_DEPTH_MISMATCH，音频用 MEDIA_FILENAME_AUDIO_CODEC_MISMATCH / MEDIA_TITLE_AUDIO_CODEC_MISMATCH。HEVC/H.265/x265 等价，AVC/H.264/x264 等价；分辨率结合宽度与画幅判断；音频忽略大小写、空格和连字符。标题未声明的属性或额外音轨不算问题。\n\
+         4. 将文件名、种子标题和发布标题中的字幕声明与 subtitle_count 及每轨 language/title/format/default/forced 比较。“内封/内嵌”要求存在字幕轨；“简繁”要求证据能确认简体与繁体两类字幕。明确不符时使用 MEDIA_FILENAME_SUBTITLE_MISMATCH 或 MEDIA_TITLE_SUBTITLE_MISMATCH；若存在字幕轨但名称和语言不足以确认简繁等细节，使用 MEDIA_SUBTITLE_DETAILS_UNVERIFIABLE 返回 WARNING，不得猜测。未声明字幕时不要因存在额外字幕轨而报错。\n\
+         5. 核对种子标题、发布标题和文件名中的作品名、英文名与集数。仅当相似文本存在少量字符遗漏、重复、替换或换位时使用 TITLE_TEXT_SUSPECTED_TYPO；别名、语言、发布组、标点、空格、大小写和技术标签差异不算 typo。\n\
+         6. 标题中的技术声明适用于所有主媒体文件；逐文件报告不一致。只有全部可用检查完成且无问题时 findings 才能为空。\n\
+         7. evidence_path 只能是上下文中的相对文件路径、有效 JSON Pointer 或 null；description 用简体中文概述实际检查结果。\n\n\
          快照摘要：{}\n\
          {UNTRUSTED_CONTEXT_BEGIN}\n\
          {serialized}\n\
@@ -993,6 +1045,23 @@ mod tests {
                         video_codec: Some("HEVC".into()),
                         video_bit_depth: Some(10),
                         audio_codecs: vec!["AAC".into()],
+                        subtitle_languages: vec!["zh-Hans".into(), "zh-Hant".into()],
+                        subtitle_tracks: vec![
+                            crate::domain::publish_plan::PlanSubtitleTrack {
+                                language: Some("zh-Hans".into()),
+                                title: Some("简体中文".into()),
+                                format: Some("ASS".into()),
+                                default: Some("Yes".into()),
+                                forced: Some("No".into()),
+                            },
+                            crate::domain::publish_plan::PlanSubtitleTrack {
+                                language: Some("zh-Hant".into()),
+                                title: Some("繁體中文".into()),
+                                format: Some("ASS".into()),
+                                default: Some("No".into()),
+                                forced: Some("No".into()),
+                            },
+                        ],
                         ..Default::default()
                     }),
                     message: None,
@@ -1032,11 +1101,10 @@ mod tests {
         assert!(prompt.contains("audio_codecs"));
         assert!(prompt.contains("MEDIA_TITLE_CODEC_MISMATCH"));
         assert!(prompt.contains("检查方法："));
-        assert!(prompt.contains("输入字段说明："));
-        assert!(prompt.contains("files[].content 只是 JSON 字符串形式的大小元数据"));
-        assert!(prompt.contains("version 和 bytes 仅为协议元数据"));
-        assert!(prompt.contains("遍历 media_info 的每一项"));
-        assert!(prompt.contains("只有完成上述所有可用检查"));
+        assert!(!prompt.contains("files[].content"));
+        assert!(!prompt.contains("version 和 bytes"));
+        assert!(prompt.contains("逐项检查 media_info"));
+        assert!(prompt.contains("全部可用检查完成"));
         assert!(prompt.contains("templates[0].title"));
         assert!(prompt.contains("torrent_name"));
         assert!(system_prompt.contains("检查模式："));
@@ -1071,10 +1139,30 @@ mod tests {
             .nth(1)
             .and_then(|rest| rest.split(UNTRUSTED_CONTEXT_END).next())
             .expect("delimited body");
-        let parsed: ContextProjection =
-            serde_json::from_str(between.trim()).expect("body is projection JSON");
-        assert_eq!(parsed.torrent_name, projection.torrent_name);
-        assert_eq!(parsed.files[0].relative_path, "video/episode.mkv");
+        let parsed: Value =
+            serde_json::from_str(between.trim()).expect("body is compact audit JSON");
+        assert_eq!(parsed["torrent_name"], projection.torrent_name);
+        assert_eq!(parsed["files"][0]["relative_path"], "video/episode.mkv");
+        assert!(parsed.get("torrent_tree").is_none());
+        assert!(parsed.get("shared_content").is_none());
+        assert!(parsed.get("bytes").is_none());
+        assert!(parsed["media_info"][0]["summary"]
+            .get("duration_ms")
+            .is_none());
+        assert!(parsed["media_info"][0]["summary"]
+            .get("subtitle_languages")
+            .is_none());
+
+        let compact_bytes = serde_json::to_vec(&compact_audit_context(&projection))
+            .expect("compact audit context serializes")
+            .len();
+        let full_bytes = serde_json::to_vec(&projection)
+            .expect("full projection serializes")
+            .len();
+        assert!(
+            compact_bytes < full_bytes,
+            "provider context should be smaller: compact={compact_bytes}, full={full_bytes}"
+        );
     }
 
     #[test]
@@ -1097,6 +1185,11 @@ mod tests {
         assert!(prompt.contains("HEVC-10bit AAC"));
         assert!(prompt.contains("\"video_bit_depth\":10"));
         assert!(prompt.contains("\"audio_codecs\":[\"AAC\"]"));
+        assert!(prompt.contains("\"subtitle_count\":2"));
+        assert!(prompt.contains("简体中文"));
+        assert!(prompt.contains("繁體中文"));
+        assert!(prompt.contains("MEDIA_TITLE_SUBTITLE_MISMATCH"));
+        assert!(prompt.contains("MEDIA_SUBTITLE_DETAILS_UNVERIFIABLE"));
         assert!(prompt.contains("少量字符遗漏、重复、替换或换位"));
     }
 

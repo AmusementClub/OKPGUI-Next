@@ -502,7 +502,7 @@ fn json_object_output_contract(schema_name: &str) -> &'static str {
             "只返回业务结果 JSON object。顶层必须且只能包含 episode、resolution、suggested_title；每项为 null，或包含 value、confidence、evidence 的对象。请根据本次输入实际判断，不要复用固定结果。不要返回结构定义、Markdown 或解释文字。"
         }
         "okpgui_audit" => {
-            "只返回业务结果 JSON object。顶层必须且只能包含 description 和 findings；description 是简体中文字符串；findings 是数组，每项必须且只能包含 code、severity、message、evidence_path。请根据本次输入实际检查，不要复用固定结果。不要返回结构定义、Markdown 或解释文字。"
+            "只返回业务结果 JSON object。顶层必须且只能包含 description 和 findings；description 是简体中文字符串；findings 是数组，每项必须且只能包含 code、severity、message、evidence_path。完整格式示例：{\"description\":\"标题、种子文件信息与 MediaInfo 核对结果符合预期。\",\"findings\":[]}。发现问题时，findings 示例：[{\"code\":\"MEDIA_TITLE_CODEC_MISMATCH\",\"severity\":\"CRITICAL\",\"message\":\"标题声明的视频编码与 MediaInfo 实测结果不一致。\",\"evidence_path\":\"video/example.mkv\"}]。示例只说明输出格式；必须根据本次输入实际检查，不得复用示例内容。不要返回结构定义、Markdown 或解释文字。"
         }
         _ => "只返回符合任务字段约定的单一业务结果 JSON object，不要返回结构定义、Markdown 或解释文字。",
     }
