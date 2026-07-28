@@ -106,6 +106,7 @@ interface Template {
 interface ConfigPayload {
     last_used_template: string | null;
     okp_executable_path: string;
+    default_media_search_folder?: string;
     templates: Record<string, Partial<Template>>;
 }
 
@@ -264,6 +265,7 @@ export default function HomePage() {
     const [selectedProfile, setSelectedProfile] = useState('');
     const [selectedProfileData, setSelectedProfileData] = useState<Profile | null>(null);
     const [okpExecutablePath, setOkpExecutablePath] = useState('');
+    const [defaultMediaSearchFolder, setDefaultMediaSearchFolder] = useState('');
     const [loadedProfileName, setLoadedProfileName] = useState('');
 
     // Torrent state
@@ -480,6 +482,7 @@ export default function HomePage() {
             }
 
             setOkpExecutablePath(config.okp_executable_path || '');
+            setDefaultMediaSearchFolder(config.default_media_search_folder || '');
             const initialTemplateName =
                 config.last_used_template ?? (config.templates.default ? 'default' : null);
 
@@ -1330,6 +1333,7 @@ export default function HomePage() {
             const publishRequest: PublishRequestPayload = {
                 publish_id: publishId,
                 torrent_path: torrentPath,
+                content_root: defaultMediaSearchFolder,
                 profile_name: frozenProfileName,
                 template: frozenTemplate,
             };

@@ -36,6 +36,17 @@ pub const MAX_MEDIA_RELATIVE_ENTRIES: usize = 256;
 /// Concurrent MediaInfo child processes per batch (V2 safety constant).
 pub const MEDIA_PROBE_CONCURRENCY: usize = 2;
 
+/// Prevent the console MediaInfo binary from flashing a terminal window on Windows.
+pub(crate) fn configure_mediainfo_command(_command: &mut Command) {
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        _command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 static EMBEDDED_TOOL_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -1028,7 +1039,9 @@ fn probe_one(
             Some("MediaInfo sidecar is missing".to_string()),
         );
     }
-    let mut child = match Command::new(sidecar)
+    let mut command = Command::new(sidecar);
+    configure_mediainfo_command(&mut command);
+    let mut child = match command
         .arg("--Output=JSON")
         .arg(&request.path)
         .stdout(Stdio::piped())

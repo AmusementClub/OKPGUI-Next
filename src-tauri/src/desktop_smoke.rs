@@ -17,7 +17,10 @@
 use crate::ai::audit::{Acknowledgements, AuditDecision};
 use crate::ai::credentials::{decide_session_only_cold_start, SessionOnlyColdStartAction};
 use crate::ai::jobs::{AiJobState, JobKind};
-use crate::ai::media::{packaged_mediainfo_candidates, resolve_or_release_packaged_mediainfo};
+use crate::ai::media::{
+    configure_mediainfo_command, packaged_mediainfo_candidates,
+    resolve_or_release_packaged_mediainfo,
+};
 use crate::commands::ai_commands::{
     ai_cancel_job, ai_get_job, cancel_pending_audit_for_publish_core,
     cancel_preflight_session_core, start_job_backend,
@@ -211,7 +214,9 @@ fn spawn_mediainfo_version(sidecar: &Path) -> Result<String, String> {
     if !sidecar.is_file() {
         return Err(format!("sidecar path is not a file: {}", sidecar.display()));
     }
-    let mut child = Command::new(sidecar)
+    let mut command = Command::new(sidecar);
+    configure_mediainfo_command(&mut command);
+    let mut child = command
         .arg("--Version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

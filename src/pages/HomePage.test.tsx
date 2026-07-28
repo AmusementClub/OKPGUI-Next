@@ -1023,6 +1023,7 @@ describe('HomePage publish content pipeline', () => {
             saveTemplateResult?: (args: Record<string, unknown>) => unknown;
             aiSettings?: Record<string, unknown> | null;
             auditDecision?: string;
+            defaultMediaSearchFolder?: string;
         } = {},
     ) {
         const extraProfiles = options.extraProfiles ?? {};
@@ -1034,6 +1035,7 @@ describe('HomePage publish content pipeline', () => {
                     return Promise.resolve({
                         last_used_template: 'default',
                         okp_executable_path: '/okp',
+                        default_media_search_folder: options.defaultMediaSearchFolder ?? '',
                         templates: {
                             default: {
                                 profile: 'p1',
@@ -2991,6 +2993,73 @@ describe('HomePage publish content pipeline', () => {
             expect(findInvokeArgs('prepare_plan')).toHaveLength(1);
             expect(findInvokeArgs('ai_start_formal_audit')).toHaveLength(1);
             expect(findInvokeArgs('ai_start_media_info')).toHaveLength(0);
+        } finally {
+            await rendered.unmount();
+        }
+    });
+
+    it('runs configured MediaInfo before formal audit for Home publish', async () => {
+        mountWithTemplate(
+            {},
+            { acgnx_asia_token: 'token-abc' },
+            {
+                defaultMediaSearchFolder: '/media/releases',
+                aiSettings: {
+                    provider: 'open_ai',
+                    endpoint: 'https://api.openai.com/v1',
+                    model: 'gpt-test',
+                    mode: 'auto',
+                    auth_mode: 'bearer',
+                    custom_header_name: null,
+                    credential_ref: { id: 'cred-1' },
+                    enabled: true,
+                },
+            },
+        );
+
+        const baseImpl = invokeMock.getMockImplementation();
+        invokeMock.mockImplementation((command: string, args?: Record<string, unknown>) => {
+            if (command === 'ai_start_media_info') {
+                return Promise.resolve({
+                    job_id: 'media-home-1',
+                    state: 'succeeded',
+                    request_generation: 1,
+                    snapshot_hash: 'sha256:media-home',
+                    progress: 100,
+                    error_code: null,
+                    results: [],
+                });
+            }
+            return baseImpl ? baseImpl(command, args) : Promise.resolve(null);
+        });
+
+        const rendered = await renderElement(<HomePage />);
+        try {
+            await flushAsync();
+            await selectTorrentAndOpenConfirm(rendered.container, 'ACGNx Asia');
+
+            expect(findInvokeArgs('prepare_plan')).toEqual([
+                expect.objectContaining({
+                    request: expect.objectContaining({
+                        content_root: '/media/releases',
+                    }),
+                }),
+            ]);
+            expect(findInvokeArgs('ai_start_media_info')).toEqual([
+                {
+                    request: {
+                        plan_token: 'prepared-token',
+                        relative_entries: [],
+                    },
+                },
+            ]);
+            const mediaCall = invokeMock.mock.invocationCallOrder[
+                invokeMock.mock.calls.findIndex(([command]) => command === 'ai_start_media_info')
+            ];
+            const auditCall = invokeMock.mock.invocationCallOrder[
+                invokeMock.mock.calls.findIndex(([command]) => command === 'ai_start_formal_audit')
+            ];
+            expect(mediaCall).toBeLessThan(auditCall);
         } finally {
             await rendered.unmount();
         }
