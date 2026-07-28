@@ -14,6 +14,7 @@ use crate::ai::audit::{
 };
 use crate::ai::provider::ProviderUsage;
 use crate::config::{SiteSelection, Template};
+use crate::profile::Profile;
 use crate::publish::{OkpExecutableIdentity, PublishRequest, ResolvedOkpExecutable};
 
 /// Backend-owned formal/local audit evidence bound to a prepared plan token.
@@ -51,6 +52,23 @@ pub enum PlanMediaStatus {
     Tested,
     /// Terminal MediaInfo success with no usable measured media.
     CheckFailed,
+}
+
+/// Private identity for a measured media file.
+///
+/// Never serialized to the frontend. Included in plan media-evidence hashes and
+/// `LocalExecutionBinding` so prepared publish can recompute and fail closed on drift.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MediaFileIdentity {
+    pub relative_name: String,
+    pub size: u64,
+    /// High-resolution mtime (seconds since UNIX epoch).
+    pub modified_unix_secs: u64,
+    /// Nanosecond remainder of mtime (0–999_999_999).
+    pub modified_unix_nanos: u32,
+    /// SHA-256 over first/middle/last 64 KiB samples plus file length.
+    /// Middle sample catches same-size interior mutations that edge hashes miss.
+    pub content_digest: String,
 }
 
 /// Relative, normalized media summary owned by a prepared plan.
@@ -110,6 +128,9 @@ pub struct PlanMediaEvidence {
     /// Includes every torrent media file considered by the bound MediaInfo run.
     #[serde(default)]
     pub results: Vec<PlanMediaFileResult>,
+    /// Private measured-file identities. Never leave Rust over IPC.
+    #[serde(skip)]
+    pub(crate) file_identities: Vec<MediaFileIdentity>,
 }
 
 impl PlanMediaEvidence {
@@ -119,22 +140,27 @@ impl PlanMediaEvidence {
 
     /// Digest only the normalized media outcome, excluding job identity and plan identity.
     /// Sorting makes equivalent probe batches hash identically even if completion order differs.
+    /// Private file identities are included so identity drift changes the plan hash.
     pub fn canonical_content_hash(&self) -> String {
         #[derive(Serialize)]
         struct MediaPayload<'a> {
             status: PlanMediaStatus,
             summaries: &'a [PlanMediaSummary],
             results: &'a [PlanMediaFileResult],
+            file_identities: &'a [MediaFileIdentity],
         }
 
         let mut summaries = self.summaries.clone();
         let mut results = self.results.clone();
+        let mut file_identities = self.file_identities.clone();
         summaries.sort();
         results.sort();
+        file_identities.sort_by(|left, right| left.relative_name.cmp(&right.relative_name));
         digest_json(&MediaPayload {
             status: self.status,
             summaries: &summaries,
             results: &results,
+            file_identities: &file_identities,
         })
     }
 
@@ -179,6 +205,7 @@ mod media_audit_state_tests {
                     message: Some("timeout".into()),
                 },
             ],
+            file_identities: Vec::new(),
         };
 
         assert_eq!(evidence.audit_state(), MediaEvidenceAuditState::CheckFailed);
@@ -281,6 +308,12 @@ pub(crate) struct LocalExecutionBinding {
     /// Selected OKP executable identity (path + launch mode + file-byte SHA-256).
     /// Optional only when prepare could not resolve OKP (already a local blocker).
     okp_identity: Option<OkpExecutableIdentity>,
+    /// Private MediaInfo measured-file identities bound after a successful plan media pass.
+    media_file_identities: Vec<MediaFileIdentity>,
+    /// Canonical digest of the frozen profile snapshot (cookies, tokens, names).
+    profile_digest: String,
+    /// Profile contents captured at prepare; prepared publish uses this snapshot only.
+    frozen_profile: Profile,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -357,13 +390,32 @@ impl PublishPlan {
         Ok(())
     }
 
+    /// True when formal audit has started (job attached or formal_ran) on this plan.
+    /// Plan-bound MediaInfo must not start or bind after this point.
+    pub fn formal_audit_has_started(&self) -> bool {
+        self.audit_evidence.as_ref().is_some_and(|evidence| {
+            evidence.formal_ran
+                || evidence
+                    .job_id
+                    .as_ref()
+                    .is_some_and(|job_id| !job_id.trim().is_empty())
+        })
+    }
+
     /// Bind MediaInfo summaries to this plan. Rejects identity mismatch.
     ///
     /// A changed normalized media outcome rolls the plan snapshot hash and invalidates
     /// previous audit evidence/acknowledgements. Rebinding identical media is idempotent.
     /// Callers must only invoke this for Succeeded terminal MediaInfo jobs after
     /// revalidating the private local execution binding.
+    /// Rejects binds after formal audit has started so late MediaInfo cannot clear audit.
     pub fn bind_media_evidence(&mut self, evidence: PlanMediaEvidence) -> Result<String, String> {
+        if self.formal_audit_has_started() {
+            return Err(
+                "media evidence cannot bind after formal audit has started; re-run preflight"
+                    .to_string(),
+            );
+        }
         if evidence.snapshot_hash != self.snapshot_hash {
             return Err("media evidence snapshot_hash does not match prepared plan".to_string());
         }
@@ -397,6 +449,9 @@ impl PublishPlan {
         self.snapshot_hash = next_hash.clone();
         let mut evidence = evidence;
         evidence.snapshot_hash = next_hash.clone();
+        if let Some(binding) = self.local_execution_binding.as_mut() {
+            binding.media_file_identities = evidence.file_identities.clone();
+        }
         self.media_evidence = Some(evidence);
         if media_changed {
             self.audit_evidence = None;
@@ -485,6 +540,7 @@ impl PublishPlan {
             request,
             String::new(),
             okp_identity,
+            Profile::default(),
         )
     }
 
@@ -493,6 +549,7 @@ impl PublishPlan {
         request: PublishRequest,
         content_root: String,
         okp_identity: Option<OkpExecutableIdentity>,
+        frozen_profile: Profile,
     ) -> Result<Self, String> {
         let content_root = if content_root.trim().is_empty() {
             String::new()
@@ -505,6 +562,7 @@ impl PublishPlan {
         let sites = selected_site_codes(&request.template.sites);
         let template_digest = digest_template(&request.template);
         let torrent_name = torrent_basename(&request.torrent_path);
+        let profile_digest = digest_profile(&frozen_profile);
         let snapshot_hash = compute_canonical_snapshot_hash(
             &torrent_identity.digest,
             &torrent_name,
@@ -520,6 +578,7 @@ impl PublishPlan {
             torrent_identity.len,
             &template_digest,
             &sites,
+            &profile_digest,
         );
         let mut plan = Self::new(snapshot_hash.clone(), request_generation);
         plan.canonical_snapshot = Some(CanonicalSnapshot {
@@ -535,10 +594,14 @@ impl PublishPlan {
         plan.set_local_binding(LocalExecutionBinding {
             request,
             content_root,
+            // filled when plan-bound MediaInfo succeeds
+            media_file_identities: Vec::new(),
             torrent_digest: torrent_identity.digest,
             torrent_len: torrent_identity.len,
             binding_fingerprint,
             okp_identity,
+            profile_digest,
+            frozen_profile,
         });
         Ok(plan)
     }
@@ -599,8 +662,14 @@ impl PublishPlan {
 }
 
 impl LocalExecutionBinding {
+    #[allow(dead_code)]
     pub(crate) fn into_publish_request(self) -> PublishRequest {
         self.request
+    }
+
+    /// Consume the binding into the publish request and frozen profile snapshot.
+    pub(crate) fn into_publish_parts(self) -> (PublishRequest, Profile) {
+        (self.request, self.frozen_profile)
     }
 
     pub(crate) fn request(&self) -> &PublishRequest {
@@ -626,12 +695,40 @@ impl LocalExecutionBinding {
         self.okp_identity.as_ref()
     }
 
+    pub(crate) fn frozen_profile(&self) -> &Profile {
+        &self.frozen_profile
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn profile_digest(&self) -> &str {
+        &self.profile_digest
+    }
+
+    /// Reject live profile drift after prepare/ack. Cookies, tokens, account names,
+    /// and other profile fields must match the frozen prepare-time snapshot.
+    pub(crate) fn revalidate_profile(&self, live: &Profile) -> Result<(), String> {
+        let live_digest = digest_profile(live);
+        if live_digest != self.profile_digest {
+            return Err(format!(
+                "发布配置「{}」内容已变化（Cookie/令牌/账号等），请重新执行发布前检查。",
+                self.request.profile_name
+            ));
+        }
+        // Integrity: frozen snapshot must still match its stored digest.
+        if digest_profile(&self.frozen_profile) != self.profile_digest {
+            return Err("发布执行绑定中的配置快照已损坏，请重新执行发布前检查。".to_string());
+        }
+        Ok(())
+    }
+
     /// Re-check torrent existence/identity/digest, OKP executable identity, and
     /// private execution fingerprint against the bound request. Returns
     /// human-readable failures without consuming the plan token.
     /// On success, yields the revalidated `ResolvedOkpExecutable` when identity
     /// was bound (for prepared-plan launch). `None` only when identity was never
     /// captured (legacy/test bindings); prepared publish must fail closed on `None`.
+    ///
+    /// Profile drift is checked separately via [`Self::revalidate_profile`] (needs live load).
     pub(crate) fn revalidate(&self) -> Result<Option<ResolvedOkpExecutable>, Vec<String>> {
         let mut failures = Vec::new();
         let torrent_identity = match read_torrent_identity(&self.request.torrent_path) {
@@ -672,6 +769,7 @@ impl LocalExecutionBinding {
             torrent_identity.len,
             &template_digest,
             &sites,
+            &self.profile_digest,
         );
         if fingerprint != self.binding_fingerprint {
             failures.push("发布执行绑定已失效，请重新执行发布前检查。".to_string());
@@ -685,6 +783,14 @@ impl LocalExecutionBinding {
             }
         }
 
+        if let Err(media_failures) = crate::ai::media::revalidate_media_file_identities(
+            &self.request.torrent_path,
+            &self.content_root,
+            &self.media_file_identities,
+        ) {
+            failures.extend(media_failures);
+        }
+
         if failures.is_empty() {
             Ok(resolved_okp)
         } else {
@@ -695,7 +801,7 @@ impl LocalExecutionBinding {
     /// Prepared-plan publish gate: revalidate binding and require a bound OKP
     /// executable. Live app config is never consulted; returns the exact binary
     /// whose private identity was revalidated. Unbound identity fails closed
-    /// with an actionable message.
+    /// with an actionable message. Measured media identities are re-checked.
     pub(crate) fn revalidate_for_prepared_publish(
         &self,
     ) -> Result<ResolvedOkpExecutable, Vec<String>> {
@@ -798,6 +904,7 @@ fn compute_binding_fingerprint(
     torrent_len: u64,
     template_digest: &str,
     sites: &[String],
+    profile_digest: &str,
 ) -> String {
     #[derive(Serialize)]
     struct BindingPayload<'a> {
@@ -807,6 +914,7 @@ fn compute_binding_fingerprint(
         torrent_digest: &'a str,
         torrent_len: u64,
         profile_name: &'a str,
+        profile_digest: &'a str,
         template_digest: &'a str,
         sites: &'a [String],
     }
@@ -817,10 +925,16 @@ fn compute_binding_fingerprint(
         torrent_digest,
         torrent_len,
         profile_name: &request.profile_name,
+        profile_digest,
         template_digest,
         sites,
     };
     digest_json(&payload)
+}
+
+/// Canonical digest of a profile snapshot (cookies, tokens, account identity).
+pub(crate) fn digest_profile(profile: &Profile) -> String {
+    digest_json(profile)
 }
 
 fn digest_json<T: Serialize>(value: &T) -> String {
@@ -975,6 +1089,7 @@ impl PlanRegistry {
         ai_enabled_and_configured: bool,
         okp_identity: Option<OkpExecutableIdentity>,
     ) -> Result<PreparedPlanResponse, String> {
+        // Test/helper path: empty frozen profile. Production prepare must pass a real snapshot.
         self.prepare_plan_with_request_blockers_and_content_root(
             request_generation,
             request,
@@ -982,9 +1097,11 @@ impl PlanRegistry {
             local_blockers,
             ai_enabled_and_configured,
             okp_identity,
+            Profile::default(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn prepare_plan_with_request_blockers_and_content_root(
         &mut self,
         request_generation: u64,
@@ -993,12 +1110,14 @@ impl PlanRegistry {
         local_blockers: Vec<String>,
         ai_enabled_and_configured: bool,
         okp_identity: Option<OkpExecutableIdentity>,
+        frozen_profile: Profile,
     ) -> Result<PreparedPlanResponse, String> {
         let mut plan = PublishPlan::from_publish_request_with_content_root(
             request_generation,
             request,
             content_root,
             okp_identity,
+            frozen_profile,
         )?;
         for blocker in local_blockers {
             plan.add_local_blocker(blocker);
@@ -1345,6 +1464,12 @@ impl PlanRegistry {
             .plans
             .get_mut(token)
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        if plan.formal_audit_has_started() {
+            return Err(
+                "media evidence cannot bind after formal audit has started; re-run preflight"
+                    .to_string(),
+            );
+        }
         // Identity must match the plan's current backend-owned snapshot before any write.
         if evidence.snapshot_hash != plan.snapshot_hash
             || evidence.request_generation != plan.request_generation
@@ -1354,6 +1479,14 @@ impl PlanRegistry {
         // Revalidate private binding so same-path replacements fail closed without bind.
         if let Some(binding) = plan.get_local_binding() {
             if let Err(failures) = binding.revalidate() {
+                return Err(failures.join("；"));
+            }
+            // Validate the incoming measured identities before mutating the plan.
+            if let Err(failures) = crate::ai::media::revalidate_media_file_identities(
+                binding.request().torrent_path.as_str(),
+                binding.content_root(),
+                &evidence.file_identities,
+            ) {
                 return Err(failures.join("；"));
             }
         } else {
@@ -1381,6 +1514,12 @@ impl PlanRegistry {
         let plan = self
             .inspect_plan(token)
             .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        if plan.formal_audit_has_started() {
+            return Err(
+                "MediaInfo cannot start after formal audit has started; re-run preflight"
+                    .to_string(),
+            );
+        }
         let snapshot_hash = plan.snapshot_hash.clone();
         let request_generation = plan.request_generation;
         let binding = plan
@@ -1676,6 +1815,7 @@ mod tests {
             request.clone(),
             first_root.display().to_string(),
             None,
+            Profile::default(),
         )
         .expect("first plan");
         let second = PublishPlan::from_publish_request_with_content_root(
@@ -1683,6 +1823,7 @@ mod tests {
             request,
             second_root.display().to_string(),
             None,
+            Profile::default(),
         )
         .expect("second plan");
 
@@ -1705,6 +1846,58 @@ mod tests {
 
         let _ = std::fs::remove_file(&torrent_path);
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn frozen_profile_digest_gates_drift_and_fingerprint() {
+        let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
+        let request = sample_request(torrent_path.clone());
+        let profile_a = Profile {
+            cookies: "a=1".into(),
+            dmhy_name: "user-a".into(),
+            acgrip_api_token: "token-a".into(),
+            ..Profile::default()
+        };
+        let profile_b = Profile {
+            cookies: "a=2".into(),
+            dmhy_name: "user-a".into(),
+            acgrip_api_token: "token-a".into(),
+            ..Profile::default()
+        };
+        let plan_a = PublishPlan::from_publish_request_with_content_root(
+            1,
+            request.clone(),
+            String::new(),
+            None,
+            profile_a.clone(),
+        )
+        .expect("plan a");
+        let plan_b = PublishPlan::from_publish_request_with_content_root(
+            1,
+            request,
+            String::new(),
+            None,
+            profile_b.clone(),
+        )
+        .expect("plan b");
+        let binding_a = plan_a.get_local_binding().expect("binding a");
+        let binding_b = plan_b.get_local_binding().expect("binding b");
+        assert_ne!(
+            binding_a.binding_fingerprint(),
+            binding_b.binding_fingerprint(),
+            "profile content must change the execution fingerprint"
+        );
+        assert_ne!(binding_a.profile_digest(), binding_b.profile_digest());
+        assert!(binding_a.revalidate_profile(&profile_a).is_ok());
+        let drift = binding_a
+            .revalidate_profile(&profile_b)
+            .expect_err("cookie drift must fail closed");
+        assert!(
+            drift.contains("内容已变化"),
+            "unexpected drift message: {drift}"
+        );
+        assert_eq!(binding_a.frozen_profile().cookies, "a=1");
+        let _ = std::fs::remove_file(&torrent_path);
     }
 
     #[test]
@@ -2222,6 +2415,7 @@ mod tests {
                         scan_type: None,
                     }],
                     results: vec![],
+                    file_identities: Vec::new(),
                 },
             )
             .expect("bind media");
@@ -2270,6 +2464,7 @@ mod tests {
                     status: PlanMediaStatus::Tested,
                     summaries: vec![],
                     results: vec![],
+                    file_identities: Vec::new(),
                 },
             )
             .expect_err("unknown token");
@@ -2289,6 +2484,7 @@ mod tests {
                         ..PlanMediaSummary::default()
                     }],
                     results: vec![],
+                    file_identities: Vec::new(),
                 },
             )
             .expect_err("forged snapshot");
@@ -2315,6 +2511,7 @@ mod tests {
                     status: PlanMediaStatus::CheckFailed,
                     summaries: vec![],
                     results: vec![],
+                    file_identities: Vec::new(),
                 },
             )
             .expect_err("forged generation");
@@ -2360,6 +2557,7 @@ mod tests {
                         ..PlanMediaSummary::default()
                     }],
                     results: vec![],
+                    file_identities: Vec::new(),
                 },
             )
             .expect_err("drift must reject bind");
@@ -2526,5 +2724,48 @@ mod tests {
             registry.resolve_related_audit_job_id(&token).as_deref(),
             Some("job-from-bind")
         );
+    }
+
+    #[test]
+    fn media_bind_rejected_after_formal_audit_started() {
+        let mut plan = PublishPlan::new("sha256:snap".into(), 1);
+        plan.canonical_snapshot = Some(CanonicalSnapshot {
+            hash: "sha256:snap".into(),
+            template_id: "t".into(),
+            template_digest: "d".into(),
+            sites: vec!["a".into()],
+            torrent_name: "x.torrent".into(),
+            torrent_digest: "td".into(),
+            profile_name: "p".into(),
+            media_evidence_hash: String::new(),
+        });
+        plan.bind_audit_evidence(PlanAuditEvidence {
+            decision: AuditDecision::Pending,
+            description: None,
+            findings: vec![],
+            unknown_codes: vec![],
+            formal_ran: false,
+            model: None,
+            usage: None,
+            duration_ms: None,
+            job_id: Some("formal-job".into()),
+            snapshot_hash: "sha256:snap".into(),
+            request_generation: 1,
+        })
+        .unwrap();
+        assert!(plan.formal_audit_has_started());
+        let err = plan
+            .bind_media_evidence(PlanMediaEvidence {
+                job_id: "media".into(),
+                snapshot_hash: "sha256:snap".into(),
+                request_generation: 1,
+                status: PlanMediaStatus::Tested,
+                summaries: vec![],
+                results: vec![],
+                file_identities: Vec::new(),
+            })
+            .expect_err("must reject after formal started");
+        assert!(err.contains("formal audit"));
+        assert!(plan.audit_evidence.is_some());
     }
 }

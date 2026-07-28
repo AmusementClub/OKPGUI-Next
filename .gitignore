@@ -51,7 +51,10 @@ src-tauri/binaries/*
 !src-tauri/binaries/.gitkeep
 
 # Desktop E2E / packaged-smoke evidence output (local or CI artifact; not source)
-tests/desktop-e2e/out/
+tests/package-smoke/out/
 
 # Playwright runtime output
 test-results/
+
+# pnpm content-addressable store (never commit)
+.pnpm-store/

@@ -3,16 +3,16 @@
 //! When launched with `OKPGUI_DESKTOP_SMOKE_OUT=<path>`, the process runs production
 //! domain paths (prepare plan, acknowledgements, publish-safe audit cancel, session
 //! cancel, MediaInfo resolve+spawn, keyring session-only policy) and
-//! writes a JSON report for the Node evidence harness.
+//! writes a compact JSON handshake for the package-smoke runner.
 //!
 //! Honesty contract:
 //! - This is **not** mocked Playwright / Vite invoke.
 //! - This is **not** Tauri WebView IPC or WebDriver UI automation.
 //! - It runs inside the release binary against the same Rust modules that back commands.
 //! - `production_binary_marker` is true when hard probes pass.
-//! - `production_ipc_marker` is **always false** here (no webview/command wire exercised).
 //! - Dual-entry UI names (`home-*` / `quick-publish-*`) are **skipped**, not dual-passed.
 //! - Event delivery to a WebView is **skipped** (no AppHandle/WebView in this path).
+//! - Package-smoke gates on process exit status; this JSON is a four-field handshake only.
 
 use crate::ai::audit::{Acknowledgements, AuditDecision};
 use crate::ai::credentials::{decide_session_only_cold_start, SessionOnlyColdStartAction};
@@ -33,31 +33,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SmokeNamedTest {
-    name: String,
-    result: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-}
-
+/// Compact package-smoke handshake. Diagnostics go to stdout/stderr, not this report.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct SmokeReport {
-    /// Always false for host/packaged binary smoke — no WebView Tauri IPC wire.
-    production_ipc_marker: bool,
     /// True when hard production binary probes passed.
     production_binary_marker: bool,
     /// Stable fingerprint string for the Node harness (binary production paths).
     production_marker: String,
     ok: bool,
-    named_tests: Vec<SmokeNamedTest>,
-    platform: String,
-    arch: String,
-    schema_version: u32,
     /// Whether current_exe appears to live inside a macOS .app bundle.
     packaged_app_layout: bool,
+}
+
+fn log_probe(name: &str, ok: bool, detail: &str) {
+    if ok {
+        println!("desktop-smoke: pass {name}: {detail}");
+    } else {
+        eprintln!("desktop-smoke: fail {name}: {detail}");
+    }
+}
+
+fn log_skip(name: &str, detail: &str) {
+    println!("desktop-smoke: skip {name}: {detail}");
 }
 
 fn write_temp_torrent() -> PathBuf {
@@ -85,18 +83,6 @@ fn sample_request(torrent_path: PathBuf) -> PublishRequest {
             ..Default::default()
         },
     }
-}
-
-fn push(tests: &mut Vec<SmokeNamedTest>, name: &str, result: &str, detail: String) {
-    tests.push(SmokeNamedTest {
-        name: name.to_string(),
-        result: result.to_string(),
-        detail: Some(detail),
-    });
-}
-
-fn push_ok(tests: &mut Vec<SmokeNamedTest>, name: &str, ok: bool, detail: String) {
-    push(tests, name, if ok { "pass" } else { "fail" }, detail);
 }
 
 fn bind_pending_audit(
@@ -142,9 +128,11 @@ fn smoke_resource_roots() -> Vec<PathBuf> {
     let packaged_only = std::env::var("OKPGUI_SMOKE_PACKAGED_ONLY")
         .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    if let Ok(override_dir) = std::env::var("OKPGUI_SMOKE_RESOURCE_DIR") {
-        if !override_dir.is_empty() {
-            roots.push(PathBuf::from(override_dir));
+    if !packaged_only {
+        if let Ok(override_dir) = std::env::var("OKPGUI_SMOKE_RESOURCE_DIR") {
+            if !override_dir.is_empty() {
+                roots.push(PathBuf::from(override_dir));
+            }
         }
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -283,7 +271,6 @@ fn spawn_mediainfo_version(sidecar: &Path) -> Result<String, String> {
 /// Run production smoke and write JSON to `out_path`.
 /// Returns process exit code (0 = all hard probes pass).
 pub fn run_and_write(out_path: &Path) -> i32 {
-    let mut named = Vec::new();
     let mut all_ok = true;
     let packaged_app_layout = detect_packaged_app_layout();
     // When require-sidecar is set (packaged CI) or we are inside a .app, sidecar is hard.
@@ -292,13 +279,13 @@ pub fn run_and_write(out_path: &Path) -> i32 {
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
 
+    // Schema validation remains a hard internal probe; not part of the JSON handshake.
     let schema_version = config_schema_version();
     let schema_ok = schema_version >= 3;
-    push_ok(
-        &mut named,
+    log_probe(
         "schema-version-v3",
         schema_ok,
-        format!("CONFIG_SCHEMA_VERSION={schema_version}"),
+        &format!("CONFIG_SCHEMA_VERSION={schema_version}"),
     );
     all_ok &= schema_ok;
 
@@ -367,40 +354,32 @@ pub fn run_and_write(out_path: &Path) -> i32 {
     match &prepare_publish_ok {
         Ok(token) => {
             let preview = token.chars().take(12).collect::<String>();
-            push_ok(
-                &mut named,
+            log_probe(
                 "shared-backend-prepare-observe-ack-publish",
                 true,
-                format!(
+                &format!(
                     "host/packaged binary backend contract: prepare+pending-ack+publish-safe cancel kept token live ({preview}…). Not WebView IPC; not dual UI entry."
                 ),
             );
         }
         Err(err) => {
-            push_ok(
-                &mut named,
+            log_probe(
                 "shared-backend-prepare-observe-ack-publish",
                 false,
-                format!("shared backend contract failed: {err}"),
+                &format!("shared backend contract failed: {err}"),
             );
             all_ok = false;
         }
     }
 
     // Dual-entry UI critical flows: host smoke cannot prove Home vs Quick Publish UI paths.
-    push(
-        &mut named,
+    log_skip(
         "home-prepare-observe-ack-publish",
-        "skipped",
-        "host/packaged binary smoke cannot exercise the Home UI entry or WebView IPC; covered by desktop-webdriver when available, else Playwright UI integration (mocked IPC). Shared backend proven under shared-backend-prepare-observe-ack-publish."
-            .to_string(),
+        "host/packaged binary smoke cannot exercise the Home UI entry or WebView IPC; covered by Playwright UI integration (mocked IPC). Shared backend proven under shared-backend-prepare-observe-ack-publish.",
     );
-    push(
-        &mut named,
+    log_skip(
         "quick-publish-prepare-observe-ack-publish",
-        "skipped",
-        "host/packaged binary smoke cannot exercise the Quick Publish UI entry or WebView IPC; covered by desktop-webdriver when available, else Playwright UI integration (mocked IPC). Shared backend proven under shared-backend-prepare-observe-ack-publish."
-            .to_string(),
+        "host/packaged binary smoke cannot exercise the Quick Publish UI entry or WebView IPC; covered by Playwright UI integration (mocked IPC). Shared backend proven under shared-backend-prepare-observe-ack-publish.",
     );
 
     // Session cancel / recovery: invalidate token (poll-failure / return-to-edit path).
@@ -428,11 +407,10 @@ pub fn run_and_write(out_path: &Path) -> i32 {
         Ok(())
     })();
     let cancel_recovery_pass = cancel_recovery_ok.is_ok();
-    push_ok(
-        &mut named,
+    log_probe(
         "cancellation-and-failed-poll-recovery",
         cancel_recovery_pass,
-        cancel_recovery_ok.err().unwrap_or_else(|| {
+        &cancel_recovery_ok.err().unwrap_or_else(|| {
             "session cancel invalidates token; job cancelled (backend lifecycle, not event bus)"
                 .to_string()
         }),
@@ -463,11 +441,10 @@ pub fn run_and_write(out_path: &Path) -> i32 {
         Ok(())
     })();
     let escalate_pass = escalate_ok.is_ok();
-    push_ok(
-        &mut named,
+    log_probe(
         "plan-bound-ai-cancel-job-escalates",
         escalate_pass,
-        escalate_ok
+        &escalate_ok
             .err()
             .unwrap_or_else(|| "ai_cancel_job invalidates plan-bound audit token".to_string()),
     );
@@ -477,24 +454,21 @@ pub fn run_and_write(out_path: &Path) -> i32 {
     let sidecar_result = probe_mediainfo_sidecar();
     match &sidecar_result {
         Ok(detail) => {
-            push_ok(&mut named, "sidecar-mediainfo-probe", true, detail.clone());
+            log_probe("sidecar-mediainfo-probe", true, detail);
         }
         Err(err) => {
             if require_sidecar {
-                push_ok(
-                    &mut named,
+                log_probe(
                     "sidecar-mediainfo-probe",
                     false,
-                    format!("required sidecar probe failed: {err}"),
+                    &format!("required sidecar probe failed: {err}"),
                 );
                 all_ok = false;
             } else {
                 // Soft only when not packaged and not explicitly required — skip, do not fake pass.
-                push(
-                    &mut named,
+                log_skip(
                     "sidecar-mediainfo-probe",
-                    "skipped",
-                    format!(
+                    &format!(
                         "MediaInfo not resolved/spawned in this layout ({err}). Set OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR=1 or run from packaged .app for a hard gate."
                     ),
                 );
@@ -511,99 +485,55 @@ pub fn run_and_write(out_path: &Path) -> i32 {
             && decide_session_only_cold_start(true, None, false) == ClearStalePointer
             && decide_session_only_cold_start(false, Some("cred-1"), false) == LeaveUnchanged
     };
-    push_ok(
-        &mut named,
+    log_probe(
         "keyring-session-only-probe",
         keyring_ok,
         if keyring_ok {
-            "decide_session_only_cold_start: session-only missing secret → ClearStalePointer; durable/missing marker → LeaveUnchanged; no secret restore invented".to_string()
+            "decide_session_only_cold_start: session-only missing secret → ClearStalePointer; durable/missing marker → LeaveUnchanged; no secret restore invented"
         } else {
-            "session-only cold-start policy assertions failed".to_string()
+            "session-only cold-start policy assertions failed"
         },
     );
     all_ok &= keyring_ok;
 
     // Event delivery to WebView cannot be proven without AppHandle + listener.
-    push(
-        &mut named,
+    log_skip(
         "event-delivery-probe",
-        "skipped",
-        "host/packaged binary smoke has no WebView/AppHandle; PreflightSessionChanged emit/subscribe is not exercised. Session cancel lifecycle is covered by cancellation-and-failed-poll-recovery. Real event delivery requires desktop-webdriver."
-            .to_string(),
+        "host/packaged binary smoke has no WebView/AppHandle; PreflightSessionChanged emit/subscribe is not exercised. Session cancel lifecycle is covered by cancellation-and-failed-poll-recovery.",
     );
 
-    // Honest production path labels (not webview IPC).
-    push_ok(
-        &mut named,
+    log_probe(
         "production-binary-probe",
         all_ok,
         if all_ok {
             "Production prepare_plan / cancel / MediaInfo / keyring-policy paths exercised in built binary (not WebView IPC)"
-                .to_string()
         } else {
-            "One or more hard production binary probes failed".to_string()
+            "One or more hard production binary probes failed"
         },
     );
-    // Deprecated alias name used by older probe catalogs — keep as skipped honesty.
-    push(
-        &mut named,
-        "production-ipc-probe",
-        "skipped",
-        "Renamed honesty: host smoke does not exercise Tauri IPC wire. See production-binary-probe and productionBinaryMarker. productionIpcMarker remains false."
-            .to_string(),
-    );
-    push_ok(
-        &mut named,
+    log_probe(
         "minimal-backend-roundtrip",
         prepare_publish_ok.is_ok(),
-        "prepare_plan + pending bind + cancel_pending_audit_for_publish round-trip (backend modules, not IPC)"
-            .to_string(),
-    );
-    push(
-        &mut named,
-        "minimal-ipc-roundtrip",
-        "skipped",
-        "Host smoke is not an IPC round-trip. See minimal-backend-roundtrip. Real IPC requires desktop-webdriver."
-            .to_string(),
+        "prepare_plan + pending bind + cancel_pending_audit_for_publish round-trip (backend modules, not IPC)",
     );
 
-    push_ok(
-        &mut named,
-        "packaged-binary-present",
-        true,
-        if packaged_app_layout {
-            "Smoke executed inside a macOS .app Contents/MacOS executable".to_string()
-        } else {
-            "Smoke executed inside the launched application binary process (not necessarily a .app bundle)"
-                .to_string()
-        },
-    );
     if packaged_app_layout {
-        push_ok(
-            &mut named,
+        log_probe(
             "packaged-app-layout",
             true,
-            "current_exe path contains .app/Contents/MacOS/".to_string(),
+            "current_exe path contains .app/Contents/MacOS/",
         );
     } else {
-        push(
-            &mut named,
+        log_skip(
             "packaged-app-layout",
-            "skipped",
-            "Not running from a macOS .app bundle path; raw/host binary layout.".to_string(),
+            "Not running from a macOS .app bundle path; raw/host binary layout.",
         );
     }
 
     let report = SmokeReport {
-        // Hard rule: this harness never proves WebView/Tauri IPC.
-        production_ipc_marker: false,
         production_binary_marker: all_ok,
         production_marker: "OKPGUI_PRODUCTION_BINARY_V1".to_string(),
         ok: all_ok,
-        named_tests: named,
-        platform: std::env::consts::OS.to_string(),
-        arch: std::env::consts::ARCH.to_string(),
-        schema_version,
         packaged_app_layout,
     };
 

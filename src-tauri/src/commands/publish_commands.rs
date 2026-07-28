@@ -2,12 +2,13 @@ use crate::ai::audit::Acknowledgements;
 use crate::domain::publish_plan::{
     get_or_create_registry, PlanRegistry, PreparedPlanResponse, PublishPlan,
 };
+use crate::profile::{load_profiles, Profile};
 use crate::publish::publish_events::emit_publish_event;
 use crate::publish::{
-    bind_configured_okp_for_prepare, collect_publish_local_blockers_with_resolved_okp,
+    bind_configured_okp_for_prepare, collect_publish_local_blockers_with_resolved_okp_and_profile,
     prepare_local_blockers_and_okp_identity, PublishComplete, PublishRequest,
 };
-use crate::services::publish_service::{run_publish, run_publish_with_resolved_okp};
+use crate::services::publish_service::{run_publish, run_publish_with_resolved_okp_and_profile};
 use serde::{Deserialize, Serialize};
 use std::sync::Mutex;
 
@@ -49,6 +50,13 @@ pub async fn prepare_plan(
     let bind = bind_configured_okp_for_prepare(&app);
     let (okp_identity, local_blockers) =
         prepare_local_blockers_and_okp_identity(&app, &request.request, bind);
+    // Freeze profile contents (cookies/tokens/accounts) at prepare so post-ack drift
+    // cannot change what publish executes. Missing profile still yields local blockers.
+    let frozen_profile = load_profiles(&app)
+        .profiles
+        .get(&request.request.profile_name)
+        .cloned()
+        .unwrap_or_default();
     // AI enabled+configured → PENDING initial evidence; disabled/unconfigured → local-only GO.
     // HomePage compatibility is this backend rule only (no frontend HomePage edits required).
     let ai_enabled_and_configured =
@@ -61,7 +69,16 @@ pub async fn prepare_plan(
         local_blockers,
         ai_enabled_and_configured,
         okp_identity,
+        frozen_profile,
     )
+}
+
+fn load_live_profile(app: &tauri::AppHandle, profile_name: &str) -> Result<Profile, String> {
+    load_profiles(app)
+        .profiles
+        .get(profile_name)
+        .cloned()
+        .ok_or_else(|| format!("配置不存在: {profile_name}"))
 }
 
 #[tauri::command]
@@ -148,17 +165,22 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
             return Err(publish_gate_error(&plan));
         }
         if let Some(binding) = plan.get_local_binding() {
-            if let Ok(bound_okp) = binding.revalidate_for_prepared_publish() {
-                let early_blockers = collect_publish_local_blockers_with_resolved_okp(
-                    &app,
-                    binding.request(),
-                    &bound_okp,
-                );
-                if !early_blockers.is_empty() {
-                    return Err(format!(
-                        "prepared plan local validation failed: {}",
-                        early_blockers.join("；")
-                    ));
+            if let Ok(live_profile) = load_live_profile(&app, &binding.request().profile_name) {
+                if binding.revalidate_profile(&live_profile).is_err() {
+                    // Drift fails closed at the authoritative gate below.
+                } else if let Ok(bound_okp) = binding.revalidate_for_prepared_publish() {
+                    let early_blockers =
+                        collect_publish_local_blockers_with_resolved_okp_and_profile(
+                            binding.request(),
+                            Some(binding.frozen_profile()),
+                            &bound_okp,
+                        );
+                    if !early_blockers.is_empty() {
+                        return Err(format!(
+                            "prepared plan local validation failed: {}",
+                            early_blockers.join("；")
+                        ));
+                    }
                 }
             }
             // Revalidation failure falls through to the authoritative locked gate.
@@ -166,9 +188,9 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
     }
 
     // Authoritative pre-consume gate under the registry lock:
-    // evidence + decision + bound OKP revalidate + bound local blockers, then consume.
-    // Launch uses the bound executable already validated here — never revalidate after consume.
-    let (request, bound_okp) = {
+    // evidence + decision + bound OKP revalidate + profile drift + bound local blockers, then consume.
+    // Launch uses the bound executable and frozen profile already validated here.
+    let (request, frozen_profile, bound_okp) = {
         let mut guard = registry().lock().unwrap_or_else(|error| error.into_inner());
         let plan = guard
             .inspect_plan(&token)
@@ -181,6 +203,10 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
         let binding = plan
             .get_local_binding()
             .ok_or_else(|| "prepared plan has no backend execution binding".to_string())?;
+        let live_profile = load_live_profile(&app, &binding.request().profile_name)?;
+        binding
+            .revalidate_profile(&live_profile)
+            .map_err(|error| format!("prepared plan profile revalidation failed: {error}"))?;
         let bound_okp = binding
             .revalidate_for_prepared_publish()
             .map_err(|failures| {
@@ -189,8 +215,11 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
                     failures.join("；")
                 )
             })?;
-        let current_blockers =
-            collect_publish_local_blockers_with_resolved_okp(&app, binding.request(), &bound_okp);
+        let current_blockers = collect_publish_local_blockers_with_resolved_okp_and_profile(
+            binding.request(),
+            Some(binding.frozen_profile()),
+            &bound_okp,
+        );
         if !current_blockers.is_empty() {
             return Err(format!(
                 "prepared plan local validation failed: {}",
@@ -205,16 +234,22 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
         let binding = plan
             .get_local_binding_owned()
             .ok_or_else(|| "prepared plan has no backend execution binding".to_string())?;
-        // Reuse pre-consume validated bound A for launch (no post-consume revalidation).
-        (binding.into_publish_request(), bound_okp)
+        // Reuse pre-consume validated bound A + frozen profile (no post-consume revalidation).
+        let (request, frozen_profile) = binding.into_publish_parts();
+        (request, frozen_profile, bound_okp)
     };
 
     let app_handle = app.clone();
     let request_payload = request.clone();
     let result = tauri::async_runtime::spawn_blocking(move || {
-        // Launch the exact already-resolved OKP whose identity was revalidated pre-consume.
-        // Do not call run_publish (live config) for prepared plans.
-        run_publish_with_resolved_okp(&app_handle, &request_payload, bound_okp)
+        // Launch bound OKP with the prepare-time frozen profile only.
+        // Do not call run_publish (live config/profile) for prepared plans.
+        run_publish_with_resolved_okp_and_profile(
+            &app_handle,
+            &request_payload,
+            bound_okp,
+            frozen_profile,
+        )
     })
     .await
     .map_err(|error| format!("发布任务执行失败: {}", error))?;

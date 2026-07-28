@@ -13,7 +13,6 @@ pub enum AuthMode {
     Bearer,
     AnthropicApiKey,
     CustomHeader,
-    None,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -627,11 +626,10 @@ pub fn apply_public_credential_session_flag(
     connection: &mut PublicConnectionConfig,
     store: &OsCredentialStore,
 ) {
-    connection.credential_session_only =
-        match (connection.auth_mode, connection.credential_ref.as_ref()) {
-            (AuthMode::None, _) | (_, None) => false,
-            (_, Some(reference)) => store.credential_is_session_only(reference),
-        };
+    connection.credential_session_only = match connection.credential_ref.as_ref() {
+        None => false,
+        Some(reference) => store.credential_is_session_only(reference),
+    };
 }
 
 /// Decision for cold-start recovery of a session-only credential generation.
@@ -811,34 +809,25 @@ pub struct CredentialSecretWritePlan {
     /// Present only when this call created a new secret entry eligible for rollback delete.
     pub rollback_candidate_id: Option<String>,
     /// After the new config is successfully persisted, best-effort delete this previous secret.
-    /// Set for `AuthMode::None` (orphan clear) and for successful rotation away from the old id.
+    /// Set for successful rotation away from the old id (or when the next pointer is cleared).
     pub delete_after_success_id: Option<String>,
 }
 
 /// Decide next credential pointer and whether a candidate secret may be rolled back.
 ///
-/// - `AuthMode::None` clears the pointer, never writes a secret, and schedules old-secret cleanup
-///   only after a successful config persist (never on pre-switch failure).
 /// - When a new secret is provided, always allocate `unique_candidate_id` (never in-place replace).
 /// - When a caller-supplied candidate equals the active `old_ref_id`, reject with an error so
 ///   rollback/cleanup cannot overwrite or delete the live secret under the same id.
 /// - When no secret is provided, keep the explicit connection ref or the previous active ref.
+/// - `auth_mode` is retained for call-site compatibility; all modes require a real auth path
+///   (`AuthMode::None` was removed).
 pub fn plan_credential_secret_write(
-    auth_mode: AuthMode,
+    _auth_mode: AuthMode,
     old_ref_id: Option<String>,
     connection_ref_id: Option<String>,
     secret_provided: bool,
     unique_candidate_id: impl Into<String>,
 ) -> Result<CredentialSecretWritePlan, String> {
-    if auth_mode == AuthMode::None {
-        return Ok(CredentialSecretWritePlan {
-            next_ref_id: None,
-            rollback_candidate_id: None,
-            // Clear orphan only after successful switch; pre-switch failure keeps old secret.
-            delete_after_success_id: old_ref_id,
-        });
-    }
-
     if secret_provided {
         let candidate = unique_candidate_id.into();
         // Plan-level defense: never treat the active ref as a disposable candidate.
@@ -871,7 +860,7 @@ pub fn plan_credential_secret_write(
 
 /// Pure helper: which previous secret id (if any) should be deleted after config switch succeeds.
 ///
-/// - Switch to no credential (`next` is `None`) → delete `old` when present (`AuthMode::None`).
+/// - Switch to no credential (`next` is `None`) → delete `old` when present.
 /// - Rotation to a different id → delete `old` when it differs from `next`.
 /// - Same id kept → delete nothing (rollback path never reaches this on failure either).
 pub fn previous_secret_to_delete_after_successful_switch(
@@ -1051,8 +1040,8 @@ pub enum CredentialJournalRecoveryAction {
 
 /// True when the live config credential pointer matches the journal's next generation.
 ///
-/// `AuthMode::None` commits with `next_ref = None`; that matches only when the live
-/// config also has no credential ref (and the journal recorded an old ref or commit).
+/// ConfigCommitted clear-ref journals match only when the live config also has no
+/// credential ref (and the journal recorded an old ref or commit).
 pub fn config_points_to_journal_next(
     active_ref: Option<&str>,
     journal: &CredentialRotationJournal,
@@ -1518,22 +1507,6 @@ mod tests {
             "error should mention the colliding id without embedding secret material: {err}"
         );
 
-        // AuthMode::None still ignores the candidate id entirely (even when equal to old_ref).
-        let none_plan = plan_credential_secret_write(
-            AuthMode::None,
-            Some("active-connection".into()),
-            Some("active-connection".into()),
-            true,
-            "active-connection",
-        )
-        .expect("AuthMode::None must ignore candidate collision");
-        assert!(none_plan.next_ref_id.is_none());
-        assert!(none_plan.rollback_candidate_id.is_none());
-        assert_eq!(
-            none_plan.delete_after_success_id.as_deref(),
-            Some("active-connection")
-        );
-
         // No-secret path keeps previous semantics and does not consume the candidate id.
         let keep = plan_credential_secret_write(
             AuthMode::Bearer,
@@ -1549,37 +1522,14 @@ mod tests {
     }
 
     #[test]
-    fn auth_mode_none_never_creates_candidate_and_clears_old_after_success() {
-        let store = SessionSecretStore::new();
-        let old_ref = CredentialRef {
-            id: "was-active".into(),
-        };
-        store
-            .set(&old_ref, SecretValue::new("orphan-risk-secret"))
-            .unwrap();
-
-        let plan = plan_credential_secret_write(
-            AuthMode::None,
-            Some(old_ref.id.clone()),
-            Some(old_ref.id.clone()),
-            true, // even if a secret string is present, None mode ignores it
-            "must-not-be-used",
-        )
-        .expect("AuthMode::None plan must succeed");
-        assert!(plan.next_ref_id.is_none());
-        assert!(plan.rollback_candidate_id.is_none());
-        assert_eq!(plan.delete_after_success_id.as_deref(), Some("was-active"));
-
-        // Pre-switch failure: rollback is a no-op for None; old secret remains.
-        rollback_credential_candidate(&store, &plan).unwrap();
+    fn previous_secret_delete_helper_clears_old_when_next_is_none() {
         assert_eq!(
-            store.get(&old_ref).unwrap().unwrap().expose(),
-            "orphan-risk-secret"
+            previous_secret_to_delete_after_successful_switch(Some("was-active"), None).as_deref(),
+            Some("was-active")
         );
-
-        // Successful switch: clear previous active secret so it is not an orphan.
-        cleanup_previous_secret_after_success(&store, &plan).unwrap();
-        assert!(store.get(&old_ref).unwrap().is_none());
+        assert!(
+            previous_secret_to_delete_after_successful_switch(Some("same"), Some("same")).is_none()
+        );
     }
 
     #[test]
@@ -2240,19 +2190,17 @@ mod tests {
     }
 
     #[test]
-    fn credential_journal_auth_mode_none_clear_recovery() {
-        let plan = plan_credential_secret_write(
-            AuthMode::None,
-            Some("was-active".into()),
-            None,
-            false,
-            "unused",
-        )
-        .expect("AuthMode::None clear plan");
+    fn credential_journal_clear_ref_recovery_without_auth_mode_none() {
+        // Legacy clear-ref journals (next_ref = None) still recover after AuthMode::None removal.
+        let plan = CredentialSecretWritePlan {
+            next_ref_id: None,
+            rollback_candidate_id: None,
+            delete_after_success_id: Some("was-active".into()),
+        };
         let journal = CredentialRotationJournal::prepare(
             &plan,
             CredentialJournalSettingsMetadata {
-                auth_mode: "none".into(),
+                auth_mode: "bearer".into(),
                 enabled: false,
                 ..Default::default()
             },

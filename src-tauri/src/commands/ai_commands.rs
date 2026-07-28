@@ -416,7 +416,6 @@ fn journal_settings_metadata(
             AuthMode::Bearer => "bearer".to_string(),
             AuthMode::AnthropicApiKey => "anthropic_api_key".to_string(),
             AuthMode::CustomHeader => "custom_header".to_string(),
-            AuthMode::None => "none".to_string(),
         },
         enabled: connection.enabled,
         mode: match connection.mode {
@@ -588,7 +587,7 @@ fn public_connection_from_ai_config(ai: &crate::config::AIConfig) -> PublicConne
     let auth_mode = match ai.auth_mode.to_ascii_lowercase().as_str() {
         "anthropic_api_key" | "x_api_key" => AuthMode::AnthropicApiKey,
         "custom_header" => AuthMode::CustomHeader,
-        "none" => AuthMode::None,
+        // Legacy "none" is migrated at config load; never accepted as a live mode.
         _ => AuthMode::Bearer,
     };
     PublicConnectionConfig {
@@ -618,9 +617,6 @@ fn public_connection_from_ai_config(ai: &crate::config::AIConfig) -> PublicConne
 fn resolve_stored_secret(
     connection: &PublicConnectionConfig,
 ) -> Result<Option<SecretValue>, String> {
-    if connection.auth_mode == AuthMode::None {
-        return Ok(None);
-    }
     let Some(reference) = connection.credential_ref.clone() else {
         return Ok(None);
     };
@@ -652,7 +648,6 @@ pub fn ai_save_settings(
         .as_ref()
         .and_then(|reference| reference.key_ref.clone());
     // New secrets always write to a unique candidate; never overwrite the active secret in place.
-    // AuthMode::None never creates a candidate and schedules old-secret cleanup only after success.
     // Plan rejects candidate == old_ref so rollback cannot delete the live secret.
     let write_plan = plan_credential_secret_write(
         connection.auth_mode,
@@ -738,7 +733,7 @@ pub fn ai_save_settings(
     // Evaluated after candidate write so Linux fallback is reflected accurately.
     // Never trust the webview-supplied connection.credential_session_only flag.
     let persisted_session_only = match next_ref.as_ref() {
-        Some(id) if connection.auth_mode != AuthMode::None => {
+        Some(id) => {
             let reference = CredentialRef { id: id.clone() };
             if credential_store().credential_is_session_only(&reference) {
                 true
@@ -783,7 +778,6 @@ pub fn ai_save_settings(
             AuthMode::Bearer => "bearer",
             AuthMode::AnthropicApiKey => "anthropic_api_key",
             AuthMode::CustomHeader => "custom_header",
-            AuthMode::None => "none",
         }
         .to_string(),
         custom_header_name: connection.custom_header_name.clone(),
@@ -1516,6 +1510,38 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
     Ok(view)
 }
 
+/// Synthetic terminal job when the manager no longer holds the id (evicted / never
+/// registered). Fail closed: never invent Succeeded so late completion after cancel
+/// or terminal retention cannot bind evidence or surface measured success.
+fn job_gone_terminal(
+    job_id: &str,
+    kind: JobKind,
+    request_generation: u64,
+    snapshot_hash: &str,
+    prefer_cancelled: bool,
+) -> AiJob {
+    AiJob {
+        id: job_id.to_string(),
+        kind,
+        state: if prefer_cancelled {
+            AiJobState::Cancelled
+        } else {
+            AiJobState::Failed
+        },
+        request_generation,
+        snapshot_hash: snapshot_hash.to_string(),
+        provider_identity: None,
+        progress: 100,
+        error_code: Some(if prefer_cancelled {
+            "CANCELLED".to_string()
+        } else {
+            "JOB_GONE".to_string()
+        }),
+        debug_record_id: None,
+        created_at_unix: now_unix(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn finish_media_info_job(
     job_id: &str,
@@ -1528,25 +1554,24 @@ fn finish_media_info_job(
     results: Vec<MediaProbeResult>,
 ) -> MediaInfoJobView {
     let summary = summary.into();
-    let job =
-        complete_job_backend(job_id, success, error_code.clone(), summary).unwrap_or_else(|_| {
-            AiJob {
-                id: job_id.to_string(),
-                kind: JobKind::MediaInfo,
-                state: if success {
-                    AiJobState::Succeeded
-                } else {
-                    AiJobState::Failed
-                },
+    let prefer_cancelled = media_cancel_flags()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(job_id)
+        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let job = match complete_job_backend(job_id, success, error_code.clone(), summary) {
+        Ok(job) => job,
+        Err(_) => {
+            // Missing/evicted job: fail closed. Never fabricate Succeeded.
+            job_gone_terminal(
+                job_id,
+                JobKind::MediaInfo,
                 request_generation,
-                snapshot_hash: snapshot_hash.to_string(),
-                provider_identity: None,
-                progress: 100,
-                error_code: error_code.clone(),
-                debug_record_id: None,
-                created_at_unix: now_unix(),
-            }
-        });
+                snapshot_hash,
+                prefer_cancelled,
+            )
+        }
+    };
 
     let mut results = results;
     // Only Succeeded may retain Measured summaries; cancel/stale/failed strip them.
@@ -1555,7 +1580,7 @@ fn finish_media_info_job(
     }
 
     // Bind plan-owned media evidence only on Succeeded terminal jobs.
-    // Cancel / timeout / nonzero / malformed / oversized / Failed never mutate the plan.
+    // Cancel / timeout / nonzero / malformed / oversized / Failed / JOB_GONE never mutate the plan.
     // Identity mismatch or drift also leave plan media evidence unchanged.
     let bound_snapshot_hash =
         if !plan_token.is_empty() && media_info_may_bind_plan_evidence(job.state) {
@@ -1720,6 +1745,7 @@ fn merge_media_results(
             state: fallback_state,
             summary: None,
             message: Some(message.to_string()),
+            identity: None,
         });
         return pre;
     }
@@ -1801,9 +1827,7 @@ pub async fn ai_start_recognition(
         return Err("请先在 AI 设置中完成连接和模型配置。".to_string());
     }
 
-    let secret = if connection.auth_mode == AuthMode::None {
-        None
-    } else {
+    let secret = {
         let reference = connection
             .credential_ref
             .clone()
@@ -2038,20 +2062,23 @@ fn finish_recognition_failure(
     message: impl Into<String>,
 ) -> RecognitionJobView {
     let message = message.into();
-    let job = complete_job_backend(job_id, false, error_code.clone(), message.clone())
-        .unwrap_or_else(|_| AiJob {
-            id: job_id.to_string(),
-            kind: JobKind::Recognition,
-            state: AiJobState::Failed,
+    let prefer_cancelled = recognition_cancel_flags()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .get(job_id)
+        .is_some_and(|flag| flag.load(Ordering::Relaxed));
+    let job = match complete_job_backend(job_id, false, error_code.clone(), message.clone()) {
+        Ok(job) => job,
+        // Missing/evicted: fail closed without a result (never invent Succeeded).
+        Err(_) => job_gone_terminal(
+            job_id,
+            JobKind::Recognition,
             request_generation,
-            snapshot_hash: snapshot_hash.to_string(),
-            provider_identity: None,
-            progress: 100,
-            error_code: error_code.clone(),
-            debug_record_id: None,
-            created_at_unix: now_unix(),
-        });
-    // If cancel/stale won the race, honor that terminal state without a result.
+            snapshot_hash,
+            prefer_cancelled,
+        ),
+    };
+    // If cancel/stale/eviction won the race, honor that terminal state without a result.
     store_recognition_view(RecognitionJobView {
         job_id: job_id.to_string(),
         state: job.state,
@@ -2066,6 +2093,7 @@ fn finish_recognition_failure(
 
 /// Store a validated result only when the job is still non-terminal; complete as
 /// Succeeded only then. Late cancel between validation and complete drops the result.
+/// Completion after terminal eviction fails closed (no fabricated Succeeded / result).
 fn finish_recognition_success(
     job_id: &str,
     request_generation: u64,
@@ -2089,18 +2117,22 @@ fn finish_recognition_success(
         result.resolution.is_some(),
         result.suggested_title.is_some()
     );
-    let job = complete_job_backend(job_id, true, None, summary).unwrap_or_else(|_| AiJob {
-        id: job_id.to_string(),
-        kind: JobKind::Recognition,
-        state: AiJobState::Succeeded,
-        request_generation,
-        snapshot_hash: snapshot_hash.to_string(),
-        provider_identity: None,
-        progress: 100,
-        error_code: None,
-        debug_record_id: None,
-        created_at_unix: now_unix(),
-    });
+    let job = match complete_job_backend(job_id, true, None, summary) {
+        Ok(job) => job,
+        // Evicted or unknown: fail closed. Never invent Succeeded after cancel+prune.
+        Err(_) => {
+            return store_recognition_view(RecognitionJobView {
+                job_id: job_id.to_string(),
+                state: AiJobState::Failed,
+                request_generation,
+                snapshot_hash: snapshot_hash.to_string(),
+                progress: 100,
+                error_code: Some("JOB_GONE".to_string()),
+                message: Some("recognition job no longer available; result discarded".to_string()),
+                result: None,
+            });
+        }
+    };
 
     if !recognition_may_return_result(job.state) {
         // Cancel/stale won the race after validation: never surface the result.
@@ -2139,19 +2171,17 @@ fn finish_recognition_cancelled(
 ) -> RecognitionJobView {
     let message = message.into();
     // Ensure Cancelled (idempotent if ai_cancel_job already ran).
+    // Missing/evicted job: synthesize Cancelled only (never Succeeded).
     let job = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
-        manager.cancel(job_id).unwrap_or_else(|_| AiJob {
-            id: job_id.to_string(),
-            kind: JobKind::Recognition,
-            state: AiJobState::Cancelled,
-            request_generation,
-            snapshot_hash: snapshot_hash.to_string(),
-            provider_identity: None,
-            progress: 100,
-            error_code: Some("CANCELLED".to_string()),
-            debug_record_id: None,
-            created_at_unix: now_unix(),
+        manager.cancel(job_id).unwrap_or_else(|_| {
+            job_gone_terminal(
+                job_id,
+                JobKind::Recognition,
+                request_generation,
+                snapshot_hash,
+                true,
+            )
         })
     };
     store_recognition_view(RecognitionJobView {
@@ -2435,23 +2465,6 @@ pub fn ai_project_context(request: AiProjectContextRequest) -> Result<ContextPro
 pub struct AiFormalAuditRequest {
     /// Opaque prepared-plan token. Backend snapshot identity + binding are authoritative.
     pub plan_token: String,
-    /// Deprecated: ignored. Prompt uses plan-token ContextProjection only.
-    #[serde(default)]
-    pub title: Option<String>,
-    /// Deprecated: ignored. Prompt uses plan-token ContextProjection only.
-    #[serde(default)]
-    pub torrent_name: Option<String>,
-    /// Deprecated: ignored. Prompt uses plan-token ContextProjection only.
-    #[serde(default)]
-    pub sites: Vec<String>,
-    /// Deprecated client fields: accepted for wire compatibility but ignored for binding.
-    #[serde(default)]
-    pub request_generation: Option<u64>,
-    #[serde(default)]
-    pub snapshot_hash: Option<String>,
-    /// Deprecated: ignored. Plan-token local_blockers are authoritative.
-    #[serde(default)]
-    pub local_blockers: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2485,7 +2498,6 @@ fn connection_is_configured(connection: &PublicConnectionConfig) -> bool {
         return false;
     }
     match connection.auth_mode {
-        AuthMode::None => true,
         AuthMode::CustomHeader => {
             connection
                 .custom_header_name
@@ -2809,9 +2821,7 @@ fn resolve_local_formal_audit(
     }
 
     // Resolve secret only after prerequisites pass; never return it to the client.
-    let secret = if connection.auth_mode == AuthMode::None {
-        None
-    } else {
+    let secret = {
         let reference = connection
             .credential_ref
             .clone()
@@ -3133,17 +3143,7 @@ pub async fn ai_start_formal_audit(
         return Ok(result);
     }
 
-    // Client title/torrent_name/sites/local_blockers are intentionally ignored: prompt
-    // context is projected from the plan token binding inside run_provider_formal_audit.
-    let _ = (
-        &request.title,
-        &request.torrent_name,
-        &request.sites,
-        &request.local_blockers,
-        &request.snapshot_hash,
-        &request.request_generation,
-    );
-
+    // Prompt context is projected from the plan token binding inside run_provider_formal_audit.
     let identity = capability_identity(&connection, secret.as_ref());
     let job_id = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -3260,16 +3260,6 @@ pub async fn ai_compute_audit(
     if let Some(result) = local_done {
         return Ok(result);
     }
-
-    // Client title/torrent_name/sites/local_blockers are intentionally ignored.
-    let _ = (
-        &request.title,
-        &request.torrent_name,
-        &request.sites,
-        &request.local_blockers,
-        &request.snapshot_hash,
-        &request.request_generation,
-    );
 
     let identity = capability_identity(&connection, secret.as_ref());
     let job_id = {
@@ -4177,14 +4167,13 @@ pub async fn ai_list_models(
         None if model_discovery_may_use_stored_secret(&connection, &saved) => {
             resolve_stored_secret(&saved)?
         }
-        None if connection.auth_mode == AuthMode::None => None,
         None => {
             return Err(
                 "enter a credential for this draft connection before refreshing models".to_string(),
             );
         }
     };
-    if connection.auth_mode != AuthMode::None && secret.is_none() {
+    if secret.is_none() {
         return Err("AI credential is missing from the secure store".to_string());
     }
 
@@ -4952,19 +4941,9 @@ mod formal_audit_lifecycle_tests {
             "request_generation": 99
         });
         let request: AiFormalAuditRequest =
-            serde_json::from_value(raw).expect("deserialize with deprecated fields");
+            serde_json::from_value(raw).expect("deserialize ignores unknown deprecated fields");
         assert_eq!(request.plan_token, "plan_only");
-        // Fields remain parseable for serde compatibility but must not be treated as authority
-        // by resolve_local_formal_audit / run_provider_formal_audit (covered by call sites).
-        assert_eq!(
-            request.title.as_deref(),
-            Some("client-title-must-not-drive-prompt")
-        );
-        assert_eq!(request.local_blockers, vec!["client-blocker".to_string()]);
-        assert_eq!(
-            request.snapshot_hash.as_deref(),
-            Some("sha256:client-forged")
-        );
+        // Deprecated client authority fields are no longer on the wire type.
     }
 }
 
@@ -5319,6 +5298,63 @@ mod recognition_command_tests {
         );
     }
 
+    /// Cancel → force terminal retention eviction → late finish_recognition_success
+    /// must not resurrect Succeeded or surface a result.
+    #[test]
+    fn recognition_cancel_eviction_late_success_fails_closed() {
+        let _guard = command_test_guard();
+        let job_id = start_job_backend(JobKind::Recognition, 9, "sha256:recog-evict", None);
+        let flag = Arc::new(AtomicBool::new(false));
+        recognition_cancel_flags()
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), Arc::clone(&flag));
+
+        let cancelled = ai_cancel_job(job_id.clone()).unwrap();
+        assert_eq!(cancelled.state, AiJobState::Cancelled);
+        assert!(flag.load(Ordering::Relaxed));
+
+        // Flood terminal retention so the cancelled job is pruned from the manager.
+        for index in 0..crate::ai::jobs::TERMINAL_JOB_MAX_RECORDS {
+            let filler = start_job_backend(
+                JobKind::Audit,
+                index as u64 + 100,
+                format!("sha256:filler-recog-{index}"),
+                None,
+            );
+            complete_job_backend(&filler, true, None, "fill").unwrap();
+        }
+        assert!(
+            ai_get_job(job_id.clone()).is_none(),
+            "cancelled recognition job must be evicted after terminal cap flood"
+        );
+
+        let late = finish_recognition_success(
+            &job_id,
+            9,
+            "sha256:recog-evict",
+            sample_recognition_result(&job_id),
+            &flag,
+        );
+        assert_ne!(
+            late.state,
+            AiJobState::Succeeded,
+            "late success after eviction must not invent Succeeded"
+        );
+        assert!(
+            matches!(
+                late.state,
+                AiJobState::Cancelled | AiJobState::Failed | AiJobState::Stale
+            ),
+            "expected fail-closed terminal state, got {:?}",
+            late.state
+        );
+        assert!(
+            late.result.is_none(),
+            "late success after eviction must not surface recognition result"
+        );
+    }
+
     #[test]
     fn failed_recognition_never_returns_result() {
         let _guard = command_test_guard();
@@ -5470,6 +5506,7 @@ mod media_info_job_tests {
                 scan_type: None,
             }),
             message: None,
+            identity: None,
         }];
         let sanitized = sanitize_media_results_for_non_success(results);
         assert_eq!(sanitized.len(), 1);
@@ -5509,6 +5546,7 @@ mod media_info_job_tests {
                         ..MediaInfoSummary::default()
                     }),
                     message: None,
+                    identity: None,
                 }],
             },
         );
@@ -5567,6 +5605,7 @@ mod media_info_job_tests {
                         ..MediaInfoSummary::default()
                     }),
                     message: None,
+                    identity: None,
                 }],
             },
         );
@@ -6308,6 +6347,7 @@ mod media_info_job_tests {
                 state: MediaProbeState::Measured,
                 summary: Some(MediaInfoSummary::default()),
                 message: None,
+                identity: None,
             }],
         );
         complete_job_backend(&job_id, true, None, "ok").unwrap();
@@ -6438,6 +6478,7 @@ mod media_info_plan_bind_tests {
                     scan_type: None,
                 }),
                 message: None,
+                identity: None,
             }],
         );
         assert_eq!(view.state, AiJobState::Succeeded);
@@ -6488,6 +6529,7 @@ mod media_info_plan_bind_tests {
                 state: MediaProbeState::TimedOut,
                 summary: None,
                 message: Some("timed out".into()),
+                identity: None,
             }],
         );
         assert_eq!(failed.state, AiJobState::Failed);
@@ -6519,6 +6561,7 @@ mod media_info_plan_bind_tests {
                     ..crate::ai::media::MediaInfoSummary::default()
                 }),
                 message: None,
+                identity: None,
             }]),
         );
         assert!(
@@ -6546,6 +6589,88 @@ mod media_info_plan_bind_tests {
         let _ = std::fs::remove_file(&torrent_path);
     }
 
+    /// Cancel → force terminal retention eviction → late finish_media_info_job(success)
+    /// must not invent Succeeded or bind plan media evidence.
+    #[test]
+    fn media_info_cancel_eviction_late_success_fails_closed() {
+        let _guard = command_test_guard();
+        reset_media_job_globals();
+        let (token, snapshot_hash, torrent_path) = prepare_bound_plan(17);
+        let job_id = start_job_backend(JobKind::MediaInfo, 17, &snapshot_hash, None);
+        let flag = Arc::new(AtomicBool::new(false));
+        media_cancel_flags()
+            .lock()
+            .unwrap()
+            .insert(job_id.clone(), Arc::clone(&flag));
+
+        let cancelled = ai_cancel_job(job_id.clone()).unwrap();
+        assert_eq!(cancelled.state, AiJobState::Cancelled);
+        assert!(flag.load(Ordering::Relaxed));
+
+        for index in 0..crate::ai::jobs::TERMINAL_JOB_MAX_RECORDS {
+            let filler = start_job_backend(
+                JobKind::Audit,
+                index as u64 + 200,
+                format!("sha256:filler-media-{index}"),
+                None,
+            );
+            complete_job_backend(&filler, true, None, "fill").unwrap();
+        }
+        assert!(
+            ai_get_job(job_id.clone()).is_none(),
+            "cancelled MediaInfo job must be evicted after terminal cap flood"
+        );
+
+        let late = finish_media_info_job(
+            &job_id,
+            &token,
+            17,
+            &snapshot_hash,
+            true,
+            None,
+            "late success after eviction",
+            vec![MediaProbeResult {
+                relative_name: "show/ep01.mkv".into(),
+                state: MediaProbeState::Measured,
+                summary: Some(crate::ai::media::MediaInfoSummary {
+                    duration_ms: Some(9_000),
+                    width: Some(1920),
+                    height: Some(1080),
+                    video_codec: Some("AV1".into()),
+                    video_bit_depth: Some(10),
+                    audio_codecs: vec!["AAC".into()],
+                    subtitle_languages: vec![],
+                    subtitle_tracks: vec![],
+                    scan_type: None,
+                }),
+                message: None,
+                identity: None,
+            }],
+        );
+        assert_ne!(
+            late.state,
+            AiJobState::Succeeded,
+            "late success after eviction must not invent Succeeded"
+        );
+        assert!(
+            late.results
+                .iter()
+                .all(|item| item.state != MediaProbeState::Measured && item.summary.is_none()),
+            "measured success must be stripped: {:?}",
+            late.results
+        );
+        assert!(
+            get_or_create_registry()
+                .lock()
+                .unwrap()
+                .inspect_plan(&token)
+                .and_then(|plan| plan.media_evidence.clone())
+                .is_none(),
+            "evicted late success must not bind plan media evidence"
+        );
+        let _ = std::fs::remove_file(&torrent_path);
+    }
+
     #[test]
     fn token_mismatch_and_identity_drift_reject_bind_without_mutating() {
         let _guard = command_test_guard();
@@ -6567,6 +6692,7 @@ mod media_info_plan_bind_tests {
                     ..crate::ai::media::MediaInfoSummary::default()
                 }),
                 message: None,
+                identity: None,
             }],
         )
         .expect_err("unknown token");
@@ -6589,6 +6715,7 @@ mod media_info_plan_bind_tests {
                     ..crate::ai::media::MediaInfoSummary::default()
                 }),
                 message: None,
+                identity: None,
             }],
         )
         .expect_err("forged snapshot");
@@ -6612,6 +6739,7 @@ mod media_info_plan_bind_tests {
                     ..crate::ai::media::MediaInfoSummary::default()
                 }),
                 message: None,
+                identity: None,
             }],
         )
         .expect_err("drift");

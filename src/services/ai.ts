@@ -42,7 +42,7 @@ export function isAiConfigured(settings: AiSettings | null | undefined): boolean
     return Boolean(settings?.enabled)
         && Boolean(settings?.endpoint?.trim())
         && Boolean(settings?.model?.trim())
-        && (settings?.auth_mode === 'none' || Boolean(settings?.credential_ref?.id));
+        && Boolean(settings?.credential_ref?.id);
 }
 
 export async function getAiSettings(): Promise<AiSettings> {

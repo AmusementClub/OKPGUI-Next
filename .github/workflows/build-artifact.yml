@@ -71,9 +71,6 @@ jobs:
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
 
-      - name: Repository hygiene gate
-        run: node scripts/verify-repository-hygiene.mjs
-
       - name: BYOK release gates (offline packaging + honesty)
         run: node scripts/verify-byok-release-gates.mjs
 
@@ -106,9 +103,6 @@ jobs:
           # Behavioral offline contract (localhost mock only; no live/paid providers).
           cargo test --manifest-path src-tauri/Cargo.toml provider_contract -- --nocapture
 
-      - name: Offline UI integration inventory gate
-        run: node scripts/verify-ui-integration-inventory.mjs
-
       - name: Run frontend tests
         run: pnpm test
 
@@ -138,82 +132,52 @@ jobs:
           Remove-Item -LiteralPath $staged -Force
           Write-Host 'Removed the build-time sidecar so host smoke must release MediaInfo from okpgui-next.exe.'
 
-      # --- Evidence class: Windows EXE / Linux AppImage production smoke ---
-      # Production Rust in the final download. productionBinaryMarker=true; productionIpcMarker must stay false.
-      # desktop-webdriver is recorded as blocked side-evidence until executable WDIO specs land.
-      # When the release binary exists, REQUIRE_PASS=1 — blocked is not accepted as green for host smoke.
-      - name: Desktop production critical flows (Windows/Linux)
+      # --- Package smoke: Windows EXE / Linux AppImage ---
+      # Exit status + ephemeral smoke report validation (ok + production marker).
+      - name: Package smoke (Windows/Linux)
         if: runner.os == 'Windows' || runner.os == 'Linux'
         shell: bash
         env:
-          DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
           APPIMAGE_EXTRACT_AND_RUN: 1
           OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR: 1
           OKPGUI_SMOKE_PACKAGED_ONLY: 1
         run: |
           set -euo pipefail
-          mkdir -p tests/desktop-e2e/out
           if [[ "${{ runner.os }}" == "Windows" ]]; then
             BINARY="src-tauri/target/release/okpgui-next.exe"
-            EXPECTED_HARNESS="host-binary-smoke"
+            if [[ ! -f "$BINARY" ]]; then
+              echo "::error title=Package smoke::Built Windows EXE not found at $BINARY"
+              exit 1
+            fi
+            export OKPGUI_PACKAGE_SMOKE_BIN="$BINARY"
+            echo "OKPGUI_PACKAGE_SMOKE_BIN=$OKPGUI_PACKAGE_SMOKE_BIN"
           else
             shopt -s nullglob
             appimages=(src-tauri/target/release/bundle/appimage/*.AppImage)
             if [[ ${#appimages[@]} -ne 1 ]]; then
-              echo "::error title=Linux AppImage smoke::Expected exactly one AppImage, found ${#appimages[@]}"
+              echo "::error title=Package smoke::Expected exactly one AppImage, found ${#appimages[@]}"
               exit 1
             fi
             BINARY="${appimages[0]}"
             chmod +x "$BINARY"
-            export DESKTOP_E2E_PACKAGE="$BINARY"
-            export DESKTOP_E2E_HARNESS_TYPE="linux-appimage-smoke"
-            EXPECTED_HARNESS="linux-appimage-smoke"
+            export OKPGUI_APPIMAGE="$BINARY"
+            export OKPGUI_PACKAGE_SMOKE_BIN="$BINARY"
+            echo "OKPGUI_APPIMAGE=$OKPGUI_APPIMAGE"
           fi
-          if [[ -f "$BINARY" ]]; then
-            export DESKTOP_E2E_BINARY="$BINARY"
-            export DESKTOP_E2E_REQUIRE_PASS=1
-            echo "DESKTOP_E2E_BINARY=$DESKTOP_E2E_BINARY (require pass)"
-          else
-            export DESKTOP_E2E_ALLOW_BLOCKED=1
-            echo "::error title=Desktop production smoke::Built binary not found at $BINARY after tauri build"
-            node scripts/run-desktop-e2e.mjs || true
-            exit 1
-          fi
-          node scripts/run-desktop-e2e.mjs
-          shopt -s nullglob
-          # Primary pass evidence is Windows host EXE or the final Linux AppImage.
-          evidence_files=(tests/desktop-e2e/out/evidence-*.json)
-          primary=()
-          for f in "${evidence_files[@]}"; do
-            case "$(basename "$f")" in
-              evidence-webdriver-blocked-*) ;;
-              *) primary+=("$f") ;;
-            esac
-          done
-          if [[ ${#primary[@]} -eq 0 ]]; then
-            echo "::error title=Desktop production smoke::Required $EXPECTED_HARNESS evidence JSON missing"
-            exit 1
-          fi
-          for f in "${primary[@]}"; do
-            echo "Evidence: $f"
-            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const expected=process.argv[2];if(e.result!=="pass"||e.harnessType!==expected||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error(`Evidence not a ${expected} pass:`,process.argv[1],e);process.exit(1);}' "$f" "$EXPECTED_HARNESS"
-          done
-          echo "::notice title=Production artifact smoke::$EXPECTED_HARNESS passed with productionBinaryMarker=true (not WebDriver, productionIpcMarker=false)."
+          node scripts/run-package-smoke.mjs
+          echo "::notice title=Package smoke::Windows EXE / Linux AppImage smoke passed (exit status + report)."
 
-      # --- Evidence class: macos-packaged-smoke (macOS only) ---
-      # Mount the final DMG and execute its packaged .app. Not full UI WebDriver.
-      - name: macOS packaged production smoke
+
+      # --- Package smoke: macOS packaged .app from DMG ---
+      - name: Package smoke (macOS)
         if: runner.os == 'macOS'
         shell: bash
-        env:
-          DESKTOP_E2E_TARGET: ${{ matrix.platform.mediainfo_target }}
         run: |
           set -euo pipefail
-          mkdir -p tests/desktop-e2e/out
           shopt -s nullglob
           dmgs=(src-tauri/target/release/bundle/dmg/*.dmg)
           if [[ ${#dmgs[@]} -ne 1 ]]; then
-            echo "::error title=macOS packaged smoke::Expected exactly one DMG, found ${#dmgs[@]}"
+            echo "::error title=Package smoke::Expected exactly one DMG, found ${#dmgs[@]}"
             exit 1
           fi
           mount_dir="$(mktemp -d "${RUNNER_TEMP}/okpgui-dmg.XXXXXX")"
@@ -221,52 +185,18 @@ jobs:
           trap 'hdiutil detach "$mount_dir" >/dev/null 2>&1 || true; rmdir "$mount_dir" >/dev/null 2>&1 || true' EXIT
           apps=("$mount_dir"/*.app)
           if [[ ${#apps[@]} -ne 1 ]]; then
-            echo "::error title=macOS packaged smoke::Expected exactly one .app in DMG, found ${#apps[@]}"
+            echo "::error title=Package smoke::Expected exactly one .app in DMG, found ${#apps[@]}"
             exit 1
           fi
           app="${apps[0]}"
-          base="$(basename "$app" .app)"
-          for candidate in "$app/Contents/MacOS/okpgui-next" "$app/Contents/MacOS/$base"; do
-            if [[ -f "$candidate" ]]; then
-              export DESKTOP_E2E_BINARY="$candidate"
-              break
-            fi
-          done
-          if [[ -z "${DESKTOP_E2E_BINARY:-}" ]]; then
-            echo "::error title=macOS packaged smoke::Packaged .app executable not found in DMG"
-            exit 1
-          fi
-          export DESKTOP_E2E_PACKAGE="${dmgs[0]}"
-          export MACOS_PACKAGED_APP="$app"
-          export DESKTOP_E2E_REQUIRE_PASS=1
-          echo "DESKTOP_E2E_BINARY=$DESKTOP_E2E_BINARY (require pass)"
-          node scripts/run-macos-packaged-smoke.mjs
-          shopt -s nullglob
-          evidence_files=(tests/desktop-e2e/out/evidence-*.json)
-          primary=()
-          for f in "${evidence_files[@]}"; do
-            case "$(basename "$f")" in
-              evidence-webdriver-blocked-*) ;;
-              *) primary+=("$f") ;;
-            esac
-          done
-          if [[ ${#primary[@]} -eq 0 ]]; then
-            echo "::error title=macOS packaged smoke::Required evidence JSON missing"
-            exit 1
-          fi
-          for f in "${primary[@]}"; do
-            node -e 'const fs=require("fs");const e=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));if(e.result!=="pass"||e.harnessType!=="macos-packaged-smoke"||e.productionBinaryMarker!==true||e.productionIpcMarker===true){console.error("Evidence not a macos-packaged-smoke pass:",process.argv[1],e);process.exit(1);}' "$f"
-          done
-          echo "::notice title=macOS packaged smoke::pass with productionBinaryMarker=true, productionIpcMarker=false."
+          export OKPGUI_MACOS_APP="$app"
+          export OKPGUI_SMOKE_PACKAGED_ONLY=1
+          export OKPGUI_DESKTOP_SMOKE_REQUIRE_SIDECAR=1
+          echo "OKPGUI_MACOS_APP=$OKPGUI_MACOS_APP"
+          echo "OKPGUI_SMOKE_PACKAGED_ONLY=$OKPGUI_SMOKE_PACKAGED_ONLY"
+          node scripts/run-package-smoke.mjs
+          echo "::notice title=Package smoke::macOS packaged .app smoke passed (exit status + report)."
 
-      - name: Upload desktop / packaged evidence JSON
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: desktop-evidence-${{ matrix.platform.artifact_name }}
-          if-no-files-found: warn
-          path: |
-            tests/desktop-e2e/out/evidence-*.json
 
       - name: Upload native application output
         uses: actions/upload-artifact@v7

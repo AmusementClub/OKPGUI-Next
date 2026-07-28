@@ -129,10 +129,15 @@ export function useAiPreflight() {
     decisionRef.current = state.decision;
     const lifecycleRef = useRef<AiPreflightLifecycle>(initialState.lifecycle);
     lifecycleRef.current = state.lifecycle;
+    /** Latest acknowledgements for pure IPC scheduling outside setState updaters. */
+    const acknowledgementsRef = useRef<AiAcknowledgements>(initialState.acknowledgements);
+    acknowledgementsRef.current = state.acknowledgements;
     /** When true, late poll/completion must not replace UI or re-bind a consumed plan. */
     const suppressAuditUpdatesRef = useRef(false);
     const disposedRef = useRef(false);
     const ackWriteRef = useRef(0);
+    /** Per-token FIFO of acknowledgement write promises; only the newest success may bind. */
+    const ackQueueByTokenRef = useRef<Map<string, Promise<void>>>(new Map());
     const pollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     /** Last draft used by prepare; retry reuses it after reconciliation. */
     const lastPrepareRequestRef = useRef<{
@@ -915,48 +920,63 @@ export function useAiPreflight() {
     }, [stopPolling]);
 
     const setAcknowledgement = useCallback((key: keyof AiAcknowledgements, checked: boolean) => {
-        setState((current) => {
-            if (
-                current.lifecycle === 'reconciling'
-                || current.lifecycle === 'unavailable'
-                || current.lifecycle === 'cancelled'
-            ) {
-                return current;
-            }
-            const acknowledgements = { ...current.acknowledgements, [key]: checked };
-            const token = current.token;
-            // Persist acks on the backend plan so publish never trusts caller-only checkboxes.
-            if (token) {
-                const writeId = ++ackWriteRef.current;
-                void setPlanAcknowledgements(token, acknowledgements)
-                    .then(() => {
-                        if (ackWriteRef.current !== writeId || disposedRef.current) {
-                            return;
-                        }
-                        setState((latest) => (
-                            latest.token === token
-                                ? { ...latest, acknowledgementsBound: true }
-                                : latest
-                        ));
-                    })
-                    .catch(() => {
-                        if (ackWriteRef.current !== writeId || disposedRef.current) {
-                            return;
-                        }
-                        setState((latest) => (
-                            latest.token === token
-                                ? { ...latest, acknowledgementsBound: false }
-                                : latest
-                        ));
-                    });
-            }
-            return {
-                ...current,
-                acknowledgements,
-                // Non-GO decisions require a successful backend bind before confirm.
-                acknowledgementsBound: token ? false : true,
-            };
-        });
+        // Use refs for lifecycle/token/acks so IPC scheduling does not depend on setState
+        // updater timing (updaters must stay pure and may run deferred concurrently).
+        if (
+            lifecycleRef.current === 'reconciling'
+            || lifecycleRef.current === 'unavailable'
+            || lifecycleRef.current === 'cancelled'
+        ) {
+            return;
+        }
+        const token = tokenRef.current;
+        const acknowledgements = { ...acknowledgementsRef.current, [key]: checked };
+        acknowledgementsRef.current = acknowledgements;
+        setState((current) => ({
+            ...current,
+            acknowledgements,
+            // Non-GO decisions require a successful backend bind before confirm.
+            acknowledgementsBound: token ? false : true,
+        }));
+        if (!token) {
+            return;
+        }
+
+        // Persist acks on the backend plan so publish never trusts caller-only checkboxes.
+        // Serialize writes per token so rapid toggles cannot race; only the newest
+        // successful snapshot for the current token may set acknowledgementsBound=true.
+        const writeId = ++ackWriteRef.current;
+        const previous = ackQueueByTokenRef.current.get(token) ?? Promise.resolve();
+        const next = previous
+            .catch(() => undefined)
+            .then(async () => {
+                try {
+                    await setPlanAcknowledgements(token, acknowledgements);
+                    if (ackWriteRef.current !== writeId || disposedRef.current) {
+                        return;
+                    }
+                    setState((latest) => (
+                        latest.token === token
+                            ? { ...latest, acknowledgementsBound: true }
+                            : latest
+                    ));
+                } catch {
+                    if (ackWriteRef.current !== writeId || disposedRef.current) {
+                        return;
+                    }
+                    setState((latest) => (
+                        latest.token === token
+                            ? { ...latest, acknowledgementsBound: false }
+                            : latest
+                    ));
+                }
+            })
+            .finally(() => {
+                if (ackQueueByTokenRef.current.get(token) === next) {
+                    ackQueueByTokenRef.current.delete(token);
+                }
+            });
+        ackQueueByTokenRef.current.set(token, next);
     }, []);
 
     const decision = state.decision;

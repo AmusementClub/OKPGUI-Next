@@ -56,18 +56,15 @@ import {
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
 import {
-    cancelAiJob,
     isAiConfigured,
-    pollPlanMediaInfo,
     publishPreparedPlan,
     readFriendlyError,
-    startDefaultMediaInfo,
 } from '../services/ai';
 import {
     buildRecognitionLocalContextKey,
-    type MediaInfoJobView,
     type PublishRequestPayload,
 } from '../types/ai';
+import { useAutomaticMediaInfo } from '../hooks/useAutomaticMediaInfo';
 import {
     resolvePublishTitleMetadata,
     type ParsedTitleDetails,
@@ -137,12 +134,6 @@ export default function QuickPublishPage() {
     const [isPreparingPublish, setIsPreparingPublish] = useState(false);
     const [statusMessage, setStatusMessage] = useState('');
     const [errorMessage, setErrorMessage] = useState('');
-    const [autoMediaInfo, setAutoMediaInfo] = useState<{
-        status: 'idle' | 'checking' | 'done' | 'failed';
-        results: MediaInfoJobView['results'];
-        message: string;
-    }>({ status: 'idle', results: [], message: '' });
-    const autoMediaInfoGenerationRef = useRef(0);
     const [confirmDraft, setConfirmDraft] = useState<QuickPublishRuntimeDraft | null>(null);
     const frozenPlanRef = useRef<FrozenPublishPlan | null>(null);
     /** Bumps on covered draft mutations so in-flight resolve/prepare cannot freeze stale data. */
@@ -331,55 +322,7 @@ export default function QuickPublishPage() {
         [quickPublishTemplates, torrentInfo?.name],
     );
 
-    useEffect(() => {
-        const torrentPath = draft.torrent_path.trim();
-        if (!torrentPath || !defaultMediaSearchFolder.trim()) {
-            setAutoMediaInfo({ status: 'idle', results: [], message: '' });
-            return;
-        }
-
-        const generation = ++autoMediaInfoGenerationRef.current;
-        let disposed = false;
-        let jobId = '';
-        setAutoMediaInfo({ status: 'checking', results: [], message: '正在自动检查媒体信息...' });
-
-        const run = async () => {
-            try {
-                let terminal = await startDefaultMediaInfo(torrentPath);
-                jobId = terminal.job_id;
-                while (!terminal.state || !['succeeded', 'failed', 'cancelled', 'stale'].includes(terminal.state)) {
-                    await new Promise((resolve) => window.setTimeout(resolve, 250));
-                    if (disposed || generation !== autoMediaInfoGenerationRef.current) return;
-                    const polled = await pollPlanMediaInfo(jobId);
-                    if (polled) terminal = polled;
-                }
-                if (disposed || generation !== autoMediaInfoGenerationRef.current) return;
-                const measured = terminal.results.filter((result) => result.state === 'measured').length;
-                const unresolved = terminal.results.length - measured;
-                setAutoMediaInfo({
-                    status: terminal.state === 'succeeded' ? 'done' : 'failed',
-                    results: terminal.results,
-                    message: terminal.state === 'succeeded'
-                        ? `MediaInfo 已检查 ${terminal.results.length} 个文件：${measured} 个已识别，${unresolved} 个未识别。`
-                        : 'MediaInfo 自动检查未完成。',
-                });
-            } catch (error) {
-                if (!disposed && generation === autoMediaInfoGenerationRef.current) {
-                    setAutoMediaInfo({
-                        status: 'failed',
-                        results: [],
-                        message: readFriendlyError(error, 'MediaInfo 自动检查失败。'),
-                    });
-                }
-            }
-        };
-        void run();
-
-        return () => {
-            disposed = true;
-            if (jobId) void cancelAiJob(jobId);
-        };
-    }, [defaultMediaSearchFolder, draft.torrent_path]);
+    const autoMediaInfo = useAutomaticMediaInfo(draft.torrent_path, defaultMediaSearchFolder);
 
     const publishSitesList = useMemo(
         () => Object.values(publishSites).sort((left, right) => left.siteLabel.localeCompare(right.siteLabel, 'zh-CN')),
@@ -1024,9 +967,19 @@ export default function QuickPublishPage() {
                         className="flex items-center gap-2 border-y border-cyan-500/20 bg-cyan-500/5 px-4 py-3 text-sm text-slate-300"
                     >
                         {autoMediaInfo.status === 'checking' ? <Loader2 size={15} className="animate-spin text-cyan-300" /> : null}
-                        <span className={autoMediaInfo.status === 'failed' ? 'text-amber-300' : 'text-cyan-200'}>
+                        <span className={`min-w-0 flex-1 ${autoMediaInfo.status === 'failed' ? 'text-amber-300' : 'text-cyan-200'}`}>
                             {autoMediaInfo.message}
                         </span>
+                        {autoMediaInfo.status === 'failed' ? (
+                            <button
+                                type="button"
+                                data-testid="automatic-media-info-retry"
+                                onClick={() => autoMediaInfo.retry()}
+                                className="shrink-0 rounded-lg border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs text-amber-100 transition-colors hover:bg-amber-500/20"
+                            >
+                                重试
+                            </button>
+                        ) : null}
                     </div>
                 ) : null}
 
@@ -1102,7 +1055,7 @@ export default function QuickPublishPage() {
                             <div className="min-w-0 flex-1">
                                 <div className="text-xs text-slate-500">实际媒体文件夹</div>
                                 <div className="mt-1 break-all text-sm text-slate-200">
-                                    {draft.content_root || '未选择，MediaInfo 将仅尝试种子附近的安全目录。'}
+                                    {draft.content_root || '未选择。计划内 MediaInfo 需要先选择媒体文件夹；设置里的默认媒体目录仍可触发自动检查。'}
                                 </div>
                             </div>
                             <button

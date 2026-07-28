@@ -299,22 +299,20 @@ export default function AiSettingsPage() {
                         )}
                     </div>
 
-                    {settings.auth_mode !== 'none' ? (
-                        <label className="block text-xs text-slate-500">
-                            <span className="flex items-center gap-1">
-                                <KeyRound size={13} />
-                                替换密钥
-                            </span>
-                            <input
-                                type="password"
-                                value={secret}
-                                onChange={(event) => setSecret(event.target.value)}
-                                autoComplete="new-password"
-                                placeholder={settings.credential_ref ? '已配置，留空保持不变' : '输入后保存'}
-                                className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
-                            />
-                        </label>
-                    ) : null}
+                    <label className="block text-xs text-slate-500">
+                        <span className="flex items-center gap-1">
+                            <KeyRound size={13} />
+                            替换密钥
+                        </span>
+                        <input
+                            type="password"
+                            value={secret}
+                            onChange={(event) => setSecret(event.target.value)}
+                            autoComplete="new-password"
+                            placeholder={settings.credential_ref ? '已配置，留空保持不变' : '输入后保存'}
+                            className="mt-1 w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-sm text-slate-200"
+                        />
+                    </label>
 
                     <div className="flex flex-wrap items-center gap-3 border-t border-slate-700 pt-4">
                         <button

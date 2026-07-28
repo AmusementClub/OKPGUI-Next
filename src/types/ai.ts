@@ -2,7 +2,7 @@ import type { LegacyPublishTemplatePayload } from '../utils/quickPublish';
 
 export type AiProvider = 'open_ai' | 'anthropic';
 export type AiMode = 'auto' | 'responses' | 'chat' | 'anthropic_messages';
-export type AiAuthMode = 'bearer' | 'anthropic_api_key' | 'custom_header' | 'none';
+export type AiAuthMode = 'bearer' | 'anthropic_api_key' | 'custom_header';
 export type AiDecision = 'GO' | 'WARNING' | 'NO_GO' | 'PENDING' | 'LOCAL_BLOCKED';
 export type FindingSeverity = 'WARNING' | 'CRITICAL';
 export type AiCapabilityState = 'unknown' | 'probing' | 'ready' | 'unsupported' | 'failed';
@@ -84,23 +84,10 @@ export interface AiAuditInput {
 /**
  * Request for the Rust-owned formal audit command (bound to a prepared plan token).
  * Send `plan_token` only — provider prompt is projected from the plan binding server-side.
- * Deprecated optional fields remain for transitional wire compatibility and are ignored.
  */
 export interface AiFormalAuditRequest {
     /** Opaque prepared-plan token; backend snapshot identity + binding are authoritative. */
     plan_token: string;
-    /** @deprecated Ignored; prompt uses plan-token ContextProjection only. */
-    title?: string | null;
-    /** @deprecated Ignored; prompt uses plan-token ContextProjection only. */
-    torrent_name?: string | null;
-    /** @deprecated Ignored; prompt uses plan-token ContextProjection only. */
-    sites?: string[];
-    /** @deprecated Ignored by backend; retained only for transitional callers. */
-    request_generation?: number;
-    /** @deprecated Ignored by backend; retained only for transitional callers. */
-    snapshot_hash?: string;
-    /** @deprecated Ignored by backend; plan blockers are authoritative. */
-    local_blockers?: string[];
 }
 
 export interface AiProviderUsage {
@@ -198,7 +185,8 @@ export type MediaProbeState =
     | 'cancelled'
     | 'missing_file'
     | 'ambiguous_match'
-    | 'size_mismatch';
+    | 'size_mismatch'
+    | 'changed_during_probe';
 
 export interface SubtitleTrackSummary {
     language?: string | null;

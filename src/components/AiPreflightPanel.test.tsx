@@ -13,7 +13,7 @@ function baseState(overrides: Partial<AiPreflightState> = {}): AiPreflightState 
             endpoint: 'https://api.example.test/v1',
             model: 'm',
             mode: 'auto',
-            auth_mode: 'none',
+            auth_mode: 'bearer',
             enabled: true,
         },
         audit: null,

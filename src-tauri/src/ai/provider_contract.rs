@@ -893,15 +893,15 @@ mod tests {
         let request = build_models_list_request(
             ProviderKind::OpenAi,
             &format!("http://{addr}"),
-            AuthMode::None,
+            AuthMode::Bearer,
         )
         .unwrap();
         let error = send_managed_provider_request(
             &client,
             &request,
-            AuthMode::None,
+            AuthMode::Bearer,
             None,
-            None,
+            Some("test-token"),
             ProviderKind::OpenAi,
         )
         .await

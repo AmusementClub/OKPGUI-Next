@@ -204,10 +204,15 @@ pub struct DebugExportMetadata {
     pub exported_at_unix: u64,
 }
 
+/// Max terminal jobs retained for poll/status after completion (matches debug retention).
+pub const TERMINAL_JOB_MAX_RECORDS: usize = DEBUG_RECORD_MAX_RECORDS;
+
 #[derive(Debug, Clone)]
 pub struct AiJobManager {
     jobs: HashMap<String, AiJob>,
     queue: VecDeque<String>,
+    /// FIFO of terminal job ids for bounded poll retention. Never holds queued/running ids.
+    terminal_retention: VecDeque<String>,
     debug_records: Vec<DebugRecord>,
     /// Full path to `records.json` when durable store is configured; `None` = memory only.
     debug_store_path: Option<PathBuf>,
@@ -227,11 +232,31 @@ impl AiJobManager {
         Self {
             jobs: HashMap::new(),
             queue: VecDeque::new(),
+            terminal_retention: VecDeque::new(),
             debug_records: Vec::new(),
             debug_store_path: None,
             running: 0,
             max_running: max_running.max(1),
             next_id: 1,
+        }
+    }
+
+    /// Record a job as terminal once and prune oldest terminal entries past the cap.
+    /// Never evicts queued or running jobs.
+    fn record_terminal_and_prune(&mut self, id: &str) {
+        if self.terminal_retention.iter().any(|queued| queued == id) {
+            return;
+        }
+        self.terminal_retention.push_back(id.to_string());
+        while self.terminal_retention.len() > TERMINAL_JOB_MAX_RECORDS {
+            let Some(oldest) = self.terminal_retention.pop_front() else {
+                break;
+            };
+            if let Some(job) = self.jobs.get(&oldest) {
+                if job.state.is_terminal() {
+                    self.jobs.remove(&oldest);
+                }
+            }
         }
     }
 
@@ -363,6 +388,7 @@ impl AiJobManager {
             self.queue.retain(|queued| queued != id);
         }
         self.finish_debug(id, AiJobState::Cancelled, "job cancelled", None);
+        self.record_terminal_and_prune(id);
         self.jobs
             .get(id)
             .cloned()
@@ -402,6 +428,7 @@ impl AiJobManager {
         }
         self.finish_debug(id, state, summary.into(), usage);
         self.promote_next();
+        self.record_terminal_and_prune(id);
         self.jobs
             .get(id)
             .cloned()
@@ -428,6 +455,7 @@ impl AiJobManager {
         }
         self.finish_debug(id, AiJobState::Stale, reason.into(), None);
         self.promote_next();
+        self.record_terminal_and_prune(id);
         self.jobs
             .get(id)
             .cloned()
@@ -1420,5 +1448,49 @@ mod tests {
         assert_eq!(reloaded[0].job_id, listed[0].job_id);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn terminal_job_fifo_retention_evicts_oldest_only() {
+        let mut manager = AiJobManager::new(4);
+        let mut ids = Vec::new();
+        for index in 0..(TERMINAL_JOB_MAX_RECORDS + 5) {
+            let id = manager.start(JobKind::Audit, index as u64, format!("snap-{index}"), None);
+            manager
+                .complete(&id, true, None, format!("done-{index}"), None)
+                .unwrap();
+            ids.push(id);
+        }
+        // Oldest terminal jobs are gone; newest remain pollable.
+        assert!(manager.get(&ids[0]).is_none());
+        assert!(manager.get(&ids[4]).is_none());
+        assert!(manager.get(ids.last().unwrap()).is_some());
+        assert_eq!(
+            manager
+                .list()
+                .into_iter()
+                .filter(|job| job.state.is_terminal())
+                .count(),
+            TERMINAL_JOB_MAX_RECORDS
+        );
+    }
+
+    #[test]
+    fn terminal_retention_never_evicts_active_jobs() {
+        let mut manager = AiJobManager::new(2);
+        let active = manager.start(JobKind::MediaInfo, 1, "sha256:active", None);
+        for index in 0..(TERMINAL_JOB_MAX_RECORDS + 3) {
+            let id = manager.start(
+                JobKind::Audit,
+                index as u64 + 10,
+                format!("t-{index}"),
+                None,
+            );
+            manager
+                .complete(&id, false, Some("X".into()), "fail", None)
+                .unwrap();
+        }
+        let active_job = manager.get(&active).expect("active job must remain");
+        assert!(!active_job.state.is_terminal());
     }
 }

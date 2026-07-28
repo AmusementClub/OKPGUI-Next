@@ -551,7 +551,6 @@ pub async fn send_managed_provider_request(
             let token = secret.ok_or_else(|| "provider credential is required".to_string())?;
             builder = builder.header(header.as_str(), token);
         }
-        AuthMode::None => {}
     }
 
     let mut response = builder.send().await.map_err(|error| {
@@ -964,7 +963,7 @@ fn managed_auth_header(auth_mode: AuthMode) -> Option<String> {
     match auth_mode {
         AuthMode::Bearer => Some("authorization".to_string()),
         AuthMode::AnthropicApiKey => Some("x-api-key".to_string()),
-        AuthMode::CustomHeader | AuthMode::None => None,
+        AuthMode::CustomHeader => None,
     }
 }
 

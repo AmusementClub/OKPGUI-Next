@@ -1,22 +1,23 @@
 use crate::domain::publish_plan::{
-    PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary, PlanSubtitleTrack,
+    MediaFileIdentity, PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary,
+    PlanSubtitleTrack,
 };
 use crate::torrent::project_safe_torrent_context;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-#[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
-use std::io::Read;
+use std::fs::File;
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 use std::io::Write;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 #[cfg(any(test, all(target_os = "windows", target_arch = "x86_64")))]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 const VIDEO_EXTENSIONS: &[&str] = &["mkv", "mp4", "avi", "mov", "webm", "m4v", "ts", "m2ts"];
 const MAX_DISCOVERY_DEPTH: usize = 4;
@@ -25,6 +26,8 @@ const MAX_DISCOVERY_FILES: usize = 10_000;
 /// limit so a chatty child cannot fill the OS pipe and deadlock the waiter.
 const MAX_PIPE_BYTES: usize = 256 * 1024;
 const MESSAGE_CHAR_LIMIT: usize = 240;
+/// Bytes sampled from each end of a media file for private identity digests.
+pub const MEDIA_IDENTITY_SAMPLE_BYTES: usize = 64 * 1024;
 
 /// Default per-file MediaInfo probe timeout (V2 safety constant).
 pub const DEFAULT_MEDIA_PROBE_TIMEOUT_MS: u64 = 30_000;
@@ -110,6 +113,8 @@ pub enum MediaProbeState {
     AmbiguousMatch,
     /// On-disk size differs from the torrent-declared expected size.
     SizeMismatch,
+    /// File bytes/mtime/size changed while MediaInfo was running; never bindable.
+    ChangedDuringProbe,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +123,26 @@ pub struct MediaProbeResult {
     pub state: MediaProbeState,
     pub summary: Option<MediaInfoSummary>,
     pub message: Option<String>,
+    /// Private; omitted from IPC / frontend JSON.
+    #[serde(skip)]
+    pub(crate) identity: Option<MediaFileIdentity>,
+}
+
+impl MediaProbeResult {
+    fn with_state(
+        relative_name: impl Into<String>,
+        state: MediaProbeState,
+        summary: Option<MediaInfoSummary>,
+        message: Option<String>,
+    ) -> Self {
+        Self {
+            relative_name: relative_name.into(),
+            state,
+            summary,
+            message,
+            identity: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -154,6 +179,11 @@ pub fn build_plan_media_evidence(
     } else {
         PlanMediaStatus::Tested
     };
+    let file_identities = results
+        .iter()
+        .filter(|item| item.state == MediaProbeState::Measured)
+        .filter_map(|item| item.identity.clone())
+        .collect::<Vec<_>>();
     PlanMediaEvidence {
         job_id: job_id.to_string(),
         snapshot_hash: snapshot_hash.to_string(),
@@ -161,6 +191,7 @@ pub fn build_plan_media_evidence(
         status,
         summaries,
         results: plan_media_results(results),
+        file_identities,
     }
 }
 
@@ -212,6 +243,7 @@ fn media_probe_state_label(state: MediaProbeState) -> &'static str {
         MediaProbeState::MissingFile => "missing_file",
         MediaProbeState::AmbiguousMatch => "ambiguous_match",
         MediaProbeState::SizeMismatch => "size_mismatch",
+        MediaProbeState::ChangedDuringProbe => "changed_during_probe",
     }
 }
 
@@ -609,26 +641,24 @@ fn resolve_media_relative_entries_impl(
         }
         // Absolute / path-like values are never probe authority.
         if !is_safe_relative_name(relative_name) {
-            pre_results.push(MediaProbeResult {
-                relative_name: "[invalid]".to_string(),
-                state: MediaProbeState::StartFailed,
-                summary: None,
-                message: Some("Media probe relative name is invalid".to_string()),
-            });
+            pre_results.push(MediaProbeResult::with_state(
+                "[invalid]",
+                MediaProbeState::StartFailed,
+                None,
+                Some("Media probe relative name is invalid".to_string()),
+            ));
             continue;
         }
         let label = relative_name.replace('\\', "/");
         let matches = resolve_under_roots(&label, &roots);
         match matches.as_slice() {
             [] => {
-                pre_results.push(MediaProbeResult {
-                    relative_name: label,
-                    state: MediaProbeState::MissingFile,
-                    summary: None,
-                    message: Some(
-                        "Media file was not found under allowed content roots".to_string(),
-                    ),
-                });
+                pre_results.push(MediaProbeResult::with_state(
+                    label,
+                    MediaProbeState::MissingFile,
+                    None,
+                    Some("Media file was not found under allowed content roots".to_string()),
+                ));
             }
             [only] => {
                 if let Some(expected) = entry.expected_size {
@@ -636,12 +666,12 @@ fn resolve_media_relative_entries_impl(
                         .map(|metadata| metadata.len())
                         .unwrap_or(u64::MAX);
                     if actual != expected {
-                        pre_results.push(MediaProbeResult {
-                            relative_name: label,
-                            state: MediaProbeState::SizeMismatch,
-                            summary: None,
-                            message: Some("On-disk size does not match torrent entry".to_string()),
-                        });
+                        pre_results.push(MediaProbeResult::with_state(
+                            label,
+                            MediaProbeState::SizeMismatch,
+                            None,
+                            Some("On-disk size does not match torrent entry".to_string()),
+                        ));
                         continue;
                     }
                 }
@@ -651,12 +681,12 @@ fn resolve_media_relative_entries_impl(
                 });
             }
             _ => {
-                pre_results.push(MediaProbeResult {
-                    relative_name: label,
-                    state: MediaProbeState::AmbiguousMatch,
-                    summary: None,
-                    message: Some("Media file matched multiple content roots".to_string()),
-                });
+                pre_results.push(MediaProbeResult::with_state(
+                    label,
+                    MediaProbeState::AmbiguousMatch,
+                    None,
+                    Some("Media file matched multiple content roots".to_string()),
+                ));
             }
         }
     }
@@ -1026,6 +1056,7 @@ fn probe_one(
             MediaProbeState::StartFailed,
             None,
             Some("Media probe relative name is invalid".to_string()),
+            None,
         );
     }
     if cancellation.load(Ordering::Relaxed) {
@@ -1037,8 +1068,21 @@ fn probe_one(
             MediaProbeState::MissingSidecar,
             None,
             Some("MediaInfo sidecar is missing".to_string()),
+            None,
         );
     }
+    let pre_identity = match capture_media_file_identity(&request.path, &request.relative_name) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return result(
+                request,
+                MediaProbeState::StartFailed,
+                None,
+                Some(error),
+                None,
+            );
+        }
+    };
     let mut command = Command::new(sidecar);
     configure_mediainfo_command(&mut command);
     let mut child = match command
@@ -1055,6 +1099,7 @@ fn probe_one(
                 MediaProbeState::StartFailed,
                 None,
                 Some(error.to_string()),
+                None,
             );
         }
     };
@@ -1092,10 +1137,15 @@ fn probe_one(
             MediaProbeState::TimedOut,
             None,
             Some("MediaInfo probe timed out".to_string()),
+            None,
         ),
-        WaitOutcome::WaitError(error) => {
-            result(request, MediaProbeState::StartFailed, None, Some(error))
-        }
+        WaitOutcome::WaitError(error) => result(
+            request,
+            MediaProbeState::StartFailed,
+            None,
+            Some(error),
+            None,
+        ),
         WaitOutcome::Exited(status) => {
             if stdout.truncated || stderr.truncated {
                 return result(
@@ -1103,6 +1153,7 @@ fn probe_one(
                     MediaProbeState::OversizedOutput,
                     None,
                     Some("MediaInfo output exceeded bounded pipe limit".to_string()),
+                    None,
                 );
             }
             if !status.success() {
@@ -1116,18 +1167,53 @@ fn probe_one(
                 } else {
                     detail
                 };
-                return result(request, MediaProbeState::NonZeroExit, None, Some(message));
+                return result(
+                    request,
+                    MediaProbeState::NonZeroExit,
+                    None,
+                    Some(message),
+                    None,
+                );
+            }
+            let post_identity =
+                match capture_media_file_identity(&request.path, &request.relative_name) {
+                    Ok(identity) => identity,
+                    Err(error) => {
+                        return result(
+                            request,
+                            MediaProbeState::StartFailed,
+                            None,
+                            Some(error),
+                            None,
+                        );
+                    }
+                };
+            if post_identity != pre_identity {
+                return result(
+                    request,
+                    MediaProbeState::ChangedDuringProbe,
+                    None,
+                    Some("Media file changed during MediaInfo probe".to_string()),
+                    None,
+                );
             }
             let summary = serde_json::from_slice::<Value>(&stdout.data)
                 .ok()
                 .and_then(|value| normalize_media_info(&value));
             match summary {
-                Some(summary) => result(request, MediaProbeState::Measured, Some(summary), None),
+                Some(summary) => result(
+                    request,
+                    MediaProbeState::Measured,
+                    Some(summary),
+                    None,
+                    Some(post_identity),
+                ),
                 None => result(
                     request,
                     MediaProbeState::MalformedJson,
                     None,
                     Some("MediaInfo JSON was not recognized".to_string()),
+                    None,
                 ),
             }
         }
@@ -1204,6 +1290,7 @@ fn cancelled_result(request: &MediaProbeRequest) -> MediaProbeResult {
         MediaProbeState::Cancelled,
         None,
         Some("MediaInfo probe cancelled".to_string()),
+        None,
     )
 }
 
@@ -1212,12 +1299,141 @@ fn result(
     state: MediaProbeState,
     summary: Option<MediaInfoSummary>,
     message: Option<String>,
+    identity: Option<MediaFileIdentity>,
 ) -> MediaProbeResult {
-    MediaProbeResult {
-        relative_name: safe_relative_name(&request.relative_name),
+    let mut probe = MediaProbeResult::with_state(
+        safe_relative_name(&request.relative_name),
         state,
         summary,
-        message: message.map(|value| compact(value.as_bytes())),
+        message.map(|value| compact(value.as_bytes())),
+    );
+    probe.identity = identity;
+    probe
+}
+
+/// Capture a private media-file identity (safe relative name + size + high-res mtime + samples).
+pub(crate) fn capture_media_file_identity(
+    path: &Path,
+    relative_name: &str,
+) -> Result<MediaFileIdentity, String> {
+    let relative_name = safe_relative_name(relative_name);
+    if relative_name == "[invalid]" {
+        return Err("media identity relative name is invalid".to_string());
+    }
+    let meta =
+        std::fs::metadata(path).map_err(|error| format!("media identity metadata: {error}"))?;
+    if !meta.is_file() {
+        return Err("media identity path is not a file".to_string());
+    }
+    let size = meta.len();
+    let (modified_unix_secs, modified_unix_nanos) = meta
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+        .unwrap_or((0, 0));
+    let content_digest = media_sample_content_digest(path, size)?;
+    Ok(MediaFileIdentity {
+        relative_name,
+        size,
+        modified_unix_secs,
+        modified_unix_nanos,
+        content_digest,
+    })
+}
+
+/// Digest first / middle / last [`MEDIA_IDENTITY_SAMPLE_BYTES`] plus length.
+///
+/// The middle window is centered at `size / 2` so same-size interior rewrites are
+/// not invisible to edge-only sampling.
+fn media_sample_content_digest(path: &Path, size: u64) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|error| format!("media identity open: {error}"))?;
+    let sample = MEDIA_IDENTITY_SAMPLE_BYTES as u64;
+
+    let mut read_window = |offset: u64, len: usize| -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|error| format!("media identity seek: {error}"))?;
+        let mut buf = vec![0_u8; len];
+        file.read_exact(&mut buf)
+            .map_err(|error| format!("media identity read: {error}"))?;
+        Ok(buf)
+    };
+
+    let head_len = usize::try_from(sample.min(size)).unwrap_or(0);
+    let first = read_window(0, head_len)?;
+
+    let mut middle = Vec::new();
+    if size > sample {
+        let mid_len = usize::try_from(sample.min(size)).unwrap_or(0);
+        let mid_start = size.saturating_sub(sample) / 2;
+        middle = read_window(mid_start, mid_len)?;
+    }
+
+    let mut last = Vec::new();
+    if size > sample {
+        let tail_start = size.saturating_sub(sample);
+        last = read_window(tail_start, MEDIA_IDENTITY_SAMPLE_BYTES)?;
+    }
+
+    let mut hasher = Sha256::new();
+    hasher.update(&first);
+    hasher.update(&middle);
+    hasher.update(&last);
+    hasher.update(size.to_le_bytes());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Re-resolve measured media files under original allowed roots and recompute identities.
+///
+/// Missing, replaced, ambiguous, or changed files fail closed.
+pub(crate) fn revalidate_media_file_identities(
+    torrent_path: &str,
+    content_root: &str,
+    identities: &[MediaFileIdentity],
+) -> Result<(), Vec<String>> {
+    if identities.is_empty() {
+        return Ok(());
+    }
+    let roots = allowed_media_content_roots(
+        torrent_path,
+        (!content_root.trim().is_empty()).then_some(content_root),
+    )
+    .map_err(|error| vec![error])?;
+    let mut failures = Vec::new();
+    for identity in identities {
+        let matches = resolve_under_roots(&identity.relative_name, &roots);
+        match matches.len() {
+            0 => failures.push(format!(
+                "媒体文件缺失或不可用：{}，请重新执行发布前检查。",
+                identity.relative_name
+            )),
+            1 => {
+                let path = &matches[0];
+                match capture_media_file_identity(path, &identity.relative_name) {
+                    Ok(current) if current == *identity => {}
+                    Ok(_) => failures.push(format!(
+                        "媒体文件内容已变化：{}，请重新执行发布前检查。",
+                        identity.relative_name
+                    )),
+                    Err(_) => failures.push(format!(
+                        "媒体文件无法校验：{}，请重新执行发布前检查。",
+                        identity.relative_name
+                    )),
+                }
+            }
+            _ => failures.push(format!(
+                "媒体文件路径不唯一：{}，请重新执行发布前检查。",
+                identity.relative_name
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures)
     }
 }
 
@@ -1439,6 +1655,7 @@ mod tests {
                     scan_type: None,
                 }),
                 message: None,
+                identity: None,
             },
             MediaProbeResult {
                 relative_name: "/private/tmp/secret.mkv".into(),
@@ -1448,18 +1665,21 @@ mod tests {
                     ..MediaInfoSummary::default()
                 }),
                 message: None,
+                identity: None,
             },
             MediaProbeResult {
                 relative_name: "show/ep02.mkv".into(),
                 state: MediaProbeState::TimedOut,
                 summary: None,
                 message: Some("timeout".into()),
+                identity: None,
             },
             MediaProbeResult {
                 relative_name: "missing.mkv".into(),
                 state: MediaProbeState::MissingFile,
                 summary: None,
                 message: None,
+                identity: None,
             },
         ];
         let evidence = build_plan_media_evidence("job-1", "sha256:snap", 3, &results);
@@ -1502,6 +1722,7 @@ mod tests {
                 state: MediaProbeState::MissingFile,
                 summary: None,
                 message: None,
+                identity: None,
             }],
         );
         assert_eq!(empty.status, PlanMediaStatus::CheckFailed);
@@ -2332,17 +2553,113 @@ mod tests {
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
 
+        // Real on-disk path required so private identity capture can run before MediaInfo.
+        let media = std::env::temp_dir().join(format!(
+            "okpgui_mediainfo_oversize_media_{}.mkv",
+            std::process::id()
+        ));
+        std::fs::write(&media, vec![3_u8; 1_024]).unwrap();
+
         let request = MediaProbeRequest {
             relative_name: "video.mkv".into(),
-            path: PathBuf::from("/private/video.mkv"),
+            path: media.clone(),
         };
         let cancelled = AtomicBool::new(false);
         let results = probe_media_files(vec![request], &script, &cancelled, Duration::from_secs(5));
         let _ = std::fs::remove_file(&script);
+        let _ = std::fs::remove_file(&media);
 
         assert_eq!(results[0].state, MediaProbeState::OversizedOutput);
         let serialized = serde_json::to_string(&results).unwrap();
-        assert!(!serialized.contains("/private"));
+        assert!(!serialized.contains(media.to_string_lossy().as_ref()));
         assert!(!serialized.contains(script.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn media_edge_identity_is_stable_for_unchanged_file() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_media_identity_stable_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("clip.mkv");
+        std::fs::write(&path, vec![7_u8; 8_192]).unwrap();
+        let first = capture_media_file_identity(&path, "clip.mkv").unwrap();
+        let second = capture_media_file_identity(&path, "clip.mkv").unwrap();
+        assert_eq!(first, second);
+        assert_eq!(first.size, 8_192);
+        assert!(!first.content_digest.is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn media_edge_identity_changes_when_bytes_change() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_media_identity_change_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("clip.mkv");
+        std::fs::write(&path, vec![1_u8; 4_096]).unwrap();
+        let before = capture_media_file_identity(&path, "clip.mkv").unwrap();
+        std::fs::write(&path, vec![2_u8; 4_096]).unwrap();
+        let after = capture_media_file_identity(&path, "clip.mkv").unwrap();
+        assert_ne!(before.content_digest, after.content_digest);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn middle_only_mutation_changes_identity_for_large_file() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_media_identity_middle_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("large.mkv");
+        // > 128 KiB so head/mid/tail windows are distinct.
+        let size = 256 * 1024_usize;
+        let mut bytes = vec![9_u8; size];
+        std::fs::write(&path, &bytes).unwrap();
+        let before = capture_media_file_identity(&path, "large.mkv").unwrap();
+        // Same-size interior rewrite only (middle window region).
+        let mid = size / 2;
+        bytes[mid] = 0xAA;
+        bytes[mid + 1] = 0xBB;
+        std::fs::write(&path, &bytes).unwrap();
+        // Preserve mtime as closely as possible is not required; digest must still change.
+        let after = capture_media_file_identity(&path, "large.mkv").unwrap();
+        assert_eq!(before.size, after.size);
+        assert_ne!(
+            before.content_digest, after.content_digest,
+            "middle-only mutation must change content digest"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn revalidate_media_identities_fails_closed_on_missing_file() {
+        let root = std::env::temp_dir().join(format!(
+            "okpgui_media_identity_missing_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let torrent = root.join("sample.torrent");
+        std::fs::write(
+            &torrent,
+            b"d4:infod4:name4:clip12:piece lengthi1e6:pieces0:ee",
+        )
+        .unwrap();
+        let media = root.join("clip.mkv");
+        std::fs::write(&media, vec![9_u8; 2_048]).unwrap();
+        let identity = capture_media_file_identity(&media, "clip.mkv").unwrap();
+        std::fs::remove_file(&media).unwrap();
+        let err = revalidate_media_file_identities(torrent.to_str().unwrap(), "", &[identity])
+            .expect_err("missing file must fail");
+        assert!(err.join(" ").contains("clip.mkv"));
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

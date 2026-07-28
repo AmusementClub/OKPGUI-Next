@@ -686,17 +686,21 @@ fn config_write_lock() -> &'static Mutex<()> {
 /// Read config from disk without taking the process lock.
 /// Parse failures return Err so callers do not silently treat a corrupt file as empty.
 /// Future schema versions are refused without rewrite. Older schemas are migrated
-/// in memory; when an upgrade is needed the original file is backed up and the
-/// migrated config is written back so the bump is durable and idempotent.
-fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
+/// in memory; schema-only upgrades (no orphan credential) are written back here.
+///
+/// When legacy `auth_mode: "none"` migration yields an orphan credential id, the
+/// migrated config is **not** written here. Callers with an app data dir must
+/// journal the orphan id first, then commit the config (crash-consistent cleanup).
+/// Returns `(config, orphan_credential_id)`.
+fn read_config_file(path: &std::path::Path) -> Result<(AppConfig, Option<String>), String> {
     if !path.exists() {
-        return Ok(AppConfig::default());
+        return Ok((AppConfig::default(), None));
     }
 
     let data =
         std::fs::read_to_string(path).map_err(|error| format!("无法读取配置文件: {}", error))?;
     if data.trim().is_empty() {
-        return Ok(AppConfig::default());
+        return Ok((AppConfig::default(), None));
     }
 
     let mut config: AppConfig = serde_json::from_str(&data)
@@ -711,14 +715,22 @@ fn read_config_file(path: &std::path::Path) -> Result<AppConfig, String> {
 
     let from_version = config.schema_version;
     let needs_upgrade = from_version < CONFIG_SCHEMA_VERSION;
-    migrate_config(&mut config);
+    let auth_none_migration = migrate_config(&mut config);
+    let auth_none_migrated = auth_none_migration.is_some();
+    let orphan = auth_none_migration
+        .flatten()
+        .filter(|id| !id.trim().is_empty());
 
+    // Schema upgrades and credential-less auth_mode:none migrations persist here.
+    // Orphan cleanup must journal-before-config in load_config_unlocked.
     if needs_upgrade {
         backup_config_before_upgrade(path, from_version)?;
+    }
+    if orphan.is_none() && (needs_upgrade || auth_none_migrated) {
         write_config_file(path, &config)?;
     }
 
-    Ok(config)
+    Ok((config, orphan))
 }
 
 /// Copy the pre-upgrade config beside the live file. Best-effort: failure aborts
@@ -747,7 +759,162 @@ fn backup_config_before_upgrade(path: &std::path::Path, from_version: u32) -> Re
 }
 
 fn load_config_unlocked(app: &AppHandle) -> Result<AppConfig, String> {
-    read_config_file(&config_path(app))
+    let path = config_path(app);
+    let (config, orphan_credential_id) = read_config_file(&path)?;
+    if let Some(old_id) = orphan_credential_id.filter(|id| !id.trim().is_empty()) {
+        // Crash-consistent: journal old ref → write migrated config → ConfigCommitted → delete.
+        if let Err(error) = commit_legacy_auth_none_migration(app, &path, &config, &old_id) {
+            eprintln!(
+                "[okpgui] legacy auth_mode none credential cleanup failed for {old_id}: {error}"
+            );
+        }
+    } else if let Err(error) = recover_legacy_auth_none_journal_if_present(app, &config) {
+        // Prior boot may have committed config + journal but failed secret delete.
+        eprintln!("[okpgui] legacy auth_mode none journal recovery failed: {error}");
+    }
+    Ok(config)
+}
+
+fn legacy_auth_none_cleanup_plan(
+    old_id: &str,
+) -> crate::ai::credentials::CredentialSecretWritePlan {
+    crate::ai::credentials::CredentialSecretWritePlan {
+        next_ref_id: None,
+        rollback_candidate_id: None,
+        delete_after_success_id: Some(old_id.to_string()),
+    }
+}
+
+fn legacy_auth_none_journal_metadata() -> crate::ai::credentials::CredentialJournalSettingsMetadata
+{
+    crate::ai::credentials::CredentialJournalSettingsMetadata {
+        auth_mode: "bearer".into(),
+        enabled: false,
+        ..Default::default()
+    }
+}
+
+/// Journal the orphan credential id **before** committing the migrated config, then
+/// delete the keyring secret. Ordering:
+/// 1. Prepared journal (old_ref recorded)
+/// 2. write migrated config (credential_ref cleared)
+/// 3. ConfigCommitted journal
+/// 4. delete secret + clear journal
+///
+/// A crash after (1) leaves the on-disk config unmigrated (or still migratable) with a
+/// journal for recovery. A crash after (2)/(3) leaves ConfigCommitted/clear-ref journal
+/// so the next startup finishes secret deletion.
+fn commit_legacy_auth_none_migration(
+    app: &AppHandle,
+    config_file: &std::path::Path,
+    config: &AppConfig,
+    old_id: &str,
+) -> Result<(), String> {
+    use crate::ai::credentials::{
+        cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
+        write_credential_journal, CredentialJournalPhase, CredentialRotationJournal,
+        OsCredentialStore, CREDENTIAL_JOURNAL_TTL_SECS,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("app data dir unavailable for credential cleanup: {error}"))?;
+    let journal_path = credential_journal_path(&data_dir);
+    let plan = legacy_auth_none_cleanup_plan(old_id);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    // (1) Durable record of the orphan id before clearing the config pointer.
+    let prepared = CredentialRotationJournal::prepare(
+        &plan,
+        legacy_auth_none_journal_metadata(),
+        now,
+        CREDENTIAL_JOURNAL_TTL_SECS,
+    );
+    write_credential_journal(&journal_path, &prepared)?;
+
+    // (2) Commit migrated config only after the journal exists.
+    write_config_file(config_file, config)?;
+
+    // (3) Advance phase so recovery treats this as a committed clear-ref cleanup.
+    let committed = prepared.with_phase(CredentialJournalPhase::ConfigCommitted);
+    write_credential_journal(&journal_path, &committed)?;
+
+    // (4) Delete keyring secret; retain journal on failure for next boot.
+    let store = OsCredentialStore::new("com.okpgui.okpgui-next.ai");
+    cleanup_previous_secret_after_success(&store, &plan)?;
+    clear_credential_journal(&journal_path)?;
+    Ok(())
+}
+
+/// When config is already migrated (no orphan from migrate) but a clear-ref journal
+/// remains from a prior crash after config commit, finish secret deletion.
+fn recover_legacy_auth_none_journal_if_present(
+    app: &AppHandle,
+    config: &AppConfig,
+) -> Result<(), String> {
+    use crate::ai::credentials::{
+        apply_credential_journal_recovery, credential_journal_path, load_credential_journal,
+        OsCredentialStore,
+    };
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("app data dir unavailable for journal recovery: {error}"))?;
+    let journal_path = credential_journal_path(&data_dir);
+    let Some(journal) = load_credential_journal(&journal_path)? else {
+        return Ok(());
+    };
+    let active_ref = config
+        .ai
+        .credential_ref
+        .as_ref()
+        .and_then(|bundle| bundle.key_ref.as_deref());
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let store = OsCredentialStore::new("com.okpgui.okpgui-next.ai");
+    apply_credential_journal_recovery(&store, &journal_path, &journal, active_ref, now)?;
+    Ok(())
+}
+
+/// Test-only: journal-before-config ordering for auth_mode none migration without AppHandle.
+#[cfg(test)]
+fn commit_legacy_auth_none_migration_for_test<S: crate::ai::credentials::SecretStore>(
+    config_file: &std::path::Path,
+    journal_dir: &std::path::Path,
+    config: &AppConfig,
+    old_id: &str,
+    store: &S,
+) -> Result<(), String> {
+    use crate::ai::credentials::{
+        cleanup_previous_secret_after_success, clear_credential_journal, credential_journal_path,
+        write_credential_journal, CredentialJournalPhase, CredentialRotationJournal,
+        CREDENTIAL_JOURNAL_TTL_SECS,
+    };
+
+    let journal_path = credential_journal_path(journal_dir);
+    let plan = legacy_auth_none_cleanup_plan(old_id);
+    let prepared = CredentialRotationJournal::prepare(
+        &plan,
+        legacy_auth_none_journal_metadata(),
+        1_700_000_000,
+        CREDENTIAL_JOURNAL_TTL_SECS,
+    );
+    write_credential_journal(&journal_path, &prepared)?;
+    write_config_file(config_file, config)?;
+    let committed = prepared.with_phase(CredentialJournalPhase::ConfigCommitted);
+    write_credential_journal(&journal_path, &committed)?;
+    cleanup_previous_secret_after_success(store, &plan)?;
+    clear_credential_journal(&journal_path)?;
+    Ok(())
 }
 
 /// Last config load failure, surfaced to the frontend so a corrupt config file
@@ -940,13 +1107,18 @@ fn apply_upsert_quick_publish_template(
 
 /// Migrate in-memory config to `CONFIG_SCHEMA_VERSION`.
 ///
+/// Returns `Some(None)` when auth_mode:"none" was migrated without a credential id,
+/// `Some(Some(id))` when migrated with a prior credential id that must be journal-deleted,
+/// and `None` when no auth_mode none migration ran.
+///
 /// Field migrations are idempotent. Explicit version steps document each bump even
 /// when no structural AI fields change (v2 → v3 is currently field-preserving).
-fn migrate_config(config: &mut AppConfig) {
+fn migrate_config(config: &mut AppConfig) -> Option<Option<String>> {
     let from_version = config.schema_version;
 
     // Shared field normalizations (safe on every load, including already-current schema).
     migrate_quick_publish_templates(config);
+    let mut auth_none = migrate_legacy_auth_mode_none(&mut config.ai);
     config.last_used_template =
         resolve_existing_key(&config.templates, config.last_used_template.take());
     config.last_used_quick_publish_template = resolve_existing_key(
@@ -963,9 +1135,14 @@ fn migrate_config(config: &mut AppConfig) {
         // AI fields (enabled/provider/endpoint/model/auth/capability/discovered_models/
         // credential_ref/credential_session_only) round-trip unchanged; missing keys use defaults.
         migrate_ai_config_v2_to_v3(&mut config.ai);
+        // v2→v3 may also surface legacy none if not already handled above.
+        if auth_none.is_none() {
+            auth_none = migrate_legacy_auth_mode_none(&mut config.ai);
+        }
     }
 
     config.schema_version = CONFIG_SCHEMA_VERSION;
+    auth_none
 }
 
 /// Explicit v2→v3 AI config step. Currently preserves all AI fields and only ensures
@@ -974,6 +1151,33 @@ fn migrate_ai_config_v2_to_v3(ai: &mut AIConfig) {
     // credential_session_only defaults via serde; leave explicit false when absent.
     // Never invent secrets or claim restore during migration.
     let _ = ai.credential_session_only;
+}
+
+/// One-way migration: legacy `auth_mode: "none"` is never a live mode.
+///
+/// Becomes the provider default auth mode, disables AI, and clears credential /
+/// capability state. Returns `Some(old_key_ref)` when migration applied (`old_key_ref`
+/// is `None` when no credential id was present). Callers must persist the migrated
+/// config and journal-delete any old keyring secret.
+fn migrate_legacy_auth_mode_none(ai: &mut AIConfig) -> Option<Option<String>> {
+    if !ai.auth_mode.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    let old_key_ref = ai
+        .credential_ref
+        .as_ref()
+        .and_then(|reference| reference.key_ref.clone());
+    ai.auth_mode = match ai.provider.to_ascii_lowercase().as_str() {
+        "anthropic" => "anthropic_api_key".to_string(),
+        _ => "bearer".to_string(),
+    };
+    ai.enabled = false;
+    ai.credential_ref = None;
+    ai.capability = None;
+    ai.discovered_models.clear();
+    ai.models_fetched_at_unix = None;
+    ai.credential_session_only = false;
+    Some(old_key_ref)
 }
 
 fn migrate_quick_publish_templates(config: &mut AppConfig) {
@@ -1796,7 +2000,7 @@ mod tests {
         assert!(path.exists());
         assert!(!path.with_extension("json.tmp").exists());
 
-        let restored = read_config_file(&path).expect("read");
+        let (restored, _) = read_config_file(&path).expect("read");
         assert_eq!(restored.last_used_template.as_deref(), Some("alpha"));
         assert!(restored.templates.contains_key("alpha"));
 
@@ -1841,7 +2045,7 @@ mod tests {
             "temp file must be consumed by replace"
         );
 
-        let restored = read_config_file(&path).expect("read replaced");
+        let (restored, _) = read_config_file(&path).expect("read replaced");
         assert_eq!(restored.last_used_template.as_deref(), Some("second"));
         assert!(restored.templates.contains_key("second"));
         // Old content must no longer be the sole survivor after a successful replace.
@@ -2580,7 +2784,7 @@ mod tests {
         }"#;
         std::fs::write(&path, v2).expect("write v2");
 
-        let loaded = read_config_file(&path).expect("v2 upgrade");
+        let (loaded, _) = read_config_file(&path).expect("v2 upgrade");
         assert_eq!(loaded.schema_version, 3);
         assert!(loaded.ai.enabled);
         assert_eq!(
@@ -2605,9 +2809,271 @@ mod tests {
         assert!(backup.contains("\"schema_version\": 2"));
 
         // Idempotent second load: no error, schema stays 3, backup preserved.
-        let again = read_config_file(&path).expect("v3 round-trip load");
+        let (again, _) = read_config_file(&path).expect("v3 round-trip load");
         assert_eq!(again.schema_version, 3);
         assert_eq!(again.ai.model, "gpt-4o");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_legacy_auth_mode_none_disables_ai() {
+        let mut ai = AIConfig {
+            enabled: true,
+            provider: "openai".into(),
+            auth_mode: "none".into(),
+            credential_ref: Some(CredentialBundleRef {
+                provider: "openai".into(),
+                key_ref: Some("legacy".into()),
+            }),
+            model: "gpt".into(),
+            endpoint: "https://api.openai.com/v1".into(),
+            capability: None,
+            discovered_models: vec!["gpt".into()],
+            models_fetched_at_unix: Some(1),
+            credential_session_only: true,
+            ..AIConfig::default()
+        };
+        let first = migrate_legacy_auth_mode_none(&mut ai);
+        assert_eq!(first, Some(Some("legacy".into())));
+        assert_eq!(ai.auth_mode, "bearer");
+        assert!(!ai.enabled);
+        assert!(ai.credential_ref.is_none());
+        assert!(ai.discovered_models.is_empty());
+        assert!(!ai.credential_session_only);
+        // idempotent
+        assert_eq!(migrate_legacy_auth_mode_none(&mut ai), None);
+        assert_eq!(ai.auth_mode, "bearer");
+    }
+
+    #[test]
+    fn migrate_legacy_auth_mode_none_anthropic_default() {
+        let mut ai = AIConfig {
+            provider: "anthropic".into(),
+            auth_mode: "none".into(),
+            enabled: true,
+            ..AIConfig::default()
+        };
+        let result = migrate_legacy_auth_mode_none(&mut ai);
+        assert_eq!(result, Some(None));
+        assert_eq!(ai.auth_mode, "anthropic_api_key");
+        assert!(!ai.enabled);
+    }
+
+    #[test]
+    fn migrate_legacy_auth_mode_none_defers_persist_until_journaled() {
+        let dir =
+            std::env::temp_dir().join(format!("okpgui_auth_none_persist_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("okpgui_config.json");
+        let mut config = AppConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+        config.ai.enabled = true;
+        config.ai.auth_mode = "none".into();
+        config.ai.credential_ref = Some(CredentialBundleRef {
+            provider: "openai".into(),
+            key_ref: Some("orphan-key".into()),
+        });
+        write_config_file(&path, &config).expect("write legacy none");
+
+        let (loaded, orphan) = read_config_file(&path).expect("migrate on load");
+        assert_eq!(orphan.as_deref(), Some("orphan-key"));
+        assert_eq!(loaded.ai.auth_mode, "bearer");
+        assert!(!loaded.ai.enabled);
+        assert!(loaded.ai.credential_ref.is_none());
+
+        // Crash-safety: orphan migration must not clear credential_ref on disk until journaled.
+        let disk_before: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk_before.ai.auth_mode, "none");
+        assert_eq!(
+            disk_before
+                .ai
+                .credential_ref
+                .as_ref()
+                .and_then(|bundle| bundle.key_ref.as_deref()),
+            Some("orphan-key")
+        );
+
+        // Journal-before-config commit, then secret delete.
+        use crate::ai::credentials::SecretStore;
+        let store = crate::ai::credentials::SessionSecretStore::default();
+        let orphan_ref = crate::ai::credentials::CredentialRef {
+            id: "orphan-key".into(),
+        };
+        store
+            .set(
+                &orphan_ref,
+                crate::ai::credentials::SecretValue::new("secret-material"),
+            )
+            .unwrap();
+        commit_legacy_auth_none_migration_for_test(&path, &dir, &loaded, "orphan-key", &store)
+            .expect("journaled commit");
+
+        let disk: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.ai.auth_mode, "bearer");
+        assert!(disk.ai.credential_ref.is_none());
+        assert!(store.get(&orphan_ref).unwrap().is_none());
+        assert!(
+            !crate::ai::credentials::credential_journal_path(&dir).exists(),
+            "journal must clear after successful cleanup"
+        );
+
+        // Second load: already migrated file must not re-report orphan id.
+        let (again, orphan2) = read_config_file(&path).expect("second load");
+        assert!(orphan2.is_none());
+        assert_eq!(again.ai.auth_mode, "bearer");
+        assert!(!again.ai.enabled);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrate_legacy_auth_mode_none_without_credential_persists_on_current_schema() {
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui_auth_none_no_credential_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("okpgui_config.json");
+        let mut config = AppConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+        config.ai.enabled = true;
+        config.ai.auth_mode = "none".into();
+        config.ai.credential_ref = None;
+        write_config_file(&path, &config).expect("write legacy none without credential");
+
+        let (loaded, orphan) = read_config_file(&path).expect("migrate on load");
+        assert!(orphan.is_none());
+        assert_eq!(loaded.ai.auth_mode, "bearer");
+        assert!(!loaded.ai.enabled);
+
+        let disk: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.ai.auth_mode, "bearer");
+        assert!(!disk.ai.enabled);
+        assert!(disk.ai.credential_ref.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_none_crash_after_journal_before_config_keeps_legacy_disk() {
+        use crate::ai::credentials::{
+            credential_journal_path, load_credential_journal, write_credential_journal,
+            CredentialJournalPhase, CredentialRotationJournal, CREDENTIAL_JOURNAL_TTL_SECS,
+        };
+
+        let dir =
+            std::env::temp_dir().join(format!("okpgui_auth_none_crash_pre_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("okpgui_config.json");
+        let mut config = AppConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+        config.ai.auth_mode = "none".into();
+        config.ai.credential_ref = Some(CredentialBundleRef {
+            provider: "openai".into(),
+            key_ref: Some("pre-crash-key".into()),
+        });
+        write_config_file(&path, &config).unwrap();
+
+        let (migrated, orphan) = read_config_file(&path).unwrap();
+        assert_eq!(orphan.as_deref(), Some("pre-crash-key"));
+
+        // Simulate step (1) only: journal Prepared, config not yet rewritten.
+        let plan = legacy_auth_none_cleanup_plan("pre-crash-key");
+        let journal = CredentialRotationJournal::prepare(
+            &plan,
+            legacy_auth_none_journal_metadata(),
+            100,
+            CREDENTIAL_JOURNAL_TTL_SECS,
+        );
+        write_credential_journal(&credential_journal_path(&dir), &journal).unwrap();
+
+        let disk: AppConfig =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(disk.ai.auth_mode, "none");
+        assert_eq!(
+            disk.ai
+                .credential_ref
+                .as_ref()
+                .and_then(|b| b.key_ref.as_deref()),
+            Some("pre-crash-key")
+        );
+        let on_disk = load_credential_journal(&credential_journal_path(&dir))
+            .unwrap()
+            .expect("journal");
+        assert_eq!(on_disk.phase, CredentialJournalPhase::Prepared);
+        assert_eq!(on_disk.old_ref.as_deref(), Some("pre-crash-key"));
+        // Migrated in-memory config is ready for a retry of commit.
+        assert!(migrated.ai.credential_ref.is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_none_crash_after_config_commit_recovers_via_journal() {
+        use crate::ai::credentials::{
+            apply_credential_journal_recovery, credential_journal_path, load_credential_journal,
+            write_credential_journal, CredentialJournalPhase, CredentialRef,
+            CredentialRotationJournal, SecretStore, SecretValue, SessionSecretStore,
+            CREDENTIAL_JOURNAL_TTL_SECS,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "okpgui_auth_none_crash_post_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("okpgui_config.json");
+
+        // Config already migrated (crash after write, before secret delete).
+        let mut migrated = AppConfig {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            ..AppConfig::default()
+        };
+        migrated.ai.auth_mode = "bearer".into();
+        migrated.ai.enabled = false;
+        migrated.ai.credential_ref = None;
+        write_config_file(&path, &migrated).unwrap();
+
+        let plan = legacy_auth_none_cleanup_plan("post-crash-key");
+        let journal = CredentialRotationJournal::prepare(
+            &plan,
+            legacy_auth_none_journal_metadata(),
+            100,
+            CREDENTIAL_JOURNAL_TTL_SECS,
+        )
+        .with_phase(CredentialJournalPhase::ConfigCommitted);
+        let journal_path = credential_journal_path(&dir);
+        write_credential_journal(&journal_path, &journal).unwrap();
+
+        let store = SessionSecretStore::default();
+        let orphan_ref = CredentialRef {
+            id: "post-crash-key".into(),
+        };
+        store
+            .set(&orphan_ref, SecretValue::new("still-in-keyring"))
+            .unwrap();
+
+        let loaded_journal = load_credential_journal(&journal_path)
+            .unwrap()
+            .expect("journal present");
+        apply_credential_journal_recovery(&store, &journal_path, &loaded_journal, None, 100)
+            .expect("recovery");
+        assert!(store.get(&orphan_ref).unwrap().is_none());
+        assert!(!journal_path.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

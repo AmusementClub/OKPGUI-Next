@@ -1,6 +1,6 @@
 use tauri::AppHandle;
 
-use crate::profile::load_profiles;
+use crate::profile::{load_profiles, Profile};
 use crate::publish::publish_events::emit_publish_site_complete;
 use crate::publish::publish_history::{build_publish_summary, persist_updated_site_cookies};
 use crate::publish::{
@@ -9,31 +9,42 @@ use crate::publish::{
 };
 
 /// Legacy / non-prepared publish path: resolve OKP from the live app config.
-/// Prepared-plan callers must use [`run_publish_with_resolved_okp`] with the
-/// already-revalidated bound executable so config drift cannot switch binaries.
+/// Prepared-plan callers must use [`run_publish_with_resolved_okp_and_profile`] with the
+/// already-revalidated bound executable and frozen prepare-time profile.
 #[allow(dead_code)]
 pub fn run_publish(app: &AppHandle, request: &PublishRequest) -> Result<String, String> {
     let okp_core = find_okp_executable(app)?;
     run_publish_with_resolved_okp(app, request, okp_core)
 }
 
-/// Execute publish with a caller-supplied resolved OKP executable.
-/// Used by prepared-plan publish after identity revalidate-and-resolve so the
-/// launched binary is exactly the one whose private identity was revalidated.
+/// Execute publish with a caller-supplied resolved OKP executable and **live** profile load.
+/// Prefer [`run_publish_with_resolved_okp_and_profile`] for prepared plans.
 pub(crate) fn run_publish_with_resolved_okp(
     app: &AppHandle,
     request: &PublishRequest,
     okp_core: ResolvedOkpExecutable,
 ) -> Result<String, String> {
-    let _publish_guard = PublishGuard::acquire()?;
-
-    let torrent_path = validate_torrent_path(&request.torrent_path)?;
     let profiles = load_profiles(app);
     let profile = profiles
         .profiles
         .get(&request.profile_name)
         .cloned()
         .ok_or_else(|| format!("配置不存在: {}", request.profile_name))?;
+    run_publish_with_resolved_okp_and_profile(app, request, okp_core, profile)
+}
+
+/// Execute publish with bound OKP and a caller-supplied profile snapshot.
+/// Prepared-plan publish must pass the frozen prepare-time profile so post-ack
+/// cookie/token/site drift cannot change what is published.
+pub(crate) fn run_publish_with_resolved_okp_and_profile(
+    app: &AppHandle,
+    request: &PublishRequest,
+    okp_core: ResolvedOkpExecutable,
+    profile: Profile,
+) -> Result<String, String> {
+    let _publish_guard = PublishGuard::acquire()?;
+
+    let torrent_path = validate_torrent_path(&request.torrent_path)?;
 
     let selected_sites = collect_site_publish_configs(&request.template, &profile)
         .into_iter()

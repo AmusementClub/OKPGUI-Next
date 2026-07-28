@@ -39,7 +39,9 @@ const violations = trackedFiles.filter((file) => {
   return forbiddenFiles.has(file)
     || segments.some((segment) => forbiddenDirectories.has(segment))
     || segments.some((segment) => segment.startsWith('.aider'))
-    || (segments[0] === '.github' && segments[1] === 'instructions');
+    || (segments[0] === '.github' && segments[1] === 'instructions')
+    || segments[0] === '.pnpm-store'
+    || file.includes('/.pnpm-store/');
 });
 
 if (violations.length > 0) {

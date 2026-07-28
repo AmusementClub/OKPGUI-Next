@@ -14,6 +14,7 @@ const {
     pollFormalAuditMock,
     cancelPreflightSessionMock,
     cancelAiJobMock,
+    cancelPendingAuditForPublishMock,
     invalidatePublishPlanMock,
     startPlanMediaInfoMock,
     pollPlanMediaInfoMock,
@@ -26,6 +27,7 @@ const {
     pollFormalAuditMock: vi.fn(),
     cancelPreflightSessionMock: vi.fn(),
     cancelAiJobMock: vi.fn(),
+    cancelPendingAuditForPublishMock: vi.fn(),
     invalidatePublishPlanMock: vi.fn(),
     startPlanMediaInfoMock: vi.fn(),
     pollPlanMediaInfoMock: vi.fn(),
@@ -43,6 +45,7 @@ vi.mock('../services/ai', async () => {
         pollFormalAudit: pollFormalAuditMock,
         cancelPreflightSession: cancelPreflightSessionMock,
         cancelAiJob: cancelAiJobMock,
+        cancelPendingAuditForPublish: cancelPendingAuditForPublishMock,
         invalidatePublishPlan: invalidatePublishPlanMock,
         startPlanMediaInfo: startPlanMediaInfoMock,
         pollPlanMediaInfo: pollPlanMediaInfoMock,
@@ -167,9 +170,9 @@ describe('useAiPreflight', () => {
             endpoint: 'https://api.example.test/v1',
             model: 'gpt-test',
             mode: 'auto',
-            auth_mode: 'none',
+            auth_mode: 'bearer',
             custom_header_name: null,
-            credential_ref: null,
+            credential_ref: { id: 'cred-test' },
             enabled: true,
             capability: null,
             discovered_models: [],
@@ -192,6 +195,11 @@ describe('useAiPreflight', () => {
             request_generation: 1,
             snapshot_hash: 'sha256:snap',
             progress: 100,
+        });
+        cancelPendingAuditForPublishMock.mockResolvedValue({
+            job_state: 'cancelled',
+            plan_token_live: true,
+            decision: 'PENDING',
         });
         invalidatePublishPlanMock.mockResolvedValue(undefined);
         startPlanMediaInfoMock.mockResolvedValue({
@@ -492,6 +500,185 @@ describe('useAiPreflight', () => {
         expect(startFormalAuditMock).toHaveBeenCalledWith({ plan_token: 'plan-token-1' });
         expect(hook.result.state.snapshot_hash).toBe('sha256:media');
         expect(hook.result.state.lifecycle).toBe('terminal');
+        hook.unmount();
+    });
+
+    it('serializes rapid acknowledgement toggles and only newest success binds', async () => {
+        const writes: Array<ReturnType<typeof deferred<void>>> = [];
+        setPlanAcknowledgementsMock.mockImplementation(() => {
+            const gate = deferred<void>();
+            writes.push(gate);
+            return gate.promise;
+        });
+        startFormalAuditMock.mockResolvedValueOnce(pendingAudit({
+            decision: 'WARNING',
+            formal_ran: true,
+            job_id: null,
+        }));
+        const hook = renderHook();
+        await act(async () => {
+            await Promise.resolve();
+        });
+        await act(async () => {
+            await hook.result.prepare(sampleRequest);
+        });
+        expect(hook.result.state.token).toBe('plan-token-1');
+        expect(hook.result.state.lifecycle).toBe('terminal');
+        expect(hook.result.state.decision).toBe('WARNING');
+
+        act(() => {
+            hook.result.setAcknowledgement('warning', true);
+        });
+        act(() => {
+            hook.result.setAcknowledgement('warning', false);
+        });
+        act(() => {
+            hook.result.setAcknowledgement('warning', true);
+        });
+        // The FIFO chain invokes the mock only as each prior write settles.
+        await act(async () => {
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(writes.length).toBe(1);
+        expect(hook.result.state.acknowledgementsBound).toBe(false);
+
+        // Resolve oldest first — must not bind because a newer write is still queued.
+        await act(async () => {
+            writes[0].resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(writes.length).toBe(2);
+        expect(hook.result.state.acknowledgementsBound).toBe(false);
+
+        await act(async () => {
+            writes[1].resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(writes.length).toBe(3);
+        expect(hook.result.state.acknowledgementsBound).toBe(false);
+
+        await act(async () => {
+            writes[2].resolve();
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(hook.result.state.acknowledgementsBound).toBe(true);
+        expect(hook.result.state.acknowledgements.warning).toBe(true);
+        hook.unmount();
+    });
+
+    it('failed latest acknowledgement leaves confirmation unbound', async () => {
+        setPlanAcknowledgementsMock.mockRejectedValue(new Error('bind failed'));
+        startFormalAuditMock.mockResolvedValueOnce(pendingAudit({
+            decision: 'WARNING',
+            formal_ran: true,
+            job_id: null,
+        }));
+        const hook = renderHook();
+        await act(async () => {
+            await Promise.resolve();
+        });
+        await act(async () => {
+            await hook.result.prepare(sampleRequest);
+        });
+        await act(async () => {
+            hook.result.setAcknowledgement('warning', true);
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(hook.result.state.acknowledgementsBound).toBe(false);
+        expect(hook.result.canConfirm).toBe(false);
+        hook.unmount();
+    });
+
+    it('PENDING becomes confirmable only after bound acknowledgement and uses publish-safe cancel', async () => {
+        const pollGate = deferred<AiAuditResult | null>();
+        pollFormalAuditMock.mockReturnValue(pollGate.promise);
+
+        const hook = renderHook();
+        await act(async () => {
+            await Promise.resolve();
+        });
+
+        await act(async () => {
+            await hook.result.prepare(sampleRequest);
+        });
+
+        expect(hook.result.state.decision).toBe('PENDING');
+        expect(hook.result.state.lifecycle).toBe('auditing');
+        expect(hook.result.state.job_id).toBe('job-audit-1');
+        expect(hook.result.canConfirm).toBe(false);
+
+        await act(async () => {
+            hook.result.setAcknowledgement('pending', true);
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+        expect(setPlanAcknowledgementsMock).toHaveBeenCalledWith('plan-token-1', {
+            warning: false,
+            critical: false,
+            pending: true,
+        });
+        expect(hook.result.state.acknowledgementsBound).toBe(true);
+        expect(hook.result.canConfirm).toBe(true);
+
+        await act(async () => {
+            await hook.result.cancelPendingAuditForPublish();
+        });
+
+        expect(cancelPendingAuditForPublishMock).toHaveBeenCalledWith('plan-token-1', 'job-audit-1');
+        expect(cancelAiJobMock).not.toHaveBeenCalled();
+        expect(cancelPreflightSessionMock).not.toHaveBeenCalled();
+
+        // Late poll completion must not replace retained PENDING after cancel-for-publish.
+        await act(async () => {
+            pollGate.resolve({
+                decision: 'GO',
+                findings: [],
+                unknown_codes: [],
+                formal_ran: true,
+                job_id: 'job-audit-1',
+                plan_token: 'plan-token-1',
+                snapshot_hash: 'sha256:snap',
+                request_generation: 1,
+            });
+            await Promise.resolve();
+            await Promise.resolve();
+        });
+
+        expect(hook.result.state.decision).toBe('PENDING');
+        expect(hook.result.state.token).toBe('plan-token-1');
+        hook.unmount();
+    });
+
+    it('invalidates prepared tokens when formal audit start fails', async () => {
+        startFormalAuditMock.mockRejectedValueOnce(new Error('provider down'));
+
+        const hook = renderHook();
+        await act(async () => {
+            await Promise.resolve();
+        });
+
+        let thrown: unknown;
+        await act(async () => {
+            try {
+                await hook.result.prepare(sampleRequest);
+            } catch (error) {
+                thrown = error;
+            }
+        });
+
+        expect(thrown).toBeInstanceOf(Error);
+        expect(String(thrown)).toMatch(/provider down/);
+        // clearTokenSideEffects uses the mocked invalidatePublishPlan export.
+        expect(invalidatePublishPlanMock).toHaveBeenCalledWith('plan-token-1');
+        expect(hook.result.state.token).toBeNull();
+        expect(hook.result.state.decision).toBe('IDLE');
+        expect(hook.result.state.lifecycle).toBe('idle');
+        expect(hook.result.state.error).toMatch(/provider down|无法准备|发布前检查/);
         hook.unmount();
     });
 });

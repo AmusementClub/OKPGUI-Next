@@ -837,14 +837,12 @@ pub(crate) fn collect_publish_local_blockers_with_okp_resolve_error(
     )
 }
 
-/// Collect local blockers using a caller-supplied already-resolved OKP executable.
+/// Collect local blockers using a caller-supplied already-resolved OKP executable
+/// and a **live** profile load. Prepare-time OKP binding uses this path.
 ///
-/// Prepared-plan publish must call this with the bound/revalidated identity A so
-/// OKP-related local checks (including the acgrip API-token version gate) never
-/// re-resolve from live app config. Live config may have switched to another valid
-/// executable B or become missing/invalid; that must not false-block a plan bound
-/// to A, nor surface a live-config path error. Invalid bound A still fails closed
-/// via identity revalidation before this helper runs (or via version gates on A).
+/// Prepared-plan publish after ack must use
+/// [`collect_publish_local_blockers_with_resolved_okp_and_profile`] with the frozen
+/// prepare-time profile so cookie/token drift cannot change site selection.
 pub(crate) fn collect_publish_local_blockers_with_resolved_okp(
     app: &AppHandle,
     request: &PublishRequest,
@@ -852,6 +850,16 @@ pub(crate) fn collect_publish_local_blockers_with_resolved_okp(
 ) -> Vec<String> {
     let profiles = load_profiles(app);
     let profile = profiles.profiles.get(&request.profile_name);
+    collect_publish_local_blockers_with_resolved_okp_and_profile(request, profile, resolved_okp)
+}
+
+/// Collect local blockers with bound OKP identity A and an explicit profile snapshot.
+/// Prepared-plan publish passes the frozen prepare-time profile.
+pub(crate) fn collect_publish_local_blockers_with_resolved_okp_and_profile(
+    request: &PublishRequest,
+    profile: Option<&Profile>,
+    resolved_okp: &ResolvedOkpExecutable,
+) -> Vec<String> {
     let selected_sites = profile
         .map(|profile| {
             collect_site_publish_configs(&request.template, profile)
