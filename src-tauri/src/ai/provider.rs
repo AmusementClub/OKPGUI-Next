@@ -1418,7 +1418,7 @@ mod tests {
             .and_then(Value::as_str)
             .expect("system prompt");
         assert!(system.contains("description 和 findings"));
-        assert!(system.contains("请根据本次输入实际检查"));
+        assert!(system.contains("必须根据本次输入实际检查"));
         assert!(!system.contains("additionalProperties"));
         assert!(!system.contains("\"type\":\"object\""));
         assert!(!serialized.contains("input_image"));
