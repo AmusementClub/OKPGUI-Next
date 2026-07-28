@@ -56,6 +56,11 @@ pub struct PublicConnectionConfig {
     pub credential_ref: Option<CredentialRef>,
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub use_proxy: bool,
+    /// Runtime-only proxy resolved from the backend-owned app config.
+    #[serde(skip)]
+    pub proxy_url: Option<String>,
     /// Last persisted capability probe outcome (non-secret).
     #[serde(default)]
     pub capability: Option<PublicCapabilityStatus>,
@@ -81,6 +86,8 @@ impl Default for PublicConnectionConfig {
             custom_header_name: None,
             credential_ref: None,
             enabled: false,
+            use_proxy: false,
+            proxy_url: None,
             capability: None,
             discovered_models: Vec::new(),
             models_fetched_at_unix: None,
@@ -1330,6 +1337,8 @@ mod tests {
             custom_header_name: None,
             credential_ref: Some(CredentialRef { id: "c1".into() }),
             enabled: true,
+            use_proxy: false,
+            proxy_url: None,
             capability: None,
             discovered_models: Vec::new(),
             models_fetched_at_unix: None,
@@ -1361,11 +1370,15 @@ mod tests {
                 id: "stale-cred".into(),
             }),
             enabled: false,
+            use_proxy: false,
+            proxy_url: None,
             capability: Some(PublicCapabilityStatus {
                 state: crate::ai::provider::CapabilityState::Ready,
                 identity_digest: capability_identity(
                     &PublicConnectionConfig {
                         enabled: true,
+                        use_proxy: false,
+                        proxy_url: None,
                         credential_ref: Some(CredentialRef {
                             id: "stale-cred".into(),
                         }),

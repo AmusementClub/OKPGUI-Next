@@ -125,6 +125,35 @@ describe('AiSettingsPage model discovery and direct JSON configuration', () => {
         expect(auth!.value).toBe('custom_header');
     });
 
+    it('saves the optional shared proxy setting for all AI requests', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') return baseSettings({ use_proxy: false });
+            if (command === 'ai_save_settings') return baseSettings({ use_proxy: true });
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+        const useProxy = rendered.container.querySelector<HTMLInputElement>(
+            'input[aria-label="通过通用代理访问 AI"]',
+        );
+        expect(useProxy).toBeTruthy();
+        expect(useProxy!.checked).toBe(false);
+        await act(async () => {
+            useProxy!.click();
+        });
+
+        const save = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('保存连接'),
+        );
+        await act(async () => save!.click());
+        await flushAsync();
+
+        const saveCall = invokeMock.mock.calls.find(([command]) => command === 'ai_save_settings');
+        expect(saveCall?.[1]).toMatchObject({ connection: { use_proxy: true } });
+        expect(rendered.container.textContent).toContain('模型刷新、AI 识别和发布前检查');
+    });
+
     it('loads settings without exposing secrets and shows manual model fallback path', async () => {
         invokeMock.mockImplementation(async (command: string) => {
             if (command === 'ai_get_settings') {

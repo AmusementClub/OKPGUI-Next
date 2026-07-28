@@ -133,11 +133,22 @@ pub struct ProviderFailure {
     pub message: String,
 }
 
+#[cfg(test)]
 pub fn build_no_redirect_client() -> Result<Client, String> {
-    Client::builder()
+    build_no_redirect_client_with_proxy(None)
+}
+
+pub fn build_no_redirect_client_with_proxy(proxy_url: Option<&str>) -> Result<Client, String> {
+    let mut builder = Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(60))
-        .connect_timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(10));
+    if let Some(proxy_url) = proxy_url.map(str::trim).filter(|value| !value.is_empty()) {
+        builder = builder.proxy(
+            reqwest::Proxy::all(proxy_url).map_err(|error| format!("AI 代理地址无效：{error}"))?,
+        );
+    }
+    builder
         .build()
         .map_err(|error| format!("provider client build failed: {error}"))
 }

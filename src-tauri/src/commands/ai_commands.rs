@@ -33,7 +33,7 @@ use crate::ai::media::{
     MAX_MEDIA_RELATIVE_ENTRIES,
 };
 use crate::ai::provider::{
-    auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
+    auto_fallback_allowed, build_models_list_request, build_no_redirect_client_with_proxy,
     build_structured_request_with_system, classify_http_failure, extract_provider_json,
     extract_provider_usage, formal_attempt_modes, parse_models_list_response,
     send_managed_provider_request, CapabilityIdentity, OutputCapability, ProviderFailure,
@@ -549,9 +549,24 @@ pub fn ai_validate_custom_header(name: String) -> Result<String, String> {
 pub fn ai_get_settings(app: AppHandle) -> PublicConnectionConfig {
     let config = crate::config::load_config(&app);
     let mut connection = public_connection_from_ai_config(&config.ai);
+    connection.proxy_url = resolve_ai_proxy_url(&config, connection.use_proxy);
     // Non-secret session-only indicator (never secret material or raw keyring errors).
     apply_public_credential_session_flag(&mut connection, credential_store());
     connection
+}
+
+fn resolve_ai_proxy_url(config: &crate::config::AppConfig, use_proxy: bool) -> Option<String> {
+    (use_proxy && config.proxy.proxy_type == "http")
+        .then(|| config.proxy.proxy_host.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn build_ai_client(connection: &PublicConnectionConfig) -> Result<reqwest::Client, String> {
+    if connection.use_proxy && connection.proxy_url.is_none() {
+        return Err("AI 已启用通用代理，但杂项设置中没有可用的 HTTP 代理地址。".to_string());
+    }
+    build_no_redirect_client_with_proxy(connection.proxy_url.as_deref())
 }
 
 /// Modes for formal provider work come directly from the saved connection.
@@ -589,6 +604,8 @@ fn public_connection_from_ai_config(ai: &crate::config::AIConfig) -> PublicConne
             .and_then(|reference| reference.key_ref.clone())
             .map(|id| CredentialRef { id }),
         enabled: ai.enabled,
+        use_proxy: ai.use_proxy,
+        proxy_url: None,
         // Capability probes were removed. Legacy persisted snapshots are ignored.
         capability: None,
         discovered_models: ai.discovered_models.clone(),
@@ -739,6 +756,7 @@ pub fn ai_save_settings(
 
     let mut ai = crate::config::AIConfig {
         enabled: connection.enabled,
+        use_proxy: connection.use_proxy,
         provider: match connection.provider {
             ProviderKind::OpenAi => "openai".to_string(),
             ProviderKind::Anthropic => "anthropic".to_string(),
@@ -2250,7 +2268,7 @@ async fn run_recognition_worker(
         return;
     }
 
-    let client = match build_no_redirect_client() {
+    let client = match build_ai_client(&connection) {
         Ok(client) => client,
         Err(error) => {
             let message = compact_provider_error(&error);
@@ -2966,7 +2984,7 @@ async fn run_provider_formal_audit(
         }
     };
     let schema = formal_audit_schema();
-    let client = match build_no_redirect_client() {
+    let client = match build_ai_client(&connection) {
         Ok(client) => client,
         Err(error) => {
             let message = compact_provider_error(&error);
@@ -4125,10 +4143,12 @@ fn model_discovery_may_use_stored_secret(
 #[tauri::command]
 pub async fn ai_list_models(
     app: AppHandle,
-    connection: PublicConnectionConfig,
+    mut connection: PublicConnectionConfig,
     secret: Option<String>,
 ) -> Result<AiModelDiscoveryResult, String> {
-    let saved = ai_get_settings(app);
+    let saved = ai_get_settings(app.clone());
+    let config = crate::config::load_config(&app);
+    connection.proxy_url = resolve_ai_proxy_url(&config, connection.use_proxy);
     let draft_secret = secret
         .filter(|value| !value.is_empty())
         .map(SecretValue::new);
@@ -4168,7 +4188,7 @@ pub async fn ai_list_models(
         return Err("AI credential is missing from the secure store".to_string());
     }
 
-    let client = build_no_redirect_client()?;
+    let client = build_ai_client(&connection)?;
     let request = build_models_list_request(
         connection.provider,
         &connection.endpoint,
@@ -5051,11 +5071,31 @@ mod formal_configuration_tests {
                 id: "cred-1".into(),
             }),
             enabled: true,
+            use_proxy: false,
+            proxy_url: None,
             capability: None,
             discovered_models: Vec::new(),
             models_fetched_at_unix: None,
             credential_session_only: false,
         }
+    }
+
+    #[test]
+    fn ai_proxy_requires_backend_configured_valid_address() {
+        let mut connection = configured_connection();
+        connection.use_proxy = true;
+        let missing = build_ai_client(&connection).expect_err("missing proxy must fail");
+        assert!(missing.contains("杂项设置"));
+
+        connection.proxy_url = Some("://invalid-proxy".into());
+        let invalid = build_ai_client(&connection).expect_err("invalid proxy must fail");
+        assert!(invalid.contains("AI 代理地址无效"));
+
+        connection.proxy_url = Some("http://127.0.0.1:7890".into());
+        build_ai_client(&connection).expect("valid HTTP proxy client");
+        assert!(!serde_json::to_string(&connection)
+            .expect("serialize public settings")
+            .contains("127.0.0.1"));
     }
 
     #[test]

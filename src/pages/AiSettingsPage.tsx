@@ -224,6 +224,21 @@ export default function AiSettingsPage() {
                         />
                     </label>
 
+                    <label className="flex items-start gap-3 text-sm text-slate-200">
+                        <input
+                            type="checkbox"
+                            checked={settings.use_proxy ?? false}
+                            onChange={(event) => update('use_proxy', event.target.checked)}
+                            aria-label="通过通用代理访问 AI"
+                        />
+                        <span>
+                            <span className="block">通过通用代理访问 AI</span>
+                            <span className="mt-1 block text-[11px] text-slate-500">
+                                使用“杂项 → 代理设置”中的 HTTP 代理，应用于模型刷新、AI 识别和发布前检查。
+                            </span>
+                        </span>
+                    </label>
+
                     <div className="space-y-2">
                         <div className="flex flex-wrap items-end gap-2">
                             <label className="min-w-0 flex-1 text-xs text-slate-500">

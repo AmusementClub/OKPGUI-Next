@@ -387,6 +387,8 @@ pub struct AiCapabilityConfig {
 pub struct AIConfig {
     #[serde(default)]
     pub enabled: bool,
+    #[serde(default)]
+    pub use_proxy: bool,
     #[serde(default = "default_ai_provider")]
     pub provider: String,
     #[serde(default)]
@@ -1064,6 +1066,7 @@ pub fn ai_connection_identity_fields_changed(before: &AIConfig, after: &AIConfig
         || before.custom_header_name != after.custom_header_name
         || before.credential_ref != after.credential_ref
         || before.enabled != after.enabled
+        || before.use_proxy != after.use_proxy
 }
 
 #[tauri::command]

@@ -57,6 +57,7 @@ export interface AiSettings {
     custom_header_name?: string | null;
     credential_ref?: CredentialRef | null;
     enabled: boolean;
+    use_proxy?: boolean;
     capability?: AiCapabilityStatus | null;
     discovered_models?: string[];
     models_fetched_at_unix?: number | null;

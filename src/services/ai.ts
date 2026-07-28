@@ -32,6 +32,7 @@ export const disabledAiSettings: AiSettings = {
     custom_header_name: null,
     credential_ref: null,
     enabled: false,
+    use_proxy: false,
     capability: null,
     discovered_models: [],
     models_fetched_at_unix: null,
