@@ -45,6 +45,11 @@ function isActiveCheck(lifecycle: AiPreflightLifecycle): boolean {
         || lifecycle === 'auditing';
 }
 
+function formatDuration(durationMs: number): string {
+    if (durationMs < 1000) return `${Math.round(durationMs)} 毫秒`;
+    return `${(durationMs / 1000).toFixed(durationMs >= 10_000 ? 1 : 2)} 秒`;
+}
+
 export default function AiPreflightPanel({
     state,
     configured,
@@ -83,6 +88,20 @@ export default function AiPreflightPanel({
         && (terminalFailure || (Boolean(state.error) && lifecycle === 'idle'))
         && !reconciling;
     const showRetryReconciliation = Boolean(onRetryReconciliation) && reconciling;
+    const usage = state.audit?.usage;
+    const inputTokens = usage?.input_tokens ?? null;
+    const outputTokens = usage?.output_tokens ?? null;
+    const hasTokenUsage = inputTokens !== null || outputTokens !== null;
+    const totalTokens = (inputTokens ?? 0) + (outputTokens ?? 0);
+    const durationMs = state.audit?.duration_ms ?? null;
+    const tokensPerSecond = outputTokens !== null && outputTokens > 0 && durationMs !== null && durationMs > 0
+        ? outputTokens / (durationMs / 1000)
+        : null;
+    const showMetrics = !reconciling
+        && !terminalFailure
+        && lifecycle === 'terminal'
+        && state.audit?.formal_ran
+        && (Boolean(state.audit?.model) || hasTokenUsage || durationMs !== null);
 
     return (
         <section className={`rounded-xl border px-4 py-3 ${tone}`} data-testid="ai-preflight-panel">
@@ -123,6 +142,24 @@ export default function AiPreflightPanel({
                     <p className="mt-1 whitespace-pre-wrap text-xs leading-relaxed text-slate-200">
                         {state.audit.description}
                     </p>
+                </div>
+            ) : null}
+
+            {showMetrics ? (
+                <div
+                    className="mt-3 flex flex-wrap gap-x-4 gap-y-1 border-t border-slate-700/60 pt-3 text-[11px] text-slate-400"
+                    data-testid="ai-preflight-metrics"
+                >
+                    {state.audit?.model ? <span>模型 {state.audit.model}</span> : null}
+                    {hasTokenUsage ? (
+                        <span>
+                            Token {totalTokens.toLocaleString('zh-CN')}
+                            {'（输入 '}{(inputTokens ?? 0).toLocaleString('zh-CN')}
+                            {' / 输出 '}{(outputTokens ?? 0).toLocaleString('zh-CN')}）
+                        </span>
+                    ) : null}
+                    {tokensPerSecond !== null ? <span>{tokensPerSecond.toFixed(1)} tok/s</span> : null}
+                    {durationMs !== null ? <span>耗时 {formatDuration(durationMs)}</span> : null}
                 </div>
             ) : null}
 

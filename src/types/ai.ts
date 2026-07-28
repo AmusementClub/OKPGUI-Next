@@ -102,6 +102,13 @@ export interface AiFormalAuditRequest {
     local_blockers?: string[];
 }
 
+export interface AiProviderUsage {
+    input_tokens?: number | null;
+    output_tokens?: number | null;
+    cached_tokens?: number | null;
+    reasoning_tokens?: number | null;
+}
+
 export interface AiAuditResult {
     decision: AiDecision;
     /** AI-generated Simplified Chinese summary for the user; absent on local-only paths. */
@@ -110,6 +117,9 @@ export interface AiAuditResult {
     unknown_codes: string[];
     local_blockers?: string[];
     formal_ran?: boolean;
+    model?: string | null;
+    usage?: AiProviderUsage | null;
+    duration_ms?: number | null;
     job_id?: string | null;
     /** Backend-issued plan identity echoed with the audit result. */
     plan_token?: string;
@@ -140,6 +150,9 @@ export interface PlanAuditEvidence {
     unknown_codes?: string[];
     /** False for prepare-time local-only / PENDING seeds; true only after formal provider audit. */
     formal_ran: boolean;
+    model?: string | null;
+    usage?: AiProviderUsage | null;
+    duration_ms?: number | null;
     job_id?: string | null;
     snapshot_hash: string;
     request_generation: number;

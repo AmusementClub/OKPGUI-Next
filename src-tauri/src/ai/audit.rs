@@ -74,8 +74,13 @@ const KNOWN_CODES: &[&str] = &[
     "MEDIA_CHECK_FAILED",
     "MEDIA_FILENAME_RESOLUTION_MISMATCH",
     "MEDIA_FILENAME_CODEC_MISMATCH",
+    "MEDIA_FILENAME_BIT_DEPTH_MISMATCH",
+    "MEDIA_FILENAME_AUDIO_CODEC_MISMATCH",
     "MEDIA_TITLE_RESOLUTION_MISMATCH",
     "MEDIA_TITLE_CODEC_MISMATCH",
+    "MEDIA_TITLE_BIT_DEPTH_MISMATCH",
+    "MEDIA_TITLE_AUDIO_CODEC_MISMATCH",
+    "TITLE_TEXT_SUSPECTED_TYPO",
     "TEMPLATE_STALE",
     "TORRENT_STALE",
     "PAYLOAD_TOO_LARGE",
@@ -92,13 +97,18 @@ const CRITICAL_CODES: &[&str] = &[
     "TORRENT_STALE",
     "MEDIA_FILENAME_RESOLUTION_MISMATCH",
     "MEDIA_FILENAME_CODEC_MISMATCH",
+    "MEDIA_FILENAME_BIT_DEPTH_MISMATCH",
+    "MEDIA_FILENAME_AUDIO_CODEC_MISMATCH",
     "MEDIA_TITLE_RESOLUTION_MISMATCH",
     "MEDIA_TITLE_CODEC_MISMATCH",
+    "MEDIA_TITLE_BIT_DEPTH_MISMATCH",
+    "MEDIA_TITLE_AUDIO_CODEC_MISMATCH",
 ];
 
 const WARNING_CODES: &[&str] = &[
     "MEDIA_NOT_TESTED",
     "MEDIA_CHECK_FAILED",
+    "TITLE_TEXT_SUSPECTED_TYPO",
     "PAYLOAD_TOO_LARGE",
     "PROVIDER_WARNING",
 ];
@@ -288,15 +298,18 @@ pub fn build_formal_audit_prompt(
          检查方法：\n\
          1. 先确认上述字段中实际有哪些可用证据；缺失字段不得自行补全。\n\
          2. 遍历 media_info 的每一项。每项对应一个种子内媒体文件，relative_name 是该文件的相对文件名。\n\
-         3. state 为 measured 时，以 summary.width、summary.height、summary.video_codec 为技术事实；其他 state 不得臆测技术参数，并针对该文件使用 MEDIA_CHECK_FAILED 返回 WARNING。\n\
+         3. state 为 measured 时，以 summary.width、summary.height、summary.video_codec、summary.video_bit_depth、summary.audio_codecs 为技术事实；其他 state 不得臆测技术参数，并针对该文件使用 MEDIA_CHECK_FAILED 返回 WARNING。\n\
          4. 对每个 measured 项，将实际宽高依次与 relative_name 文件名、torrent_name 种子标题、templates[0].title 发布标题中的 2160p、1080p、720p 或明确尺寸比较。文件名不符使用 MEDIA_FILENAME_RESOLUTION_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_RESOLUTION_MISMATCH。允许常见非标准有效高度，例如 1920x800 仍可表示 1080p 内容；必须结合宽度和常见画幅判断。\n\
          5. 对每个 measured 项，将实际编码依次与 relative_name、torrent_name、templates[0].title 中的编码声明比较。HEVC、H.265、x265 属于同一编码家族；AVC、H.264、x264 属于同一编码家族。文件名不符使用 MEDIA_FILENAME_CODEC_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_CODEC_MISMATCH。\n\
-         6. torrent_name 或 templates[0].title 中的分辨率、编码声明视为对所有主媒体文件的声明；逐文件检查并为每个不一致文件分别返回 finding。未声明某属性时，不要仅因缺少标签而报错。\n\
-         7. 汇总所有逐文件结果。只有完成上述所有可用检查且没有发现不一致时，findings 才能为空。\n\n\
+         6. 对每个 measured 项，将 summary.video_bit_depth 与文件名、种子标题、发布标题中的 8bit、8-bit、10bit、10-bit、12bit 等声明比较。文件名不符使用 MEDIA_FILENAME_BIT_DEPTH_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_BIT_DEPTH_MISMATCH。\n\
+         7. 对每个 measured 项，将文件名、种子标题、发布标题中明确声明的 AAC、FLAC、AC-3、E-AC-3、Opus、MP3 等音频编码与 summary.audio_codecs 实际集合比较；忽略大小写、空格和连字符差异。声明的编码不在实际集合中时才报告，未在标题中声明的额外音轨不得单独视为不一致。文件名不符使用 MEDIA_FILENAME_AUDIO_CODEC_MISMATCH；种子标题或发布标题不符使用 MEDIA_TITLE_AUDIO_CODEC_MISMATCH。\n\
+         8. 将 torrent_name、templates[0].title 与各 relative_name 中作品名、英文名、集数等非技术文本互相核对。只有某处词语与其他至少一处明确文本高度相似且仅有少量字符遗漏、重复、替换或换位时，才使用 TITLE_TEXT_SUSPECTED_TYPO 返回 WARNING，并指出两个实际拼写；作品别名、语言差异、发布组名、标点、空格、大小写和技术标签差异不得当作 typo。\n\
+         9. torrent_name 或 templates[0].title 中的分辨率、视频编码、位深、音频编码声明视为对所有主媒体文件的声明；逐文件检查并为每个不一致文件分别返回 finding。未声明某属性时，不要仅因缺少标签而报错。\n\
+         10. 汇总所有逐文件结果。只有完成上述所有可用检查且没有发现不一致时，findings 才能为空。\n\n\
          证据与结果规则：\n\
-         8. evidence_path 必须为 null、下方上下文中的有效 JSON Pointer，或上下文中实际存在的相对文件路径。不得创建绝对路径或不存在的路径；无法确定时使用 null。\n\
-         9. description 必须面向用户总结本次实际执行的检查，不得包含问题代码、结构定义或未经上下文支持的断言。\n\
-         10. findings 为空时，description 应明确说明标题、种子文件信息与已取得的 MediaInfo 技术信息符合预期；findings 非空时应概述最重要的不一致及其影响。\n\n\
+         11. evidence_path 必须为 null、下方上下文中的有效 JSON Pointer，或上下文中实际存在的相对文件路径。不得创建绝对路径或不存在的路径；无法确定时使用 null。\n\
+         12. description 必须面向用户总结本次实际执行的检查，不得包含问题代码、结构定义或未经上下文支持的断言。\n\
+         13. findings 为空时，description 应明确说明标题、种子文件信息与已取得的 MediaInfo 技术信息符合预期；findings 非空时应概述最重要的不一致及其影响。\n\n\
          快照摘要：{}\n\
          {UNTRUSTED_CONTEXT_BEGIN}\n\
          {serialized}\n\
@@ -978,6 +991,8 @@ mod tests {
                         width: Some(1920),
                         height: Some(1080),
                         video_codec: Some("HEVC".into()),
+                        video_bit_depth: Some(10),
+                        audio_codecs: vec!["AAC".into()],
                         ..Default::default()
                     }),
                     message: None,
@@ -1010,6 +1025,11 @@ mod tests {
         assert!(prompt.contains("video/episode.1080p.x265.mkv"));
         assert!(prompt.contains("video/episode-02.mkv"));
         assert!(prompt.contains("MEDIA_FILENAME_RESOLUTION_MISMATCH"));
+        assert!(prompt.contains("MEDIA_TITLE_BIT_DEPTH_MISMATCH"));
+        assert!(prompt.contains("MEDIA_TITLE_AUDIO_CODEC_MISMATCH"));
+        assert!(prompt.contains("TITLE_TEXT_SUSPECTED_TYPO"));
+        assert!(prompt.contains("video_bit_depth"));
+        assert!(prompt.contains("audio_codecs"));
         assert!(prompt.contains("MEDIA_TITLE_CODEC_MISMATCH"));
         assert!(prompt.contains("检查方法："));
         assert!(prompt.contains("输入字段说明："));
@@ -1055,6 +1075,29 @@ mod tests {
             serde_json::from_str(between.trim()).expect("body is projection JSON");
         assert_eq!(parsed.torrent_name, projection.torrent_name);
         assert_eq!(parsed.files[0].relative_path, "video/episode.mkv");
+    }
+
+    #[test]
+    fn formal_audit_prompt_carries_typo_audio_and_bit_depth_evidence() {
+        let mut projection = sample_projection();
+        let bad_title = "[LoliHouse] 数码宝贝BEATBRAK / DIGIMON BEATBREAK - 40 [WebRip 720p AVC-8bit FLAC][简繁内封字幕]";
+        projection.torrent_name = bad_title.into();
+        projection.templates[0]["title"] = json!(bad_title);
+        projection.media_info[0].relative_name =
+            "[LoliHouse] DIGIMON BEATBREAK - 40 [WebRip 1080p HEVC-10bit AAC].mkv".into();
+        let relative_name = projection.media_info[0].relative_name.clone();
+        let summary = projection.media_info[0].summary.as_mut().expect("summary");
+        summary.relative_name = relative_name;
+        summary.video_bit_depth = Some(10);
+        summary.audio_codecs = vec!["AAC".into()];
+
+        let prompt = build_formal_audit_prompt("sha256:case", &projection).expect("prompt");
+        assert!(prompt.contains("数码宝贝BEATBRAK"));
+        assert!(prompt.contains("DIGIMON BEATBREAK"));
+        assert!(prompt.contains("HEVC-10bit AAC"));
+        assert!(prompt.contains("\"video_bit_depth\":10"));
+        assert!(prompt.contains("\"audio_codecs\":[\"AAC\"]"));
+        assert!(prompt.contains("少量字符遗漏、重复、替换或换位"));
     }
 
     #[test]

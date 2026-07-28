@@ -115,6 +115,7 @@ pub struct MediaInfoSummary {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub video_codec: Option<String>,
+    pub video_bit_depth: Option<u32>,
     pub audio_codecs: Vec<String>,
     pub subtitle_languages: Vec<String>,
     pub scan_type: Option<String>,
@@ -165,6 +166,7 @@ pub fn plan_media_results(results: &[MediaProbeResult]) -> Vec<PlanMediaFileResu
                 width: summary.width,
                 height: summary.height,
                 video_codec: summary.video_codec.clone(),
+                video_bit_depth: summary.video_bit_depth,
                 audio_codecs: summary.audio_codecs.clone(),
                 subtitle_languages: summary.subtitle_languages.clone(),
                 scan_type: summary.scan_type.clone(),
@@ -216,6 +218,7 @@ pub fn plan_media_summaries(results: &[MediaProbeResult]) -> Vec<PlanMediaSummar
                 width: summary.width,
                 height: summary.height,
                 video_codec: summary.video_codec.clone(),
+                video_bit_depth: summary.video_bit_depth,
                 audio_codecs: summary.audio_codecs.clone(),
                 subtitle_languages: summary.subtitle_languages.clone(),
                 scan_type: summary.scan_type.clone(),
@@ -1284,6 +1287,9 @@ fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
             .and_then(|track| track.get("CodecID").or_else(|| track.get("Format")))
             .and_then(Value::as_str)
             .map(ToString::to_string),
+        video_bit_depth: video
+            .and_then(|track| track.get("BitDepth"))
+            .and_then(parse_u32),
         audio_codecs,
         subtitle_languages,
         scan_type: video
@@ -1332,7 +1338,7 @@ mod tests {
         let value = json!({
             "media": {"track": [
                 {"@type": "General", "Duration": "1234.5", "CompleteName": "/private/video.mkv"},
-                {"@type": "Video", "Width": "1920", "Height": 1080, "Format": "AV1"},
+                {"@type": "Video", "Width": "1920", "Height": 1080, "Format": "AV1", "BitDepth": "10"},
                 {"@type": "Audio", "Format": "AAC", "Language": "jpn"},
                 {"@type": "Text", "Language": "chi"}
             ]}
@@ -1341,6 +1347,8 @@ mod tests {
         // MediaInfo Duration is seconds; 1234.5s → 1_234_500 ms.
         assert_eq!(normalized.duration_ms, Some(1_234_500));
         assert_eq!(normalized.width, Some(1920));
+        assert_eq!(normalized.video_bit_depth, Some(10));
+        assert_eq!(normalized.audio_codecs, vec!["AAC"]);
         assert!(!serde_json::to_string(&normalized)
             .unwrap()
             .contains("/private"));
@@ -1357,6 +1365,7 @@ mod tests {
                     width: Some(1920),
                     height: Some(1080),
                     video_codec: Some("AV1 sk-secret-token".into()),
+                    video_bit_depth: Some(10),
                     audio_codecs: vec!["AAC".into()],
                     subtitle_languages: vec![],
                     scan_type: None,
@@ -1394,6 +1403,7 @@ mod tests {
         assert_eq!(evidence.results[2].state, "missing_file");
         assert!(evidence.results[0].summary.is_some());
         assert_eq!(evidence.summaries[0].relative_name, "show/ep01.mkv");
+        assert_eq!(evidence.summaries[0].video_bit_depth, Some(10));
         assert!(evidence.summaries[0]
             .video_codec
             .as_deref()

@@ -35,8 +35,9 @@ use crate::ai::media::{
 use crate::ai::provider::{
     auto_fallback_allowed, build_models_list_request, build_no_redirect_client,
     build_structured_request_with_system, classify_http_failure, extract_provider_json,
-    formal_attempt_modes, parse_models_list_response, send_managed_provider_request,
-    CapabilityIdentity, OutputCapability, ProviderFailure, ProviderKind, ProviderMode,
+    extract_provider_usage, formal_attempt_modes, parse_models_list_response,
+    send_managed_provider_request, CapabilityIdentity, OutputCapability, ProviderFailure,
+    ProviderKind, ProviderMode, ProviderUsage,
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
@@ -53,9 +54,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-#[cfg(test)]
-use std::time::Instant;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 use tauri_plugin_opener::OpenerExt;
 
@@ -115,13 +114,36 @@ struct FormalValidationError {
 }
 
 enum FormalProviderCallResult<T> {
-    Success(T),
+    Success {
+        value: T,
+        usage: Option<ProviderUsage>,
+    },
     Cancelled,
     Failed {
         failure: ProviderFailure,
         formal_ran: bool,
         error_code: &'static str,
+        usage: Option<ProviderUsage>,
     },
+}
+
+fn merge_provider_usage(total: &mut Option<ProviderUsage>, next: Option<ProviderUsage>) {
+    let Some(next) = next else { return };
+    let total = total.get_or_insert(ProviderUsage {
+        input_tokens: None,
+        output_tokens: None,
+        cached_tokens: None,
+        reasoning_tokens: None,
+    });
+    fn add(total: &mut Option<u64>, next: Option<u64>) {
+        if let Some(next) = next {
+            *total = Some(total.unwrap_or(0).saturating_add(next));
+        }
+    }
+    add(&mut total.input_tokens, next.input_tokens);
+    add(&mut total.output_tokens, next.output_tokens);
+    add(&mut total.cached_tokens, next.cached_tokens);
+    add(&mut total.reasoning_tokens, next.reasoning_tokens);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -141,6 +163,7 @@ where
     C: Fn() -> bool,
 {
     let attempt_modes = formal_modes_for_connection(connection);
+    let mut usage = None;
     'modes: for attempted_mode in attempt_modes {
         for request_attempt in 0..FORMAL_PROVIDER_ATTEMPTS {
             if is_cancelled() {
@@ -176,6 +199,7 @@ where
                         },
                         formal_ran: false,
                         error_code: "PROVIDER_HTTP",
+                        usage,
                     };
                 }
             };
@@ -200,9 +224,13 @@ where
                         },
                         formal_ran: true,
                         error_code: "PROVIDER_HTTP",
+                        usage,
                     };
                 }
             };
+            if let Ok(envelope) = serde_json::from_str::<Value>(&body) {
+                merge_provider_usage(&mut usage, extract_provider_usage(&envelope));
+            }
             if !(200..300).contains(&status) {
                 let failure = classify_http_failure(status, &body);
                 if auto_fallback_allowed(
@@ -217,6 +245,7 @@ where
                     failure,
                     formal_ran: true,
                     error_code: "PROVIDER_HTTP",
+                    usage,
                 };
             }
 
@@ -238,12 +267,13 @@ where
                         failure,
                         formal_ran: true,
                         error_code: "PROVIDER_HTTP",
+                        usage,
                     };
                 }
             };
 
             match validate(&structured) {
-                Ok(value) => return FormalProviderCallResult::Success(value),
+                Ok(value) => return FormalProviderCallResult::Success { value, usage },
                 Err(error) if error.retryable && formal_retry_remaining(request_attempt) => {}
                 Err(error) => {
                     return FormalProviderCallResult::Failed {
@@ -254,6 +284,7 @@ where
                         },
                         formal_ran: true,
                         error_code: error.code,
+                        usage,
                     };
                 }
             }
@@ -268,6 +299,7 @@ where
         },
         formal_ran: false,
         error_code: "PROVIDER_HTTP",
+        usage,
     }
 }
 
@@ -2258,7 +2290,7 @@ async fn run_recognition_worker(
 
     update_recognition_job_progress(&job_id, 75, "validating recognition output");
     let output = match outcome {
-        FormalProviderCallResult::Success(value) => value,
+        FormalProviderCallResult::Success { value, .. } => value,
         FormalProviderCallResult::Cancelled => {
             finish_recognition_cancelled(
                 &job_id,
@@ -2414,6 +2446,12 @@ pub struct AiFormalAuditResult {
     pub local_blockers: Vec<String>,
     /// True only when a real provider HTTP call was attempted/completed.
     pub formal_ran: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     pub job_id: Option<String>,
     /// Backend plan identity echoed so the client never invents binding keys.
     pub plan_token: String,
@@ -2489,6 +2527,9 @@ fn local_audit_result(
         unknown_codes: validated.unknown_codes,
         local_blockers: input.local_blockers,
         formal_ran,
+        model: None,
+        usage: None,
+        duration_ms: None,
         job_id,
         plan_token,
         snapshot_hash,
@@ -2527,6 +2568,9 @@ fn bind_audit_to_plan(result: &AiFormalAuditResult) -> Result<(), String> {
             findings: result.findings.clone(),
             unknown_codes: result.unknown_codes.clone(),
             formal_ran: result.formal_ran,
+            model: result.model.clone(),
+            usage: result.usage.clone(),
+            duration_ms: result.duration_ms,
             job_id: result.job_id.clone(),
             snapshot_hash: result.snapshot_hash.clone(),
             request_generation: result.request_generation,
@@ -2565,6 +2609,9 @@ fn pending_audit_result(
         unknown_codes: Vec::new(),
         local_blockers,
         formal_ran: false,
+        model: None,
+        usage: None,
+        duration_ms: None,
         job_id: Some(job_id),
         plan_token,
         snapshot_hash,
@@ -2584,6 +2631,9 @@ fn formal_result_from_plan_evidence(
         unknown_codes: evidence.unknown_codes.clone(),
         local_blockers,
         formal_ran: evidence.formal_ran,
+        model: evidence.model.clone(),
+        usage: evidence.usage.clone(),
+        duration_ms: evidence.duration_ms,
         job_id: evidence.job_id.clone(),
         plan_token,
         snapshot_hash: evidence.snapshot_hash.clone(),
@@ -2945,6 +2995,7 @@ async fn run_provider_formal_audit(
     };
 
     let system_prompt = formal_audit_system_prompt();
+    let provider_started = Instant::now();
     let outcome = run_formal_provider_call(
         &client,
         &connection,
@@ -2963,9 +3014,13 @@ async fn run_provider_formal_audit(
         },
     )
     .await;
+    let duration_ms = u64::try_from(provider_started.elapsed().as_millis()).unwrap_or(u64::MAX);
 
     match outcome {
-        FormalProviderCallResult::Success(output) => {
+        FormalProviderCallResult::Success {
+            value: output,
+            usage,
+        } => {
             let findings = validate_findings_against_projection(output.findings, &projection);
             let mut result = local_audit_result(
                 plan_token,
@@ -2978,6 +3033,9 @@ async fn run_provider_formal_audit(
             );
             result.description =
                 user_facing_formal_description(output.description, &result.findings);
+            result.model = Some(connection.model.clone());
+            result.usage = usage;
+            result.duration_ms = Some(duration_ms);
             let summary = format!(
                 "formal audit decision={} findings={}",
                 match result.decision {
@@ -2995,6 +3053,7 @@ async fn run_provider_formal_audit(
             failure,
             formal_ran,
             error_code,
+            usage,
         } => {
             let message = if error_code == "PROVIDER_SCHEMA" {
                 "AI 返回格式不符合审核要求，自动纠正后仍无法解析。请重试检查或更换模型。"
@@ -3002,7 +3061,7 @@ async fn run_provider_formal_audit(
             } else {
                 compact_provider_error(&failure.message)
             };
-            let result = local_audit_result(
+            let mut result = local_audit_result(
                 plan_token,
                 snapshot_hash,
                 request_generation,
@@ -3016,6 +3075,9 @@ async fn run_provider_formal_audit(
                 formal_ran,
                 Some(job_id.clone()),
             );
+            result.model = Some(connection.model.clone());
+            result.usage = usage;
+            result.duration_ms = Some(duration_ms);
             complete_and_bind_formal_audit(
                 &job_id,
                 false,
@@ -4253,6 +4315,39 @@ mod debug_record_and_exit_tests {
 mod formal_audit_lifecycle_tests {
     use super::*;
 
+    #[test]
+    fn provider_usage_merge_sums_all_actual_attempts() {
+        let mut total = None;
+        merge_provider_usage(
+            &mut total,
+            Some(ProviderUsage {
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                cached_tokens: Some(40),
+                reasoning_tokens: None,
+            }),
+        );
+        merge_provider_usage(
+            &mut total,
+            Some(ProviderUsage {
+                input_tokens: Some(110),
+                output_tokens: Some(30),
+                cached_tokens: None,
+                reasoning_tokens: Some(8),
+            }),
+        );
+
+        assert_eq!(
+            total,
+            Some(ProviderUsage {
+                input_tokens: Some(210),
+                output_tokens: Some(50),
+                cached_tokens: Some(40),
+                reasoning_tokens: Some(8),
+            })
+        );
+    }
+
     fn sample_formal_result(job_id: &str, decision_findings: Vec<Finding>) -> AiFormalAuditResult {
         local_audit_result(
             "plan-token-test".to_string(),
@@ -4370,6 +4465,9 @@ mod formal_audit_lifecycle_tests {
                         findings: vec![],
                         unknown_codes: vec![],
                         formal_ran: false,
+                        model: None,
+                        usage: None,
+                        duration_ms: None,
                         job_id: None,
                         snapshot_hash: snap,
                         request_generation: 23,
@@ -4632,6 +4730,41 @@ mod formal_audit_lifecycle_tests {
             "running job must not surface terminal evidence"
         );
         let _ = ai_cancel_job(job_id);
+    }
+
+    #[test]
+    fn terminal_audit_poll_preserves_usage_and_duration() {
+        let _guard = command_test_guard();
+        let snapshot = "sha256:metrics";
+        let generation = 5;
+        let (token, job_id) = prepare_pending_audit_session(snapshot, generation);
+        let mut result = local_audit_result(
+            token.clone(),
+            snapshot.to_string(),
+            generation,
+            Vec::new(),
+            Vec::new(),
+            true,
+            Some(job_id.clone()),
+        );
+        result.usage = Some(ProviderUsage {
+            input_tokens: Some(800),
+            output_tokens: Some(200),
+            cached_tokens: Some(300),
+            reasoning_tokens: Some(50),
+        });
+        result.model = Some("gpt-5.1".into());
+        result.duration_ms = Some(4_000);
+
+        complete_and_bind_formal_audit(&job_id, true, None, "metrics", result)
+            .expect("complete and bind");
+        let polled = ai_poll_formal_audit(token, job_id)
+            .expect("poll")
+            .expect("terminal result");
+
+        assert_eq!(polled.usage.unwrap().output_tokens, Some(200));
+        assert_eq!(polled.model.as_deref(), Some("gpt-5.1"));
+        assert_eq!(polled.duration_ms, Some(4_000));
     }
 
     #[test]
@@ -5290,6 +5423,7 @@ mod media_info_job_tests {
                 width: Some(1920),
                 height: Some(1080),
                 video_codec: Some("AV1".into()),
+                video_bit_depth: Some(10),
                 audio_codecs: vec!["AAC".into()],
                 subtitle_languages: vec![],
                 scan_type: None,
@@ -5388,6 +5522,7 @@ mod media_info_job_tests {
                         width: Some(1920),
                         height: Some(1080),
                         video_codec: Some("AV1".into()),
+                        video_bit_depth: Some(10),
                         ..MediaInfoSummary::default()
                     }),
                     message: None,
@@ -6255,6 +6390,7 @@ mod media_info_plan_bind_tests {
                     width: Some(1920),
                     height: Some(1080),
                     video_codec: Some("AV1".into()),
+                    video_bit_depth: Some(10),
                     audio_codecs: vec!["AAC".into()],
                     subtitle_languages: vec![],
                     scan_type: None,

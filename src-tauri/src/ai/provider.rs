@@ -1034,7 +1034,7 @@ pub fn classify_probe_response_for_capability(
             mode: resolved_mode,
             status,
             message: failure.message,
-            usage: parsed.as_ref().and_then(extract_usage),
+            usage: parsed.as_ref().and_then(extract_provider_usage),
             output_capability: None,
         },
         None => CapabilityProbeResult {
@@ -1047,7 +1047,7 @@ pub fn classify_probe_response_for_capability(
                 OutputCapability::JsonObject => "JSON compatibility mode is available",
             }
             .to_string(),
-            usage: parsed.as_ref().and_then(extract_usage),
+            usage: parsed.as_ref().and_then(extract_provider_usage),
             output_capability: Some(output_capability),
         },
     }
@@ -1186,8 +1186,7 @@ pub fn classify_http_failure(status: u16, body: &str) -> ProviderFailure {
     }
 }
 
-#[cfg(test)]
-fn extract_usage(value: &Value) -> Option<ProviderUsage> {
+pub(crate) fn extract_provider_usage(value: &Value) -> Option<ProviderUsage> {
     let usage = value.get("usage")?;
     Some(ProviderUsage {
         input_tokens: usage

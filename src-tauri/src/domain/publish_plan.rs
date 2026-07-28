@@ -12,6 +12,7 @@ use crate::ai::audit::{
     media_findings_from_plan_evidence, Acknowledgements, AuditDecision, Finding,
     MediaEvidenceAuditState,
 };
+use crate::ai::provider::ProviderUsage;
 use crate::config::{SiteSelection, Template};
 use crate::publish::{OkpExecutableIdentity, PublishRequest, ResolvedOkpExecutable};
 
@@ -26,6 +27,12 @@ pub struct PlanAuditEvidence {
     #[serde(default)]
     pub unknown_codes: Vec<String>,
     pub formal_ran: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<ProviderUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     #[serde(default)]
     pub job_id: Option<String>,
     /// Must equal the plan's snapshot_hash at bind time.
@@ -55,6 +62,7 @@ pub struct PlanMediaSummary {
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub video_codec: Option<String>,
+    pub video_bit_depth: Option<u32>,
     #[serde(default)]
     pub audio_codecs: Vec<String>,
     #[serde(default)]
@@ -191,6 +199,9 @@ impl PlanAuditEvidence {
             findings: Vec::new(),
             unknown_codes: Vec::new(),
             formal_ran: false,
+            model: None,
+            usage: None,
+            duration_ms: None,
             job_id: None,
             snapshot_hash,
             request_generation,
@@ -323,6 +334,9 @@ impl PublishPlan {
             findings: evidence.findings,
             unknown_codes: evidence.unknown_codes,
             formal_ran: evidence.formal_ran,
+            model: evidence.model,
+            usage: evidence.usage,
+            duration_ms: evidence.duration_ms,
             job_id: evidence.job_id,
             snapshot_hash: evidence.snapshot_hash,
             request_generation: evidence.request_generation,
@@ -1710,6 +1724,9 @@ mod tests {
                     findings: vec![],
                     unknown_codes: vec![],
                     formal_ran: true,
+                    model: None,
+                    usage: None,
+                    duration_ms: None,
                     job_id: Some("job-1".into()),
                     snapshot_hash: prepared.snapshot_hash.clone(),
                     request_generation: 3,
@@ -1761,6 +1778,9 @@ mod tests {
                     findings: vec![],
                     unknown_codes: vec![],
                     formal_ran: false,
+                    model: None,
+                    usage: None,
+                    duration_ms: None,
                     job_id: None,
                     snapshot_hash: blocked.snapshot_hash.clone(),
                     request_generation: 4,
@@ -2150,6 +2170,9 @@ mod tests {
             findings: vec![],
             unknown_codes: vec![],
             formal_ran: false,
+            model: None,
+            usage: None,
+            duration_ms: None,
             job_id: None,
             snapshot_hash: "sha256:other".into(),
             request_generation: 9,
@@ -2181,6 +2204,7 @@ mod tests {
                         width: Some(1920),
                         height: Some(1080),
                         video_codec: Some("AV1".into()),
+                        video_bit_depth: Some(10),
                         audio_codecs: vec!["AAC".into()],
                         subtitle_languages: vec![],
                         scan_type: None,
@@ -2470,6 +2494,9 @@ mod tests {
                     findings: Vec::new(),
                     unknown_codes: Vec::new(),
                     formal_ran: false,
+                    model: None,
+                    usage: None,
+                    duration_ms: None,
                     job_id: Some("job-from-bind".into()),
                     snapshot_hash: "sha256:indexed".into(),
                     request_generation: 2,

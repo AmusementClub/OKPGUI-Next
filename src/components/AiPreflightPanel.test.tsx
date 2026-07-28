@@ -114,6 +114,61 @@ describe('AiPreflightPanel', () => {
         unmount();
     });
 
+    it('shows token usage, output throughput, and elapsed time for a terminal provider audit', () => {
+        const { container, unmount } = renderPanel({
+            state: baseState({
+                decision: 'GO',
+                lifecycle: 'terminal',
+                job_id: null,
+                audit: {
+                    decision: 'GO',
+                    findings: [],
+                    unknown_codes: [],
+                    formal_ran: true,
+                    model: 'gpt-5.1',
+                    usage: { input_tokens: 1000, output_tokens: 234 },
+                    duration_ms: 12_600,
+                    plan_token: 'plan-token',
+                    snapshot_hash: 'sha256:x',
+                    request_generation: 1,
+                },
+            }),
+            canConfirm: true,
+        });
+
+        const metrics = container.querySelector('[data-testid="ai-preflight-metrics"]');
+        expect(metrics?.textContent).toContain('模型 gpt-5.1');
+        expect(metrics?.textContent).toContain('Token 1,234（输入 1,000 / 输出 234）');
+        expect(metrics?.textContent).toContain('18.6 tok/s');
+        expect(metrics?.textContent).toContain('耗时 12.6 秒');
+        unmount();
+    });
+
+    it('shows elapsed time without zero token placeholders when the provider omits usage', () => {
+        const { container, unmount } = renderPanel({
+            state: baseState({
+                decision: 'WARNING',
+                lifecycle: 'terminal',
+                audit: {
+                    decision: 'WARNING',
+                    findings: [],
+                    unknown_codes: [],
+                    formal_ran: true,
+                    duration_ms: 850,
+                    plan_token: 'plan-token',
+                    snapshot_hash: 'sha256:x',
+                    request_generation: 1,
+                },
+            }),
+        });
+
+        const metrics = container.querySelector('[data-testid="ai-preflight-metrics"]');
+        expect(metrics?.textContent).toBe('耗时 850 毫秒');
+        expect(metrics?.textContent).not.toContain('Token');
+        expect(metrics?.textContent).not.toContain('tok/s');
+        unmount();
+    });
+
     it('shows retry reconciliation only while reconciling and never live error-free pending', () => {
         const onRetryReconciliation = vi.fn();
         const { container, unmount } = renderPanel({
