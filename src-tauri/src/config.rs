@@ -1891,6 +1891,7 @@ mod tests {
         // New name without previous name still works.
         apply_save_template(&mut config, "beta".to_string(), sample_template(), None)
             .expect("new-name save");
+        assert!(config.templates.contains_key("alpha"));
         assert!(config.templates.contains_key("beta"));
     }
 
