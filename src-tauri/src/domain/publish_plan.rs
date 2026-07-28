@@ -40,13 +40,13 @@ pub struct PlanAuditEvidence {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanMediaStatus {
-    /// At least one redacted Measured summary was bound.
+    /// At least one Measured summary was bound.
     Tested,
     /// Terminal MediaInfo success with no usable measured media.
     CheckFailed,
 }
 
-/// Redacted, relative, normalized media summary owned by a prepared plan.
+/// Relative, normalized media summary owned by a prepared plan.
 /// Absolute paths never appear; codec/language strings are free-text only.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct PlanMediaSummary {
@@ -62,8 +62,8 @@ pub struct PlanMediaSummary {
     pub scan_type: Option<String>,
 }
 
-/// One sanitized per-file MediaInfo outcome retained for formal AI audit context.
-/// The state is a stable English machine value; messages and paths are redacted.
+/// One validated per-file MediaInfo outcome retained for formal AI audit context.
+/// The state is a stable English machine value; messages and paths are preserved.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct PlanMediaFileResult {
     pub relative_name: String,
@@ -85,7 +85,7 @@ pub struct PlanMediaEvidence {
     pub snapshot_hash: String,
     pub request_generation: u64,
     pub status: PlanMediaStatus,
-    /// Redacted relative measured summaries only (never absolute paths).
+    /// Valid relative measured summaries only.
     #[serde(default)]
     pub summaries: Vec<PlanMediaSummary>,
     /// Includes every torrent media file considered by the bound MediaInfo run.
@@ -121,10 +121,48 @@ impl PlanMediaEvidence {
 
     /// Map identity-matched plan media evidence to formal/local audit state.
     pub fn audit_state(&self) -> MediaEvidenceAuditState {
-        match self.status {
-            PlanMediaStatus::Tested => MediaEvidenceAuditState::Tested,
-            PlanMediaStatus::CheckFailed => MediaEvidenceAuditState::CheckFailed,
+        if self.status == PlanMediaStatus::CheckFailed
+            || self.results.iter().any(|result| result.state != "measured")
+        {
+            MediaEvidenceAuditState::CheckFailed
+        } else {
+            MediaEvidenceAuditState::Tested
         }
+    }
+}
+
+#[cfg(test)]
+mod media_audit_state_tests {
+    use super::*;
+
+    #[test]
+    fn partial_media_probe_failure_is_check_failed_for_local_audit() {
+        let evidence = PlanMediaEvidence {
+            job_id: "media-job".into(),
+            snapshot_hash: "sha256:media".into(),
+            request_generation: 1,
+            status: PlanMediaStatus::Tested,
+            summaries: vec![PlanMediaSummary {
+                relative_name: "show/ep01.mkv".into(),
+                ..PlanMediaSummary::default()
+            }],
+            results: vec![
+                PlanMediaFileResult {
+                    relative_name: "show/ep01.mkv".into(),
+                    state: "measured".into(),
+                    summary: None,
+                    message: None,
+                },
+                PlanMediaFileResult {
+                    relative_name: "show/ep02.mkv".into(),
+                    state: "timed_out".into(),
+                    summary: None,
+                    message: Some("timeout".into()),
+                },
+            ],
+        };
+
+        assert_eq!(evidence.audit_state(), MediaEvidenceAuditState::CheckFailed);
     }
 }
 
@@ -294,7 +332,7 @@ impl PublishPlan {
         Ok(())
     }
 
-    /// Bind redacted MediaInfo summaries to this plan. Rejects identity mismatch.
+    /// Bind MediaInfo summaries to this plan. Rejects identity mismatch.
     ///
     /// A changed normalized media outcome rolls the plan snapshot hash and invalidates
     /// previous audit evidence/acknowledgements. Rebinding identical media is idempotent.
@@ -569,11 +607,9 @@ impl LocalExecutionBinding {
     /// On success, yields the revalidated `ResolvedOkpExecutable` when identity
     /// was bound (for prepared-plan launch). `None` only when identity was never
     /// captured (legacy/test bindings); prepared publish must fail closed on `None`.
-    /// Failure messages never include raw OKP or torrent absolute paths (path-free
-    /// categories for existence/read/type and identity errors).
     pub(crate) fn revalidate(&self) -> Result<Option<ResolvedOkpExecutable>, Vec<String>> {
         let mut failures = Vec::new();
-        let torrent_identity = match read_torrent_identity_path_free(&self.request.torrent_path) {
+        let torrent_identity = match read_torrent_identity(&self.request.torrent_path) {
             Ok(identity) => identity,
             Err(error) => {
                 failures.push(error);
@@ -581,15 +617,24 @@ impl LocalExecutionBinding {
             }
         };
         if torrent_identity.digest != self.torrent_digest {
-            failures.push("种子文件内容已变化，请重新执行发布前检查。".to_string());
+            failures.push(format!(
+                "种子文件内容已变化：{}，请重新执行发布前检查。",
+                self.request.torrent_path
+            ));
         }
         if torrent_identity.len != self.torrent_len {
-            failures.push("种子文件大小已变化，请重新执行发布前检查。".to_string());
+            failures.push(format!(
+                "种子文件大小已变化：{}，请重新执行发布前检查。",
+                self.request.torrent_path
+            ));
         }
         if !self.content_root.is_empty() {
             match crate::ai::media::validate_media_content_root(&self.content_root) {
                 Ok(current) if current == std::path::Path::new(&self.content_root) => {}
-                _ => failures.push("实际媒体文件夹已变化，请重新执行发布前检查。".to_string()),
+                _ => failures.push(format!(
+                    "实际媒体文件夹已变化：{}，请重新执行发布前检查。",
+                    self.content_root
+                )),
             }
         }
 
@@ -625,7 +670,7 @@ impl LocalExecutionBinding {
     /// Prepared-plan publish gate: revalidate binding and require a bound OKP
     /// executable. Live app config is never consulted; returns the exact binary
     /// whose private identity was revalidated. Unbound identity fails closed
-    /// with a path-free message.
+    /// with an actionable message.
     pub(crate) fn revalidate_for_prepared_publish(
         &self,
     ) -> Result<ResolvedOkpExecutable, Vec<String>> {
@@ -646,21 +691,6 @@ fn read_torrent_identity(torrent_path: &str) -> Result<TorrentIdentity, String> 
     let path = validate_torrent_file_path(torrent_path)?;
     let bytes = std::fs::read(&path)
         .map_err(|error| format!("无法读取种子文件：{} ({})", path.display(), error))?;
-    let len = bytes.len() as u64;
-    let mut hasher = Sha256::new();
-    hasher.update(&bytes);
-    Ok(TorrentIdentity {
-        digest: format!("sha256:{}", hex::encode(hasher.finalize())),
-        len,
-    })
-}
-
-/// Prepared-publish revalidation: same torrent identity checks as prepare, but
-/// failure messages never include absolute torrent paths (IPC-safe).
-fn read_torrent_identity_path_free(torrent_path: &str) -> Result<TorrentIdentity, String> {
-    let path = validate_torrent_file_path_path_free(torrent_path)?;
-    let bytes =
-        std::fs::read(&path).map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
     let len = bytes.len() as u64;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
@@ -691,32 +721,6 @@ fn validate_torrent_file_path(torrent_path: &str) -> Result<PathBuf, String> {
         .unwrap_or(false);
     if !is_torrent {
         return Err(format!("所选文件不是 .torrent 文件：{}", torrent.display()));
-    }
-    Ok(torrent)
-}
-
-/// Path-free torrent path validation for prepared-publish revalidation IPC errors.
-fn validate_torrent_file_path_path_free(torrent_path: &str) -> Result<PathBuf, String> {
-    let torrent_path = torrent_path.trim();
-    if torrent_path.is_empty() {
-        return Err("未选择种子文件，请先选择 .torrent 文件。".to_string());
-    }
-    let torrent = PathBuf::from(torrent_path);
-    if !torrent.exists() {
-        return Err("种子文件不存在，请重新执行发布前检查。".to_string());
-    }
-    let metadata = std::fs::metadata(&torrent)
-        .map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
-    if !metadata.is_file() {
-        return Err("种子路径不是文件，请重新执行发布前检查。".to_string());
-    }
-    let is_torrent = torrent
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(|ext| ext.eq_ignore_ascii_case("torrent"))
-        .unwrap_or(false);
-    if !is_torrent {
-        return Err("所选文件不是 .torrent 文件，请重新执行发布前检查。".to_string());
     }
     Ok(torrent)
 }
@@ -1290,7 +1294,7 @@ impl PlanRegistry {
         Ok(plan)
     }
 
-    /// Bind redacted MediaInfo evidence to a live prepared plan token.
+    /// Bind MediaInfo evidence to a live prepared plan token.
     ///
     /// Fail-closed:
     /// - empty / missing / expired token → error (no plan leak; plan state untouched)
@@ -1908,8 +1912,8 @@ mod tests {
             "unexpected failures: {joined}"
         );
         assert!(
-            !joined.contains(&okp_path_str),
-            "failure must not expose OKP path: {joined}"
+            joined.contains(&okp_path_str),
+            "failure must preserve the OKP path: {joined}"
         );
         // Token remains available after revalidation failure (not consumed).
         assert!(registry.inspect_plan(&token).is_some());
@@ -1937,7 +1941,7 @@ mod tests {
             .expect("binding");
         // Generic revalidate may succeed (torrent/fingerprint only).
         assert!(binding.revalidate().expect("torrent ok").is_none());
-        // Prepared publish requires bound OKP and fails closed path-free.
+        // Prepared publish requires bound OKP and fails closed.
         let failures = binding
             .revalidate_for_prepared_publish()
             .expect_err("unbound OKP must fail prepared publish");
@@ -1946,7 +1950,6 @@ mod tests {
             joined.contains("未绑定") || joined.contains("OKP"),
             "unexpected: {joined}"
         );
-        assert!(!joined.contains('/'), "must be path-free: {joined}");
         let _ = std::fs::remove_file(&torrent_path);
     }
 
@@ -2027,7 +2030,7 @@ mod tests {
     }
 
     #[test]
-    fn prepared_publish_revalidate_torrent_errors_are_path_free() {
+    fn prepared_publish_revalidate_torrent_errors_preserve_path() {
         use crate::publish::capture_okp_executable_identity;
 
         let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
@@ -2062,12 +2065,8 @@ mod tests {
             "unexpected category: {joined}"
         );
         assert!(
-            !joined.contains(&torrent_path_str),
-            "must not expose absolute torrent path: {joined}"
-        );
-        assert!(
-            !joined.contains("/tmp") && !joined.contains("okpgui"),
-            "must not leak path fragments: {joined}"
+            joined.contains(&torrent_path_str),
+            "must preserve the absolute torrent path: {joined}"
         );
         // Token remains available after revalidation failure (not consumed).
         assert!(registry.inspect_plan(&prepared.token).is_some());
@@ -2079,7 +2078,7 @@ mod tests {
     fn prepare_unresolved_okp_identity_none_requires_blockers_for_fail_closed() {
         // Registry contract: okp_identity=None is only safe when local blockers make
         // the plan unpublishable. Prepare IPC must supply blockers from the single
-        // resolve/bind path (Unresolved error or capture-failure path-free blocker).
+        // resolve/bind path (Unresolved error or capture-failure blocker).
         let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
         let mut registry = PlanRegistry::default();
         let prepared = registry
@@ -2160,7 +2159,7 @@ mod tests {
     }
 
     #[test]
-    fn media_evidence_success_bind_is_identity_matched_and_path_free() {
+    fn media_evidence_success_bind_is_identity_matched() {
         let torrent_path = write_temp_torrent(b"d4:infod4:name4:testee");
         let request = sample_request(torrent_path.clone());
         let mut registry = PlanRegistry::default();

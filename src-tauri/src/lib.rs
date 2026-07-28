@@ -86,7 +86,6 @@ pub fn run() {
             commands::ai_commands::ai_start_recognition,
             commands::ai_commands::ai_poll_recognition,
             commands::ai_commands::ai_recognize,
-            commands::ai_commands::ai_redact_value,
             commands::ai_commands::ai_project_context,
             commands::ai_commands::ai_compute_audit,
             // Start returns PENDING+job_id immediately; poll reads plan-bound terminal evidence.
@@ -107,7 +106,7 @@ pub fn run() {
             // Publish-time PENDING cancel: stop formal job without invalidating the frozen token.
             commands::ai_commands::ai_cancel_pending_audit_for_publish,
             // Non-secret debug-record IPC only (bounded retention; no raw bodies/secrets).
-            // Export returns safe basename metadata only (redacted bundle + canary scan).
+            // Export returns safe basename metadata only; record contents remain unchanged.
             commands::ai_commands::ai_list_debug_records,
             commands::ai_commands::ai_clear_debug_records,
             commands::ai_commands::ai_export_debug_records,

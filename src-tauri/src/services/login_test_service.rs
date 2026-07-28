@@ -113,19 +113,7 @@ fn truncate_detail(detail: &str) -> String {
     }
 }
 
-fn redact_secret(detail: &str, secret: &str) -> String {
-    if secret.is_empty() {
-        detail.to_string()
-    } else {
-        detail.replace(secret, "[已隐藏]")
-    }
-}
-
-fn parse_acgrip_api_test_response(
-    status: StatusCode,
-    body_bytes: &[u8],
-    api_token: &str,
-) -> LoginTestResult {
+fn parse_acgrip_api_test_response(status: StatusCode, body_bytes: &[u8]) -> LoginTestResult {
     if status.is_success() {
         return LoginTestResult {
             success: true,
@@ -153,8 +141,6 @@ fn parse_acgrip_api_test_response(
         (None, Some(message)) => message.to_string(),
         (None, None) => truncate_detail(&body),
     };
-    let detail = redact_secret(&detail, api_token.trim());
-
     LoginTestResult {
         success: false,
         message: if detail.is_empty() {
@@ -195,11 +181,7 @@ async fn perform_acgrip_api_token_test_at(
         .await
         .map_err(|e| format!("读取 ACG.RIP API 响应失败: {}", e))?;
 
-    Ok(parse_acgrip_api_test_response(
-        status,
-        &body_bytes,
-        api_token,
-    ))
+    Ok(parse_acgrip_api_test_response(status, &body_bytes))
 }
 
 fn dmhy_team_select_regex() -> &'static Regex {
@@ -507,7 +489,7 @@ mod tests {
 
     #[test]
     fn test_acgrip_api_success_response_accepts_token() {
-        let result = parse_acgrip_api_test_response(StatusCode::OK, br#"{}"#, "secret-token");
+        let result = parse_acgrip_api_test_response(StatusCode::OK, br#"{}"#);
 
         assert!(result.success);
         assert!(result.message.contains("API Token"));
@@ -518,7 +500,6 @@ mod tests {
         let result = parse_acgrip_api_test_response(
             StatusCode::UNAUTHORIZED,
             br#"{"error":"INVALID_TOKEN","message":"token is invalid"}"#,
-            "secret-token",
         );
 
         assert!(!result.success);
@@ -528,11 +509,7 @@ mod tests {
     #[test]
     fn test_acgrip_api_non_json_response_is_truncated() {
         let body = "upstream error ".repeat(30);
-        let result = parse_acgrip_api_test_response(
-            StatusCode::BAD_GATEWAY,
-            body.as_bytes(),
-            "secret-token",
-        );
+        let result = parse_acgrip_api_test_response(StatusCode::BAD_GATEWAY, body.as_bytes());
 
         assert!(!result.success);
         assert!(result.message.contains("HTTP 502"));
@@ -540,16 +517,14 @@ mod tests {
     }
 
     #[test]
-    fn test_acgrip_api_error_response_redacts_token() {
+    fn test_acgrip_api_error_response_preserves_detail() {
         let token = "secret-token";
         let result = parse_acgrip_api_test_response(
             StatusCode::UNAUTHORIZED,
             br#"{"error":"INVALID_TOKEN","message":"secret-token rejected"}"#,
-            token,
         );
 
-        assert!(!result.message.contains(token));
-        assert!(result.message.contains("[已隐藏]"));
+        assert!(result.message.contains(token));
     }
 
     #[test]

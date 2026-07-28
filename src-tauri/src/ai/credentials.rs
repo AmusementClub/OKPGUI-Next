@@ -89,7 +89,7 @@ impl Default for PublicConnectionConfig {
     }
 }
 
-/// In-memory secret holder. Debug redacts contents; Drop best-effort zeroizes bytes.
+/// In-memory secret holder. Drop best-effort zeroizes bytes.
 #[derive(Clone)]
 pub struct SecretValue(String);
 
@@ -114,12 +114,6 @@ impl Drop for SecretValue {
             }
         }
         self.0.clear();
-    }
-}
-
-impl std::fmt::Debug for SecretValue {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("SecretValue([REDACTED])")
     }
 }
 
@@ -965,7 +959,7 @@ pub enum CredentialJournalPhase {
     ConfigCommitted,
 }
 
-/// Redacted, non-secret settings snapshot for audit / recovery correlation.
+/// Non-secret settings snapshot for audit / recovery correlation.
 /// Never includes `SecretValue`, raw keys, or keyring payloads.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct CredentialJournalSettingsMetadata {
@@ -986,7 +980,7 @@ pub struct CredentialJournalSettingsMetadata {
 /// App-local durable journal for one in-flight credential rotation.
 ///
 /// Bytes on disk are intentionally non-secret: only credential *refs* (ids),
-/// phase, TTL, and redacted connection metadata. Never serialize `SecretValue`.
+/// phase, TTL, and non-secret connection metadata. Never serialize `SecretValue`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CredentialRotationJournal {
     pub version: u32,
@@ -1007,7 +1001,7 @@ pub struct CredentialRotationJournal {
 }
 
 impl CredentialRotationJournal {
-    /// Build a `Prepared` journal from a write plan and redacted metadata.
+    /// Build a `Prepared` journal from a write plan and non-secret metadata.
     pub fn prepare(
         plan: &CredentialSecretWritePlan,
         metadata: CredentialJournalSettingsMetadata,
@@ -1227,9 +1221,8 @@ mod tests {
     use serde_json::to_string;
 
     #[test]
-    fn secret_value_does_not_serialize_or_debug_in_plaintext() {
-        let secret = SecretValue::new("sk-test-secret");
-        assert!(!format!("{secret:?}").contains("sk-test-secret"));
+    fn secret_value_is_not_part_of_public_connection_serialization() {
+        let _secret = SecretValue::new("sk-test-secret");
         assert!(to_string(&PublicConnectionConfig::default())
             .unwrap()
             .contains("enabled"));
@@ -2006,7 +1999,7 @@ mod tests {
         assert!(!body.contains("api_key"));
         assert!(!body.contains("\"secret\""));
         assert!(!body.contains("sk-"));
-        // Refs and redacted connection metadata only.
+        // Refs and non-secret connection metadata only.
         assert!(body.contains("candidate-ref"));
         assert!(body.contains("old-ref"));
         assert!(body.contains("openai"));

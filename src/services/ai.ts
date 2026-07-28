@@ -131,14 +131,6 @@ export async function publishPreparedPlan(
     await invoke('publish_prepared_plan', { token: resolved });
 }
 
-/**
- * @deprecated Backend owns snapshot identity. Kept as a no-op stub so non-owned
- * call sites compile; never hashes client data and never falls back to FNV.
- */
-export async function snapshotHash(_request: PublishRequestPayload): Promise<string> {
-    return '';
-}
-
 /** Invoke the Rust-owned formal audit path (local-only when AI is disabled; awaits terminal). */
 export async function computeAiAudit(request: AiFormalAuditRequest): Promise<AiAuditResult> {
     return invoke<AiAuditResult>('ai_compute_audit', { request });

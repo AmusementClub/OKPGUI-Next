@@ -21,7 +21,6 @@ const contractPath = path.join(
   'ai',
   'provider_contract.rs',
 );
-const redactionPath = path.join(rootDir, 'src-tauri', 'src', 'ai', 'redaction.rs');
 const providerPath = path.join(rootDir, 'src-tauri', 'src', 'ai', 'provider.rs');
 
 const REQUIRED_SCENARIOS = [
@@ -49,7 +48,7 @@ const REQUIRED_MARKERS = [
   'localhost_mock_redirect_is_classified_without_following',
   'ordinary_audit_text_with_word_refusal_is_not_envelope_refusal',
   'CANARY_SECRET',
-  'assert_request_body_sanitary',
+  'assert_request_body_has_no_credentials',
   // Must never instruct live network.
   'never call live or paid providers',
 ];
@@ -81,14 +80,13 @@ function assertNotContains(haystack, needle, label) {
 }
 
 function main() {
-  for (const filePath of [contractPath, redactionPath, providerPath]) {
+  for (const filePath of [contractPath, providerPath]) {
     if (!existsSync(filePath)) {
       die(`required source missing: ${path.relative(rootDir, filePath)}`);
     }
   }
 
   const contract = readFileSync(contractPath, 'utf8');
-  const redaction = readFileSync(redactionPath, 'utf8');
   const provider = readFileSync(providerPath, 'utf8');
 
   for (const scenario of REQUIRED_SCENARIOS) {
@@ -101,13 +99,8 @@ function main() {
     assertNotContains(contract, marker, 'provider_contract');
   }
 
-  // Security/redaction corpus must remain present and canary-aware.
-  assertContains(redaction, 'sk-proj-', 'redaction corpus');
-  assertContains(redaction, 'REDACTED', 'redaction corpus');
-  assertContains(redaction, 'redacts_production_api_key_shapes', 'redaction tests');
-  assertContains(redaction, 'redacts_paths_urls_and_image_payloads', 'redaction tests');
-
-  // Production provider module must keep no-redirect + envelope-only refusal rules.
+  // Production provider module must keep no-redirect, envelope-only refusal, and
+  // compact business-result prompts that do not embed JSON Schema as model input.
   assertContains(provider, 'redirect::Policy::none()', 'provider no-redirect');
   assertContains(provider, 'has_refusal', 'provider refusal helper');
   assertContains(provider, 'openai_chat_has_refusal', 'provider chat refusal');
@@ -116,6 +109,12 @@ function main() {
     provider,
     'ordinary_audit_text_containing_word_refusal_is_not_provider_refusal',
     'provider refusal regression',
+  );
+  assertContains(provider, 'json_object_output_contract', 'provider prompt contract');
+  assertNotContains(
+    provider,
+    '字段名和状态值必须严格符合以下结构约定',
+    'provider prompt contract',
   );
 
   console.log('verify-provider-contract: ok');

@@ -358,7 +358,7 @@ export interface AiRecognizeRequest {
 }
 
 /**
- * Redacted, typed recognition result over IPC (mirrors Rust RecognitionResult).
+ * Typed recognition result over IPC (mirrors Rust RecognitionResult).
  * episode / resolution / suggested_title are advisory only — never auto-fill the draft.
  * request_generation + snapshot_hash are backend-owned context identity.
  */
@@ -389,8 +389,8 @@ export interface RecognitionJobView {
     snapshot_hash: string;
     progress: number;
     error_code?: string | null;
-    /** Redacted status/error message (never secrets or raw provider bodies). */
+    /** Bounded status/error message. */
     message?: string | null;
-    /** Validated redacted result only when state is succeeded. */
+    /** Validated result only when state is succeeded. */
     result?: RecognitionResult | null;
 }

@@ -25,7 +25,7 @@ use std::time::Duration;
 /// Deterministic fixture IDs used by the offline mock matrix (never secrets).
 pub const FIXTURE_MODEL_OPENAI: &str = "mock-gpt-contract";
 pub const FIXTURE_MODEL_ANTHROPIC: &str = "mock-claude-contract";
-/// Canary secret used only inside mock HTTP bodies to prove redaction of errors.
+/// Canary value used only inside mock HTTP bodies to prove response bodies are not echoed.
 pub const CANARY_SECRET: &str = "sk-canary-offline-secret-never-log";
 
 /// One offline mock scenario covering a provider wire shape or failure mode.
@@ -271,16 +271,12 @@ pub fn fixture_status(scenario: MockScenario) -> u16 {
     }
 }
 
-/// Assert a request body never embeds secret material or absolute local paths.
-pub fn assert_request_body_sanitary(body: &Value) {
+/// Assert a request body never embeds credential material.
+pub fn assert_request_body_has_no_credentials(body: &Value) {
     let serialized = body.to_string();
     assert!(
         !serialized.contains(CANARY_SECRET),
         "request body must not contain canary secret"
-    );
-    assert!(
-        !serialized.contains("/Users/") && !serialized.contains("C:\\\\Users"),
-        "request body must not embed absolute user paths"
     );
 }
 
@@ -541,7 +537,7 @@ mod tests {
             responses.body.pointer("/input/1/role"),
             Some(&json!("user"))
         );
-        assert_request_body_sanitary(&responses.body);
+        assert_request_body_has_no_credentials(&responses.body);
 
         let chat = build_structured_request_with_system(
             ProviderKind::OpenAi,
@@ -573,7 +569,7 @@ mod tests {
             Some(&json!("system"))
         );
         assert_eq!(chat.body.pointer("/messages/1/role"), Some(&json!("user")));
-        assert_request_body_sanitary(&chat.body);
+        assert_request_body_has_no_credentials(&chat.body);
 
         let anthropic = build_structured_request_with_system(
             ProviderKind::Anthropic,
@@ -596,14 +592,15 @@ mod tests {
             .body
             .get("system")
             .and_then(Value::as_str)
-            .expect("Anthropic JSON mode needs a schema-bearing system prompt");
+            .expect("Anthropic JSON mode needs a business-result system prompt");
         assert!(anthropic_system.contains("系统提示"));
-        assert!(anthropic_system.contains("单一 JSON object"));
+        assert!(anthropic_system.contains("业务结果 JSON object"));
+        assert!(!anthropic_system.contains("additionalProperties"));
         assert_eq!(
             anthropic.body.pointer("/messages/0/role"),
             Some(&json!("user"))
         );
-        assert_request_body_sanitary(&anthropic.body);
+        assert_request_body_has_no_credentials(&anthropic.body);
 
         let models =
             build_models_list_request(ProviderKind::OpenAi, endpoint, AuthMode::Bearer).unwrap();
@@ -867,5 +864,44 @@ mod tests {
         assert_eq!(failure.kind, ProviderFailureKind::Redirect);
         assert!(!failure.message.contains("evil.example"));
         assert!(!failure.message.contains(CANARY_SECRET));
+    }
+
+    #[tokio::test]
+    async fn provider_response_content_length_is_bounded_before_body_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind localhost mock");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = [0u8; 4096];
+                let _ = stream.read(&mut request);
+                let response = concat!(
+                    "HTTP/1.1 200 OK\r\n",
+                    "Content-Type: application/json\r\n",
+                    "Content-Length: 262145\r\n",
+                    "Connection: close\r\n\r\n"
+                );
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.flush();
+            }
+        });
+        let client = build_no_redirect_client().unwrap();
+        let request = build_models_list_request(
+            ProviderKind::OpenAi,
+            &format!("http://{addr}"),
+            AuthMode::None,
+        )
+        .unwrap();
+        let error = send_managed_provider_request(
+            &client,
+            &request,
+            AuthMode::None,
+            None,
+            None,
+            ProviderKind::OpenAi,
+        )
+        .await
+        .expect_err("oversized response must be rejected");
+        handle.join().ok();
+        assert_eq!(error, "provider response exceeded the 256 KiB limit");
     }
 }

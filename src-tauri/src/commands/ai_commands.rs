@@ -1,6 +1,6 @@
 use crate::ai::audit::{
-    build_formal_audit_prompt, compute_decision, formal_audit_schema, formal_audit_system_prompt,
-    redact_provider_error, sanitize_audit_input, try_parse_formal_audit_output,
+    build_formal_audit_prompt, compact_provider_error, compute_decision, formal_audit_schema,
+    formal_audit_system_prompt, try_parse_formal_audit_output,
     validate_findings_against_projection, AuditDecision, AuditInput, Finding, FindingSeverity,
     ValidatedAudit,
 };
@@ -40,11 +40,9 @@ use crate::ai::provider::{
 };
 use crate::ai::recognition::{
     bind_recognition_result, build_recognition_context_snapshot, build_recognition_prompt,
-    recognition_from_provider_outcome, recognition_schema, redact_recognition_output,
-    RecognitionContextSnapshot, RecognitionResult, RECOGNITION_SCHEMA_VERSION,
-    RECOGNITION_SYSTEM_PROMPT,
+    recognition_from_provider_outcome, recognition_schema, RecognitionContextSnapshot,
+    RecognitionResult, RECOGNITION_SCHEMA_VERSION, RECOGNITION_SYSTEM_PROMPT,
 };
-use crate::ai::redaction::RedactionPolicy;
 use crate::domain::publish_plan::{
     get_or_create_registry, plan_token_digest, CancelPreflightSessionResult, PlanAuditEvidence,
     PlanRegistry, PreflightTokenState,
@@ -66,7 +64,7 @@ const FORMAL_PROVIDER_ATTEMPTS: usize = 2;
 
 fn validation_retry_prompt(original: &str) -> String {
     format!(
-        "{original}\n\n上一次返回未通过 JSON 解析或结果结构校验。请重新执行检查并生成完整的单一 JSON object，严格遵循既定输出约定；只返回业务结果实例，不得返回 JSON Schema 定义本身，也不得包含 type、properties、required、additionalProperties、json_schema、strict 等 schema 字段；不要输出 Markdown 代码围栏、解释文字或额外字段。"
+        "{original}\n\n上一次返回不是可解析的业务结果。请重新执行任务，只返回完整的单一 JSON object，并严格使用 system 消息指定的业务字段；不要返回结构定义、Markdown、解释文字或额外字段。"
     )
 }
 
@@ -80,6 +78,34 @@ fn retryable_structured_failure(failure: &ProviderFailure) -> bool {
 
 fn formal_retry_remaining(request_attempt: usize) -> bool {
     request_attempt + 1 < FORMAL_PROVIDER_ATTEMPTS
+}
+
+fn user_facing_formal_description(description: String, findings: &[Finding]) -> Option<String> {
+    let description = description.trim();
+    if description.is_empty() {
+        return None;
+    }
+    let media_note = if findings
+        .iter()
+        .any(|finding| finding.code == "MEDIA_NOT_TESTED")
+    {
+        Some("MediaInfo 尚未执行，媒体技术信息未完成核对。")
+    } else if findings
+        .iter()
+        .any(|finding| finding.code == "MEDIA_CHECK_FAILED")
+    {
+        Some("MediaInfo 未取得可用结果，媒体技术信息未完成核对。")
+    } else {
+        None
+    };
+    Some(match media_note {
+        Some(note) => format!(
+            "{} {}",
+            description.chars().take(520).collect::<String>(),
+            note
+        ),
+        None => description.chars().take(600).collect(),
+    })
 }
 
 struct FormalValidationError {
@@ -1437,12 +1463,6 @@ fn media_info_terminal_view(job: &AiJob) -> Result<MediaInfoJobView, String> {
             view.error_code = job.error_code.clone().or_else(|| Some("STALE".to_string()));
         }
     }
-    // Drop absolute paths if any leaked into messages (defense in depth).
-    for item in &mut view.results {
-        if let Some(message) = item.message.take() {
-            item.message = Some(redact_media_message(&message));
-        }
-    }
     Ok(view)
 }
 
@@ -1484,7 +1504,7 @@ fn finish_media_info_job(
         results = sanitize_media_results_for_non_success(results);
     }
 
-    // Bind plan-owned redacted media evidence only on Succeeded terminal jobs.
+    // Bind plan-owned media evidence only on Succeeded terminal jobs.
     // Cancel / timeout / nonzero / malformed / oversized / Failed never mutate the plan.
     // Identity mismatch or drift also leave plan media evidence unchanged.
     let bound_snapshot_hash =
@@ -1515,7 +1535,7 @@ fn finish_media_info_job(
     view
 }
 
-/// Attempt to bind redacted MediaInfo summaries to the matching prepared plan.
+/// Attempt to bind MediaInfo summaries to the matching prepared plan.
 ///
 /// Failures (token mismatch, identity drift, missing binding) return `Err` without
 /// mutating plan state. Never trusts client snapshot_hash as identity — the job's
@@ -1531,13 +1551,7 @@ fn try_bind_media_evidence_to_plan(
     if plan_token.is_empty() {
         return Err("prepared plan token is required".to_string());
     }
-    let evidence = build_plan_media_evidence(
-        job_id,
-        snapshot_hash,
-        request_generation,
-        results,
-        &RedactionPolicy::default(),
-    );
+    let evidence = build_plan_media_evidence(job_id, snapshot_hash, request_generation, results);
     let mut guard = get_or_create_registry()
         .lock()
         .unwrap_or_else(|error| error.into_inner());
@@ -1677,26 +1691,6 @@ fn signal_media_cancel(job_id: &str) {
     }
 }
 
-fn redact_media_message(message: &str) -> String {
-    // Strip absolute-looking segments so diagnostics never echo host paths.
-    let mut output = String::with_capacity(message.len());
-    for part in message.split_whitespace() {
-        let looks_absolute = part.starts_with('/')
-            || (part.len() > 2
-                && part.as_bytes()[0].is_ascii_alphabetic()
-                && part.as_bytes().get(1) == Some(&b':')
-                && (part.as_bytes().get(2) == Some(&b'\\')
-                    || part.as_bytes().get(2) == Some(&b'/')));
-        if looks_absolute {
-            output.push_str("[path]");
-        } else {
-            output.push_str(part);
-        }
-        output.push(' ');
-    }
-    output.trim().to_string()
-}
-
 /// One-shot / start release recognition request: safe torrent name + template pattern content only.
 ///
 /// Never accepts absolute torrent paths, publish-plan tokens, model-owned final titles, or
@@ -1717,9 +1711,9 @@ pub struct AiRecognizeRequest {
     pub title_pattern: String,
 }
 
-/// Public Recognition job view: progress + redacted errors; result only on Succeeded.
+/// Public Recognition job view: progress + bounded errors; result only on Succeeded.
 ///
-/// Validated redacted `RecognitionResult` is stored by job id and surfaced only when
+/// Validated `RecognitionResult` is stored by job id and surfaced only when
 /// `state == Succeeded`. Cancelled / Stale / Failed / late completion never return a result.
 /// `request_generation` and `snapshot_hash` are backend-owned context identity.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1732,7 +1726,7 @@ pub struct RecognitionJobView {
     pub snapshot_hash: String,
     pub progress: u8,
     pub error_code: Option<String>,
-    /// Redacted human-readable status/error (never secrets, raw paths, or provider bodies).
+    /// Bounded human-readable status/error.
     pub message: Option<String>,
     /// Present only when `state == Succeeded` and result return was allowed.
     pub result: Option<RecognitionResult>,
@@ -1773,19 +1767,12 @@ pub async fn ai_start_recognition(
 
     let identity = capability_identity(&connection, secret.as_ref());
 
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
-
-    // Backend-owned identity: sanitize → snapshot → hash → monotonic generation.
+    // Backend-owned identity: validate → snapshot → hash → monotonic generation.
     let (snapshot, context_hash) = build_recognition_context_snapshot(
         &request.torrent_name,
         &request.ep_pattern,
         &request.resolution_pattern,
         &request.title_pattern,
-        &policy,
     )?;
     let request_generation = next_recognition_generation();
 
@@ -2027,7 +2014,7 @@ fn finish_recognition_failure(
     })
 }
 
-/// Store a validated redacted result only when the job is still non-terminal; complete as
+/// Store a validated result only when the job is still non-terminal; complete as
 /// Succeeded only then. Late cancel between validation and complete drops the result.
 fn finish_recognition_success(
     job_id: &str,
@@ -2212,12 +2199,6 @@ async fn run_recognition_worker(
         return;
     }
 
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
-
     update_recognition_job_progress(&job_id, 10, "preparing recognition");
 
     let prompt = build_recognition_prompt(
@@ -2240,7 +2221,7 @@ async fn run_recognition_worker(
     let client = match build_no_redirect_client() {
         Ok(client) => client,
         Err(error) => {
-            let message = redact_provider_error(&error, &policy);
+            let message = compact_provider_error(&error);
             finish_recognition_failure(
                 &job_id,
                 request_generation,
@@ -2292,7 +2273,7 @@ async fn run_recognition_worker(
             error_code,
             ..
         } => {
-            let message = redact_provider_error(&failure.message, &policy);
+            let message = compact_provider_error(&failure.message);
             finish_recognition_failure(
                 &job_id,
                 request_generation,
@@ -2316,9 +2297,8 @@ async fn run_recognition_worker(
 
     update_recognition_job_progress(&job_id, 90, "binding recognition result");
 
-    let redacted = redact_recognition_output(output, &policy);
     let result = bind_recognition_result(
-        redacted,
+        output,
         request_generation,
         snapshot_hash.clone(),
         job_id.clone(),
@@ -2370,11 +2350,6 @@ pub async fn ai_recognize(
         }
     }
 }
-#[tauri::command]
-pub fn ai_redact_value(value: Value, secret_values: Vec<String>) -> Value {
-    RedactionPolicy::new(secret_values).redact_value(&value)
-}
-
 /// Request for plan-owned AI context projection. Opaque token only — never client
 /// torrent names, trees, templates, files, or absolute paths.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2403,13 +2378,7 @@ pub fn ai_project_context(request: AiProjectContextRequest) -> Result<ContextPro
         guard.resolve_binding_for_context(plan_token)?
     };
 
-    // Credentials never enter ContextProjection; default policy still path-redacts scalars.
-    project_context_from_binding(
-        &binding,
-        &RedactionPolicy::default(),
-        DEFAULT_CONTEXT_CEILING,
-    )
-    .map_err(context_error_to_public)
+    project_context_from_binding(&binding, DEFAULT_CONTEXT_CEILING).map_err(context_error_to_public)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2480,10 +2449,6 @@ pub fn ai_connection_is_configured_for_app(app: &AppHandle) -> bool {
     connection_is_configured(&connection)
 }
 
-/// Build a formal-audit result after sanitizing findings with the active policy.
-/// Callers pass the secret-aware policy when a credential is in scope; otherwise default.
-/// Sanitization runs before decision calculation so bind + IPC never see raw canaries.
-///
 /// Plan-owned MediaInfo state contributes `MEDIA_NOT_TESTED` / `MEDIA_CHECK_FAILED`
 /// via [`media_findings_from_plan_evidence`] — never client probe values.
 #[allow(clippy::too_many_arguments)]
@@ -2495,34 +2460,27 @@ fn local_audit_result(
     findings: Vec<Finding>,
     formal_ran: bool,
     job_id: Option<String>,
-    policy: &RedactionPolicy,
 ) -> AiFormalAuditResult {
-    // Secret-aware substring redaction on evidence_path preserves relative path shape
-    // (full redact_text would path-mangle "torrent/file.mkv"); messages use full policy.
-    let mut findings = findings
-        .into_iter()
-        .map(|mut finding| {
-            if let Some(path) = finding.evidence_path.as_ref() {
-                finding.evidence_path = Some(policy.redact_secret_substrings(path));
-            }
-            finding
-        })
-        .collect::<Vec<_>>();
+    let mut findings = findings;
     // An AI-disabled plan is a local-only path: do not turn the optional, unrun
     // MediaInfo check into a new WARNING. Once an AI/media path actually ran (or
     // already produced a local finding), plan-owned media evidence is advisory.
     // This preserves the zero-impact disabled contract without trusting client data.
     if formal_ran || job_id.is_some() || !findings.is_empty() {
-        findings.extend(load_plan_media_findings(&plan_token));
+        for media_finding in load_plan_media_findings(&plan_token) {
+            if !findings
+                .iter()
+                .any(|finding| finding.code == media_finding.code)
+            {
+                findings.push(media_finding);
+            }
+        }
     }
-    let input = sanitize_audit_input(
-        AuditInput {
-            local_blockers: local_blockers.clone(),
-            findings,
-            checking: false,
-        },
-        policy,
-    );
+    let input = AuditInput {
+        local_blockers: local_blockers.clone(),
+        findings,
+        checking: false,
+    };
     let validated = compute_decision(&input);
     AiFormalAuditResult {
         decision: validated.decision,
@@ -2588,7 +2546,6 @@ fn pending_audit_result(
     request_generation: u64,
     local_blockers: Vec<String>,
     job_id: String,
-    policy: &RedactionPolicy,
 ) -> AiFormalAuditResult {
     if !local_blockers.is_empty() {
         return local_audit_result(
@@ -2599,7 +2556,6 @@ fn pending_audit_result(
             Vec::new(),
             false,
             Some(job_id),
-            policy,
         );
     }
     AiFormalAuditResult {
@@ -2709,12 +2665,7 @@ fn resolve_local_formal_audit(
 
     // Backend plan identity is authoritative — never trust caller snapshot/generation/blockers.
     let (snapshot_hash, request_generation, plan_blockers) = plan_identity(&plan_token)?;
-    let policy = RedactionPolicy::default();
-    let local_blockers = plan_blockers
-        .into_iter()
-        .map(|blocker| policy.redact_text(&blocker))
-        .collect::<Vec<_>>();
-    let snapshot_hash = policy.redact_text(&snapshot_hash);
+    let local_blockers = plan_blockers;
 
     let connection = ai_get_settings(app.clone());
     if !connection.enabled {
@@ -2727,7 +2678,6 @@ fn resolve_local_formal_audit(
             Vec::new(),
             false,
             None,
-            &policy,
         );
         bind_audit_to_plan(&result)?;
         return Ok((
@@ -2754,7 +2704,6 @@ fn resolve_local_formal_audit(
             }],
             false,
             None,
-            &policy,
         );
         bind_audit_to_plan(&result)?;
         return Ok((
@@ -2778,7 +2727,6 @@ fn resolve_local_formal_audit(
             Vec::new(),
             false,
             None,
-            &policy,
         );
         bind_audit_to_plan(&result)?;
         return Ok((
@@ -2816,7 +2764,6 @@ fn resolve_local_formal_audit(
                     }],
                     false,
                     None,
-                    &policy,
                 );
                 bind_audit_to_plan(&result)?;
                 return Ok((
@@ -2873,12 +2820,6 @@ async fn run_provider_formal_audit(
     local_blockers: Vec<String>,
     job_id: String,
 ) -> Result<AiFormalAuditResult, String> {
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
-
     // Project plan-owned context before any provider HTTP. Fail closed (no truncation).
     let projection = {
         let (binding, media_info) = {
@@ -2888,7 +2829,7 @@ async fn run_provider_formal_audit(
             match guard.resolve_context_for_audit(&plan_token) {
                 Ok(context) => context,
                 Err(error) => {
-                    let message = policy.redact_text(&error);
+                    let message = error;
                     let result = local_audit_result(
                         plan_token,
                         snapshot_hash,
@@ -2902,7 +2843,6 @@ async fn run_provider_formal_audit(
                         }],
                         false,
                         Some(job_id.clone()),
-                        &policy,
                     );
                     return complete_and_bind_formal_audit(
                         &job_id,
@@ -2917,7 +2857,6 @@ async fn run_provider_formal_audit(
         match project_context_from_binding_with_media(
             &binding,
             &media_info,
-            &policy,
             DEFAULT_CONTEXT_CEILING,
         ) {
             Ok(projection) => projection,
@@ -2937,7 +2876,6 @@ async fn run_provider_formal_audit(
                     vec![finding],
                     false,
                     Some(job_id.clone()),
-                    &policy,
                 );
                 return complete_and_bind_formal_audit(
                     &job_id,
@@ -2953,7 +2891,7 @@ async fn run_provider_formal_audit(
     let prompt = match build_formal_audit_prompt(&snapshot_hash, &projection) {
         Ok(prompt) => prompt,
         Err(error) => {
-            let message = policy.redact_text(&error);
+            let message = error;
             let result = local_audit_result(
                 plan_token,
                 snapshot_hash,
@@ -2967,7 +2905,6 @@ async fn run_provider_formal_audit(
                 }],
                 false,
                 Some(job_id.clone()),
-                &policy,
             );
             return complete_and_bind_formal_audit(
                 &job_id,
@@ -2982,7 +2919,7 @@ async fn run_provider_formal_audit(
     let client = match build_no_redirect_client() {
         Ok(client) => client,
         Err(error) => {
-            let message = redact_provider_error(&error, &policy);
+            let message = compact_provider_error(&error);
             let result = local_audit_result(
                 plan_token,
                 snapshot_hash,
@@ -2996,7 +2933,6 @@ async fn run_provider_formal_audit(
                 }],
                 false,
                 Some(job_id.clone()),
-                &policy,
             );
             return complete_and_bind_formal_audit(
                 &job_id,
@@ -3039,12 +2975,9 @@ async fn run_provider_formal_audit(
                 findings,
                 true,
                 Some(job_id.clone()),
-                &policy,
             );
-            let description = policy.redact_text(&output.description);
-            if !description.trim().is_empty() {
-                result.description = Some(description.chars().take(600).collect());
-            }
+            result.description =
+                user_facing_formal_description(output.description, &result.findings);
             let summary = format!(
                 "formal audit decision={} findings={}",
                 match result.decision {
@@ -3067,7 +3000,7 @@ async fn run_provider_formal_audit(
                 "AI 返回格式不符合审核要求，自动纠正后仍无法解析。请重试检查或更换模型。"
                     .to_string()
             } else {
-                redact_provider_error(&failure.message, &policy)
+                compact_provider_error(&failure.message)
             };
             let result = local_audit_result(
                 plan_token,
@@ -3082,7 +3015,6 @@ async fn run_provider_formal_audit(
                 }],
                 formal_ran,
                 Some(job_id.clone()),
-                &policy,
             );
             complete_and_bind_formal_audit(
                 &job_id,
@@ -3132,11 +3064,6 @@ pub async fn ai_start_formal_audit(
         &request.request_generation,
     );
 
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
     let identity = capability_identity(&connection, secret.as_ref());
     let job_id = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -3154,7 +3081,6 @@ pub async fn ai_start_formal_audit(
         request_generation,
         local_blockers.clone(),
         job_id.clone(),
-        &policy,
     );
     // Attach job id to prepare-time PENDING so cancel/publish can target the live job.
     bind_audit_to_plan(&pending)?;
@@ -3265,11 +3191,6 @@ pub async fn ai_compute_audit(
         &request.request_generation,
     );
 
-    let mut redaction_secrets = Vec::new();
-    if let Some(secret) = secret.as_ref() {
-        redaction_secrets.push(secret.expose().to_string());
-    }
-    let policy = RedactionPolicy::new(redaction_secrets);
     let identity = capability_identity(&connection, secret.as_ref());
     let job_id = {
         let mut manager = jobs().lock().unwrap_or_else(|error| error.into_inner());
@@ -3288,7 +3209,6 @@ pub async fn ai_compute_audit(
         request_generation,
         local_blockers.clone(),
         job_id.clone(),
-        &policy,
     );
     bind_audit_to_plan(&pending)?;
 
@@ -3311,9 +3231,7 @@ pub async fn ai_compute_audit(
 /// local-only callers; intentionally unregistered so webview cannot forge decisions.
 #[allow(dead_code)] // compatibility API: not referenced by production IPC path
 pub fn ai_compute_audit_local(input: AuditInput) -> Result<ValidatedAudit, String> {
-    let policy = RedactionPolicy::default();
-    let sanitized = sanitize_audit_input(input, &policy);
-    Ok(compute_decision(&sanitized))
+    Ok(compute_decision(&input))
 }
 
 /// Crate-private job lifecycle: only backend workers may start jobs.
@@ -3984,7 +3902,7 @@ pub fn ai_clear_debug_records() -> Result<(), String> {
         .clear_debug_records()
 }
 
-/// Read-only export of redacted debug records to an app-local file.
+/// Read-only export of debug records to an app-local file.
 ///
 /// Returns safe basename metadata only — never raw bundle content or absolute paths.
 /// Works with AI disabled (no network / no credential access). Storage or canary
@@ -4083,22 +4001,6 @@ pub struct AiModelDiscoveryResult {
 }
 
 #[cfg(debug_assertions)]
-fn debug_safe_provider_url(raw: &str) -> String {
-    let raw = raw.trim();
-    let without_query = raw.split(['?', '#']).next().unwrap_or(raw);
-    let Some((scheme, remainder)) = without_query.split_once("://") else {
-        return "<invalid-url>".to_string();
-    };
-    let authority_end = remainder.find('/').unwrap_or(remainder.len());
-    let authority = remainder[..authority_end]
-        .rsplit('@')
-        .next()
-        .unwrap_or("<invalid-host>");
-    let path = &remainder[authority_end..];
-    format!("{scheme}://{authority}{path}")
-}
-
-#[cfg(debug_assertions)]
 fn debug_model_response_shape(body: &str) -> String {
     match serde_json::from_str::<Value>(body) {
         Ok(Value::Object(object)) => {
@@ -4117,17 +4019,11 @@ fn debug_model_response_shape(body: &str) -> String {
 #[cfg(test)]
 mod model_discovery_debug_tests {
     use super::{
-        debug_model_response_shape, debug_safe_provider_url, model_discovery_may_use_stored_secret,
-        PublicConnectionConfig,
+        debug_model_response_shape, model_discovery_may_use_stored_secret, PublicConnectionConfig,
     };
 
     #[test]
-    fn diagnostics_strip_url_secrets_and_summarize_response_without_values() {
-        let safe_url = debug_safe_provider_url(
-            "https://user:password@example.test/v1/models?api_key=secret#fragment",
-        );
-        assert_eq!(safe_url, "https://example.test/v1/models");
-
+    fn diagnostics_summarize_response_without_values() {
         let shape = debug_model_response_shape(r#"{"data":[{"id":"secret-model"}]}"#);
         assert_eq!(shape, "json-object data-items=1");
         assert!(!shape.contains("secret-model"));
@@ -4184,9 +4080,8 @@ pub async fn ai_list_models(
     };
     #[cfg(debug_assertions)]
     eprintln!(
-        "[BYOK:model-list] start provider={:?} endpoint={} auth={:?} credential_source={} cached_models={}",
+        "[BYOK:model-list] start provider={:?} auth={:?} credential_source={} cached_models={}",
         connection.provider,
-        debug_safe_provider_url(&connection.endpoint),
         connection.auth_mode,
         credential_source,
         connection.discovered_models.len(),
@@ -4218,11 +4113,7 @@ pub async fn ai_list_models(
         connection.auth_mode,
     )?;
     #[cfg(debug_assertions)]
-    eprintln!(
-        "[BYOK:model-list] request method={} url={}",
-        request.method,
-        debug_safe_provider_url(&request.url),
-    );
+    eprintln!("[BYOK:model-list] request method={}", request.method,);
 
     let send_result = send_managed_provider_request(
         &client,
@@ -4327,7 +4218,7 @@ mod debug_record_and_exit_tests {
     }
 
     #[test]
-    fn debug_record_ipc_redacts_absolute_paths_in_summary() {
+    fn debug_record_ipc_preserves_absolute_paths_in_summary() {
         let _guard = command_test_guard();
         ai_clear_debug_records().expect("clear");
         let job_id = start_job_backend(JobKind::Audit, 10, "sha256:debug-path", None);
@@ -4343,12 +4234,7 @@ mod debug_record_and_exit_tests {
             .iter()
             .find(|record| record.job_id == job_id)
             .expect("record");
-        assert!(
-            !record.summary.contains("/Users/owen"),
-            "list IPC must not surface absolute paths: {}",
-            record.summary
-        );
-        assert!(record.summary.contains("[PATH_REDACTED]"));
+        assert!(record.summary.contains("/Users/owen/secret/file"));
         ai_clear_debug_records().expect("clear");
     }
 
@@ -4376,7 +4262,6 @@ mod formal_audit_lifecycle_tests {
             decision_findings,
             true,
             Some(job_id.to_string()),
-            &RedactionPolicy::default(),
         )
     }
 
@@ -4396,7 +4281,6 @@ mod formal_audit_lifecycle_tests {
             generation,
             Vec::new(),
             job_id.clone(),
-            &RedactionPolicy::default(),
         );
         bind_audit_to_plan(&pending).expect("bind pending");
         (token, job_id)
@@ -4709,7 +4593,6 @@ mod formal_audit_lifecycle_tests {
             3,
             Vec::new(),
             job_id.clone(),
-            &RedactionPolicy::default(),
         );
         bind_audit_to_plan(&pending).expect("bind pending");
 
@@ -4740,7 +4623,6 @@ mod formal_audit_lifecycle_tests {
             4,
             Vec::new(),
             job_id.clone(),
-            &RedactionPolicy::default(),
         );
         bind_audit_to_plan(&pending).expect("bind pending");
 
@@ -4781,12 +4663,8 @@ mod formal_audit_lifecycle_tests {
     }
 
     #[test]
-    fn formal_success_findings_redact_canary_api_key_before_bind_result() {
-        // Simulates structured provider findings that echo a live credential into
-        // message and evidence_path; the active secret-aware policy must strip it
-        // before decision calculation and the returned/bound IPC payload.
+    fn formal_success_findings_preserve_provider_text_before_bind_result() {
         const CANARY: &str = "sk-live-canary-formal-audit-key-9f3c2a1b";
-        let policy = RedactionPolicy::new([CANARY]);
         let findings = vec![Finding {
             code: "PROVIDER_WARNING".to_string(),
             severity: FindingSeverity::Warning,
@@ -4801,44 +4679,23 @@ mod formal_audit_lifecycle_tests {
             findings,
             true,
             Some("job-canary".to_string()),
-            &policy,
         );
 
         assert_eq!(result.decision, AuditDecision::Warning);
         assert_eq!(result.findings.len(), 1);
-        assert!(
-            !result.findings[0].message.contains(CANARY),
-            "canary must not appear in finding message after secret-aware sanitize: {}",
-            result.findings[0].message
-        );
-        assert!(
-            result.findings[0].message.contains("[REDACTED]"),
-            "message should carry redaction marker"
-        );
+        assert!(result.findings[0].message.contains(CANARY));
         let evidence = result.findings[0]
             .evidence_path
             .as_deref()
             .unwrap_or_default();
-        assert!(
-            !evidence.contains(CANARY),
-            "canary must not appear in evidence_path of bound result: {evidence}"
-        );
-        assert!(
-            evidence.contains("[REDACTED]"),
-            "evidence_path should retain relative shape with secret replaced: {evidence}"
-        );
+        assert!(evidence.contains(CANARY));
 
-        // Serialize as Tauri IPC would: no raw canary in the wire payload.
         let wire = serde_json::to_string(&result).expect("result serializes");
-        assert!(
-            !wire.contains(CANARY),
-            "canary must not reach IPC serialization: {wire}"
-        );
+        assert!(wire.contains(CANARY));
     }
 
     #[test]
-    fn formal_local_path_keeps_default_policy_when_no_secret() {
-        // Paths without an active credential keep default-policy behavior.
+    fn formal_local_path_preserves_messages_and_paths() {
         let result = local_audit_result(
             "plan-token-default".to_string(),
             "sha256:default".to_string(),
@@ -4852,17 +4709,10 @@ mod formal_audit_lifecycle_tests {
             }],
             false,
             None,
-            &RedactionPolicy::default(),
         );
         assert_eq!(result.decision, AuditDecision::LocalBlocked);
-        assert!(
-            !result.local_blockers[0].contains("/Users/owen"),
-            "default policy still path-redacts blockers"
-        );
-        assert!(
-            !result.findings[0].message.contains("/private"),
-            "default policy still path-redacts finding messages"
-        );
+        assert!(result.local_blockers[0].contains("/Users/owen"));
+        assert!(result.findings[0].message.contains("/private"));
         assert_eq!(
             result.findings[0].evidence_path.as_deref(),
             Some("torrent/video.mkv"),
@@ -4890,7 +4740,6 @@ mod formal_audit_lifecycle_tests {
             Vec::new(),
             false,
             None,
-            &RedactionPolicy::default(),
         );
 
         assert_eq!(result.decision, AuditDecision::Go);
@@ -4928,7 +4777,6 @@ mod formal_audit_lifecycle_tests {
             vec![too_large],
             false,
             Some("job-context".to_string()),
-            &RedactionPolicy::default(),
         );
         assert!(
             !result.formal_ran,
@@ -4981,16 +4829,6 @@ pub fn ai_connection_identity(
         config.custom_header_name.as_deref(),
         secret.as_deref(),
     )
-}
-
-/// Compile-time / type-privacy canary: ensures `SecretValue` stays private to this
-/// module and Debug formatting never becomes a public IPC export path.
-///
-/// Narrow allow: intentionally unreferenced at runtime; retained so refactors that
-/// accidentally make `SecretValue` public or loggable fail review of this sentinel.
-#[allow(dead_code)] // type-privacy sentinel; not a runtime path
-fn _secret_type_is_private(secret: SecretValue) -> String {
-    format!("{secret:?}")
 }
 
 fn now_unix() -> u64 {
@@ -5095,9 +4933,40 @@ mod formal_configuration_tests {
         assert!(!formal_retry_remaining(1));
         let prompt = validation_retry_prompt("可信原始输入");
         assert!(prompt.contains("可信原始输入"));
-        assert!(prompt.contains("不得返回 JSON Schema 定义本身"));
-        assert!(prompt.contains("additionalProperties"));
-        assert!(prompt.contains("上一次返回未通过"));
+        assert!(prompt.contains("上一次返回不是可解析的业务结果"));
+        assert!(prompt.contains("system 消息指定的业务字段"));
+        assert!(!prompt.contains("additionalProperties"));
+        assert!(!prompt.contains("properties"));
+    }
+
+    #[test]
+    fn formal_description_preserves_media_terms_and_title_punctuation() {
+        let description = user_facing_formal_description(
+            "  文件编码 H.265/HEVC、AVC/H.264 与 [组名/字幕] 标题一致。  ".to_string(),
+            &[],
+        )
+        .expect("non-empty description");
+
+        assert_eq!(
+            description,
+            "文件编码 H.265/HEVC、AVC/H.264 与 [组名/字幕] 标题一致。"
+        );
+    }
+
+    #[test]
+    fn formal_description_discloses_backend_media_findings() {
+        let description = user_facing_formal_description(
+            "标题与种子信息符合预期。".to_string(),
+            &[Finding {
+                code: "MEDIA_NOT_TESTED".to_string(),
+                severity: FindingSeverity::Warning,
+                message: "MediaInfo has not been bound".to_string(),
+                evidence_path: None,
+            }],
+        )
+        .expect("description");
+        assert!(description.contains("MediaInfo 尚未执行"));
+        assert!(description.contains("媒体技术信息未完成核对"));
     }
 
     #[test]
@@ -5128,7 +4997,7 @@ mod formal_configuration_tests {
 mod recognition_command_tests {
     use super::*;
     use crate::ai::recognition::{
-        bind_recognition_result, recognition_from_provider_outcome, sanitize_recognition_context,
+        bind_recognition_result, recognition_from_provider_outcome, validate_recognition_context,
         RECOGNITION_SCHEMA_VERSION,
     };
     use serde_json::json;
@@ -5166,20 +5035,15 @@ mod recognition_command_tests {
     }
 
     #[test]
-    fn recognition_request_context_rejects_path_like_torrent_name() {
-        let policy = RedactionPolicy::default();
-        let err = sanitize_recognition_context(
+    fn recognition_request_context_preserves_path_like_torrent_name() {
+        let context = validate_recognition_context(
             "/Users/secret/show.torrent",
             r"(?P<ep>\d+)",
             r"(?P<res>1080p)",
             "<ep> <res>",
-            &policy,
         )
-        .expect_err("absolute torrent name must fail");
-        assert!(
-            err.contains("torrent_name") || err.contains("path"),
-            "{err}"
-        );
+        .expect("absolute path text is valid recognition input");
+        assert_eq!(context.0, "/Users/secret/show.torrent");
     }
 
     fn sample_recognition_result(job_id: &str) -> RecognitionResult {
@@ -5347,13 +5211,11 @@ mod recognition_command_tests {
 
     #[test]
     fn recognition_context_identity_is_backend_owned_and_deterministic() {
-        let policy = RedactionPolicy::default();
         let (snap_a, hash_a) = build_recognition_context_snapshot(
             "Show.S01E01.1080p",
             r"(?P<ep>\d+)",
             r"(?P<res>1080p)",
             "[Group] <title> - <ep>",
-            &policy,
         )
         .expect("safe");
         let (snap_b, hash_b) = build_recognition_context_snapshot(
@@ -5361,7 +5223,6 @@ mod recognition_command_tests {
             r"(?P<ep>\d+)",
             r"(?P<res>1080p)",
             "[Group] <title> - <ep>",
-            &policy,
         )
         .expect("safe");
         assert_eq!(hash_a, hash_b);
@@ -5374,7 +5235,6 @@ mod recognition_command_tests {
             r"(?P<ep>\d+)",
             r"(?P<res>1080p)",
             "[Group] <title> - <ep>",
-            &policy,
         )
         .expect("safe");
         assert_ne!(hash_a, hash_changed);
@@ -6373,7 +6233,7 @@ mod media_info_plan_bind_tests {
     }
 
     #[test]
-    fn success_finish_binds_redacted_media_evidence_to_plan() {
+    fn success_finish_binds_media_evidence_to_plan() {
         let _guard = command_test_guard();
         reset_media_job_globals();
         let (token, snapshot_hash, torrent_path) = prepare_bound_plan(4);

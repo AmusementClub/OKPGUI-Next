@@ -1,4 +1,3 @@
-use crate::ai::redaction::RedactionPolicy;
 use crate::config::{load_config, Template};
 use crate::profile::{
     get_site_cookie_text, load_profiles, normalize_site_cookie_text,
@@ -118,21 +117,27 @@ impl OkpExecutableIdentity {
     /// OKP flow and verify path / launch mode / file-byte digest have not changed.
     /// On success returns the exact `ResolvedOkpExecutable` that was revalidated,
     /// so prepared-plan publish can launch identity A without re-reading config B.
-    /// Error messages never include the raw executable path.
     pub(crate) fn revalidate(&self) -> Result<ResolvedOkpExecutable, String> {
         let path_str = self.canonical_path.to_string_lossy();
-        let resolved = resolve_selected_okp_executable(&path_str)
-            .map_err(|_| "OKP 可执行文件已失效，请重新执行发布前检查。".to_string())?;
+        let resolved = resolve_selected_okp_executable(&path_str)?;
         if resolved.executable_path != self.canonical_path {
-            return Err("OKP 可执行文件已失效，请重新执行发布前检查。".to_string());
+            return Err(format!(
+                "OKP 可执行文件路径已变化：{}，请重新执行发布前检查。",
+                self.canonical_path.display()
+            ));
         }
         if resolved.launch_mode != self.launch_mode {
-            return Err("OKP 可执行文件启动方式已变化，请重新执行发布前检查。".to_string());
+            return Err(format!(
+                "OKP 可执行文件启动方式已变化：{}，请重新执行发布前检查。",
+                self.canonical_path.display()
+            ));
         }
-        let digest = hash_okp_executable_bytes(&resolved.executable_path)
-            .map_err(|_| "无法验证 OKP 可执行文件身份，请重新执行发布前检查。".to_string())?;
+        let digest = hash_okp_executable_bytes(&resolved.executable_path)?;
         if digest != self.executable_digest {
-            return Err("OKP 可执行文件已被替换，请重新执行发布前检查。".to_string());
+            return Err(format!(
+                "OKP 可执行文件已被替换：{}，请重新执行发布前检查。",
+                self.canonical_path.display()
+            ));
         }
         Ok(resolved)
     }
@@ -155,7 +160,10 @@ pub(crate) enum ConfiguredOkpBindResult {
     Unresolved { error: String },
     /// Resolved locally but path/mode/digest capture failed — must not leave unbound.
     /// `resolved` is still usable for OKP local checks (e.g. version gates).
-    IdentityCaptureFailed { resolved: ResolvedOkpExecutable },
+    IdentityCaptureFailed {
+        resolved: ResolvedOkpExecutable,
+        error: String,
+    },
 }
 
 /// Domain-safe bridge: resolve the selected OKP path/launch mode and capture
@@ -189,7 +197,7 @@ pub(crate) fn bind_resolved_okp_for_prepare(
         Err(error) => ConfiguredOkpBindResult::Unresolved { error },
         Ok(resolved) => match OkpExecutableIdentity::from_resolved(&resolved) {
             Ok(identity) => ConfiguredOkpBindResult::Bound { identity, resolved },
-            Err(_) => ConfiguredOkpBindResult::IdentityCaptureFailed { resolved },
+            Err(error) => ConfiguredOkpBindResult::IdentityCaptureFailed { resolved, error },
         },
     }
 }
@@ -217,12 +225,11 @@ pub(crate) fn prepare_local_blockers_and_okp_identity(
                 collect_publish_local_blockers_with_resolved_okp(app, request, &resolved);
             (Some(identity), blockers)
         }
-        ConfiguredOkpBindResult::IdentityCaptureFailed { resolved } => {
+        ConfiguredOkpBindResult::IdentityCaptureFailed { resolved, error } => {
             let mut blockers =
                 collect_publish_local_blockers_with_resolved_okp(app, request, &resolved);
-            let capture = okp_identity_capture_blocker();
-            if !blockers.contains(&capture) {
-                blockers.push(capture);
+            if !blockers.contains(&error) {
+                blockers.push(error);
             }
             (None, blockers)
         }
@@ -234,19 +241,14 @@ pub(crate) fn prepare_local_blockers_and_okp_identity(
     }
 }
 
-/// Path-free local blocker when OKP resolved but identity digest/hash could not be captured.
-pub(crate) fn okp_identity_capture_blocker() -> String {
-    "无法验证 OKP 可执行文件身份，请重新执行发布前检查。".to_string()
-}
-
-/// Path-free gate when a prepared plan has no bound OKP identity at publish time.
+/// Gate when a prepared plan has no bound OKP identity at publish time.
 pub(crate) fn okp_identity_unbound_blocker() -> String {
     "OKP 可执行文件身份未绑定，请重新执行发布前检查。".to_string()
 }
 
 fn hash_okp_executable_bytes(path: &Path) -> Result<String, String> {
     let bytes = std::fs::read(path)
-        .map_err(|_| "无法读取 OKP 可执行文件身份，请重新执行发布前检查。".to_string())?;
+        .map_err(|error| format!("无法读取 OKP 可执行文件：{} ({error})", path.display()))?;
     let mut hasher = Sha256::new();
     hasher.update(&bytes);
     Ok(format!("sha256:{}", hex::encode(hasher.finalize())))
@@ -875,9 +877,7 @@ fn collect_publish_local_blockers_with(
     okp_resolve_error: Option<String>,
 ) -> Vec<String> {
     let mut blockers = Vec::new();
-    let redaction_policy = RedactionPolicy::default();
     let mut add_blocker = |message: String| {
-        let message = redaction_policy.redact_text(&message);
         if !blockers.contains(&message) {
             blockers.push(message);
         }
@@ -2349,8 +2349,8 @@ mod tests {
             "unexpected error: {error}"
         );
         assert!(
-            !error.contains(&path_str),
-            "revalidation error must not expose OKP path: {error}"
+            error.contains(&path_str),
+            "revalidation error must preserve the OKP path: {error}"
         );
         let _ = std::fs::remove_dir_all(
             executable_path
@@ -2385,14 +2385,10 @@ mod tests {
     }
 
     #[test]
-    fn okp_identity_capture_blocker_messages_are_path_free() {
-        let path = "/secret/path/to/OKP.Core.dll";
-        let capture_msg = okp_identity_capture_blocker();
+    fn okp_identity_unbound_blocker_is_actionable() {
         let unbound_msg = okp_identity_unbound_blocker();
-        assert!(!capture_msg.contains(path));
-        assert!(!unbound_msg.contains(path));
-        assert!(capture_msg.contains("OKP"));
         assert!(unbound_msg.contains("OKP"));
+        assert!(unbound_msg.contains("重新执行"));
     }
 
     #[test]
@@ -2450,7 +2446,7 @@ mod tests {
     fn bind_resolved_okp_for_prepare_identity_capture_failed_keeps_resolved_path() {
         // Resolve succeeds, then the executable vanishes before hash capture.
         // Prepare must keep the resolved executable for OKP local checks and treat
-        // identity as unbound (caller adds path-free capture blocker).
+        // identity as unbound (caller preserves the capture error as a blocker).
         let executable_path = create_test_okp_layout("OKP.Core.dll");
         let resolved = resolve_selected_okp_executable(&executable_path.display().to_string())
             .expect("resolve");
@@ -2458,8 +2454,9 @@ mod tests {
         let _ = std::fs::remove_file(&executable_path);
         let bind = bind_resolved_okp_for_prepare(Ok(resolved));
         match bind {
-            ConfiguredOkpBindResult::IdentityCaptureFailed { resolved } => {
+            ConfiguredOkpBindResult::IdentityCaptureFailed { resolved, error } => {
                 assert_eq!(resolved.executable_path(), expected_path.as_path());
+                assert!(error.contains(&expected_path.display().to_string()));
             }
             other => panic!("expected IdentityCaptureFailed, got {other:?}"),
         }

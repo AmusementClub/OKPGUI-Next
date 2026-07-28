@@ -15,4 +15,3 @@ pub mod provider;
 #[cfg(test)]
 mod provider_contract;
 pub mod recognition;
-pub mod redaction;

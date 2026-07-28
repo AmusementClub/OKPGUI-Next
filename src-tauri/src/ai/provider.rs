@@ -401,11 +401,10 @@ pub fn build_structured_request_with_system(
     } else {
         output_capability
     };
-    let schema_prompt = if effective_output_capability == OutputCapability::JsonObject {
-        let serialized_schema = serde_json::to_string(schema)
-            .map_err(|_| "structured output schema serialization failed".to_string())?;
+    let instruction_prompt = if effective_output_capability == OutputCapability::JsonObject {
         format!(
-            "{system_prompt}\n输出必须是单一 JSON object，字段名和状态值必须严格符合以下结构约定：\n{serialized_schema}\n以上内容只是结构约束，不是要返回的数据。不得复制或返回 JSON Schema 本身，尤其不得把 type、properties、required、additionalProperties 当作结果字段。不要输出 Markdown 代码围栏或解释文字。"
+            "{system_prompt}\n{}",
+            json_object_output_contract(schema_name)
         )
     } else {
         system_prompt.to_string()
@@ -413,8 +412,8 @@ pub fn build_structured_request_with_system(
     let (url, mut body) = match (provider, resolved_mode) {
         (ProviderKind::OpenAi, ProviderMode::Responses) => {
             let mut input = Vec::new();
-            if !schema_prompt.trim().is_empty() {
-                input.push(json!({"role": "system", "content": schema_prompt}));
+            if !instruction_prompt.trim().is_empty() {
+                input.push(json!({"role": "system", "content": instruction_prompt}));
             }
             input.push(json!({
                 "role": "user",
@@ -437,8 +436,8 @@ pub fn build_structured_request_with_system(
         }
         (ProviderKind::OpenAi, ProviderMode::Chat) => {
             let mut messages = Vec::new();
-            if !schema_prompt.trim().is_empty() {
-                messages.push(json!({"role": "system", "content": schema_prompt}));
+            if !instruction_prompt.trim().is_empty() {
+                messages.push(json!({"role": "system", "content": instruction_prompt}));
             }
             messages.push(json!({
                 "role": "user",
@@ -469,10 +468,10 @@ pub fn build_structured_request_with_system(
         _ => return Err("provider and mode combination is unsupported".to_string()),
     };
 
-    if provider == ProviderKind::Anthropic && !schema_prompt.trim().is_empty() {
+    if provider == ProviderKind::Anthropic && !instruction_prompt.trim().is_empty() {
         body.as_object_mut()
             .expect("provider request body is always an object")
-            .insert("system".to_string(), Value::String(schema_prompt));
+            .insert("system".to_string(), Value::String(instruction_prompt));
     }
 
     Ok(ProviderRequest {
@@ -481,6 +480,21 @@ pub fn build_structured_request_with_system(
         body,
         managed_auth_header: managed_auth_header(auth_mode),
     })
+}
+
+fn json_object_output_contract(schema_name: &str) -> &'static str {
+    match schema_name {
+        "okpgui_probe" => {
+            "只返回业务结果 JSON object：{\"ok\":true}。不要添加其他字段、Markdown 或解释文字。"
+        }
+        "okpgui_recognition" => {
+            "只返回业务结果 JSON object。顶层必须且只能包含 episode、resolution、suggested_title；每项为 null，或包含 value、confidence、evidence 的对象。请根据本次输入实际判断，不要复用固定结果。不要返回结构定义、Markdown 或解释文字。"
+        }
+        "okpgui_audit" => {
+            "只返回业务结果 JSON object。顶层必须且只能包含 description 和 findings；description 是简体中文字符串；findings 是数组，每项必须且只能包含 code、severity、message、evidence_path。请根据本次输入实际检查，不要复用固定结果。不要返回结构定义、Markdown 或解释文字。"
+        }
+        _ => "只返回符合任务字段约定的单一业务结果 JSON object，不要返回结构定义、Markdown 或解释文字。",
+    }
 }
 
 /// Execute a provider request with managed authorization. Never logs secrets.
@@ -529,19 +543,33 @@ pub async fn send_managed_provider_request(
         AuthMode::None => {}
     }
 
-    let response = builder.send().await.map_err(|error| {
+    let mut response = builder.send().await.map_err(|error| {
         format!(
             "provider request failed: {}",
-            sanitize_transport_error(error)
+            compact_transport_error(error)
         )
     })?;
     let status = response.status().as_u16();
-    let body = response.text().await.map_err(|error| {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_STRUCTURED_TEXT_BYTES as u64)
+    {
+        return Err("provider response exceeded the 256 KiB limit".to_string());
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|error| {
         format!(
             "provider response read failed: {}",
-            sanitize_transport_error(error)
+            compact_transport_error(error)
         )
-    })?;
+    })? {
+        if body.len().saturating_add(chunk.len()) > MAX_STRUCTURED_TEXT_BYTES {
+            return Err("provider response exceeded the 256 KiB limit".to_string());
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body =
+        String::from_utf8(body).map_err(|_| "provider response was not valid UTF-8".to_string())?;
     Ok((status, body))
 }
 
@@ -555,11 +583,8 @@ pub fn resolve_custom_auth_header_name(custom_header_name: Option<&str>) -> Resu
     validate_custom_header_name(header)
 }
 
-fn sanitize_transport_error(error: reqwest::Error) -> String {
-    // reqwest errors can include URLs; strip them via without_url (takes self by value).
-    // Take ownership so without_url can consume the error (reqwest::Error is not Clone).
-    let text = error.without_url().to_string();
-    text.chars().take(240).collect()
+fn compact_transport_error(error: reqwest::Error) -> String {
+    error.to_string().chars().take(240).collect()
 }
 
 /// Extract the strict structured JSON object from a successful provider response body.
@@ -600,11 +625,20 @@ pub fn extract_provider_json(
     }
     reject_incomplete_completion(provider, resolved_mode, &parsed)?;
     extract_structured_object(provider, resolved_mode, &parsed, output_capability).ok_or_else(
-        || ProviderFailure {
-            kind: ProviderFailureKind::Schema,
-            status: None,
-            message: "provider returned JSON mode or an incompatible shape, not strict schema"
-                .to_string(),
+        || {
+            let message = match output_capability {
+                OutputCapability::StrictSchema => {
+                    "provider returned JSON mode or an incompatible shape, not strict schema"
+                }
+                OutputCapability::JsonObject => {
+                    "provider response did not contain a compatible JSON object"
+                }
+            };
+            ProviderFailure {
+                kind: ProviderFailureKind::Schema,
+                status: None,
+                message: message.to_string(),
+            }
         },
     )
 }
@@ -1211,11 +1245,11 @@ mod tests {
         assert!(chat.body["response_format"].get("strict").is_none());
         assert!(chat.body["messages"][0]["content"]
             .as_str()
-            .is_some_and(|prompt| prompt.contains("单一 JSON object")));
+            .is_some_and(|prompt| prompt.contains("业务结果 JSON object")));
     }
 
     #[test]
-    fn openai_json_object_requests_include_schema_prompt_and_4096_limit() {
+    fn openai_json_object_requests_include_business_contract_and_4096_limit() {
         let schema = json!({
             "type": "object",
             "properties": {"ok": {"type": "boolean"}},
@@ -1260,9 +1294,10 @@ mod tests {
                 .and_then(Value::as_str),
         ] {
             let prompt = prompt.expect("JSON mode must carry a system prompt");
-            assert!(prompt.contains("单一 JSON object"));
-            assert!(prompt.contains("additionalProperties"));
-            assert!(prompt.contains("不得复制或返回 JSON Schema"));
+            assert!(prompt.contains("业务结果 JSON object"));
+            assert!(prompt.contains("{\"ok\":true}"));
+            assert!(!prompt.contains("additionalProperties"));
+            assert!(!prompt.contains("\"type\":\"object\""));
         }
     }
 
@@ -1367,6 +1402,15 @@ mod tests {
             "audit-prompt"
         );
         let serialized = serde_json::to_string(&request.body).unwrap();
+        let system = request
+            .body
+            .pointer("/messages/0/content")
+            .and_then(Value::as_str)
+            .expect("system prompt");
+        assert!(system.contains("description 和 findings"));
+        assert!(system.contains("请根据本次输入实际检查"));
+        assert!(!system.contains("additionalProperties"));
+        assert!(!system.contains("\"type\":\"object\""));
         assert!(!serialized.contains("input_image"));
         assert!(!serialized.contains("image_url"));
         assert!(!serialized.contains("base64"));

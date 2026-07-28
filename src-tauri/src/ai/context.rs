@@ -1,9 +1,8 @@
-use crate::ai::redaction::RedactionPolicy;
 use crate::config::Template;
 use crate::domain::publish_plan::{LocalExecutionBinding, PlanMediaFileResult};
 use crate::torrent::{project_safe_torrent_context, SafeTorrentProjection};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{json, Value};
 use std::collections::HashMap;
 
 pub const DEFAULT_CONTEXT_CEILING: usize = 512 * 1024;
@@ -51,7 +50,7 @@ pub enum ContextError {
     },
     InvalidRelativePath(String),
     Serialization(String),
-    /// Path-free torrent parse / tree safety failure.
+    /// Torrent parse / tree safety failure.
     Torrent(String),
     /// Bound torrent identity or fingerprint drifted after parse (replacement fail-closed).
     IdentityDrift(String),
@@ -78,44 +77,31 @@ impl std::fmt::Display for ContextError {
 
 impl std::error::Error for ContextError {}
 
-/// Map projection errors to public IPC strings.
-/// Absolute paths never leave; `PAYLOAD_TOO_LARGE` is preserved verbatim (non-truncating).
+/// Preserve projection diagnostics for IPC callers without rewriting their contents.
 pub fn context_error_to_public(error: ContextError) -> String {
-    match error {
-        ContextError::PayloadTooLarge { bytes, ceiling } => {
-            format!("PAYLOAD_TOO_LARGE: {bytes} bytes exceeds {ceiling}")
-        }
-        ContextError::InvalidRelativePath(_) => {
-            "context projection rejected unsafe relative paths".to_string()
-        }
-        ContextError::Serialization(_) => "context serialization failed".to_string(),
-        ContextError::Torrent(message) => message,
-        ContextError::IdentityDrift(message) => message,
-    }
+    error.to_string()
 }
 
 /// Project allowlisted context from a prepared plan's private local execution binding.
 ///
-/// 1. Parse the bound torrent in Rust (path-free errors).
+/// 1. Parse the bound torrent in Rust.
 /// 2. Build an explicit allowlist of relative tree/file metadata + template content.
 /// 3. Revalidate torrent identity/fingerprint after parse so replacements fail closed.
-/// 4. Redact and enforce the ceiling without truncation.
+/// 4. Enforce the ceiling without truncation or rewriting values.
 ///
 /// Absolute paths, raw bencode, trackers, credentials, generic PublishPlan
 /// serialization, and client-supplied names/files never enter the projection.
 pub fn project_context_from_binding(
     binding: &LocalExecutionBinding,
-    policy: &RedactionPolicy,
     ceiling: usize,
 ) -> Result<ContextProjection, ContextError> {
-    project_context_from_binding_with_media(binding, &[], policy, ceiling)
+    project_context_from_binding_with_media(binding, &[], ceiling)
 }
 
 /// Project backend-owned torrent/template context plus identity-matched MediaInfo outcomes.
 pub fn project_context_from_binding_with_media(
     binding: &LocalExecutionBinding,
     media_info: &[PlanMediaFileResult],
-    policy: &RedactionPolicy,
     ceiling: usize,
 ) -> Result<ContextProjection, ContextError> {
     let torrent_path = binding.request().torrent_path.as_str();
@@ -129,7 +115,7 @@ pub fn project_context_from_binding_with_media(
     let mut input =
         build_projection_input_from_bound_sources(&safe_torrent, &binding.request().template);
     input.media_info = media_info.to_vec();
-    project_context(input, policy, ceiling)
+    project_context(input, ceiling)
 }
 
 /// Build internal projection input from backend-owned torrent + template sources only.
@@ -199,39 +185,27 @@ fn allowlisted_template(template: &Template) -> Value {
 
 pub fn project_context(
     input: ContextProjectionInput,
-    policy: &RedactionPolicy,
     ceiling: usize,
 ) -> Result<ContextProjection, ContextError> {
     let files = input
         .files
         .into_iter()
-        .map(|mut file| {
+        .map(|file| {
             if !is_safe_relative_path(&file.relative_path) {
                 return Err(ContextError::InvalidRelativePath(file.relative_path));
             }
-            // Secret-only on relative_path: path/URL heuristics would corrupt
-            // multi-component forms such as `dir/video.mkv` → `dir[PATH_REDACTED]`.
-            file.relative_path = policy.redact_secret_substrings(&file.relative_path);
-            if !is_safe_relative_path(&file.relative_path) {
-                return Err(ContextError::InvalidRelativePath(file.relative_path));
-            }
-            // Free-text file content keeps path/URL/base64 heuristics.
-            file.content = policy.redact_text(&file.content);
             Ok(file)
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     let mut projection = ContextProjection {
         version: 1,
-        // Torrent name / tree are allowlisted relative metadata — secret substrings
-        // only so safe multi-component relative paths keep their shape.
-        torrent_name: policy.redact_secret_substrings(&input.torrent_name),
-        torrent_tree: redact_torrent_metadata_value(&input.torrent_tree, policy),
-        // Template / shared free-text keep full path/URL heuristics.
-        templates: deduplicate_values(input.templates, policy),
-        shared_content: deduplicate_values(input.shared_content, policy),
+        torrent_name: input.torrent_name,
+        torrent_tree: input.torrent_tree,
+        templates: deduplicate_values(input.templates),
+        shared_content: deduplicate_values(input.shared_content),
         files,
-        media_info: sanitize_media_info(input.media_info, policy),
+        media_info: normalize_media_info(input.media_info)?,
         bytes: 0,
     };
 
@@ -245,67 +219,21 @@ pub fn project_context(
     Ok(projection)
 }
 
-fn sanitize_media_info(
+fn normalize_media_info(
     results: Vec<PlanMediaFileResult>,
-    policy: &RedactionPolicy,
-) -> Vec<PlanMediaFileResult> {
+) -> Result<Vec<PlanMediaFileResult>, ContextError> {
     results
         .into_iter()
-        .filter_map(|mut result| {
-            result.relative_name = policy.redact_secret_substrings(&result.relative_name);
+        .map(|mut result| {
             if !is_safe_relative_path(&result.relative_name) {
-                return None;
+                return Err(ContextError::InvalidRelativePath(result.relative_name));
             }
-            result.state = policy.redact_text(&result.state);
-            result.message = result.message.map(|message| policy.redact_text(&message));
             if let Some(summary) = result.summary.as_mut() {
                 summary.relative_name = result.relative_name.clone();
-                summary.video_codec = summary
-                    .video_codec
-                    .take()
-                    .map(|value| policy.redact_text(&value));
-                summary.audio_codecs = summary
-                    .audio_codecs
-                    .drain(..)
-                    .map(|value| policy.redact_text(&value))
-                    .collect();
-                summary.subtitle_languages = summary
-                    .subtitle_languages
-                    .drain(..)
-                    .map(|value| policy.redact_text(&value))
-                    .collect();
-                summary.scan_type = summary
-                    .scan_type
-                    .take()
-                    .map(|value| policy.redact_text(&value));
             }
-            Some(result)
+            Ok(result)
         })
         .collect()
-}
-
-/// Redact torrent-tree / path metadata with secret-substring replacement only.
-///
-/// Generic path heuristics (`dir/video.mkv` → `dir[PATH_REDACTED]`) must not run
-/// on allowlisted relative torrent metadata. Free-text fields use `redact_value`.
-fn redact_torrent_metadata_value(value: &Value, policy: &RedactionPolicy) -> Value {
-    match value {
-        Value::Object(object) => {
-            let mut result = Map::new();
-            for (key, child) in object {
-                result.insert(key.clone(), redact_torrent_metadata_value(child, policy));
-            }
-            Value::Object(result)
-        }
-        Value::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| redact_torrent_metadata_value(item, policy))
-                .collect(),
-        ),
-        Value::String(text) => Value::String(policy.redact_secret_substrings(text)),
-        other => other.clone(),
-    }
 }
 
 /// Fixed-point size of the projection once `bytes` embeds its own serialization length.
@@ -331,15 +259,14 @@ fn measure_final_projection_bytes(projection: &ContextProjection) -> Result<usiz
     Ok(bytes)
 }
 
-fn deduplicate_values(values: Vec<Value>, policy: &RedactionPolicy) -> Vec<Value> {
+fn deduplicate_values(values: Vec<Value>) -> Vec<Value> {
     let mut seen = HashMap::<String, usize>::new();
     let mut result = Vec::new();
     for value in values {
-        let redacted = policy.redact_value(&value);
-        let key = serde_json::to_string(&redacted).unwrap_or_default();
+        let key = serde_json::to_string(&value).unwrap_or_default();
         if let std::collections::hash_map::Entry::Vacant(e) = seen.entry(key) {
             e.insert(result.len());
-            result.push(redacted);
+            result.push(value);
         }
     }
     result
@@ -369,16 +296,6 @@ fn is_safe_relative_path(path: &str) -> bool {
     path.chars().count() <= 1024
 }
 
-/// Build a JSON object from explicit allowlisted entries (compatibility helper).
-#[allow(dead_code)] // compatibility helper for allowlisted context builders
-pub fn safe_object(entries: impl IntoIterator<Item = (String, Value)>) -> Value {
-    let mut object = Map::new();
-    for (key, value) in entries {
-        object.insert(key, value);
-    }
-    Value::Object(object)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -405,8 +322,7 @@ mod tests {
             }],
             media_info: vec![],
         };
-        let result =
-            project_context(input, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING).unwrap();
+        let result = project_context(input, DEFAULT_CONTEXT_CEILING).unwrap();
         assert_eq!(result.templates.len(), 1);
         assert_eq!(result.shared_content.len(), 1);
         assert_eq!(result.torrent_name, "日語标题");
@@ -423,11 +339,7 @@ mod tests {
             ..Default::default()
         };
         assert!(matches!(
-            project_context(
-                bad_path,
-                &RedactionPolicy::default(),
-                DEFAULT_CONTEXT_CEILING
-            ),
+            project_context(bad_path, DEFAULT_CONTEXT_CEILING),
             Err(ContextError::InvalidRelativePath(_))
         ));
 
@@ -440,7 +352,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let err = project_context(large, &RedactionPolicy::default(), 10).unwrap_err();
+        let err = project_context(large, 10).unwrap_err();
         assert!(matches!(err, ContextError::PayloadTooLarge { .. }));
         let public = context_error_to_public(err);
         assert!(
@@ -473,7 +385,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    project_context(input, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING),
+                    project_context(input, DEFAULT_CONTEXT_CEILING),
                     Err(ContextError::InvalidRelativePath(_))
                 ),
                 "expected reject for {path:?}"
@@ -488,13 +400,30 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(project_context(ok, &RedactionPolicy::default(), DEFAULT_CONTEXT_CEILING).is_ok());
+        assert!(project_context(ok, DEFAULT_CONTEXT_CEILING).is_ok());
     }
 
     #[test]
-    fn redaction_strips_secrets_from_template_and_file_content() {
+    fn invalid_media_info_path_fails_instead_of_dropping_the_file() {
+        let input = ContextProjectionInput {
+            media_info: vec![PlanMediaFileResult {
+                relative_name: "../outside/video.mkv".into(),
+                state: "measured".into(),
+                summary: None,
+                message: None,
+            }],
+            ..Default::default()
+        };
+        let error = project_context(input, DEFAULT_CONTEXT_CEILING)
+            .expect_err("invalid MediaInfo paths must not disappear from the prompt silently");
+        assert!(
+            matches!(error, ContextError::InvalidRelativePath(path) if path == "../outside/video.mkv")
+        );
+    }
+
+    #[test]
+    fn projection_preserves_template_and_file_content_verbatim() {
         let secret = "sk-super-secret-canary-xyz";
-        let policy = RedactionPolicy::new(vec![secret.to_string()]);
         let input = ContextProjectionInput {
             torrent_name: format!("show-{secret}"),
             torrent_tree: json!({"name": format!("file-{secret}.mkv")}),
@@ -510,13 +439,9 @@ mod tests {
             }],
             media_info: vec![],
         };
-        let result = project_context(input, &policy, DEFAULT_CONTEXT_CEILING).unwrap();
+        let result = project_context(input, DEFAULT_CONTEXT_CEILING).unwrap();
         let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            !serialized.contains(secret),
-            "secret must not appear in projection: {serialized}"
-        );
-        assert!(serialized.contains("[REDACTED]"));
+        assert!(serialized.contains(secret));
     }
 
     fn write_valid_torrent(name: &str, contents_marker: &[u8]) -> PathBuf {
@@ -562,19 +487,15 @@ mod tests {
     }
 
     #[test]
-    fn project_from_binding_allowlists_relative_metadata_and_hides_absolute_paths() {
+    fn project_from_binding_allowlists_relative_metadata_and_excludes_execution_fields() {
         let torrent_path = write_valid_torrent("show.mkv", b"v1-identity-marker");
         let abs = torrent_path.display().to_string();
         let plan =
             PublishPlan::from_publish_request(1, sample_request(torrent_path.clone(), None), None)
                 .expect("plan");
         let binding = plan.get_local_binding().expect("binding");
-        let projection = project_context_from_binding(
-            binding,
-            &RedactionPolicy::default(),
-            DEFAULT_CONTEXT_CEILING,
-        )
-        .expect("project");
+        let projection =
+            project_context_from_binding(binding, DEFAULT_CONTEXT_CEILING).expect("project");
 
         assert_eq!(projection.torrent_name, "show.mkv");
         assert_eq!(projection.files.len(), 1);
@@ -614,20 +535,16 @@ mod tests {
         std::fs::write(&torrent_path, replaced_bytes).expect("overwrite bound path");
         let _ = std::fs::remove_file(&replaced);
 
-        let err = project_context_from_binding(
-            &binding,
-            &RedactionPolicy::default(),
-            DEFAULT_CONTEXT_CEILING,
-        )
-        .expect_err("replacement must fail closed");
+        let err = project_context_from_binding(&binding, DEFAULT_CONTEXT_CEILING)
+            .expect_err("replacement must fail closed");
         assert!(
             matches!(err, ContextError::IdentityDrift(_)),
             "expected IdentityDrift, got {err:?}"
         );
         let public = context_error_to_public(err);
         assert!(
-            !public.contains(torrent_path.to_string_lossy().as_ref()),
-            "public error must not include absolute path: {public}"
+            public.contains(torrent_path.to_string_lossy().as_ref()),
+            "public error must preserve the absolute path: {public}"
         );
 
         let _ = std::fs::remove_file(&torrent_path);
@@ -673,9 +590,9 @@ mod tests {
     }
 
     #[test]
-    fn binding_projection_redacts_template_secrets() {
+    fn binding_projection_preserves_template_content() {
         let secret = "sk-ctx-binding-secret-999";
-        let torrent_path = write_valid_torrent("show.mkv", b"redact-marker");
+        let torrent_path = write_valid_torrent("show.mkv", b"content-marker");
         let plan = PublishPlan::from_publish_request(
             3,
             sample_request(torrent_path.clone(), Some(secret)),
@@ -683,11 +600,9 @@ mod tests {
         )
         .expect("plan");
         let binding = plan.get_local_binding().expect("binding");
-        let policy = RedactionPolicy::new(vec![secret.to_string()]);
-        let projection =
-            project_context_from_binding(binding, &policy, DEFAULT_CONTEXT_CEILING).unwrap();
+        let projection = project_context_from_binding(binding, DEFAULT_CONTEXT_CEILING).unwrap();
         let serialized = serde_json::to_string(&projection).unwrap();
-        assert!(!serialized.contains(secret));
+        assert!(serialized.contains(secret));
         let _ = std::fs::remove_file(&torrent_path);
     }
 
@@ -698,8 +613,7 @@ mod tests {
         request.template.description = "Y".repeat(2048);
         let plan = PublishPlan::from_publish_request(4, request, None).expect("plan");
         let binding = plan.get_local_binding().expect("binding");
-        let err = project_context_from_binding(binding, &RedactionPolicy::default(), 64)
-            .expect_err("must exceed ceiling");
+        let err = project_context_from_binding(binding, 64).expect_err("must exceed ceiling");
         match &err {
             ContextError::PayloadTooLarge { bytes, ceiling } => {
                 assert!(*bytes > *ceiling);
@@ -714,11 +628,9 @@ mod tests {
 
     #[test]
     fn multi_component_relative_paths_survive_projection_and_stay_consistent() {
-        // Regression M6: full redact_value/redact_text path heuristics turned
-        // `dir/video.mkv` into `dir[PATH_REDACTED]`. Torrent metadata must keep
-        // multi-component relative shape while still redacting secret substrings.
+        // Regression: projection must preserve multi-component relative paths and
+        // input text exactly; path-like values are normal media metadata.
         let secret = "sk-path-canary-m6-xyz";
-        let policy = RedactionPolicy::new(vec![secret.to_string()]);
         let input = ContextProjectionInput {
             torrent_name: format!("Show-{secret}"),
             torrent_tree: json!({
@@ -764,11 +676,10 @@ mod tests {
             media_info: vec![],
         };
 
-        let result = project_context(input, &policy, DEFAULT_CONTEXT_CEILING).unwrap();
+        let result = project_context(input, DEFAULT_CONTEXT_CEILING).unwrap();
 
-        // Multi-component relative path survives projection (no PATH_REDACTED).
+        // Multi-component relative path survives projection.
         assert_eq!(result.files[0].relative_path, "dir/video.mkv");
-        assert!(!result.files[0].relative_path.contains("PATH_REDACTED"));
 
         let tree_files = result.torrent_tree["files"]
             .as_array()
@@ -784,38 +695,22 @@ mod tests {
             tree_files[0]["relative_path"].as_str().unwrap()
         );
 
-        // Secret substrings still redacted on path metadata without path-shape heuristics.
-        assert_eq!(result.files[1].relative_path, "dir/[REDACTED].txt");
+        assert_eq!(result.files[1].relative_path, format!("dir/{secret}.txt"));
         assert_eq!(
             tree_files[1]["relative_path"].as_str().unwrap(),
-            "dir/[REDACTED].txt"
+            format!("dir/{secret}.txt")
         );
-        assert!(!result.torrent_name.contains(secret));
-        assert!(result.torrent_name.contains("[REDACTED]"));
+        assert!(result.torrent_name.contains(secret));
 
         let serialized = serde_json::to_string(&result).unwrap();
-        assert!(
-            !serialized.contains(secret),
-            "secret must not appear in projection: {serialized}"
-        );
-        assert!(
-            !serialized.contains("dir[PATH_REDACTED]"),
-            "path heuristics must not run on torrent relative paths: {serialized}"
-        );
+        assert!(serialized.contains(secret));
 
-        // Free-text template/shared-content fields still apply path/URL heuristics.
         let templates = serde_json::to_string(&result.templates).unwrap();
-        assert!(!templates.contains(secret));
-        assert!(
-            templates.contains("PATH_REDACTED") || !templates.contains("/Users/owen"),
-            "template free-text must still redact absolute paths: {templates}"
-        );
+        assert!(templates.contains(secret));
+        assert!(templates.contains("/Users/owen/private"));
         let shared = serde_json::to_string(&result.shared_content).unwrap();
-        assert!(!shared.contains("user:pass"));
-        assert!(
-            shared.contains("PATH_REDACTED") || !shared.contains("/tmp/abs"),
-            "shared free-text must still redact absolute paths: {shared}"
-        );
+        assert!(shared.contains("user:pass"));
+        assert!(shared.contains("/tmp/abs"));
     }
 
     #[test]
@@ -838,12 +733,8 @@ mod tests {
             media_info: vec![],
         };
 
-        let ok = project_context(
-            input.clone(),
-            &RedactionPolicy::default(),
-            DEFAULT_CONTEXT_CEILING,
-        )
-        .expect("projection under default ceiling");
+        let ok = project_context(input.clone(), DEFAULT_CONTEXT_CEILING)
+            .expect("projection under default ceiling");
         let actual = serde_json::to_vec(&ok).expect("serialize").len();
         assert_eq!(
             ok.bytes, actual,
@@ -854,13 +745,13 @@ mod tests {
 
         // Exact final size is accepted; one byte under is rejected without truncation.
         let exact = ok.bytes;
-        let again = project_context(input.clone(), &RedactionPolicy::default(), exact)
-            .expect("exact final size must be accepted");
+        let again =
+            project_context(input.clone(), exact).expect("exact final size must be accepted");
         assert_eq!(again.bytes, exact);
         assert_eq!(serde_json::to_vec(&again).unwrap().len(), exact);
 
-        let err = project_context(input, &RedactionPolicy::default(), exact - 1)
-            .expect_err("one under final size must fail closed");
+        let err =
+            project_context(input, exact - 1).expect_err("one under final size must fail closed");
         match err {
             ContextError::PayloadTooLarge { bytes, ceiling } => {
                 assert_eq!(ceiling, exact - 1);

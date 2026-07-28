@@ -277,7 +277,7 @@ pub struct SafeRelativeFileMeta {
     pub size: u64,
 }
 
-/// Path-free, allowlisted torrent metadata for plan-owned AI context projection.
+/// Allowlisted torrent metadata for plan-owned AI context projection.
 /// Never includes trackers, announce lists, raw bencode, piece hashes, or absolute paths.
 #[derive(Debug, Clone, Serialize)]
 pub struct SafeTorrentProjection {
@@ -290,13 +290,13 @@ pub struct SafeTorrentProjection {
 
 /// Parse a bound torrent path into allowlisted relative metadata for AI context.
 ///
-/// Failure messages are path-free (safe for public IPC). Absolute paths, trackers,
-/// raw bencode, and piece material never appear in the result.
+/// Absolute execution paths, trackers, raw bencode, and piece material are not
+/// part of the projected business context.
 pub fn project_safe_torrent_context(path: &str) -> Result<SafeTorrentProjection, String> {
     validate_torrent_path_for_context(path)?;
-    let (torrent, _compat_notice) = read_torrent_compat_path_free(path)?;
+    let (torrent, _compat_notice) = read_torrent_compat(path)?;
     let info = torrent_to_info(torrent, None)
-        .map_err(|_| "无法解析种子文件内容，请重新执行发布前检查。".to_string())?;
+        .map_err(|error| format!("无法解析种子文件内容：{path} ({error})"))?;
     safe_projection_from_torrent_info(&info)
 }
 
@@ -307,12 +307,12 @@ fn validate_torrent_path_for_context(path: &str) -> Result<(), String> {
     }
     let torrent = std::path::PathBuf::from(path);
     if !torrent.exists() {
-        return Err("种子文件不存在，请重新执行发布前检查。".to_string());
+        return Err(format!("种子文件不存在：{}", torrent.display()));
     }
     let metadata = std::fs::metadata(&torrent)
-        .map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
+        .map_err(|error| format!("无法读取种子文件：{} ({error})", torrent.display()))?;
     if !metadata.is_file() {
-        return Err("种子路径不是文件，请重新执行发布前检查。".to_string());
+        return Err(format!("种子路径不是文件：{}", torrent.display()));
     }
     let is_torrent = torrent
         .extension()
@@ -320,37 +320,14 @@ fn validate_torrent_path_for_context(path: &str) -> Result<(), String> {
         .map(|ext| ext.eq_ignore_ascii_case("torrent"))
         .unwrap_or(false);
     if !is_torrent {
-        return Err("所选文件不是 .torrent 文件，请重新执行发布前检查。".to_string());
+        return Err(format!("所选文件不是 .torrent 文件：{}", torrent.display()));
     }
     Ok(())
 }
 
-/// Same as `read_torrent_compat` but maps all failures to path-free messages.
-fn read_torrent_compat_path_free(path: &str) -> Result<(Torrent, Option<String>), String> {
-    match Torrent::read_from_file(path) {
-        Ok(torrent) => Ok((torrent, None)),
-        Err(_strict_error) => {
-            let bytes = std::fs::read(path)
-                .map_err(|_| "无法读取种子文件，请重新执行发布前检查。".to_string())?;
-            let Some(normalized) = sort_top_level_bencode_dictionary(&bytes) else {
-                return Err("无法解析种子文件内容，请重新执行发布前检查。".to_string());
-            };
-            let torrent = Torrent::read_from_bytes(normalized)
-                .map_err(|_| "无法解析种子文件内容，请重新执行发布前检查。".to_string())?;
-            Ok((
-                torrent,
-                Some(
-                    "该种子文件不符合 BEP 3（顶层字典键未按字节排序）。界面已用内存修正后的副本读取；磁盘上的原文件未改动，发布时仍上传原文件。建议重新生成规范种子。"
-                        .to_string(),
-                ),
-            ))
-        }
-    }
-}
-
 fn safe_projection_from_torrent_info(info: &TorrentInfo) -> Result<SafeTorrentProjection, String> {
     if !is_safe_path_component(&info.name) {
-        return Err("种子名称包含不安全路径成分，请重新执行发布前检查。".to_string());
+        return Err(format!("种子名称包含不安全路径成分：{}", info.name));
     }
 
     let mut files = Vec::new();
@@ -373,11 +350,11 @@ fn collect_safe_relative_files(
     out: &mut Vec<SafeRelativeFileMeta>,
 ) -> Result<(), String> {
     if !is_safe_path_component(&root.name) {
-        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+        return Err(format!("种子文件树包含不安全相对路径：{}", root.name));
     }
     if root.is_file {
         if !is_safe_relative_torrent_path(&root.name) {
-            return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+            return Err(format!("种子文件树包含不安全相对路径：{}", root.name));
         }
         out.push(SafeRelativeFileMeta {
             relative_path: root.name.clone(),
@@ -397,7 +374,7 @@ fn collect_safe_relative_files_under(
     out: &mut Vec<SafeRelativeFileMeta>,
 ) -> Result<(), String> {
     if !is_safe_path_component(&node.name) {
-        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+        return Err(format!("种子文件树包含不安全相对路径：{}", node.name));
     }
     let relative_path = if parent_rel.is_empty() {
         node.name.clone()
@@ -405,7 +382,7 @@ fn collect_safe_relative_files_under(
         format!("{parent_rel}/{}", node.name)
     };
     if !is_safe_relative_torrent_path(&relative_path) {
-        return Err("种子文件树包含不安全相对路径，请重新执行发布前检查。".to_string());
+        return Err(format!("种子文件树包含不安全相对路径：{relative_path}"));
     }
     if node.is_file {
         out.push(SafeRelativeFileMeta {
@@ -621,7 +598,7 @@ mod tests {
     }
 
     #[test]
-    fn project_safe_torrent_context_is_relative_only_and_path_free_on_errors() {
+    fn project_safe_torrent_context_is_relative_only_and_preserves_error_paths() {
         let path = write_minimal_single_file_torrent("video.mkv");
         let abs = path.to_string_lossy().to_string();
         let projection = project_safe_torrent_context(&abs).expect("safe projection");
@@ -638,7 +615,10 @@ mod tests {
 
         let missing = project_safe_torrent_context("/tmp/definitely-missing-okpgui.torrent");
         let err = missing.expect_err("missing torrent");
-        assert!(!err.contains("/tmp/"), "error must be path-free: {err}");
+        assert!(
+            err.contains("/tmp/definitely-missing-okpgui.torrent"),
+            "error must preserve the path: {err}"
+        );
     }
 
     #[test]
@@ -654,12 +634,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let err = result.expect_err(".. path must fail closed");
         assert!(
-            err.contains("不安全") || err.contains("无法解析"),
+            err.contains("不安全") || err.contains("无法解析") || err.contains("malformed torrent"),
             "unexpected: {err}"
         );
         assert!(
-            !err.contains(".."),
-            "should not echo raw path in public error"
+            err.contains(".."),
+            "should preserve the rejected path: {err}"
         );
     }
 }

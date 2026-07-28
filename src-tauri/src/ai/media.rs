@@ -1,4 +1,3 @@
-use crate::ai::redaction::RedactionPolicy;
 use crate::domain::publish_plan::{
     PlanMediaEvidence, PlanMediaFileResult, PlanMediaStatus, PlanMediaSummary,
 };
@@ -123,7 +122,7 @@ pub struct MediaInfoSummary {
 
 /// Build plan-owned media evidence from a Succeeded MediaInfo terminal result set.
 ///
-/// Only `Measured` rows with redacted relative names and normalized summaries are kept.
+/// Only `Measured` rows with safe relative names and normalized summaries are kept.
 /// Absolute paths never enter the plan. Empty measured set → `CheckFailed` (still a
 /// successful job bind so formal/local audit can derive `MEDIA_CHECK_FAILED`).
 ///
@@ -134,9 +133,8 @@ pub fn build_plan_media_evidence(
     snapshot_hash: &str,
     request_generation: u64,
     results: &[MediaProbeResult],
-    policy: &RedactionPolicy,
 ) -> PlanMediaEvidence {
-    let summaries = redacted_plan_media_summaries(results, policy);
+    let summaries = plan_media_summaries(results);
     let status = if summaries.is_empty() {
         PlanMediaStatus::CheckFailed
     } else {
@@ -148,15 +146,12 @@ pub fn build_plan_media_evidence(
         request_generation,
         status,
         summaries,
-        results: redacted_plan_media_results(results, policy),
+        results: plan_media_results(results),
     }
 }
 
 /// Preserve one safe, bounded outcome for every torrent media file considered by MediaInfo.
-pub fn redacted_plan_media_results(
-    results: &[MediaProbeResult],
-    policy: &RedactionPolicy,
-) -> Vec<PlanMediaFileResult> {
+pub fn plan_media_results(results: &[MediaProbeResult]) -> Vec<PlanMediaFileResult> {
     results
         .iter()
         .filter_map(|item| {
@@ -164,40 +159,18 @@ pub fn redacted_plan_media_results(
             if relative_name == "[invalid]" {
                 return None;
             }
-            let relative_name = policy.redact_secret_substrings(&relative_name);
-            if !is_safe_relative_name(&relative_name) {
-                return None;
-            }
             let summary = item.summary.as_ref().map(|summary| PlanMediaSummary {
                 relative_name: relative_name.clone(),
                 duration_ms: summary.duration_ms,
                 width: summary.width,
                 height: summary.height,
-                video_codec: summary
-                    .video_codec
-                    .as_deref()
-                    .map(|value| policy.redact_text(value)),
-                audio_codecs: summary
-                    .audio_codecs
-                    .iter()
-                    .map(|value| policy.redact_text(value))
-                    .collect(),
-                subtitle_languages: summary
-                    .subtitle_languages
-                    .iter()
-                    .map(|value| policy.redact_text(value))
-                    .collect(),
-                scan_type: summary
-                    .scan_type
-                    .as_deref()
-                    .map(|value| policy.redact_text(value)),
+                video_codec: summary.video_codec.clone(),
+                audio_codecs: summary.audio_codecs.clone(),
+                subtitle_languages: summary.subtitle_languages.clone(),
+                scan_type: summary.scan_type.clone(),
             });
             let message = item.message.as_deref().and_then(|message| {
-                let redacted = policy.redact_text(message);
-                let bounded = redacted
-                    .chars()
-                    .take(MESSAGE_CHAR_LIMIT)
-                    .collect::<String>();
+                let bounded = message.chars().take(MESSAGE_CHAR_LIMIT).collect::<String>();
                 (!bounded.trim().is_empty()).then_some(bounded)
             });
             Some(PlanMediaFileResult {
@@ -226,11 +199,8 @@ fn media_probe_state_label(state: MediaProbeState) -> &'static str {
     }
 }
 
-/// Extract redacted relative Measured summaries only (path-free).
-pub fn redacted_plan_media_summaries(
-    results: &[MediaProbeResult],
-    policy: &RedactionPolicy,
-) -> Vec<PlanMediaSummary> {
+/// Extract relative Measured summaries only.
+pub fn plan_media_summaries(results: &[MediaProbeResult]) -> Vec<PlanMediaSummary> {
     results
         .iter()
         .filter(|item| item.state == MediaProbeState::Measured)
@@ -240,34 +210,15 @@ pub fn redacted_plan_media_summaries(
             if relative_name == "[invalid]" {
                 return None;
             }
-            // Secret-only redaction preserves multi-component relative path shape.
-            let relative_name = policy.redact_secret_substrings(&relative_name);
-            if !is_safe_relative_name(&relative_name) {
-                return None;
-            }
             Some(PlanMediaSummary {
                 relative_name,
                 duration_ms: summary.duration_ms,
                 width: summary.width,
                 height: summary.height,
-                video_codec: summary
-                    .video_codec
-                    .as_deref()
-                    .map(|value| policy.redact_text(value)),
-                audio_codecs: summary
-                    .audio_codecs
-                    .iter()
-                    .map(|value| policy.redact_text(value))
-                    .collect(),
-                subtitle_languages: summary
-                    .subtitle_languages
-                    .iter()
-                    .map(|value| policy.redact_text(value))
-                    .collect(),
-                scan_type: summary
-                    .scan_type
-                    .as_deref()
-                    .map(|value| policy.redact_text(value)),
+                video_codec: summary.video_codec.clone(),
+                audio_codecs: summary.audio_codecs.clone(),
+                subtitle_languages: summary.subtitle_languages.clone(),
+                scan_type: summary.scan_type.clone(),
             })
         })
         .collect()
@@ -1278,8 +1229,7 @@ fn is_safe_relative_name(path: &str) -> bool {
 }
 
 /// Normalize a caller-supplied relative name for outbound probe results.
-/// Unsafe path-like values are replaced with a fixed redacted marker so host
-/// layout cannot be echoed through MediaProbeResult.relative_name.
+/// Unsafe path-like values are replaced with a fixed invalid marker.
 fn safe_relative_name(path: &str) -> String {
     if is_safe_relative_name(path) {
         path.replace('\\', "/")
@@ -1290,70 +1240,11 @@ fn safe_relative_name(path: &str) -> String {
 
 fn compact(bytes: &[u8]) -> String {
     let lossy = String::from_utf8_lossy(bytes);
-    let redacted = redact_absolute_paths(&lossy);
-    redacted
+    lossy
         .chars()
         .take(MESSAGE_CHAR_LIMIT)
         .collect::<String>()
         .replace(['\n', '\r'], " ")
-}
-
-/// Strip absolute filesystem paths from diagnostics so probe results never echo host paths.
-fn redact_absolute_paths(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let chars: Vec<char> = input.chars().collect();
-    let mut index = 0;
-    while index < chars.len() {
-        if is_absolute_path_start(&chars, index) {
-            index = consume_path(&chars, index);
-            output.push_str("[path]");
-            continue;
-        }
-        output.push(chars[index]);
-        index += 1;
-    }
-    output
-}
-
-fn is_absolute_path_start(chars: &[char], index: usize) -> bool {
-    let current = chars[index];
-    if current == '/' {
-        return index == 0 || is_path_boundary(chars[index - 1]);
-    }
-    // Windows drive paths such as C:\media\file.mkv
-    if current.is_ascii_alphabetic()
-        && chars.get(index + 1) == Some(&':')
-        && matches!(chars.get(index + 2), Some('\\') | Some('/'))
-        && (index == 0 || is_path_boundary(chars[index - 1]))
-    {
-        return true;
-    }
-    false
-}
-
-fn is_path_boundary(character: char) -> bool {
-    character.is_whitespace()
-        || matches!(
-            character,
-            '"' | '\'' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>' | ',' | ';' | '|'
-        )
-}
-
-fn consume_path(chars: &[char], start: usize) -> usize {
-    let mut index = start;
-    while index < chars.len() {
-        let character = chars[index];
-        if character.is_whitespace()
-            || matches!(
-                character,
-                '"' | '\'' | '`' | ')' | ']' | '}' | '>' | '<' | ',' | ';' | '|'
-            )
-        {
-            break;
-        }
-        index += 1;
-    }
-    index
 }
 
 fn normalize_media_info(value: &Value) -> Option<MediaInfoSummary> {
@@ -1437,7 +1328,7 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
-    fn normalizes_tracks_without_absolute_paths() {
+    fn normalizes_tracks_with_relative_names() {
         let value = json!({
             "media": {"track": [
                 {"@type": "General", "Duration": "1234.5", "CompleteName": "/private/video.mkv"},
@@ -1456,8 +1347,7 @@ mod tests {
     }
 
     #[test]
-    fn plan_media_evidence_binds_only_redacted_measured_summaries() {
-        let policy = RedactionPolicy::new(["sk-secret-token"]);
+    fn plan_media_evidence_binds_valid_results_without_rewriting_content() {
         let results = vec![
             MediaProbeResult {
                 relative_name: "show/ep01.mkv".into(),
@@ -1495,7 +1385,7 @@ mod tests {
                 message: None,
             },
         ];
-        let evidence = build_plan_media_evidence("job-1", "sha256:snap", 3, &results, &policy);
+        let evidence = build_plan_media_evidence("job-1", "sha256:snap", 3, &results);
         assert_eq!(evidence.status, PlanMediaStatus::Tested);
         assert_eq!(evidence.summaries.len(), 1);
         assert_eq!(evidence.results.len(), 3);
@@ -1504,14 +1394,14 @@ mod tests {
         assert_eq!(evidence.results[2].state, "missing_file");
         assert!(evidence.results[0].summary.is_some());
         assert_eq!(evidence.summaries[0].relative_name, "show/ep01.mkv");
-        assert!(!evidence.summaries[0]
+        assert!(evidence.summaries[0]
             .video_codec
             .as_deref()
             .unwrap_or("")
             .contains("sk-secret-token"));
         let serialized = serde_json::to_string(&evidence).unwrap();
         assert!(!serialized.contains("/private"));
-        assert!(!serialized.contains("sk-secret-token"));
+        assert!(serialized.contains("sk-secret-token"));
 
         let empty = build_plan_media_evidence(
             "job-2",
@@ -1523,7 +1413,6 @@ mod tests {
                 summary: None,
                 message: None,
             }],
-            &policy,
         );
         assert_eq!(empty.status, PlanMediaStatus::CheckFailed);
         assert!(empty.summaries.is_empty());
@@ -1861,10 +1750,9 @@ mod tests {
     }
 
     #[test]
-    fn compact_redacts_absolute_paths_from_diagnostics() {
+    fn compact_preserves_absolute_paths_in_diagnostics() {
         let message = compact(b"failed reading /private/tmp/secret/video.mkv details");
-        assert!(!message.contains("/private"));
-        assert!(message.contains("[path]"));
+        assert!(message.contains("/private/tmp/secret/video.mkv"));
     }
 
     #[test]
@@ -1900,7 +1788,7 @@ mod tests {
             assert!(!serialized.contains("server/share"));
         }
 
-        // Benign relative names remain accepted and are not redacted.
+        // Benign relative names remain accepted unchanged.
         let ok = probe_media_files(
             vec![MediaProbeRequest {
                 relative_name: "torrent/video.mkv".into(),

@@ -1761,7 +1761,7 @@ export default function HomePage() {
                                     !torrentInfo?.name?.trim()
                                         ? '需要种子显示名称'
                                         : !recognitionReady
-                                          ? '需要 AI 能力状态为 Ready'
+                                          ? '需要启用并保存有效的 AI 配置'
                                           : !recognitionPatternsActive
                                             ? '需要有效的集数/分辨率/标题模板模式'
                                             : '对当前种子与模板模式运行 AI 识别（仅建议，不自动写入）'

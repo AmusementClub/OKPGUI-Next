@@ -10,7 +10,6 @@
 //! state so memory and disk stay consistent.
 
 use crate::ai::provider::CapabilityIdentity;
-use crate::ai::redaction::RedactionPolicy;
 use crate::atomic_file;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -64,7 +63,7 @@ pub fn media_info_may_report_success(state: AiJobState) -> bool {
     matches!(state, AiJobState::Succeeded)
 }
 
-/// Whether a terminal MediaInfo job may bind redacted summaries onto a PublishPlan.
+/// Whether a terminal MediaInfo job may bind summaries onto a PublishPlan.
 ///
 /// Same gate as [`media_info_may_report_success`]: only `Succeeded` may bind.
 /// Cancel / timeout / nonzero / malformed / oversized / Failed / Stale must leave
@@ -73,7 +72,7 @@ pub fn media_info_may_bind_plan_evidence(state: AiJobState) -> bool {
     media_info_may_report_success(state)
 }
 
-/// Whether a Recognition job may surface a validated redacted `RecognitionResult`.
+/// Whether a Recognition job may surface a validated `RecognitionResult`.
 ///
 /// Only `Succeeded` qualifies. `Cancelled` / `Stale` / `Failed` (and non-terminal states)
 /// must never return advisory candidates, and late completion after cancel/stale must not
@@ -253,7 +252,7 @@ impl AiJobManager {
         let store_path = store_dir.join(DEBUG_STORE_FILE_NAME);
         self.debug_store_path = Some(store_path);
         let load_outcome = self.load_debug_store();
-        // Snapshot post-load state before retention / re-sanitization so a failed
+        // Snapshot post-load state before retention so a failed
         // cleanup write can restore memory to match the still-unchanged disk file.
         let previous_after_load = self.debug_records.clone();
         let now = now_unix();
@@ -262,7 +261,6 @@ impl AiJobManager {
             DEBUG_RECORD_MAX_AGE_SECONDS,
             DEBUG_RECORD_MAX_RECORDS,
         );
-        self.sanitize_loaded_summaries();
         // Do not immediately rewrite an empty envelope over a just-quarantined
         // corrupt file; a later complete/cancel path recreates a valid store.
         if !matches!(load_outcome, DebugStoreLoadOutcome::IsolatedCorrupt)
@@ -453,12 +451,9 @@ impl AiJobManager {
         &self.debug_records
     }
 
-    /// Read-only clone of non-secret debug records for IPC listing.
+    /// Read-only clone of debug records for IPC listing.
     pub fn list_debug_records(&self) -> Vec<DebugRecord> {
-        self.debug_records
-            .iter()
-            .map(sanitize_debug_record)
-            .collect()
+        self.debug_records.clone()
     }
 
     /// Clear all retained debug records (non-secret metadata only).
@@ -500,10 +495,9 @@ impl AiJobManager {
         }
     }
 
-    /// Write a redacted JSON export bundle under `export_dir`.
+    /// Write a JSON export bundle under `export_dir`.
     ///
     /// Returns only safe basename metadata — never raw content or absolute paths.
-    /// Rejects the export when a post-redaction canary scan detects residual leakage.
     pub fn export_debug_bundle(
         &self,
         export_dir: impl AsRef<Path>,
@@ -518,11 +512,7 @@ impl AiJobManager {
             return Err("debug export rejected: unsafe file name".to_string());
         }
 
-        let records = self
-            .debug_records
-            .iter()
-            .map(sanitize_debug_record)
-            .collect::<Vec<_>>();
+        let records = self.debug_records.clone();
         let record_count = records.len();
         let bundle = serde_json::json!({
             "version": DEBUG_STORE_VERSION,
@@ -532,13 +522,6 @@ impl AiJobManager {
         });
         let data = serde_json::to_string_pretty(&bundle)
             .map_err(|error| format!("debug export serialize failed: {error}"))?;
-
-        if debug_bundle_fails_canary_scan(&data) {
-            return Err(
-                "debug export rejected: redaction canary scan detected residual sensitive content"
-                    .to_string(),
-            );
-        }
 
         let path = export_dir.join(&file_name);
         atomic_file::write_text_file_atomically(&path, &data)
@@ -588,8 +571,7 @@ impl AiJobManager {
         let previous_debug_record_id = job_snapshot.debug_record_id.clone();
         let debug_id = self.new_id("debug");
         let completed_at = now_unix();
-        // Structural redaction of every string field before in-memory or durable retention.
-        let record = sanitize_debug_record(&DebugRecord {
+        let record = DebugRecord {
             id: debug_id,
             job_id: id.to_string(),
             kind: job_snapshot.kind,
@@ -598,7 +580,7 @@ impl AiJobManager {
             completed_at_unix: Some(completed_at),
             summary,
             usage,
-        });
+        };
         if let Some(job) = self.jobs.get_mut(id) {
             job.debug_record_id = Some(record.id.clone());
         }
@@ -647,11 +629,7 @@ impl AiJobManager {
         }
         match read_debug_store_file(&path) {
             Ok(records) => {
-                // Owned records from disk: sanitize by reference (E0631 if mapped directly).
-                self.debug_records = records
-                    .into_iter()
-                    .map(|record| sanitize_debug_record(&record))
-                    .collect();
+                self.debug_records = records;
                 DebugStoreLoadOutcome::Loaded
             }
             Err(_error) => {
@@ -660,12 +638,6 @@ impl AiJobManager {
                 self.debug_records.clear();
                 DebugStoreLoadOutcome::IsolatedCorrupt
             }
-        }
-    }
-
-    fn sanitize_loaded_summaries(&mut self) {
-        for record in &mut self.debug_records {
-            *record = sanitize_debug_record(record);
         }
     }
 
@@ -679,25 +651,12 @@ impl AiJobManager {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("debug store directory unavailable: {error}"))?;
         }
-        let records = self
-            .debug_records
-            .iter()
-            .map(sanitize_debug_record)
-            .collect::<Vec<_>>();
         let envelope = DebugRecordStoreFile {
             version: DEBUG_STORE_VERSION,
-            records,
+            records: self.debug_records.clone(),
         };
         let data = serde_json::to_string_pretty(&envelope)
             .map_err(|error| format!("debug store serialize failed: {error}"))?;
-        // Refuse to write residual leakage. Fail closed without writing; do not
-        // invent an empty "recovery" envelope here (later terminal writes retry).
-        if debug_bundle_fails_canary_scan(&data) {
-            return Err(
-                "debug store persist rejected: redaction canary scan detected residual sensitive content"
-                    .to_string(),
-            );
-        }
         atomic_file::write_text_file_atomically(path, &data)
     }
 
@@ -713,76 +672,6 @@ fn now_unix() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
         .unwrap_or_default()
-}
-
-/// Sanitize a human summary with default structural redaction (paths, base64, URL userinfo).
-///
-/// If residual canary markers remain after structural redaction, replace the entire
-/// summary so list/export/persist never retain credential-like fragments.
-fn sanitize_debug_summary(summary: &str) -> String {
-    let redacted = RedactionPolicy::default().redact_text(summary);
-    if debug_bundle_fails_canary_scan(&redacted) {
-        "[REDACTED_SUMMARY]".to_string()
-    } else {
-        redacted
-    }
-}
-
-/// Whether `value` is a safe debug identifier shape (normal generated `job-…` /
-/// `debug-…` ids, or a fixed redaction placeholder). Rejects path, URL, and
-/// credential-like material that would fail the canary scan.
-fn is_safe_debug_identifier(value: &str) -> bool {
-    if ["[REDACTED_ID]", "[REDACTED_JOB_ID]"].contains(&value) {
-        return true;
-    }
-    if value.is_empty() || value.len() > 200 {
-        return false;
-    }
-    if !value
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
-    {
-        return false;
-    }
-    !raw_text_fails_canary_scan(value)
-}
-
-/// Sanitize `id` / `job_id`: preserve normal generated identifiers; replace path,
-/// URL, credential-like, or canary-bearing values with a fixed placeholder.
-fn sanitize_debug_identifier(value: &str, field: &str) -> String {
-    if is_safe_debug_identifier(value) {
-        return value.to_string();
-    }
-    let redacted = RedactionPolicy::default().redact_text(value);
-    if is_safe_debug_identifier(&redacted) {
-        return redacted;
-    }
-    match field {
-        "job_id" => "[REDACTED_JOB_ID]".to_string(),
-        _ => "[REDACTED_ID]".to_string(),
-    }
-}
-
-fn sanitize_debug_record(record: &DebugRecord) -> DebugRecord {
-    let mut sanitized = record.clone();
-    sanitized.id = sanitize_debug_identifier(&sanitized.id, "id");
-    sanitized.job_id = sanitize_debug_identifier(&sanitized.job_id, "job_id");
-    sanitized.summary = sanitize_debug_summary(&sanitized.summary);
-    // Fail closed: list/export/persist must never surface a record whose serialized
-    // sanitized string fields still trip the canary scan.
-    match serde_json::to_string(&sanitized) {
-        Ok(serialized) if !debug_bundle_fails_canary_scan(&serialized) => sanitized,
-        _ => DebugRecord {
-            id: "[REDACTED_ID]".to_string(),
-            job_id: "[REDACTED_JOB_ID]".to_string(),
-            kind: sanitized.kind,
-            state: sanitized.state,
-            created_at_unix: sanitized.created_at_unix,
-            completed_at_unix: sanitized.completed_at_unix,
-            summary: "[REDACTED_SUMMARY]".to_string(),
-            usage: sanitized.usage,
-        },
-    }
 }
 
 fn read_debug_store_file(path: &Path) -> Result<Vec<DebugRecord>, String> {
@@ -822,201 +711,6 @@ fn is_safe_export_file_name(file_name: &str) -> bool {
         && file_name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
-}
-
-/// Post-redaction canary scan for residual sensitive material in serialized debug JSON.
-///
-/// Detects absolute paths, scheme-prefixed paths (`file://`), URL userinfo, Cookie /
-/// Authorization headers, image/base64 payloads, tracker/raw-bencode markers, and
-/// common credential fragments that must never leave the process.
-///
-/// When `text` is valid JSON, path/UNC rules run on **decoded** string values so a
-/// normal single backslash in a diagnostic (JSON-escaped as `\\` on the wire) does
-/// not false-positive as a UNC path. Raw non-JSON inputs are scanned as-is.
-pub fn debug_bundle_fails_canary_scan(text: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(text) {
-        Ok(value) => json_value_fails_canary_scan(&value),
-        Err(_) => raw_text_fails_canary_scan(text),
-    }
-}
-
-fn json_value_fails_canary_scan(value: &serde_json::Value) -> bool {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                if sensitive_json_key_canary(key) {
-                    return true;
-                }
-                if json_value_fails_canary_scan(child) {
-                    return true;
-                }
-            }
-            false
-        }
-        serde_json::Value::Array(items) => items.iter().any(json_value_fails_canary_scan),
-        // Decoded string content: path rules see real backslashes, not JSON escapes.
-        serde_json::Value::String(text) => raw_text_fails_canary_scan(text),
-        _ => false,
-    }
-}
-
-fn sensitive_json_key_canary(key: &str) -> bool {
-    let lower = key.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "api_key"
-            | "apikey"
-            | "cookie"
-            | "set-cookie"
-            | "set_cookie"
-            | "raw_bencode"
-            | "rawbencode"
-            | "profile_body"
-            | "profile_cookies"
-            | "trackers"
-            | "authorization"
-    ) || lower.contains("api_key")
-        || lower.contains("apikey")
-        || lower.contains("raw_bencode")
-        || lower.contains("profile_body")
-        || lower.contains("profile_cookies")
-}
-
-/// True when `text` contains a Windows root-relative path shape `\Component\...`
-/// (single leading `\`, not UNC `\\`). Ordinary single-backslash diagnostics such as
-/// `\x1b[0m` lack a second `\` and must not trip this rule.
-fn contains_windows_root_relative_path(text: &str) -> bool {
-    let bytes = text.as_bytes();
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] != b'\\' {
-            index += 1;
-            continue;
-        }
-        // Skip UNC / doubled backslash runs — handled by the `\\` canary separately.
-        if index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
-            index += 2;
-            while index < bytes.len() && bytes[index] == b'\\' {
-                index += 1;
-            }
-            continue;
-        }
-        // `\Component\...` — second separator after a non-empty first component.
-        let rest = &bytes[index + 1..];
-        if let Some(sep_offset) = rest.iter().position(|&byte| byte == b'\\') {
-            if sep_offset > 0 {
-                return true;
-            }
-        }
-        index += 1;
-    }
-    false
-}
-
-/// Canary rules applied to a single decoded text fragment (or a non-JSON blob).
-fn raw_text_fails_canary_scan(text: &str) -> bool {
-    let lower = text.to_ascii_lowercase();
-
-    // Absolute path leakage (Unix / Windows / UNC) and scheme-prefixed absolute paths.
-    // UNC uses a real double-backslash in decoded text; JSON wire `\\` (one backslash)
-    // must not reach here via the JSON path above.
-    // Windows root-relative (`\Users\owen\secret`) is also absolute path material.
-    if lower.contains("/users/")
-        || lower.contains("/home/")
-        || lower.contains("/private/")
-        || lower.contains("/var/folders/")
-        || lower.contains("c:\\")
-        || lower.contains("c:/")
-        || text.contains("\\\\")
-        || contains_windows_root_relative_path(text)
-        || lower.contains("file:")
-    {
-        return true;
-    }
-    // Unredacted path markers should be the only path form remaining.
-    // Reject raw POSIX absolute tokens that are not the redaction placeholder.
-    for token in text.split_whitespace() {
-        let trimmed =
-            token.trim_matches(|ch: char| matches!(ch, '"' | ',' | '{' | '}' | '[' | ']'));
-        if trimmed.starts_with('/')
-            && !trimmed.contains("[PATH_REDACTED]")
-            && trimmed.len() > 1
-            && !trimmed.starts_with("//")
-        {
-            // Allow JSON pointer-like relative fragments only when not absolute FS paths.
-            // `/ai/debug` style keys are short; real home paths are longer.
-            if trimmed.matches('/').count() >= 2 && trimmed.len() > 12 {
-                return true;
-            }
-        }
-        if trimmed.len() >= 3
-            && trimmed.as_bytes()[0].is_ascii_alphabetic()
-            && trimmed.as_bytes()[1] == b':'
-            && matches!(trimmed.as_bytes().get(2), Some(b'/' | b'\\'))
-        {
-            return true;
-        }
-        // scheme://user:pass@host residue (userinfo not fully redacted).
-        if let Some(scheme_end) = trimmed.find("://") {
-            let authority = &trimmed[scheme_end + 3..];
-            let authority_end = authority.find(['/', '?', '#']).unwrap_or(authority.len());
-            let authority = &authority[..authority_end];
-            if let Some((userinfo, _)) = authority.rsplit_once('@') {
-                if !userinfo.is_empty() && userinfo != "[REDACTED]" {
-                    return true;
-                }
-            }
-        }
-    }
-
-    if lower.contains("bearer ")
-        || (lower.contains("bearer") && (lower.contains("sk-") || lower.contains("ghp_")))
-        || lower.contains("data:image/")
-        || lower.contains("authorization:")
-        || lower.contains("\"api_key\"")
-        || lower.contains("\"apikey\"")
-        || lower.contains("set-cookie")
-        || lower.contains("cookie:")
-        || lower.contains("\"cookie\"")
-        || lower.contains("\"raw_bencode\"")
-        || lower.contains("\"rawbencode\"")
-        || lower.contains("\"profile_body\"")
-        || lower.contains("\"profile_cookies\"")
-        || lower.contains("\"trackers\"")
-    {
-        return true;
-    }
-
-    // Live / production key canaries and common provider secret prefixes.
-    if text.contains("sk-live-")
-        || text.contains("sk-canary")
-        || text.contains("sk-super-secret")
-        || text.contains("sk-proj-")
-        || text.contains("sk-ant-")
-        || text.contains("xai-")
-        || text.contains("AIza")
-        || text.contains("ghp_")
-        || text.contains("github_pat_")
-        || text.contains("AKIA")
-    {
-        return true;
-    }
-
-    // Long base64-looking blobs (image/bytes) that escaped structural redaction.
-    for token in text.split(|ch: char| {
-        ch.is_whitespace() || matches!(ch, '"' | ',' | ':' | '{' | '}' | '[' | ']')
-    }) {
-        if token.len() >= 96
-            && token.len() % 4 == 0
-            && token
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'='))
-        {
-            return true;
-        }
-    }
-
-    false
 }
 
 #[cfg(test)]
@@ -1529,344 +1223,38 @@ mod tests {
     }
 
     #[test]
-    fn export_redacts_paths_and_returns_safe_metadata_only() {
-        let dir = temp_debug_dir("export");
+    fn debug_summary_is_preserved_across_store_export_and_reload() {
+        let dir = temp_debug_dir("preserve-summary");
         let export_dir = dir.join(DEBUG_EXPORT_RELATIVE_DIR);
         let mut manager = AiJobManager::default();
         manager.init_debug_store(&dir);
 
-        let id = manager.start(JobKind::Audit, 1, "sha256:export", None);
-        manager
-            .complete(
-                &id,
-                false,
-                Some("PROVIDER_HTTP".into()),
-                "error at /Users/owen/secret/project data:image/png;base64,AAAABBBB",
-                None,
-            )
-            .unwrap();
-
-        let meta = manager.export_debug_bundle(&export_dir).expect("export ok");
-        assert!(is_safe_export_file_name(&meta.file_name));
-        assert!(!meta.file_name.contains('/'));
-        assert!(!meta.file_name.contains('\\'));
-        assert_eq!(meta.record_count, 1);
-
-        let exported = std::fs::read_to_string(export_dir.join(&meta.file_name)).expect("read");
-        assert!(
-            !exported.contains("/Users/owen"),
-            "export must not contain absolute paths"
-        );
-        assert!(
-            !exported.to_ascii_lowercase().contains("data:image"),
-            "export must not contain image payloads"
-        );
-        assert!(
-            exported.contains("[PATH_REDACTED]") || exported.contains("[IMAGE_BYTES_REDACTED]"),
-            "export should carry redaction placeholders: {exported}"
-        );
-        assert!(!debug_bundle_fails_canary_scan(&exported));
-
-        // In-memory summary is also redacted at terminal time.
-        let listed = manager.list_debug_records();
-        assert!(!listed[0].summary.contains("/Users/owen"));
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn export_canary_scan_rejects_residual_secret_markers() {
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"Bearer sk-live-canary-formal-audit-key-9f3c2a1b"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"leak /Users/owen/private/key"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"data:image/png;base64,AAAA"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"Cookie: session=abc123secret"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"Set-Cookie: id=xyz; HttpOnly"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key sk-proj-abcdefghijklmnopqrstuvwxyz"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key sk-ant-api03-abcdefghijklmnopqrst"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key xai-abcdefghijklmnopqrst"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key AIzaSyA-abcdefghijklmnopqrst"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key ghp_abcdefghijklmnopqrstuvwxyz"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"key AKIAAAAAAAAAAAAAAAAA"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"open file:///tmp/secret.pem"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"open file:///var/folders/xx/T/canary"}"#
-        ));
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"https://user:pass@evil.example/x"}"#
-        ));
-        // Decoded UNC (JSON wire `\\\\` → two backslashes) still fails closed.
-        assert!(debug_bundle_fails_canary_scan(
-            r#"{"summary":"open \\\\server\\share\\secret"}"#
-        ));
-        // Windows root-relative (JSON wire `\\Users\\...` → decoded `\Users\...`) fails closed.
-        assert!(
-            debug_bundle_fails_canary_scan(r#"{"summary":"leak \\Users\\owen\\secret"}"#),
-            "decoded Windows root-relative path must fail canary"
-        );
-        assert!(
-            debug_bundle_fails_canary_scan(r"leak \Users\owen\secret"),
-            "raw Windows root-relative path must fail canary"
-        );
-        // A normal single backslash in a diagnostic is JSON-escaped as `\\` on the wire
-        // and must not false-positive as a UNC canary when scanned as structured JSON.
-        assert!(
-            !debug_bundle_fails_canary_scan(
-                r#"{"version":1,"records":[{"summary":"diag: code \\x1b reset","usage":null}]}"#
-            ),
-            "JSON-escaped single backslash must not fail canary"
-        );
-        assert!(!debug_bundle_fails_canary_scan(
-            r#"{"version":1,"records":[{"summary":"media ok","usage":null}]}"#
-        ));
-        // Raw (non-JSON) inputs still honor path/UNC rules on the text as-is.
-        assert!(debug_bundle_fails_canary_scan(r"leak \\server\share"));
-        assert!(!debug_bundle_fails_canary_scan("media ok with code \\x1b"));
-    }
-
-    #[test]
-    fn windows_root_relative_path_sanitized_in_list_store_and_export() {
-        let dir = temp_debug_dir("win-root-rel");
-        let export_dir = dir.join(DEBUG_EXPORT_RELATIVE_DIR);
-        let mut manager = AiJobManager::default();
-        manager.init_debug_store(&dir);
-
-        // Single leading backslash Windows root-relative path (not drive letter, not UNC).
-        let summary = r"provider failed at \Users\owen\secret\project";
-        let id = manager.start(JobKind::Audit, 1, "sha256:win-root", None);
+        let summary = r"provider failed at /Users/owen/project file:///tmp/video.mkv with Cookie: session=value";
+        let id = manager.start(JobKind::Audit, 1, "sha256:preserve", None);
         manager
             .complete(&id, false, Some("PROVIDER_HTTP".into()), summary, None)
             .unwrap();
 
-        // List path must not retain the raw root-relative path.
-        let listed = manager.list_debug_records();
-        let record = listed
-            .iter()
-            .find(|record| record.job_id == id)
-            .expect("listed");
-        assert!(
-            !record.summary.contains(r"\Users\owen"),
-            "list must not retain root-relative Windows path: {}",
-            record.summary
-        );
-        assert!(
-            !debug_bundle_fails_canary_scan(&record.summary),
-            "sanitized list summary must pass canary: {}",
-            record.summary
-        );
-        assert!(
-            record.summary.contains("[PATH_REDACTED]")
-                || record.summary.contains("[REDACTED_SUMMARY]"),
-            "expected redaction placeholder: {}",
-            record.summary
-        );
+        assert_eq!(manager.list_debug_records()[0].summary, summary);
 
-        // Durable store must not retain the residual path material.
-        let store_path = dir.join(DEBUG_STORE_FILE_NAME);
-        assert!(
-            store_path.exists(),
-            "records.json must exist after complete"
-        );
-        let stored = std::fs::read_to_string(&store_path).expect("read store");
-        assert!(
-            !stored.contains(r"\Users\owen") && !stored.contains(r"\\Users\\owen"),
-            "durable store must not retain root-relative path: {stored}"
-        );
-        assert!(
-            !debug_bundle_fails_canary_scan(&stored),
-            "stored envelope must pass canary: {stored}"
-        );
-
-        // Export must sanitize or fail closed for the same shape.
-        let meta = manager.export_debug_bundle(&export_dir).expect("export ok");
-        let exported = std::fs::read_to_string(export_dir.join(&meta.file_name)).expect("read");
-        assert!(
-            !exported.contains(r"\Users\owen") && !exported.contains(r"\\Users\\owen"),
-            "export must not retain root-relative path: {exported}"
-        );
-        assert!(
-            !debug_bundle_fails_canary_scan(&exported),
-            "export must pass canary: {exported}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn sanitize_strips_cookie_production_keys_and_file_urls_from_list() {
-        let mut manager = AiJobManager::default();
-        let cases = [
-            (
-                "cookie",
-                "upstream Cookie: session=super-secret-cookie-value rejected",
-                "super-secret-cookie-value",
-            ),
-            (
-                "prod-key",
-                "invalid api key sk-proj-abcdefghijklmnopqrstuvwxyz012345",
-                "sk-proj-abcdefghijklmnopqrstuvwxyz012345",
-            ),
-            (
-                "file-tmp",
-                "failed to read file:///tmp/okpgui-canary-secret",
-                "file:///tmp/okpgui-canary-secret",
-            ),
-            (
-                "file-var",
-                "cache at file:///var/folders/xx/abcdef/T/canary-key",
-                "file:///var/folders/xx/abcdef/T/canary-key",
-            ),
-        ];
-        for (label, summary, residual) in cases {
-            let id = manager.start(JobKind::Audit, 1, format!("snap-{label}"), None);
-            manager
-                .complete(&id, false, Some("PROVIDER_HTTP".into()), summary, None)
-                .unwrap();
-            let listed = manager.list_debug_records();
-            let record = listed
-                .iter()
-                .find(|record| record.job_id == id)
-                .expect("listed");
-            assert!(
-                !record.summary.contains(residual),
-                "{label}: list must not retain residual '{residual}': {}",
-                record.summary
-            );
-            assert!(
-                !debug_bundle_fails_canary_scan(&record.summary),
-                "{label}: sanitized summary must pass canary: {}",
-                record.summary
-            );
-        }
-    }
-
-    #[test]
-    fn export_and_persist_reject_or_strip_cookie_key_and_file_url() {
-        let dir = temp_debug_dir("export-harden");
-        let export_dir = dir.join(DEBUG_EXPORT_RELATIVE_DIR);
-        let mut manager = AiJobManager::default();
-        manager.init_debug_store(&dir);
-
-        let secrets = [
-            "Cookie: session=persist-cookie-canary-9f3c",
-            "Authorization: Bearer sk-proj-persist-canary-key-abcdef",
-            "read failed file:///tmp/persist-canary.pem",
-            "read failed file:///var/folders/zz/T/persist-canary",
-        ];
-        for (index, summary) in secrets.iter().enumerate() {
-            let id = manager.start(JobKind::Audit, index as u64, format!("snap-{index}"), None);
-            manager
-                .complete(&id, false, Some("X".into()), *summary, None)
-                .unwrap();
-        }
-
-        // In-memory + list path.
-        for record in manager.list_debug_records() {
-            assert!(!record.summary.contains("persist-cookie-canary"));
-            assert!(!record.summary.contains("sk-proj-persist-canary"));
-            assert!(!record.summary.contains("file://"));
-            assert!(!record.summary.contains("/tmp/persist"));
-            assert!(!record.summary.contains("/var/folders/"));
-        }
-
-        // Durable store must exist after terminal complete and must not retain residuals.
-        let store_path = dir.join(DEBUG_STORE_FILE_NAME);
-        assert!(
-            store_path.exists(),
-            "records.json must exist after terminal complete"
-        );
-        let stored = std::fs::read_to_string(&store_path).expect("read store");
-        assert!(!stored.contains("persist-cookie-canary"), "{stored}");
-        assert!(!stored.contains("sk-proj-persist-canary"), "{stored}");
-        assert!(!stored.contains("file://"), "{stored}");
-        assert!(!debug_bundle_fails_canary_scan(&stored), "{stored}");
+        let stored = std::fs::read_to_string(dir.join(DEBUG_STORE_FILE_NAME)).expect("read store");
+        assert!(stored.contains("/Users/owen/project"));
+        assert!(stored.contains("file:///tmp/video.mkv"));
+        assert!(stored.contains("Cookie: session=value"));
 
         let meta = manager.export_debug_bundle(&export_dir).expect("export ok");
-        let exported = std::fs::read_to_string(export_dir.join(&meta.file_name)).expect("read");
-        assert!(!exported.contains("persist-cookie-canary"), "{exported}");
-        assert!(!exported.contains("sk-proj-persist-canary"), "{exported}");
-        assert!(!exported.contains("file://"), "{exported}");
-        assert!(!exported.contains("/var/folders/"), "{exported}");
-        assert!(!debug_bundle_fails_canary_scan(&exported), "{exported}");
+        let exported =
+            std::fs::read_to_string(export_dir.join(&meta.file_name)).expect("read export");
+        assert!(exported.contains("/Users/owen/project"));
+        assert!(exported.contains("file:///tmp/video.mkv"));
+        assert!(exported.contains("Cookie: session=value"));
 
-        // Reload path re-sanitizes owned records (compile + security boundary).
         let mut reloaded = AiJobManager::default();
         reloaded.init_debug_store(&dir);
-        for record in reloaded.list_debug_records() {
-            assert!(!record.summary.contains("file://"));
-            assert!(!record.summary.contains("sk-proj-persist-canary"));
-        }
+        assert_eq!(reloaded.list_debug_records()[0].summary, summary);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    #[test]
-    fn single_backslash_diagnostic_persists_and_exports() {
-        let dir = temp_debug_dir("backslash-diag");
-        let export_dir = dir.join(DEBUG_EXPORT_RELATIVE_DIR);
-        let mut manager = AiJobManager::default();
-        manager.init_debug_store(&dir);
-
-        // A normal single backslash in a diagnostic must survive sanitize/persist/export
-        // without tripping the canary on JSON escaping.
-        let summary = "provider diag: status \\x1b[0m reset path-safe";
-        let id = manager.start(JobKind::Audit, 1, "sha256:backslash", None);
-        manager.complete(&id, true, None, summary, None).unwrap();
-
-        let store_path = dir.join(DEBUG_STORE_FILE_NAME);
-        assert!(
-            store_path.exists(),
-            "records.json must exist after terminal complete with backslash diagnostic"
-        );
-        let stored = std::fs::read_to_string(&store_path).expect("read store");
-        assert!(
-            !debug_bundle_fails_canary_scan(&stored),
-            "stored envelope with single-backslash diagnostic must pass canary: {stored}"
-        );
-        // Wire form may escape the backslash; decoded summary retains it.
-        let listed = manager.list_debug_records();
-        assert_eq!(listed.len(), 1);
-        assert!(
-            listed[0].summary.contains('\\'),
-            "decoded summary should retain a single backslash: {}",
-            listed[0].summary
-        );
-
-        let meta = manager
-            .export_debug_bundle(&export_dir)
-            .expect("export must succeed for single-backslash diagnostic");
-        let exported = std::fs::read_to_string(export_dir.join(&meta.file_name)).expect("read");
-        assert!(
-            !debug_bundle_fails_canary_scan(&exported),
-            "export with single-backslash diagnostic must pass canary: {exported}"
-        );
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     #[test]
     fn no_duplicate_terminal_debug_records_across_late_complete_and_reload() {
         let dir = temp_debug_dir("dedupe");
@@ -1993,100 +1381,43 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-
     #[test]
-    fn list_and_reload_sanitize_malicious_id_and_job_id() {
-        let dir = temp_debug_dir("malicious-ids");
+    fn list_and_reload_preserve_stored_identifiers() {
+        let dir = temp_debug_dir("stored-ids");
         let store_path = dir.join(DEBUG_STORE_FILE_NAME);
         let created_at = now_unix();
         let envelope = serde_json::json!({
             "version": 1,
-            "records": [
-                {
-                    "id": "file:///tmp/okpgui-canary-debug-id",
-                    "job_id": "/Users/owen/secret/job-sk-proj-malicious-canary-key",
-                    "kind": "audit",
-                    "state": "succeeded",
-                    "created_at_unix": created_at,
-                    "completed_at_unix": created_at + 1,
-                    "summary": "ok summary",
-                    "usage": null
-                },
-                {
-                    "id": "debug-1700000000-2",
-                    "job_id": "job-1700000000-1",
-                    "kind": "audit",
-                    "state": "failed",
-                    "created_at_unix": created_at + 10,
-                    "completed_at_unix": created_at + 11,
-                    "summary": "normal generated identifiers",
-                    "usage": null
-                }
-            ]
+            "records": [{
+                "id": "file:///tmp/debug-id",
+                "job_id": "/Users/owen/project/job-id",
+                "kind": "audit",
+                "state": "succeeded",
+                "created_at_unix": created_at,
+                "completed_at_unix": created_at + 1,
+                "summary": "stored summary",
+                "usage": null
+            }]
         });
         std::fs::write(
             &store_path,
             serde_json::to_string_pretty(&envelope).expect("serialize seed"),
         )
-        .expect("seed malicious store");
+        .expect("seed store");
 
         let mut manager = AiJobManager::default();
         manager.init_debug_store(&dir);
         let listed = manager.list_debug_records();
-        assert_eq!(listed.len(), 2);
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, "file:///tmp/debug-id");
+        assert_eq!(listed[0].job_id, "/Users/owen/project/job-id");
 
-        let malicious = listed
-            .iter()
-            .find(|record| record.summary == "ok summary" || record.summary == "[REDACTED_SUMMARY]")
-            .expect("malicious-origin record listed");
-        assert!(
-            !malicious.id.contains("file:")
-                && !malicious.id.contains("/tmp/")
-                && !malicious.id.contains("okpgui-canary"),
-            "list must not expose path/canary material via id: {}",
-            malicious.id
-        );
-        assert!(
-            !malicious.job_id.contains("/Users/")
-                && !malicious.job_id.contains("sk-proj-")
-                && !malicious.job_id.contains("malicious-canary"),
-            "list must not expose path/canary material via job_id: {}",
-            malicious.job_id
-        );
-        let malicious_serialized =
-            serde_json::to_string(malicious).expect("serialize malicious listed record");
-        assert!(
-            !debug_bundle_fails_canary_scan(&malicious_serialized),
-            "listed sanitized record must pass canary: {malicious_serialized}"
-        );
-
-        let normal = listed
-            .iter()
-            .find(|record| record.summary == "normal generated identifiers")
-            .expect("normal record listed");
-        assert_eq!(normal.id, "debug-1700000000-2");
-        assert_eq!(normal.job_id, "job-1700000000-1");
-
-        // Reload path re-applies the same identifier boundary.
         let mut reloaded = AiJobManager::default();
         reloaded.init_debug_store(&dir);
-        for record in reloaded.list_debug_records() {
-            let serialized = serde_json::to_string(&record).expect("serialize");
-            assert!(
-                !debug_bundle_fails_canary_scan(&serialized),
-                "reloaded list record must pass canary: {serialized}"
-            );
-            assert!(!record.id.contains("file:"));
-            assert!(!record.job_id.contains("sk-proj-"));
-            assert!(!record.job_id.contains("/Users/"));
-        }
-        let reloaded_normal = reloaded
-            .list_debug_records()
-            .into_iter()
-            .find(|record| record.summary == "normal generated identifiers")
-            .expect("normal after reload");
-        assert_eq!(reloaded_normal.id, "debug-1700000000-2");
-        assert_eq!(reloaded_normal.job_id, "job-1700000000-1");
+        let reloaded = reloaded.list_debug_records();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].id, listed[0].id);
+        assert_eq!(reloaded[0].job_id, listed[0].job_id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
