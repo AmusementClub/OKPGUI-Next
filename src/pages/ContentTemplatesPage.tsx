@@ -65,7 +65,7 @@ export default function ContentTemplatesPage() {
                 <header className="flex flex-wrap items-center justify-between gap-4">
                     <div>
                         <p className="text-xs uppercase tracking-[0.24em] text-cyan-400/80">快速模板发布</p>
-                        <h1 className="mt-2 text-3xl font-semibold text-white">公共正文模板管理</h1>
+                        <h1 className="mt-2 text-3xl font-semibold text-slate-50">公共正文模板管理</h1>
                         <p className="mt-2 max-w-3xl text-sm text-slate-400">
                             在这里维护组级共用的小尾巴、公告和下载说明。发布模板页负责片级正文主体，这里只维护可被多个发布模板复用的公共部分。
                         </p>

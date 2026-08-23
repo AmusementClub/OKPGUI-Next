@@ -69,7 +69,7 @@ export default function ImportConflictDialog({
 
                                     <div className="rounded-xl border border-slate-700 bg-slate-900/70 px-4 py-3">
                                         <div className="text-xs uppercase tracking-wide text-slate-500">冲突目标</div>
-                                        <div className="mt-2 break-all text-sm font-medium text-white">{targetName}</div>
+                                        <div className="mt-2 break-all text-sm font-medium text-slate-50">{targetName}</div>
                                     </div>
 
                                     <div className="space-y-3 rounded-xl border border-slate-700 bg-slate-900/50 px-4 py-4">
@@ -91,7 +91,7 @@ export default function ImportConflictDialog({
                                         <button
                                             type="button"
                                             onClick={onCancel}
-                                            className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-white transition-colors hover:bg-slate-600"
+                                            className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-slate-50 transition-colors hover:bg-slate-600"
                                         >
                                             取消导入
                                         </button>

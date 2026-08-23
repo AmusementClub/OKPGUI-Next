@@ -105,7 +105,7 @@ export default function RenameTemplateDialog({
                                             type="button"
                                             onClick={onCancel}
                                             disabled={isSaving}
-                                            className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-white transition-colors hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
+                                            className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-slate-50 transition-colors hover:bg-slate-600 disabled:cursor-not-allowed disabled:opacity-40"
                                         >
                                             取消
                                         </button>

@@ -3,6 +3,19 @@
 
 <head>
   <meta charset="UTF-8" />
+  <script>
+    // 预绘制主题脚本：在 React 挂载前应用主题，避免闪烁。
+    // storage key 镜像自 src/utils/appPreferences.ts 的 THEME_STORAGE_KEY。
+    (function () {
+      var pref = 'auto';
+      try { pref = localStorage.getItem('okpgui:theme') || 'auto'; } catch (e) {}
+      var resolved = pref === 'light' || pref === 'dark'
+        ? pref
+        : (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.dataset.theme = resolved;
+      document.documentElement.style.colorScheme = resolved;
+    })();
+  </script>
   <link rel="stylesheet" href="/src/styles.css" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>OKPGUI Next</title>

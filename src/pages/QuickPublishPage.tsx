@@ -909,7 +909,7 @@ export default function QuickPublishPage() {
                 <header className="flex flex-wrap items-center justify-between gap-4">
                     <div>
                         <p className="text-xs uppercase tracking-[0.24em] text-cyan-400/80">快速模板发布</p>
-                        <h1 className="mt-2 text-3xl font-semibold text-white">模板发布</h1>
+                        <h1 className="mt-2 text-3xl font-semibold text-slate-50">模板发布</h1>
                         <p className="mt-2 max-w-3xl text-sm text-slate-400">
                             这里是运行时装配页。发布模板提供默认值，你可以在本次发布里覆盖标题、正文、身份与站点，但这些覆盖默认不会回写模板。
                         </p>

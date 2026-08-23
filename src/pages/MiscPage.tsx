@@ -1,14 +1,21 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
-import { ExternalLink, FolderSearch, Globe, Info, X } from 'lucide-react';
+import { ExternalLink, FolderSearch, Globe, Info, SunMoon, X } from 'lucide-react';
 import { useAppVersion } from '../utils/appVersion';
-import { getStartupPagePreference, setStartupPagePreference, type StartupPage } from '../utils/appPreferences';
+import { getStartupPagePreference, setStartupPagePreference, type StartupPage, type ThemePreference } from '../utils/appPreferences';
+import { useTheme } from '../hooks/useTheme';
 
 interface ProxyConfig {
     proxy_type: string;
     proxy_host: string;
 }
+
+const THEME_OPTIONS: { value: ThemePreference; label: string }[] = [
+    { value: 'auto', label: '跟随系统' },
+    { value: 'light', label: '浅色' },
+    { value: 'dark', label: '深色' },
+];
 
 export default function MiscPage() {
     const [proxyType, setProxyType] = useState('none');
@@ -18,6 +25,8 @@ export default function MiscPage() {
     const [startupPageSaved, setStartupPageSaved] = useState(false);
     const [defaultMediaFolder, setDefaultMediaFolder] = useState('');
     const [mediaFolderStatus, setMediaFolderStatus] = useState('');
+    const { preference: themePreference, setPreference: setThemePreference } = useTheme();
+    const [themeSaved, setThemeSaved] = useState(false);
     const appVersion = useAppVersion();
 
     useEffect(() => {
@@ -85,9 +94,56 @@ export default function MiscPage() {
         window.setTimeout(() => setStartupPageSaved(false), 2000);
     };
 
+    const persistTheme = (nextTheme: ThemePreference) => {
+        setThemePreference(nextTheme);
+        setThemeSaved(true);
+        window.setTimeout(() => setThemeSaved(false), 2000);
+    };
+
     return (
         <div className="flex flex-col h-full overflow-y-auto">
             <div className="p-6 space-y-6">
+                <section>
+                    <h2 className="text-sm font-medium text-slate-400 mb-3 flex items-center gap-2">
+                        <SunMoon size={16} />
+                        外观
+                    </h2>
+                    <div className="bg-slate-800/50 border border-slate-700 rounded-lg p-4 space-y-3">
+                        <div>
+                            <label className="text-xs text-slate-500 mb-1 block">主题</label>
+                            <div className="flex gap-2" role="radiogroup" aria-label="主题">
+                                {THEME_OPTIONS.map((option) => {
+                                    const checked = themePreference === option.value;
+                                    return (
+                                        <label
+                                            key={option.value}
+                                            className={[
+                                                'flex-1 px-3 py-2 text-sm text-center rounded-lg border cursor-pointer transition-colors has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-emerald-500',
+                                                checked
+                                                    ? 'bg-emerald-500/10 border-emerald-500 text-emerald-400'
+                                                    : 'bg-slate-900 border-slate-700 text-slate-400 hover:border-slate-600',
+                                            ].join(' ')}
+                                        >
+                                            <input
+                                                type="radio"
+                                                name="okp-theme"
+                                                value={option.value}
+                                                checked={checked}
+                                                onChange={() => persistTheme(option.value)}
+                                                className="sr-only"
+                                            />
+                                            {option.label}
+                                        </label>
+                                    );
+                                })}
+                            </div>
+                        </div>
+                        <p className="text-xs text-slate-500">
+                            {themeSaved ? '主题设置已保存。' : '默认跟随系统主题，选择后立即生效。'}
+                        </p>
+                    </div>
+                </section>
+
                 <section>
                     <h2 className="text-sm font-medium text-slate-400 mb-3 flex items-center gap-2">
                         <Info size={16} />
