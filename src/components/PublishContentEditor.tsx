@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import EasyMarkdownEditor from './EasyMarkdownEditor';
-import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
+import { useTheme } from '../hooks/useTheme';
+import { buildHtmlPreviewDocument } from '../utils/htmlPreviewDocument';
 import { renderMarkdownToHtml } from '../utils/markdown';
 
 interface PublishContentEditorProps {
@@ -25,59 +26,6 @@ function hasCustomHtml(markdown: string, html: string) {
     return normalizeHtml(normalizedHtml) !== normalizeHtml(renderMarkdownToHtml(markdown));
 }
 
-function buildHtmlPreviewDocument(html: string) {
-    const body = html.trim()
-        ? html
-        : '<p class="okp-html-preview-empty">暂无内容</p>';
-
-    return `<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <base target="_blank" />
-  <style>
-    :root { color-scheme: dark; }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      padding: 20px;
-      background: #0f172a;
-      color: #cbd5e1;
-      font: 14px/1.7 ${IFRAME_SANS_FONT_STACK};
-      word-break: break-word;
-    }
-    a { color: #22d3ee; }
-    img { max-width: 100%; height: auto; border-radius: 12px; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { border: 1px solid #334155; padding: 8px 10px; }
-    code, pre {
-      font-family: ${IFRAME_MONO_FONT_STACK};
-    }
-    pre {
-      overflow-x: auto;
-      padding: 14px;
-      border-radius: 12px;
-      background: #020617;
-    }
-    blockquote {
-      margin: 0 0 16px;
-      padding-left: 16px;
-      border-left: 4px solid rgba(16, 185, 129, 0.65);
-      color: #94a3b8;
-    }
-    .okp-html-preview-empty {
-      margin: 0;
-      padding: 32px 0;
-      text-align: center;
-      color: #64748b;
-    }
-  </style>
-</head>
-<body>${body}</body>
-</html>`;
-}
-
 export default function PublishContentEditor({
     contentKey,
     markdown,
@@ -86,6 +34,7 @@ export default function PublishContentEditor({
     onHtmlChange,
 }: PublishContentEditorProps) {
     const [htmlOverrideEnabled, setHtmlOverrideEnabled] = useState(() => hasCustomHtml(markdown, html));
+    const { resolvedTheme } = useTheme();
 
     useEffect(() => {
         setHtmlOverrideEnabled(hasCustomHtml(markdown, html));
@@ -116,7 +65,10 @@ export default function PublishContentEditor({
         }
     };
 
-    const htmlPreviewDocument = useMemo(() => buildHtmlPreviewDocument(effectiveHtml), [effectiveHtml]);
+    const htmlPreviewDocument = useMemo(
+        () => buildHtmlPreviewDocument(effectiveHtml, resolvedTheme, '暂无内容'),
+        [effectiveHtml, resolvedTheme],
+    );
 
     return (
         <div className="rounded-xl border border-slate-700/70 bg-slate-900/40">

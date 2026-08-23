@@ -7,9 +7,10 @@ import WarningBanner from '../components/WarningBanner';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
 import { quickPublishTemplateManagerConfig, useTemplateManager } from '../hooks/useTemplateManager';
 import { ENTITY_NAME_MAX_LENGTH, sanitizeEntityNameInput } from '../utils/entityNaming';
-import { IFRAME_MONO_FONT_STACK, IFRAME_SANS_FONT_STACK } from '../utils/iframeFonts';
+import { buildHtmlPreviewDocument } from '../utils/htmlPreviewDocument';
 import { getTemplateSaveStateMeta } from '../utils/templateAutosave';
 import FieldHelpHint from '../components/FieldHelpHint';
+import { useTheme } from '../hooks/useTheme';
 import {
     DEFAULT_EP_PATTERN,
     DEFAULT_RESOLUTION_PATTERN,
@@ -28,51 +29,6 @@ import {
     quickPublishSiteLabels,
 } from '../utils/quickPublish';
 
-function buildHtmlPreviewDocument(html: string) {
-    const body = html.trim()
-        ? html
-        : '<p class="okp-html-preview-empty">暂无 HTML 内容</p>';
-
-    return `<!doctype html>
-<html lang="zh-CN">
-<head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <base target="_blank" />
-    <style>
-        :root { color-scheme: dark; }
-        * { box-sizing: border-box; }
-        body {
-            margin: 0;
-            padding: 20px;
-            background: #0f172a;
-            color: #cbd5e1;
-            font: 14px/1.7 ${IFRAME_SANS_FONT_STACK};
-            word-break: break-word;
-        }
-        a { color: #22d3ee; }
-        img { max-width: 100%; height: auto; border-radius: 12px; }
-        table { width: 100%; border-collapse: collapse; }
-        th, td { border: 1px solid #334155; padding: 8px 10px; }
-        pre {
-            overflow-x: auto;
-            padding: 14px;
-            border-radius: 12px;
-            background: #020617;
-            font-family: ${IFRAME_MONO_FONT_STACK};
-        }
-        .okp-html-preview-empty {
-            margin: 0;
-            padding: 32px 0;
-            text-align: center;
-            color: #64748b;
-        }
-    </style>
-</head>
-<body>${body}</body>
-</html>`;
-}
-
 export default function QuickPublishTemplatesPage() {
     const { requestImportConflictStrategy, importConflictDialog } = useImportConflictDialog();
     const manager = useTemplateManager(quickPublishTemplateManagerConfig, {
@@ -88,6 +44,7 @@ export default function QuickPublishTemplatesPage() {
 
     const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
     const [profileList, setProfileList] = useState<string[]>([]);
+    const { resolvedTheme } = useTheme();
 
     const sharedContentTemplateOptions = useMemo(
         () =>
@@ -114,8 +71,8 @@ export default function QuickPublishTemplatesPage() {
     );
 
     const composedHtmlPreviewDocument = useMemo(
-        () => buildHtmlPreviewDocument(composedHtml),
-        [composedHtml],
+        () => buildHtmlPreviewDocument(composedHtml, resolvedTheme, '暂无 HTML 内容'),
+        [composedHtml, resolvedTheme],
     );
 
     const saveStateMeta = useMemo(
@@ -160,7 +117,7 @@ export default function QuickPublishTemplatesPage() {
                 <header className="flex flex-wrap items-center justify-between gap-4">
                     <div>
                         <p className="text-xs uppercase tracking-[0.24em] text-cyan-400/80">快速模板发布</p>
-                        <h1 className="mt-2 text-3xl font-semibold text-white">发布模板管理</h1>
+                        <h1 className="mt-2 text-3xl font-semibold text-slate-50">发布模板管理</h1>
                         <p className="mt-2 max-w-3xl text-sm text-slate-400">
                             发布模板现在同时管理"怎么发"和"这一片的正文主体"。公共正文模板只承载组级共用尾巴，运行时覆盖默认仍不会回写模板。
                         </p>

@@ -120,7 +120,7 @@ export default function CookieCaptureDialog({
                                     <div className="space-y-5 px-6 py-6">
                                         <div className="space-y-3 text-sm text-slate-300">
                                             <p>
-                                                正在从<span className="font-medium text-white">{siteLabel}</span>获取 Cookie。
+                                                正在从<span className="font-medium text-slate-50">{siteLabel}</span>获取 Cookie。
                                             </p>
                                             {mode === 'confirm' ? (
                                                 isCaptureReady ? (
@@ -148,7 +148,7 @@ export default function CookieCaptureDialog({
                                             <div className="flex items-center justify-end gap-3">
                                                 <button
                                                     onClick={onReportFailure}
-                                                    className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-white transition-colors hover:bg-slate-600"
+                                                    className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-slate-50 transition-colors hover:bg-slate-600"
                                                 >
                                                     登录失败
                                                 </button>
@@ -172,7 +172,7 @@ export default function CookieCaptureDialog({
                                         <div className="flex justify-end">
                                             <button
                                                 onClick={onClose}
-                                                className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-white transition-colors hover:bg-slate-600"
+                                                className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-slate-50 transition-colors hover:bg-slate-600"
                                             >
                                                 关闭
                                             </button>
@@ -185,7 +185,7 @@ export default function CookieCaptureDialog({
                                         <div className="flex flex-col gap-3 text-sm text-slate-300 md:flex-row md:items-center md:justify-between">
                                             <div className="space-y-1">
                                                 <p>
-                                                    已捕获 <span className="font-medium text-white">{siteLabel}</span> 的 Cookie。
+                                                    已捕获 <span className="font-medium text-slate-50">{siteLabel}</span> 的 Cookie。
                                                 </p>
                                                 <p className="text-slate-400">
                                                     请选择要保存的条目，默认已全选，共 {cookies.length} 条。
@@ -270,7 +270,7 @@ export default function CookieCaptureDialog({
                                             <div className="flex items-center gap-3">
                                                 <button
                                                     onClick={onClose}
-                                                    className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-white transition-colors hover:bg-slate-600"
+                                                    className="rounded-lg bg-slate-700 px-4 py-2 text-sm text-slate-50 transition-colors hover:bg-slate-600"
                                                 >
                                                     取消
                                                 </button>
