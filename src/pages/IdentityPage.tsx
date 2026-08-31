@@ -17,6 +17,7 @@ import CookieCaptureDialog, {
     CookieCaptureDialogMode,
     getCapturedCookieKey,
 } from '../components/CookieCaptureDialog';
+import ConfirmDialog from '../components/ConfirmDialog';
 import { useNoticeDialog } from '../hooks/useNoticeDialog';
 import {
     buildCookieTextFromCapturedCookies,
@@ -43,6 +44,7 @@ import {
 import { siteDefinitions, useSiteLoginTest } from '../hooks/useSiteLoginTest';
 import { useLatest } from '../hooks/useLatest';
 import { serializeForComparison } from '../utils/templateSnapshot';
+import { friendlyErrorMessage } from '../utils/friendlyError';
 
 interface Profile {
     cookies: string;
@@ -141,15 +143,7 @@ const sites: SiteConfig[] = [
 ];
 
 function getErrorMessage(error: unknown): string {
-    if (typeof error === 'string') {
-        return error;
-    }
-
-    if (error instanceof Error) {
-        return error.message;
-    }
-
-    return '获取 Cookie 失败，请重试。';
+    return friendlyErrorMessage(error, '获取 Cookie 失败，请重试。');
 }
 
 function updateProfileSiteCookies(profile: Profile, siteCode: string, rawText: string): Profile {
@@ -199,6 +193,7 @@ export default function IdentityPage() {
     const [newProfileName, setNewProfileName] = useState('');
     const [profile, setProfile] = useState<Profile>(defaultProfile);
     const [loginSite, setLoginSite] = useState<string | null>(null);
+    const [isProfileDeleteConfirmOpen, setIsProfileDeleteConfirmOpen] = useState(false);
     const [cookieDialog, setCookieDialog] = useState<CookieDialogState | null>(null);
     const {
         siteLoginTests,
@@ -325,7 +320,7 @@ export default function IdentityPage() {
             ) {
                 showNotice({
                     title: '保存配置失败',
-                    message: typeof error === 'string' ? error : '保存配置失败。',
+                    message: friendlyErrorMessage(error, '保存配置失败。'),
                 });
             }
             return false;
@@ -348,10 +343,13 @@ export default function IdentityPage() {
     const getProfileWithFieldValue = (field: keyof Profile, value: string): Profile =>
         ({ ...profile, [field]: value } as Profile);
 
+    const isDeletingProfileRef = useRef(false);
+
     const deleteProfile = async () => {
-        if (!currentProfileName) {
+        if (!currentProfileName || isDeletingProfileRef.current) {
             return;
         }
+        isDeletingProfileRef.current = true;
 
         try {
             await invoke('delete_profile', { name: currentProfileName });
@@ -362,6 +360,12 @@ export default function IdentityPage() {
             await loadProfileList();
         } catch (error) {
             console.error('删除配置失败:', error);
+            showNotice({
+                title: '删除配置失败',
+                message: friendlyErrorMessage(error, '删除配置失败，请稍后重试。'),
+            });
+        } finally {
+            isDeletingProfileRef.current = false;
         }
     };
 
@@ -622,7 +626,7 @@ export default function IdentityPage() {
             console.error('导入 Cookie 文件失败:', error);
             showNotice({
                 title: '导入 Cookie 失败',
-                message: typeof error === 'string' ? error : '导入 Cookie 文件失败。',
+                message: friendlyErrorMessage(error, '导入 Cookie 文件失败。'),
             });
         }
     };
@@ -670,7 +674,7 @@ export default function IdentityPage() {
                                 className="w-52 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
                             <button
-                                onClick={deleteProfile}
+                                onClick={() => setIsProfileDeleteConfirmOpen(true)}
                                 disabled={!currentProfileName}
                                 className="flex items-center gap-1.5 rounded-lg bg-red-600/80 px-3 py-2 text-sm text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-40"
                             >
@@ -942,6 +946,18 @@ export default function IdentityPage() {
                 onToggleAll={toggleAllCookies}
                 onToggleCookie={toggleCookieSelection}
                 onSubmitSelection={saveSelectedCookies}
+            />
+            <ConfirmDialog
+                open={isProfileDeleteConfirmOpen}
+                title="删除配置"
+                message={`确定要删除身份配置“${currentProfileName}”吗？此操作无法撤销。`}
+                confirmLabel="删除"
+                danger
+                onConfirm={() => {
+                    setIsProfileDeleteConfirmOpen(false);
+                    void deleteProfile();
+                }}
+                onCancel={() => setIsProfileDeleteConfirmOpen(false)}
             />
             {noticeDialog}
         </>

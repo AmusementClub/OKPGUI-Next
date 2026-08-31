@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { useMemo, useRef, useState } from 'react';
 import { getSiteCookieText, SiteCookies } from '../utils/cookieUtils';
+import { friendlyErrorMessage } from '../utils/friendlyError';
 import { SiteLoginStatus } from '../utils/siteStatus';
 
 export interface SiteLoginTestState {
@@ -155,7 +156,7 @@ export function useSiteLoginTest() {
                 ...current,
                 [site.key]: {
                     status: 'error',
-                    message: typeof error === 'string' ? error : '登录测试失败。',
+                    message: friendlyErrorMessage(error, '登录测试失败。'),
                 },
             }));
         }

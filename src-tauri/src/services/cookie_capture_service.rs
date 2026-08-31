@@ -778,7 +778,7 @@ pub(crate) async fn finish_cookie_capture(
 ) -> Result<CookieCaptureResult, String> {
     let status = tokio::task::spawn_blocking(move || finish_cookie_capture_sync(session_id))
         .await
-        .map_err(|e| format!("Cookie capture task failed: {}", e))??;
+        .map_err(|e| format!("Cookie 获取任务失败: {}", e))??;
 
     if !status.cookies.is_empty() {
         return Ok(CookieCaptureResult {
@@ -800,7 +800,7 @@ pub(crate) async fn finish_cookie_capture(
 pub(crate) async fn cancel_cookie_capture(session_id: String) -> Result<(), String> {
     tokio::task::spawn_blocking(move || cancel_cookie_capture_sync(session_id))
         .await
-        .map_err(|e| format!("Cookie capture task failed: {}", e))?;
+        .map_err(|e| format!("Cookie 获取任务失败: {}", e))?;
     Ok(())
 }
 

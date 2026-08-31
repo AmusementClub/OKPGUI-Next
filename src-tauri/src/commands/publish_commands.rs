@@ -274,16 +274,9 @@ pub async fn publish_prepared_plan(app: tauri::AppHandle, token: String) -> Resu
 /// Reject missing or identity-mismatched audit evidence at the Rust publish boundary.
 fn publish_evidence_gate(plan: &PublishPlan) -> Result<(), String> {
     match &plan.audit_evidence {
-        None => Err(
-            "prepared plan is missing authoritative audit evidence; prepare must bind initial evidence"
-                .to_string(),
-        ),
-        Some(evidence)
-            if !evidence.matches_plan(&plan.snapshot_hash, plan.request_generation) =>
-        {
-            Err(
-                "prepared plan audit evidence does not match plan identity".to_string(),
-            )
+        None => Err("发布计划缺少权威审核证据；准备阶段必须先绑定初始证据。".to_string()),
+        Some(evidence) if !evidence.matches_plan(&plan.snapshot_hash, plan.request_generation) => {
+            Err("发布计划的审核证据与计划身份不一致。".to_string())
         }
         Some(_) => Ok(()),
     }
@@ -292,26 +285,22 @@ fn publish_evidence_gate(plan: &PublishPlan) -> Result<(), String> {
 fn publish_gate_error(plan: &PublishPlan) -> String {
     use crate::ai::audit::AuditDecision;
     if !plan.has_authoritative_audit_evidence() {
-        return "prepared plan is missing authoritative audit evidence".to_string();
+        return "发布计划缺少权威审核证据。".to_string();
     }
     if plan.has_blockers() {
         return format!(
-            "local blockers prevent prepared publish: {}",
+            "本地校验未通过，无法发布：{}",
             plan.local_blockers.join("；")
         );
     }
     match plan.publish_decision() {
-        AuditDecision::LocalBlocked => "local blockers prevent prepared publish".to_string(),
-        AuditDecision::Warning => {
-            "WARNING decision requires explicit warning acknowledgement".to_string()
-        }
-        AuditDecision::NoGo => {
-            "NO_GO decision requires explicit critical acknowledgement".to_string()
-        }
+        AuditDecision::LocalBlocked => "本地校验未通过，无法发布。".to_string(),
+        AuditDecision::Warning => "检查结果为警告（WARNING），需要勾选确认后才能发布。".to_string(),
+        AuditDecision::NoGo => "检查结果为不通过（NO_GO），需要勾选确认后才能发布。".to_string(),
         AuditDecision::Pending => {
-            "PENDING decision requires explicit pending acknowledgement".to_string()
+            "检查结果仍在进行中（PENDING），需要勾选确认后才能发布。".to_string()
         }
-        AuditDecision::Go => "prepared plan cannot be published".to_string(),
+        AuditDecision::Go => "当前发布计划无法发布。".to_string(),
     }
 }
 
@@ -352,19 +341,19 @@ mod tests {
     fn evidence_gate_rejects_missing_and_mismatched_evidence() {
         let missing = PublishPlan::new("sha256:plan".to_string(), 7);
         let missing_error = publish_evidence_gate(&missing).expect_err("missing evidence");
-        assert!(missing_error.contains("missing authoritative audit evidence"));
+        assert!(missing_error.contains("缺少权威审核证据"));
 
         let mut mismatched = PublishPlan::new("sha256:plan".to_string(), 7);
         mismatched.audit_evidence = Some(evidence(AuditDecision::Go, "sha256:other", 7));
         let mismatch_error = publish_evidence_gate(&mismatched).expect_err("mismatched evidence");
-        assert!(mismatch_error.contains("does not match plan identity"));
+        assert!(mismatch_error.contains("与计划身份不一致"));
     }
 
     #[test]
     fn warning_pending_and_no_go_require_their_matching_acknowledgement() {
         let mut warning = plan_with_decision(AuditDecision::Warning);
         assert!(!warning.can_publish_now());
-        assert!(publish_gate_error(&warning).contains("warning acknowledgement"));
+        assert!(publish_gate_error(&warning).contains("警告（WARNING）"));
         warning.set_acknowledgements(Acknowledgements {
             warning: true,
             ..Acknowledgements::default()
@@ -373,7 +362,7 @@ mod tests {
 
         let mut pending = plan_with_decision(AuditDecision::Pending);
         assert!(!pending.can_publish_now());
-        assert!(publish_gate_error(&pending).contains("pending acknowledgement"));
+        assert!(publish_gate_error(&pending).contains("进行中（PENDING）"));
         pending.set_acknowledgements(Acknowledgements {
             pending: true,
             ..Acknowledgements::default()
@@ -393,7 +382,7 @@ mod tests {
                 evidence_path: None,
             });
         assert!(!no_go.can_publish_now());
-        assert!(publish_gate_error(&no_go).contains("critical acknowledgement"));
+        assert!(publish_gate_error(&no_go).contains("不通过（NO_GO）"));
         no_go.set_acknowledgements(Acknowledgements {
             critical: true,
             ..Acknowledgements::default()
@@ -413,7 +402,7 @@ mod tests {
         let plan_before = registry.inspect_plan(&token).cloned().expect("plan");
         assert!(publish_evidence_gate(&plan_before).is_ok());
         assert!(!plan_before.can_publish_now());
-        assert!(publish_gate_error(&plan_before).contains("pending acknowledgement"));
+        assert!(publish_gate_error(&plan_before).contains("进行中（PENDING）"));
 
         let plan_after = registry
             .inspect_plan(&token)

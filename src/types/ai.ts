@@ -48,6 +48,20 @@ export interface AiModelDiscoveryResult {
     message: string;
 }
 
+/** Failure classes for the explicit settings-page connection test. */
+export type AiConnectionTestStatus =
+    | 'success'
+    | 'auth_failure'
+    | 'network_failure'
+    | 'endpoint_schema_failure'
+    | 'not_configured';
+
+/** Structured result of `ai_test_connection`; never carries secrets or provider bodies. */
+export interface AiConnectionTestResult {
+    status: AiConnectionTestStatus;
+    message: string;
+}
+
 export interface AiSettings {
     provider: AiProvider;
     endpoint: string;

@@ -4,6 +4,7 @@ import type {
     ActiveAiJobCancelResult,
     ActiveAiJobSummary,
     AiAuditResult,
+    AiConnectionTestResult,
     AiFormalAuditRequest,
     AiJob,
     AiModelDiscoveryResult,
@@ -39,10 +40,12 @@ export const disabledAiSettings: AiSettings = {
 };
 
 export function isAiConfigured(settings: AiSettings | null | undefined): boolean {
-    return Boolean(settings?.enabled)
-        && Boolean(settings?.endpoint?.trim())
-        && Boolean(settings?.model?.trim())
-        && Boolean(settings?.credential_ref?.id);
+    if (!settings?.enabled) return false;
+    if (!settings.endpoint?.trim() || !settings.model?.trim()) return false;
+    if (!settings.credential_ref?.id) return false;
+    // 与后端 connection_is_configured 保持一致：自定义 Header 模式必须有非空 header 名。
+    if (settings.auth_mode === 'custom_header' && !settings.custom_header_name?.trim()) return false;
+    return true;
 }
 
 export async function getAiSettings(): Promise<AiSettings> {
@@ -68,6 +71,15 @@ export async function listAiModels(settings: AiSettings, secret?: string): Promi
         connection: settings,
         secret: secret || null,
     });
+}
+
+/**
+ * Test the SAVED connection end-to-end (backend loads the secret from the system
+ * keyring; the frontend never passes plaintext). Distinguishes success / auth /
+ * network / endpoint-schema / not-configured outcomes.
+ */
+export async function testAiConnection(): Promise<AiConnectionTestResult> {
+    return invoke<AiConnectionTestResult>('ai_test_connection');
 }
 
 /**

@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Copy, FileText, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import ConfirmDialog from '../components/ConfirmDialog';
 import PublishContentEditor from '../components/PublishContentEditor';
 import WarningBanner from '../components/WarningBanner';
 import { useImportConflictDialog } from '../hooks/useImportConflictDialog';
@@ -28,6 +29,7 @@ export default function ContentTemplatesPage() {
     } = manager;
 
     const [quickPublishTemplates, setQuickPublishTemplates] = useState<Record<string, QuickPublishTemplate>>({});
+    const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
 
     const referencedBy = useMemo(
         () =>
@@ -114,7 +116,7 @@ export default function ContentTemplatesPage() {
                         <button
                             type="button"
                             onClick={() => {
-                                void deleteTemplate();
+                                setIsDeleteConfirmOpen(true);
                             }}
                             disabled={isSwitching}
                             className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 transition-colors hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
@@ -362,6 +364,18 @@ export default function ContentTemplatesPage() {
                 </div>
             </div>
         </div>
+        <ConfirmDialog
+            open={isDeleteConfirmOpen}
+            title="删除公共正文模板"
+            message={`确定要删除公共正文模板“${draft.name || draft.id || '未命名模板'}”吗？此操作无法撤销。`}
+            confirmLabel="删除"
+            danger
+            onConfirm={() => {
+                setIsDeleteConfirmOpen(false);
+                void deleteTemplate();
+            }}
+            onCancel={() => setIsDeleteConfirmOpen(false)}
+        />
         {importConflictDialog}
         </>
     );

@@ -14,6 +14,7 @@ import {
     RefreshCw,
 } from 'lucide-react';
 import FieldHelpHint from '../components/FieldHelpHint';
+import ConfirmDialog from '../components/ConfirmDialog';
 import FileTree from '../components/FileTree';
 import ConsoleModal, { PublishConsoleSite } from '../components/ConsoleModal';
 import AiPreflightPanel from '../components/AiPreflightPanel';
@@ -264,6 +265,8 @@ export default function HomePage() {
     const [template, setTemplate] = useState<Template>(defaultTemplate);
     const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
     const [isRenamingTemplate, setIsRenamingTemplate] = useState(false);
+    const [isTemplateDeleteConfirmOpen, setIsTemplateDeleteConfirmOpen] = useState(false);
+    const isDeletingTemplateRef = useRef(false);
 
     // Profile state
     const [profileList, setProfileList] = useState<string[]>([]);
@@ -749,7 +752,8 @@ export default function HomePage() {
     };
 
     const deleteTemplate = async () => {
-        if (!currentTemplateName) return;
+        if (!currentTemplateName || isDeletingTemplateRef.current) return;
+        isDeletingTemplateRef.current = true;
         // Identity mutation: bump before async delete can complete so stale prepare cannot confirm.
         invalidatePreparedOnCoveredEdit({ clearHistoryAdopts: true });
         try {
@@ -766,6 +770,12 @@ export default function HomePage() {
             await refreshTemplateOptions();
         } catch (e) {
             console.error('删除模板失败:', e);
+            showNotice({
+                title: '删除模板失败',
+                message: typeof e === 'string' ? e : '删除模板失败，请稍后重试。',
+            });
+        } finally {
+            isDeletingTemplateRef.current = false;
         }
     };
 
@@ -1698,7 +1708,7 @@ export default function HomePage() {
                                 </button>
                                 <button
                                     type="button"
-                                    onClick={deleteTemplate}
+                                    onClick={() => setIsTemplateDeleteConfirmOpen(true)}
                                     disabled={!currentTemplateName}
                                     className="flex items-center justify-center gap-1.5 px-3 py-2 bg-red-600/80 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white text-sm rounded-lg transition-colors"
                                 >
@@ -2187,6 +2197,18 @@ export default function HomePage() {
                     void handleTemplateRenameConfirm();
                 }}
                 onCancel={closeTemplateRenameDialog}
+            />
+            <ConfirmDialog
+                open={isTemplateDeleteConfirmOpen}
+                title="删除模板"
+                message={`确定要删除模板“${currentTemplateName}”吗？此操作无法撤销。`}
+                confirmLabel="删除"
+                danger
+                onConfirm={() => {
+                    setIsTemplateDeleteConfirmOpen(false);
+                    void deleteTemplate();
+                }}
+                onCancel={() => setIsTemplateDeleteConfirmOpen(false)}
             />
             {noticeDialog}
         </div>

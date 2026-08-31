@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { open, save } from '@tauri-apps/plugin-dialog';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { AUTOSAVE_DEBOUNCE_MS } from '../utils/constants';
+import { friendlyErrorMessage } from '../utils/friendlyError';
 import { useLatest } from '../hooks/useLatest';
 import {
     createCopyEntityName,
@@ -203,7 +204,7 @@ export function useTemplateManager<T extends AnyTemplate>(
         try {
             fullConfig = await invoke<QuickPublishConfigPayload>('get_config');
         } catch (error) {
-            setLoadError(typeof error === 'string' ? error : '加载配置失败，请重试。');
+            setLoadError(friendlyErrorMessage(error, '加载配置失败，请重试。'));
             return;
         }
 
@@ -374,7 +375,7 @@ export function useTemplateManager<T extends AnyTemplate>(
 
             setConflictState(null);
             setSaveState('failed');
-            setErrorMessage(typeof error === 'string' ? error : `自动保存${config.entityLabel}失败。`);
+            setErrorMessage(friendlyErrorMessage(error, `自动保存${config.entityLabel}失败。`));
             setStatusMessage('');
             return 'failed';
         }
@@ -599,7 +600,7 @@ export function useTemplateManager<T extends AnyTemplate>(
             setConflictState(null);
         } catch (error) {
             setSaveState('failed');
-            setErrorMessage(typeof error === 'string' ? error : `导入${config.entityLabel}失败。`);
+            setErrorMessage(friendlyErrorMessage(error, `导入${config.entityLabel}失败。`));
             setStatusMessage('');
         }
     };
@@ -631,7 +632,7 @@ export function useTemplateManager<T extends AnyTemplate>(
             setErrorMessage('');
         } catch (error) {
             setSaveState('failed');
-            setErrorMessage(typeof error === 'string' ? error : `导出${config.entityLabel}失败。`);
+            setErrorMessage(friendlyErrorMessage(error, `导出${config.entityLabel}失败。`));
             setStatusMessage('');
         }
     };
@@ -672,7 +673,7 @@ export function useTemplateManager<T extends AnyTemplate>(
                 setErrorMessage('');
             } catch (error) {
                 setSaveState('failed');
-                setErrorMessage(typeof error === 'string' ? error : `删除${config.entityLabel}失败。`);
+                setErrorMessage(friendlyErrorMessage(error, `删除${config.entityLabel}失败。`));
                 setStatusMessage('');
             }
         } finally {
@@ -695,7 +696,7 @@ export function useTemplateManager<T extends AnyTemplate>(
             setErrorMessage('');
         } catch (error) {
             setSaveState('failed');
-            setErrorMessage(typeof error === 'string' ? error : `重新加载${config.entityLabel}失败。`);
+            setErrorMessage(friendlyErrorMessage(error, `重新加载${config.entityLabel}失败。`));
             setStatusMessage('');
         }
     };

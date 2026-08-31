@@ -335,4 +335,89 @@ describe('AiSettingsPage model discovery and direct JSON configuration', () => {
         expect(rendered.container.textContent).toContain('仅保存在本会话');
         expect(rendered.container.textContent).not.toContain('sk-');
     });
+
+    it('shows an inline local-validation notice when enabled but incomplete', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') {
+                return baseSettings({ enabled: true, model: '', credential_ref: null });
+            }
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const notice = rendered.container.querySelector('[data-testid="incomplete-config-warning"]');
+        expect(notice?.textContent).toContain('已启用但配置不完整');
+        expect(notice?.textContent).toContain('本地校验');
+    });
+
+    it('hides the local-validation notice when enabled and fully configured', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            if (command === 'ai_get_settings') return baseSettings({ enabled: true });
+            throw new Error(`unexpected command ${command}`);
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        expect(rendered.container.querySelector('[data-testid="incomplete-config-warning"]')).toBeNull();
+    });
+
+    it('tests the saved connection via IPC and shows the classified result', async () => {
+        const saved = baseSettings();
+        invokeMock.mockImplementation(async (command: string) => {
+            switch (command) {
+                case 'ai_get_settings':
+                    return saved;
+                case 'ai_test_connection':
+                    return {
+                        status: 'auth_failure',
+                        message: '密钥错误：提供商拒绝了认证（HTTP 401/403），请检查密钥是否正确。',
+                    };
+                default:
+                    throw new Error(`unexpected command ${command}`);
+            }
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const testButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('测试连接'),
+        );
+        expect(testButton).toBeTruthy();
+        await act(async () => testButton!.click());
+        await flushAsync();
+
+        // The backend resolves the saved secret; the frontend never sends one.
+        expect(invokeMock).toHaveBeenCalledWith('ai_test_connection');
+        const result = rendered.container.querySelector('[data-testid="connection-test-result"]');
+        expect(result?.textContent).toContain('密钥错误');
+    });
+
+    it('shows a success line when the connection test passes', async () => {
+        invokeMock.mockImplementation(async (command: string) => {
+            switch (command) {
+                case 'ai_get_settings':
+                    return baseSettings();
+                case 'ai_test_connection':
+                    return { status: 'success', message: '连接成功：接口与密钥均可用。' };
+                default:
+                    throw new Error(`unexpected command ${command}`);
+            }
+        });
+
+        const rendered = await renderElement(<AiSettingsPage />);
+        await flushAsync();
+
+        const testButton = Array.from(rendered.container.querySelectorAll('button')).find((button) =>
+            button.textContent?.includes('测试连接'),
+        );
+        await act(async () => testButton!.click());
+        await flushAsync();
+
+        const result = rendered.container.querySelector('[data-testid="connection-test-result"]');
+        expect(result?.textContent).toContain('连接成功');
+    });
 });

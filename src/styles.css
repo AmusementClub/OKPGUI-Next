@@ -43,14 +43,24 @@
   --color-cyan-200: var(--okp-cyan-200);
   --color-cyan-300: var(--okp-cyan-300);
   --color-cyan-400: var(--okp-cyan-400);
+  --color-violet-100: var(--okp-violet-100);
+  --color-violet-300: var(--okp-violet-300);
+  --color-violet-400: var(--okp-violet-400);
   --color-red-200: var(--okp-red-200);
   --color-red-300: var(--okp-red-300);
   --color-red-400: var(--okp-red-400);
   --color-rose-100: var(--okp-rose-100);
+  --color-rose-200: var(--okp-rose-200);
   --color-rose-300: var(--okp-rose-300);
+  --color-rose-400: var(--okp-rose-400);
+  --color-amber-50: var(--okp-amber-50);
   --color-amber-100: var(--okp-amber-100);
   --color-amber-200: var(--okp-amber-200);
+  --color-amber-300: var(--okp-amber-300);
+  --color-yellow-200: var(--okp-yellow-200);
   --color-yellow-300: var(--okp-yellow-300);
+  --color-yellow-400: var(--okp-yellow-400);
+  --color-yellow-500: var(--okp-yellow-500);
 }
 
 :root {
@@ -73,16 +83,26 @@
   --okp-cyan-50: #ecfeff;
   --okp-cyan-100: #cffafe;
   --okp-cyan-200: #a5f3fc;
-  --okp-cyan-300: #67e8a;
+  --okp-cyan-300: #67e8a9;
   --okp-cyan-400: #22d3ee;
+  --okp-violet-100: #ede9fe;
+  --okp-violet-300: #c4b5fd;
+  --okp-violet-400: #a78bfa;
   --okp-red-200: #fecaca;
   --okp-red-300: #fca5a5;
   --okp-red-400: #f87171;
   --okp-rose-100: #ffe4e6;
+  --okp-rose-200: #fecdd3;
   --okp-rose-300: #fda4af;
+  --okp-rose-400: #fb7185;
+  --okp-amber-50: #fffbeb;
   --okp-amber-100: #fef3c7;
   --okp-amber-200: #fde68a;
+  --okp-amber-300: #fcd34d;
+  --okp-yellow-200: #fef08a;
   --okp-yellow-300: #fde047;
+  --okp-yellow-400: #facc15;
+  --okp-yellow-500: #eab308;
 
   /* 语义变量：第三方组件（tagify / EasyMDE / markdown 预览）的硬编码颜色 */
   --okp-tag-bg: rgba(30, 41, 59, 0.95);
@@ -136,14 +156,24 @@
   --okp-cyan-200: #0e7490;
   --okp-cyan-300: #0891b2;
   --okp-cyan-400: #0891b2;
+  --okp-violet-100: #5b21b6;
+  --okp-violet-300: #6d28d9;
+  --okp-violet-400: #7c3aed;
   --okp-red-200: #b91c1c;
   --okp-red-300: #b91c1c;
   --okp-red-400: #dc2626;
   --okp-rose-100: #9f1239;
+  --okp-rose-200: #be123c;
   --okp-rose-300: #be123c;
+  --okp-rose-400: #be123c;
+  --okp-amber-50: #78350f;
   --okp-amber-100: #92400e;
   --okp-amber-200: #b45309;
+  --okp-amber-300: #b45309;
+  --okp-yellow-200: #a16207;
   --okp-yellow-300: #a16207;
+  --okp-yellow-400: #a16207;
+  --okp-yellow-500: #ca8a04;
 
   --okp-tag-bg: rgba(241, 245, 249, 0.95);
   --okp-tag-hover-bg: rgba(226, 232, 240, 0.98);

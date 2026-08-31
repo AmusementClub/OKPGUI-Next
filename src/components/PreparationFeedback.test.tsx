@@ -55,4 +55,28 @@ describe('PreparationFeedback', () => {
             .toContain('准备完成');
         expect(container.querySelector('[data-testid="preparation-feedback-error"]')).toBeNull();
     });
+
+    it('renders a page-specific error action and fires its handler', () => {
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+        const onAction = vi.fn();
+        act(() => {
+            root.render(
+                <PreparationFeedback
+                    error="尚未配置 OKP 可执行文件路径。"
+                    errorAction={{ label: '前往主页配置', onClick: onAction }}
+                    autoFocus={false}
+                />,
+            );
+        });
+        const actionButton = container.querySelector<HTMLButtonElement>(
+            '[data-testid="preparation-feedback-action"]',
+        );
+        expect(actionButton?.textContent).toContain('前往主页配置');
+        act(() => {
+            actionButton?.click();
+        });
+        expect(onAction).toHaveBeenCalledTimes(1);
+    });
 });

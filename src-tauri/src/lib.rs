@@ -112,6 +112,7 @@ pub fn run() {
             commands::ai_commands::ai_export_debug_records,
             commands::ai_commands::ai_open_debug_directory,
             commands::ai_commands::ai_list_models,
+            commands::ai_commands::ai_test_connection,
             commands::ai_commands::ai_connection_identity,
         ])
         .build(tauri::generate_context!())

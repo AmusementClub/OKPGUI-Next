@@ -6,6 +6,8 @@ export interface PreparationFeedbackProps {
     error: string | null | undefined;
     /** Optional non-error status line shown when no error. */
     status?: string | null;
+    /** Optional page-specific action rendered alongside retry/dismiss (e.g. navigate to settings). */
+    errorAction?: { label: string; onClick: () => void } | null;
     /** Retry prepare / re-run the failed preparation step. */
     onRetry?: (() => void) | null;
     /** Dismiss the error banner without retrying. */
@@ -25,6 +27,7 @@ export interface PreparationFeedbackProps {
 export default function PreparationFeedback({
     error,
     status,
+    errorAction,
     onRetry,
     onDismiss,
     autoFocus = true,
@@ -73,8 +76,18 @@ export default function PreparationFeedback({
                 <AlertCircle size={16} className="mt-0.5 shrink-0 text-rose-300" aria-hidden />
                 <div className="min-w-0 flex-1 space-y-2">
                     <p data-testid="preparation-feedback-message">{error}</p>
-                    {(onRetry || onDismiss) ? (
+                    {(errorAction || onRetry || onDismiss) ? (
                         <div className="flex flex-wrap items-center gap-2">
+                            {errorAction ? (
+                                <button
+                                    type="button"
+                                    data-testid="preparation-feedback-action"
+                                    onClick={errorAction.onClick}
+                                    className="inline-flex items-center gap-1.5 rounded-lg border border-rose-400/30 bg-rose-500/10 px-2.5 py-1 text-xs font-medium text-rose-100 hover:bg-rose-500/20"
+                                >
+                                    {errorAction.label}
+                                </button>
+                            ) : null}
                             {onRetry ? (
                                 <button
                                     type="button"

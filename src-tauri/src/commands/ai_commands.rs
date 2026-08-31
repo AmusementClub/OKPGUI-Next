@@ -1831,11 +1831,11 @@ pub async fn ai_start_recognition(
         let reference = connection
             .credential_ref
             .clone()
-            .ok_or_else(|| "AI credential is not configured".to_string())?;
+            .ok_or_else(|| "AI 密钥尚未配置。".to_string())?;
         Some(
             credential_store()
                 .get(&reference)?
-                .ok_or_else(|| "AI credential is missing from the secure store".to_string())?,
+                .ok_or_else(|| "系统凭据存储中找不到 AI 密钥。".to_string())?,
         )
     };
 
@@ -2567,6 +2567,29 @@ fn local_audit_result(
     }
 }
 
+/// Enabled-but-incomplete config (missing model/endpoint/credential, or a keyring entry
+/// that no longer holds the secret) follows the same local-only path as disabled AI:
+/// zero network, GO/LOCAL_BLOCKED, no injected WARNING and no forced acknowledgment.
+/// The description keeps a truthful informational note for the audit panel.
+fn incomplete_config_local_audit(
+    plan_token: String,
+    snapshot_hash: String,
+    request_generation: u64,
+    local_blockers: Vec<String>,
+) -> AiFormalAuditResult {
+    let mut result = local_audit_result(
+        plan_token,
+        snapshot_hash,
+        request_generation,
+        local_blockers,
+        Vec::new(),
+        false,
+        None,
+    );
+    result.description = Some("AI 已启用但配置不完整，本次发布沿用本地校验。".to_string());
+    result
+}
+
 /// Load plan-owned MediaInfo findings for formal/local audit derivation.
 ///
 /// Missing / expired tokens yield no media findings (caller already failed closed on
@@ -2675,15 +2698,11 @@ fn formal_result_from_plan_evidence(
 /// Frontend treats this as a failed prepare (non-publishable); prepare-time PENDING stays bound.
 fn non_bindable_formal_audit_error(job: &AiJob) -> String {
     match job.state {
-        AiJobState::Cancelled => {
-            "formal audit was cancelled; prepare-time PENDING evidence was preserved".to_string()
+        AiJobState::Cancelled => "发布前检查已取消；准备阶段的待检查证据已保留。".to_string(),
+        AiJobState::Stale => "发布前检查任务已失效；准备阶段的待检查证据已保留。".to_string(),
+        other => {
+            format!("发布前检查任务状态（{other:?}）不可绑定结果；准备阶段的待检查证据已保留。")
         }
-        AiJobState::Stale => {
-            "formal audit became stale; prepare-time PENDING evidence was preserved".to_string()
-        }
-        other => format!(
-            "formal audit job is not bindable (state={other:?}); prepare-time PENDING evidence was preserved"
-        ),
     }
 }
 
@@ -2711,7 +2730,7 @@ fn plan_identity(token: &str) -> Result<(String, u64, Vec<String>), String> {
         .unwrap_or_else(|error| error.into_inner());
     let plan = guard
         .inspect_plan(token)
-        .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        .ok_or_else(|| "发布计划标识不存在或已过期。".to_string())?;
     Ok((
         plan.snapshot_hash.clone(),
         plan.request_generation,
@@ -2740,7 +2759,7 @@ fn resolve_local_formal_audit(
 > {
     let plan_token = plan_token.trim().to_string();
     if plan_token.is_empty() {
-        return Err("prepared plan token is required for formal audit".to_string());
+        return Err("发布前检查缺少有效的计划标识。".to_string());
     }
 
     // Backend plan identity is authoritative — never trust caller snapshot/generation/blockers.
@@ -2771,19 +2790,13 @@ fn resolve_local_formal_audit(
         ));
     }
     if !connection_is_configured(&connection) {
-        let result = local_audit_result(
+        // Enabled but incomplete: same local-only GO as disabled AI — no provider
+        // call, no injected WARNING, no forced acknowledgment.
+        let result = incomplete_config_local_audit(
             plan_token.clone(),
             snapshot_hash.clone(),
             request_generation,
             local_blockers.clone(),
-            vec![Finding {
-                code: "PROVIDER_WARNING".to_string(),
-                severity: FindingSeverity::Warning,
-                message: "AI is enabled but not fully configured for formal audit".to_string(),
-                evidence_path: None,
-            }],
-            false,
-            None,
         );
         bind_audit_to_plan(&result)?;
         return Ok((
@@ -2825,23 +2838,17 @@ fn resolve_local_formal_audit(
         let reference = connection
             .credential_ref
             .clone()
-            .ok_or_else(|| "AI credential is not configured".to_string())?;
+            .ok_or_else(|| "AI 密钥尚未配置。".to_string())?;
         match credential_store().get(&reference)? {
             Some(value) => Some(value),
             None => {
-                let result = local_audit_result(
+                // Credential ref exists but the keyring no longer holds the secret:
+                // effectively incomplete config — same local-only GO as disabled AI.
+                let result = incomplete_config_local_audit(
                     plan_token.clone(),
                     snapshot_hash.clone(),
                     request_generation,
                     local_blockers.clone(),
-                    vec![Finding {
-                        code: "PROVIDER_WARNING".to_string(),
-                        severity: FindingSeverity::Warning,
-                        message: "AI credential is missing from the secure store".to_string(),
-                        evidence_path: None,
-                    }],
-                    false,
-                    None,
                 );
                 bind_audit_to_plan(&result)?;
                 return Ok((
@@ -3219,14 +3226,14 @@ pub fn ai_poll_formal_audit(
         .unwrap_or_else(|error| error.into_inner());
     let plan = guard
         .inspect_plan(&plan_token)
-        .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+        .ok_or_else(|| "发布计划标识不存在或已过期。".to_string())?;
     let evidence = plan
         .audit_evidence
         .as_ref()
-        .ok_or_else(|| "plan has no audit evidence".to_string())?;
+        .ok_or_else(|| "发布计划没有审核证据。".to_string())?;
     if evidence.job_id.as_deref() != Some(job_id.as_str()) {
         // Job finished but plan evidence is not this job's bind (consumed/superseded/cancelled).
-        return Err("formal audit evidence is not bound for this job on the plan".to_string());
+        return Err("该检查任务的审核证据未绑定到此发布计划。".to_string());
     }
     if matches!(evidence.decision, AuditDecision::Pending) {
         // Terminal job without terminal evidence yet (rare race) — keep polling.
@@ -3570,7 +3577,7 @@ pub(crate) fn cancel_pending_audit_for_publish_core(
             .unwrap_or_else(|error| error.into_inner());
         let plan = registry
             .inspect_plan(plan_token)
-            .ok_or_else(|| "prepared plan token is missing or expired".to_string())?;
+            .ok_or_else(|| "发布计划标识不存在或已过期。".to_string())?;
         let decision = match plan.publish_decision() {
             crate::ai::audit::AuditDecision::Go => "GO",
             crate::ai::audit::AuditDecision::Warning => "WARNING",
@@ -3587,11 +3594,11 @@ pub(crate) fn cancel_pending_audit_for_publish_core(
     // Publish-time cancel is only for PENDING formal audit with bound pending ack.
     if decision_label != "PENDING" {
         return Err(format!(
-            "publish-time audit cancel requires PENDING decision (got {decision_label})"
+            "发布时取消检查要求当前决定为待检查（PENDING），当前为 {decision_label}。"
         ));
     }
     if !pending_ack {
-        return Err("publish-time audit cancel requires bound pending acknowledgement".to_string());
+        return Err("发布时取消检查要求已确认待检查状态。".to_string());
     }
 
     let requested = job_id.map(str::trim).filter(|id| !id.is_empty());
@@ -3599,7 +3606,7 @@ pub(crate) fn cancel_pending_audit_for_publish_core(
         (Some(req), Some(bound)) if req != bound => {
             // Client job id must match plan-bound audit; never cancel an unrelated job.
             return Err(format!(
-                "job id {req} is not bound to the prepared plan audit (expected {bound})"
+                "任务 {req} 未绑定到此发布计划的检查（应为 {bound}）。"
             ));
         }
         (Some(req), Some(bound)) => {
@@ -3615,12 +3622,10 @@ pub(crate) fn cancel_pending_audit_for_publish_core(
             match registry.resolve_plan_token_for_job(req) {
                 Some(resolved_token) if resolved_token == plan_token => Some(req.to_string()),
                 Some(_) => {
-                    return Err("job id is bound to a different prepared plan".to_string());
+                    return Err("该任务已绑定到其他发布计划。".to_string());
                 }
                 None => {
-                    return Err(format!(
-                        "job id {req} is not bound to the prepared plan audit"
-                    ));
+                    return Err(format!("任务 {req} 未绑定到此发布计划的检查。"));
                 }
             }
         }
@@ -4159,7 +4164,7 @@ pub async fn ai_list_models(
         connection.discovered_models.len(),
     );
     if connection.endpoint.trim().is_empty() {
-        return Err("configure a provider endpoint before refreshing models".to_string());
+        return Err("请先填写接口地址再刷新模型列表。".to_string());
     }
 
     let secret = match draft_secret {
@@ -4168,13 +4173,11 @@ pub async fn ai_list_models(
             resolve_stored_secret(&saved)?
         }
         None => {
-            return Err(
-                "enter a credential for this draft connection before refreshing models".to_string(),
-            );
+            return Err("请先为当前连接输入密钥再刷新模型列表。".to_string());
         }
     };
     if secret.is_none() {
-        return Err("AI credential is missing from the secure store".to_string());
+        return Err("系统凭据存储中找不到 AI 密钥。".to_string());
     }
 
     let client = build_ai_client(&connection)?;
@@ -4214,7 +4217,7 @@ pub async fn ai_list_models(
                         models,
                         fetched_at_unix,
                         manual_fallback: false,
-                        message: "models refreshed".to_string(),
+                        message: "模型列表已刷新。".to_string(),
                     })
                 }
                 Ok(_) => {
@@ -4227,7 +4230,7 @@ pub async fn ai_list_models(
                         models: connection.discovered_models,
                         fetched_at_unix,
                         manual_fallback: true,
-                        message: "provider returned no model IDs; verify the base endpoint and model-list permissions".to_string(),
+                        message: "提供商未返回模型列表；请检查接口地址与模型列表权限。".to_string(),
                     })
                 }
                 Err(failure) => {
@@ -4255,6 +4258,131 @@ pub async fn ai_list_models(
                 manual_fallback: true,
                 message: error.chars().take(240).collect(),
             })
+        }
+    }
+}
+
+/// Failure classes for the explicit settings-page connection test.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AiConnectionTestStatus {
+    Success,
+    AuthFailure,
+    NetworkFailure,
+    EndpointSchemaFailure,
+    NotConfigured,
+}
+
+/// Structured result of `ai_test_connection`; never carries secrets or response bodies.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AiConnectionTestResult {
+    pub status: AiConnectionTestStatus,
+    pub message: String,
+}
+
+fn connection_test_result(
+    status: AiConnectionTestStatus,
+    message: impl Into<String>,
+) -> AiConnectionTestResult {
+    AiConnectionTestResult {
+        status,
+        message: message.into(),
+    }
+}
+
+/// Map a classified provider failure to a connection-test failure class.
+fn connection_test_result_from_failure(failure: &ProviderFailure) -> AiConnectionTestResult {
+    use crate::ai::provider::ProviderFailureKind;
+    match failure.kind {
+        ProviderFailureKind::Authentication => connection_test_result(
+            AiConnectionTestStatus::AuthFailure,
+            "密钥错误：提供商拒绝了认证（HTTP 401/403），请检查密钥是否正确。",
+        ),
+        ProviderFailureKind::Schema
+        | ProviderFailureKind::Malformed
+        | ProviderFailureKind::Unsupported
+        | ProviderFailureKind::Refusal => connection_test_result(
+            AiConnectionTestStatus::EndpointSchemaFailure,
+            "接口响应不符合预期：请确认接口地址指向兼容的 AI 服务。",
+        ),
+        ProviderFailureKind::RateLimited => connection_test_result(
+            AiConnectionTestStatus::NetworkFailure,
+            "请求被提供商限流（HTTP 429），请稍后再试。",
+        ),
+        ProviderFailureKind::Timeout => connection_test_result(
+            AiConnectionTestStatus::NetworkFailure,
+            "网络错误：连接 AI 接口超时。",
+        ),
+        ProviderFailureKind::Server => connection_test_result(
+            AiConnectionTestStatus::NetworkFailure,
+            "提供商服务异常（HTTP 5xx），请稍后再试。",
+        ),
+        ProviderFailureKind::Redirect => connection_test_result(
+            AiConnectionTestStatus::NetworkFailure,
+            "接口地址发生了重定向；请使用最终接口地址。",
+        ),
+    }
+}
+
+/// Explicit settings-page connection test: loads the SAVED config + secret from the
+/// system keyring (the frontend never passes plaintext), performs one minimal
+/// models-list round-trip, and classifies the outcome. Never echoes secrets or bodies.
+#[tauri::command]
+pub async fn ai_test_connection(app: AppHandle) -> Result<AiConnectionTestResult, String> {
+    let connection = ai_get_settings(app.clone());
+    if !connection_is_configured(&connection) {
+        return Ok(connection_test_result(
+            AiConnectionTestStatus::NotConfigured,
+            "配置不完整：请先填写接口地址、模型并保存密钥。",
+        ));
+    }
+    let Some(secret) = resolve_stored_secret(&connection)? else {
+        return Ok(connection_test_result(
+            AiConnectionTestStatus::NotConfigured,
+            "系统凭据存储中找不到已保存的密钥，请重新输入并保存。",
+        ));
+    };
+
+    let client = build_ai_client(&connection)?;
+    let request = build_models_list_request(
+        connection.provider,
+        &connection.endpoint,
+        connection.auth_mode,
+    )?;
+    let send_result = send_managed_provider_request(
+        &client,
+        &request,
+        connection.auth_mode,
+        connection.custom_header_name.as_deref(),
+        Some(secret.expose()),
+        connection.provider,
+    )
+    .await;
+
+    match send_result {
+        Err(error) => {
+            #[cfg(debug_assertions)]
+            eprintln!("[BYOK:test-connection] transport failure message={error}");
+            Ok(connection_test_result(
+                AiConnectionTestStatus::NetworkFailure,
+                "网络错误：无法连接 AI 接口，请检查网络或代理设置。",
+            ))
+        }
+        Ok((status, body)) => {
+            match parse_models_list_response(connection.provider, status, &body) {
+                Ok(_) => Ok(connection_test_result(
+                    AiConnectionTestStatus::Success,
+                    "连接成功：接口与密钥均可用。",
+                )),
+                Err(failure) => {
+                    #[cfg(debug_assertions)]
+                    eprintln!(
+                        "[BYOK:test-connection] failure kind={:?} status={:?}",
+                        failure.kind, failure.status,
+                    );
+                    Ok(connection_test_result_from_failure(&failure))
+                }
+            }
         }
     }
 }
@@ -4500,7 +4628,7 @@ mod formal_audit_lifecycle_tests {
             Some("job-unrelated-forged".into()),
         )
         .expect_err("unbound job id must fail");
-        assert!(err.contains("not bound"), "unexpected error: {err}");
+        assert!(err.contains("未绑定"), "unexpected error: {err}");
 
         // Missing pending ack must fail closed.
         let (token_no_ack, job_no_ack) =
@@ -4508,7 +4636,7 @@ mod formal_audit_lifecycle_tests {
         let err_ack = ai_cancel_pending_audit_for_publish_for_test(token_no_ack, Some(job_no_ack))
             .expect_err("missing pending ack");
         assert!(
-            err_ack.contains("pending acknowledgement"),
+            err_ack.contains("已确认待检查状态"),
             "unexpected error: {err_ack}"
         );
 
@@ -4676,7 +4804,7 @@ mod formal_audit_lifecycle_tests {
             sample_formal_result(&job_id, Vec::new()),
         )
         .expect_err("cancelled job must reject terminal bind");
-        assert!(err.contains("cancelled"), "{err}");
+        assert!(err.contains("已取消"), "{err}");
         assert!(!formal_audit_may_bind_terminal_evidence(
             ai_get_job(job_id).unwrap().state
         ));
@@ -4706,10 +4834,7 @@ mod formal_audit_lifecycle_tests {
         ai_cancel_job(job_id.clone()).unwrap();
         let err =
             ai_poll_formal_audit(token, job_id).expect_err("cancelled must not poll as success");
-        assert!(
-            err.contains("cancelled") || err.contains("PENDING") || err.contains("preserved"),
-            "{err}"
-        );
+        assert!(err.contains("已取消") || err.contains("保留"), "{err}");
     }
 
     #[test]
@@ -4798,7 +4923,7 @@ mod formal_audit_lifecycle_tests {
             ),
         )
         .expect_err("stale job must reject terminal bind");
-        assert!(err.contains("stale"), "{err}");
+        assert!(err.contains("已失效"), "{err}");
         assert!(!formal_audit_may_bind_terminal_evidence(
             ai_get_job(job_id).unwrap().state
         ));
@@ -5126,6 +5251,90 @@ mod formal_configuration_tests {
         let mut connection = configured_connection();
         connection.enabled = false;
         assert!(!connection_is_configured(&connection));
+    }
+
+    #[test]
+    fn enabled_but_incomplete_config_uses_local_go_without_warning() {
+        // Half-configured (enabled, missing model) must behave like disabled AI:
+        // local-only GO, zero findings, no forced acknowledgment.
+        let mut connection = configured_connection();
+        connection.model = String::new();
+        assert!(connection.enabled);
+        assert!(!connection_is_configured(&connection));
+
+        let result = incomplete_config_local_audit(
+            "plan-token-incomplete".to_string(),
+            "sha256:incomplete".to_string(),
+            5,
+            Vec::new(),
+        );
+        assert_eq!(result.decision, AuditDecision::Go);
+        assert!(
+            result.findings.is_empty(),
+            "incomplete config must not inject a PROVIDER_WARNING finding"
+        );
+        assert!(!result.formal_ran);
+        assert_eq!(
+            result.description.as_deref(),
+            Some("AI 已启用但配置不完整，本次发布沿用本地校验。"),
+            "truthful informational note must be visible in the audit panel"
+        );
+    }
+
+    #[test]
+    fn enabled_but_incomplete_config_still_respects_local_blockers() {
+        let result = incomplete_config_local_audit(
+            "plan-token-incomplete-blocked".to_string(),
+            "sha256:incomplete-blocked".to_string(),
+            6,
+            vec!["本地校验未通过".to_string()],
+        );
+        assert_eq!(result.decision, AuditDecision::LocalBlocked);
+        assert!(result.findings.is_empty());
+        assert_eq!(result.local_blockers, vec!["本地校验未通过".to_string()]);
+    }
+
+    #[test]
+    fn connection_test_failure_classification_is_structured() {
+        use crate::ai::provider::ProviderFailureKind;
+        let classified = |kind: ProviderFailureKind| {
+            connection_test_result_from_failure(&ProviderFailure {
+                kind,
+                status: Some(401),
+                message: "internal detail never echoed".to_string(),
+            })
+        };
+        assert_eq!(
+            classified(ProviderFailureKind::Authentication).status,
+            AiConnectionTestStatus::AuthFailure
+        );
+        assert_eq!(
+            classified(ProviderFailureKind::Schema).status,
+            AiConnectionTestStatus::EndpointSchemaFailure
+        );
+        assert_eq!(
+            classified(ProviderFailureKind::Malformed).status,
+            AiConnectionTestStatus::EndpointSchemaFailure
+        );
+        assert_eq!(
+            classified(ProviderFailureKind::RateLimited).status,
+            AiConnectionTestStatus::NetworkFailure
+        );
+        assert_eq!(
+            classified(ProviderFailureKind::Server).status,
+            AiConnectionTestStatus::NetworkFailure
+        );
+        assert_eq!(
+            classified(ProviderFailureKind::Timeout).status,
+            AiConnectionTestStatus::NetworkFailure
+        );
+        // User-facing messages are Chinese and never echo provider internals.
+        let auth = classified(ProviderFailureKind::Authentication);
+        assert!(auth.message.contains("密钥错误"));
+        assert!(!auth.message.contains("internal detail"));
+        // Wire format uses snake_case status values for the TS client.
+        let wire = serde_json::to_value(&auth).expect("serialize");
+        assert_eq!(wire["status"], "auth_failure");
     }
 
     #[test]

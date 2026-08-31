@@ -60,6 +60,7 @@ import {
     publishPreparedPlan,
     readFriendlyError,
 } from '../services/ai';
+import { friendlyErrorMessage } from '../utils/friendlyError';
 import {
     buildRecognitionLocalContextKey,
     type PublishRequestPayload,
@@ -91,6 +92,8 @@ interface FrozenPublishPlan {
     token: string;
     request: PublishRequestPayload;
 }
+
+const OKP_PATH_MISSING_MESSAGE = '尚未配置 OKP 可执行文件路径。';
 
 function formatBytes(bytes?: number): string {
     if (bytes === undefined || bytes === null || !Number.isFinite(bytes) || bytes <= 0) {
@@ -146,6 +149,11 @@ export default function QuickPublishPage() {
     // forcing the drag-drop effect to re-register its listener each time.
     const handleRuntimeError = useCallback((message: string) => setErrorMessage(message), []);
     const handleClearRuntimeError = useCallback(() => setErrorMessage(''), []);
+    // OKP executable path is configured on 主页 (HomePage); same event App listens to.
+    const handleNavigateHomeForOkpPath = useCallback(() => {
+        setErrorMessage('');
+        window.dispatchEvent(new CustomEvent('okpgui:navigate', { detail: 'home' }));
+    }, []);
     const publishAttemptRef = useRef<PublishAttemptContext | null>(null);
     const lastUsedPersistQueueRef = useRef(
         createLatestValuePersistQueue({
@@ -436,7 +444,7 @@ export default function QuickPublishPage() {
             applyTemplatePublishHistory(publishAttempt.templateId, updates);
             setStatusMessage('已回填快速发布模板的发布历史。');
         } catch (error) {
-            setErrorMessage(typeof error === 'string' ? error : '更新发布历史失败。');
+            setErrorMessage(friendlyErrorMessage(error, '更新发布历史失败。'));
         }
     }, [applyTemplatePublishHistory]);
 
@@ -463,7 +471,7 @@ export default function QuickPublishPage() {
             return '请先选择一个身份。';
         }
         if (!okpExecutablePath.trim()) {
-            return '请先在旧主页里配置 OKP 可执行文件路径。';
+            return OKP_PATH_MISSING_MESSAGE;
         }
         const selectedSiteKeys = quickPublishSiteKeys.filter((siteKey) => draft.sites[siteKey]);
         if (selectedSiteKeys.length === 0) {
@@ -929,6 +937,11 @@ export default function QuickPublishPage() {
                 <PreparationFeedback
                     status={statusMessage || null}
                     error={errorMessage || null}
+                    errorAction={
+                        errorMessage === OKP_PATH_MISSING_MESSAGE
+                            ? { label: '前往主页配置', onClick: handleNavigateHomeForOkpPath }
+                            : null
+                    }
                     onRetry={errorMessage ? () => { void handlePublishClick(); } : null}
                     onDismiss={errorMessage ? () => setErrorMessage('') : null}
                     retryDisabled={isPreparingPublish || isPublishing}

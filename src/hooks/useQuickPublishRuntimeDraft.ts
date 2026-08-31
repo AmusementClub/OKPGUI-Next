@@ -24,6 +24,7 @@ import {
     normalizeQuickPublishTemplate,
 } from '../utils/quickPublish';
 import { useLatest } from './useLatest';
+import { friendlyErrorMessage } from '../utils/friendlyError';
 
 export type QuickPublishTorrentInfo = TorrentInfo;
 
@@ -80,7 +81,7 @@ function mergePublishHistory(
 }
 
 function toErrorMessage(error: unknown, fallback: string): string {
-    return typeof error === 'string' ? error : fallback;
+    return friendlyErrorMessage(error, fallback);
 }
 
 export function useQuickPublishRuntimeDraft({

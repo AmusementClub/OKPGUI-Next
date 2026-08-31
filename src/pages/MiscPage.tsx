@@ -21,10 +21,12 @@ export default function MiscPage() {
     const [proxyType, setProxyType] = useState('none');
     const [proxyHost, setProxyHost] = useState('');
     const [saved, setSaved] = useState(false);
+    const [proxySaveError, setProxySaveError] = useState('');
     const [startupPage, setStartupPage] = useState<StartupPage>(() => getStartupPagePreference());
     const [startupPageSaved, setStartupPageSaved] = useState(false);
     const [defaultMediaFolder, setDefaultMediaFolder] = useState('');
     const [mediaFolderStatus, setMediaFolderStatus] = useState('');
+    const [mediaFolderStatusError, setMediaFolderStatusError] = useState(false);
     const { preference: themePreference, setPreference: setThemePreference } = useTheme();
     const [themeSaved, setThemeSaved] = useState(false);
     const appVersion = useAppVersion();
@@ -41,6 +43,7 @@ export default function MiscPage() {
             setProxyHost(proxy.proxy_host);
         } catch (e) {
             console.error('加载代理设置失败:', e);
+            setProxySaveError(typeof e === 'string' ? `加载代理设置失败：${e}` : '加载代理设置失败。');
         }
     };
 
@@ -50,6 +53,8 @@ export default function MiscPage() {
             setDefaultMediaFolder(config.default_media_search_folder ?? '');
         } catch (e) {
             console.error('加载默认媒体目录失败:', e);
+            setMediaFolderStatus(typeof e === 'string' ? `加载默认媒体目录失败：${e}` : '加载默认媒体目录失败。');
+            setMediaFolderStatusError(true);
         }
     };
 
@@ -58,9 +63,11 @@ export default function MiscPage() {
             const savedPath = await invoke<string>('save_default_media_search_folder', { path });
             setDefaultMediaFolder(savedPath);
             setMediaFolderStatus(savedPath ? '默认媒体目录已保存。' : '已关闭拖入种子后的自动 MediaInfo 检查。');
+            setMediaFolderStatusError(false);
         } catch (e) {
             console.error('保存默认媒体目录失败:', e);
-            setMediaFolderStatus(typeof e === 'string' ? e : '保存默认媒体目录失败。');
+            setMediaFolderStatus(typeof e === 'string' ? `保存默认媒体目录失败：${e}` : '保存默认媒体目录失败。');
+            setMediaFolderStatusError(true);
         }
     };
 
@@ -78,9 +85,11 @@ export default function MiscPage() {
                 proxyHost: nextProxyHost,
             });
             setSaved(true);
+            setProxySaveError('');
             setTimeout(() => setSaved(false), 2000);
         } catch (e) {
             console.error('保存代理设置失败:', e);
+            setProxySaveError(typeof e === 'string' ? `保存代理设置失败：${e}` : '保存代理设置失败。');
         }
     };
 
@@ -204,7 +213,7 @@ export default function MiscPage() {
                                 </button>
                             ) : null}
                         </div>
-                        <p className="text-xs text-slate-500">
+                        <p className={`text-xs ${mediaFolderStatusError ? 'text-rose-400' : 'text-slate-500'}`}>
                             {mediaFolderStatus || '设置后，拖入种子会在此目录中匹配媒体文件并自动运行 MediaInfo。'}
                         </p>
                     </div>
@@ -244,8 +253,9 @@ export default function MiscPage() {
                                 className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-sm text-slate-200 disabled:opacity-40 disabled:cursor-not-allowed focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             />
                         </div>
-                        <p className="text-xs text-slate-500">
-                            {saved ? '代理设置已自动保存。' : '代理类型修改后立即保存，代理地址在失焦后自动保存。'}
+                        <p className={`text-xs ${proxySaveError ? 'text-rose-400' : 'text-slate-500'}`}>
+                            {proxySaveError ||
+                                (saved ? '代理设置已自动保存。' : '代理类型修改后立即保存，代理地址在失焦后自动保存。')}
                         </p>
                     </div>
                 </section>

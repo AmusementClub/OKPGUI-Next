@@ -1,13 +1,15 @@
 import { useEffect, useState } from 'react';
-import { BrainCircuit, KeyRound, RefreshCw, Save } from 'lucide-react';
+import { BrainCircuit, KeyRound, PlugZap, RefreshCw, Save } from 'lucide-react';
 import ModelCombobox from '../components/ModelCombobox';
 import {
     getAiSettings,
+    isAiConfigured,
     listAiModels,
     readFriendlyError,
     saveAiSettings,
+    testAiConnection,
 } from '../services/ai';
-import type { AiAuthMode, AiMode, AiProvider, AiSettings } from '../types/ai';
+import type { AiAuthMode, AiConnectionTestResult, AiMode, AiProvider, AiSettings } from '../types/ai';
 
 const MODE_OPTIONS: Record<AiProvider, ReadonlyArray<{ value: AiMode; label: string }>> = {
     open_ai: [
@@ -67,8 +69,9 @@ export default function AiSettingsPage() {
     const [secret, setSecret] = useState('');
     const [status, setStatus] = useState('');
     const [modelFeedback, setModelFeedback] = useState('');
+    const [testResult, setTestResult] = useState<AiConnectionTestResult | null>(null);
     const [error, setError] = useState('');
-    const [busy, setBusy] = useState<'save' | 'models' | null>(null);
+    const [busy, setBusy] = useState<'save' | 'models' | 'test' | null>(null);
 
     const load = async () => {
         setError('');
@@ -82,6 +85,7 @@ export default function AiSettingsPage() {
         setSettings((current) => (current ? { ...current, [key]: value } : current));
         setStatus('');
         setModelFeedback('');
+        setTestResult(null);
     };
 
     const updateProvider = (provider: AiProvider) => {
@@ -98,6 +102,7 @@ export default function AiSettingsPage() {
         });
         setStatus('');
         setModelFeedback('');
+        setTestResult(null);
     };
 
     const save = async () => {
@@ -145,6 +150,22 @@ export default function AiSettingsPage() {
         }
     };
 
+    const runConnectionTest = async () => {
+        setError('');
+        setTestResult(null);
+        setBusy('test');
+        try {
+            setTestResult(await testAiConnection());
+        } catch (testError) {
+            setTestResult({
+                status: 'network_failure',
+                message: readFriendlyError(testError, '测试连接失败。'),
+            });
+        } finally {
+            setBusy(null);
+        }
+    };
+
     if (!settings) {
         return <div className="h-full overflow-y-auto p-6 text-sm text-slate-400">加载 AI 设置中...</div>;
     }
@@ -185,6 +206,15 @@ export default function AiSettingsPage() {
                         />
                         启用 AI 建议层
                     </label>
+                    {settings.enabled && !isAiConfigured(settings) ? (
+                        <p
+                            role="status"
+                            data-testid="incomplete-config-warning"
+                            className="-mt-2 text-[11px] text-amber-300"
+                        >
+                            已启用但配置不完整，发布前检查将沿用本地校验。
+                        </p>
+                    ) : null}
 
                     <div className="grid gap-4 md:grid-cols-2">
                         <label className="text-xs text-slate-500">
@@ -333,6 +363,15 @@ export default function AiSettingsPage() {
                             <RefreshCw size={15} />
                             重新加载
                         </button>
+                        <button
+                            type="button"
+                            onClick={() => void runConnectionTest()}
+                            disabled={busy !== null}
+                            className="inline-flex items-center gap-2 rounded-lg border border-slate-700 px-4 py-2 text-sm text-slate-300 hover:bg-slate-700 disabled:opacity-50"
+                        >
+                            <PlugZap size={15} />
+                            {busy === 'test' ? '正在测试...' : '测试连接'}
+                        </button>
                         {settings.credential_ref ? (
                             settings.credential_session_only ? (
                                 <span
@@ -348,6 +387,15 @@ export default function AiSettingsPage() {
                     </div>
 
                     {status ? <p className="text-xs text-emerald-300">{status}</p> : null}
+                    {testResult ? (
+                        <p
+                            role="status"
+                            data-testid="connection-test-result"
+                            className={`text-xs ${testResult.status === 'success' ? 'text-emerald-300' : 'text-amber-300'}`}
+                        >
+                            {testResult.message}
+                        </p>
+                    ) : null}
                     {error ? <p className="text-xs text-rose-300">{error}</p> : null}
                 </section>
             </div>

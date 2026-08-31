@@ -1,6 +1,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Copy, Layers3, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
+import ConfirmDialog from '../components/ConfirmDialog';
 import MarkdownContentView from '../components/MarkdownContentView';
 import PublishContentEditor from '../components/PublishContentEditor';
 import WarningBanner from '../components/WarningBanner';
@@ -43,6 +44,7 @@ export default function QuickPublishTemplatesPage() {
     } = manager;
 
     const [contentTemplates, setContentTemplates] = useState<Record<string, ContentTemplate>>({});
+    const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false);
     const [profileList, setProfileList] = useState<string[]>([]);
     const { resolvedTheme } = useTheme();
 
@@ -166,7 +168,7 @@ export default function QuickPublishTemplatesPage() {
                         <button
                             type="button"
                             onClick={() => {
-                                void deleteTemplate();
+                                setIsDeleteConfirmOpen(true);
                             }}
                             disabled={isSwitching}
                             className="inline-flex items-center gap-2 rounded-xl border border-rose-500/30 bg-rose-500/10 px-4 py-2 text-sm text-rose-100 transition-colors hover:bg-rose-500/20 disabled:cursor-not-allowed disabled:opacity-50"
@@ -600,6 +602,18 @@ export default function QuickPublishTemplatesPage() {
                 </div>
             </div>
         </div>
+        <ConfirmDialog
+            open={isDeleteConfirmOpen}
+            title="删除发布模板"
+            message={`确定要删除发布模板“${draft.name || draft.id || '未命名模板'}”吗？此操作无法撤销。`}
+            confirmLabel="删除"
+            danger
+            onConfirm={() => {
+                setIsDeleteConfirmOpen(false);
+                void deleteTemplate();
+            }}
+            onCancel={() => setIsDeleteConfirmOpen(false)}
+        />
         {importConflictDialog}
         </>
     );
