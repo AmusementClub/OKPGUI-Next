@@ -5,6 +5,7 @@ use crate::profile::{
 };
 #[cfg(target_os = "windows")]
 use encoding_rs::GB18030;
+use regex::Regex;
 use semver::Version;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -12,6 +13,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Manager};
@@ -707,7 +709,9 @@ fn cleanup_publish_artifacts(artifacts: &PublishArtifacts, keep_log: bool) {
     let _ = std::fs::remove_file(&artifacts.html_description_path);
 
     if !keep_log {
-        let _ = std::fs::remove_file(&artifacts.log_path);
+        for path in find_okp_log_paths(&artifacts.log_path) {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     let _ = std::fs::remove_dir(&artifacts.workspace_dir);
@@ -1138,13 +1142,14 @@ fn spawn_output_reader<R>(
     site_code: String,
     site_label: String,
     is_stderr: bool,
-) -> JoinHandle<()>
+) -> JoinHandle<Option<String>>
 where
     R: Read + Send + 'static,
 {
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         let mut buffer = Vec::new();
+        let mut last_error_line = None;
 
         loop {
             buffer.clear();
@@ -1156,12 +1161,16 @@ where
                         buffer.pop();
                     }
 
+                    let line = decode_publish_output(&buffer);
+                    if okp_output_has_serilog_error(&line) {
+                        last_error_line = Some(line.clone());
+                    }
                     emit_publish_output(
                         &app,
                         &publish_id,
                         &site_code,
                         &site_label,
-                        decode_publish_output(&buffer),
+                        line,
                         is_stderr,
                     );
                 }
@@ -1178,7 +1187,153 @@ where
                 }
             }
         }
+
+        last_error_line
     })
+}
+
+fn okp_serilog_error_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        // Anchor to the Serilog level token, not `[ERR]` inside a title/message.
+        // Console compact: `[HH:mm:ss ERR] ...`
+        // Console default: `HH:mm:ss [ERR] ...`
+        // File sink: `yyyy-MM-dd HH:mm:ss.fff zzz [ERR] ...`
+        Regex::new(r"^(?:\[\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+ERR\]|\d{2}:\d{2}:\d{2}(?:\.\d+)?\s+\[ERR\]|\d{4}-\d{2}-\d{2}[^\n\[]*\[ERR\])")
+            .expect("serilog ERR pattern must compile")
+    })
+}
+
+fn strip_ansi_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re =
+        RE.get_or_init(|| Regex::new(r"\x1B\[[0-9;]*[A-Za-z]").expect("ansi pattern must compile"));
+    re.replace_all(text, "")
+}
+
+fn okp_output_has_serilog_error(text: &str) -> bool {
+    strip_ansi_codes(text)
+        .lines()
+        .any(|line| okp_serilog_error_re().is_match(line))
+}
+
+fn last_okp_serilog_error_line(text: &str) -> Option<String> {
+    let stripped = strip_ansi_codes(text);
+    stripped
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .rev()
+        .find(|line| okp_serilog_error_re().is_match(line))
+        .map(ToString::to_string)
+}
+
+fn is_okp_log_filename(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    lower.starts_with("okp") && lower.ends_with(".log")
+}
+
+fn find_okp_log_paths(configured_log_path: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if configured_log_path.is_file() {
+        files.push(configured_log_path.to_path_buf());
+    }
+    if let Some(dir) = configured_log_path.parent() {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path.is_file()
+                    && is_okp_log_filename(name)
+                    && !files.iter().any(|existing| existing == &path)
+                {
+                    files.push(path);
+                }
+            }
+        }
+    }
+    files.sort_by(|left, right| {
+        let modified = |path: &PathBuf| path.metadata().and_then(|meta| meta.modified()).ok();
+        modified(right).cmp(&modified(left))
+    });
+    files
+}
+
+fn resolve_okp_log_path(configured_log_path: &Path) -> Option<PathBuf> {
+    find_okp_log_paths(configured_log_path).into_iter().next()
+}
+
+fn read_okp_log_serilog_error(configured_log_path: &Path) -> Option<String> {
+    for path in find_okp_log_paths(configured_log_path) {
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if let Some(line) = last_okp_serilog_error_line(&decode_publish_output(&bytes)) {
+            return Some(line);
+        }
+    }
+    None
+}
+
+fn join_output_reader(handle: Option<JoinHandle<Option<String>>>) -> Option<String> {
+    handle
+        .and_then(|join_handle| join_handle.join().ok())
+        .flatten()
+}
+
+fn select_okp_serilog_error_line(
+    stdout_error: Option<String>,
+    stderr_error: Option<String>,
+    log_error: Option<String>,
+) -> Option<String> {
+    stdout_error.or(stderr_error).or(log_error)
+}
+
+fn serilog_error_detail(line: &str) -> String {
+    line.split_once("ERR]")
+        .map(|(_, rest)| rest.trim())
+        .filter(|rest| !rest.is_empty())
+        .unwrap_or("OKP 日志含有错误")
+        .to_string()
+}
+
+fn evaluate_okp_process_outcome(
+    site_label: &str,
+    exit_success: bool,
+    exit_code: Option<i32>,
+    serilog_error_line: Option<&str>,
+    log_path: &Path,
+) -> (bool, String, bool) {
+    if let Some(error_line) = serilog_error_line {
+        let detail = serilog_error_detail(error_line);
+        let message = if log_path.exists() {
+            format!(
+                "{} 发布失败: {}。日志已保存到 {}",
+                site_label,
+                detail,
+                log_path.display()
+            )
+        } else {
+            format!("{} 发布失败: {}", site_label, detail)
+        };
+        return (false, message, true);
+    }
+
+    if exit_success {
+        (true, format!("{} 发布完成", site_label), false)
+    } else {
+        (
+            false,
+            format!(
+                "{}: {}",
+                site_label,
+                build_failure_message(exit_code, log_path)
+            ),
+            true,
+        )
+    }
 }
 
 fn build_failure_message(status_code: Option<i32>, log_path: &Path) -> String {
@@ -1324,6 +1479,7 @@ pub(crate) fn run_site_publish(
             .env("DOTNET_CLI_FORCE_UTF8_ENCODING", "1")
             .env("DOTNET_SYSTEM_CONSOLE_OUTPUT_ENCODING", "utf-8")
             .env("DOTNET_SYSTEM_CONSOLE_INPUT_ENCODING", "utf-8")
+            .env("NO_COLOR", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -1359,34 +1515,28 @@ pub(crate) fn run_site_publish(
             .wait()
             .map_err(|error| format!("等待 OKP.Core 完成失败: {}", error))?;
 
-        if let Some(handle) = stdout_handle.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = stderr_handle.take() {
-            let _ = handle.join();
-        }
+        let stdout_error = join_output_reader(stdout_handle.take());
+        let stderr_error = join_output_reader(stderr_handle.take());
+        let log_error = read_okp_log_serilog_error(&artifacts.log_path);
+        let serilog_error_line =
+            select_okp_serilog_error_line(stdout_error, stderr_error, log_error);
+        let resolved_log_path =
+            resolve_okp_log_path(&artifacts.log_path).unwrap_or_else(|| artifacts.log_path.clone());
 
         let updated_cookie_text = site
             .uses_cookie
             .then(|| std::fs::read_to_string(&artifacts.cookies_path).ok())
             .flatten();
 
-        if status.success() {
-            cleanup_publish_artifacts(&artifacts, false);
-            Ok(site.build_result(
-                true,
-                format!("{} 发布完成", site.label),
-                updated_cookie_text,
-            ))
-        } else {
-            let failure_message = build_failure_message(status.code(), &artifacts.log_path);
-            cleanup_publish_artifacts(&artifacts, true);
-            Ok(site.build_result(
-                false,
-                format!("{}: {}", site.label, failure_message),
-                updated_cookie_text,
-            ))
-        }
+        let (success, message, keep_log) = evaluate_okp_process_outcome(
+            site.label,
+            status.success(),
+            status.code(),
+            serilog_error_line.as_deref(),
+            &resolved_log_path,
+        );
+        cleanup_publish_artifacts(&artifacts, keep_log);
+        Ok(site.build_result(success, message, updated_cookie_text))
     })();
 
     match result {
@@ -2283,6 +2433,180 @@ mod tests {
             publish_history::updated_cookie_text_for_persistence(&result),
             Some("user-agent:\tMozilla/5.0\nhttps://share.dmhy.org\tdmhy_sid=good")
         );
+    }
+
+    #[test]
+    fn test_okp_output_has_serilog_error_matches_level_token_only() {
+        assert!(okp_output_has_serilog_error(
+            "[14:19:40 ERR] bangumi login failed"
+        ));
+        assert!(okp_output_has_serilog_error(
+            "[14:19:40.123 ERR] bangumi login failed"
+        ));
+        assert!(okp_output_has_serilog_error(
+            "14:19:40 [ERR] bangumi login failed"
+        ));
+        assert!(okp_output_has_serilog_error(
+            "2024-08-31 14:19:40.123 +08:00 [ERR] bangumi login failed"
+        ));
+        assert!(okp_output_has_serilog_error(
+            "[14:19:39 INF] 即将发布\n[14:19:40 ERR] bangumi login failed\n"
+        ));
+        assert!(okp_output_has_serilog_error(
+            "[\u{1b}[31m14:19:40 ERR\u{1b}[0m] bangumi login failed"
+        ));
+        assert!(!okp_output_has_serilog_error("[14:19:39 INF] 即将发布"));
+        assert!(!okp_output_has_serilog_error(
+            "[14:19:39 DBG] 找到了.html文件"
+        ));
+        assert!(!okp_output_has_serilog_error(
+            "[14:19:39 WRN] 你没有设置发布身份"
+        ));
+        assert!(!okp_output_has_serilog_error(
+            "[14:19:39 INF] Publishing [ERR] Special.mkv"
+        ));
+        assert!(!okp_output_has_serilog_error("ERROR in torrent title"));
+        assert!(!okp_output_has_serilog_error(r"C:\Users\ERR\cookies.txt"));
+        assert!(!okp_output_has_serilog_error(
+            "[ERROR] not a serilog u3 token"
+        ));
+        assert!(!okp_output_has_serilog_error(""));
+    }
+
+    #[test]
+    fn test_last_okp_serilog_error_line_returns_latest_match() {
+        let output = "\
+[14:19:39 INF] 即将发布
+[14:19:40 ERR] bangumi login failed
+[14:19:41 INF] 发布完成
+[14:19:42 ERR] 发布失败
+";
+        assert_eq!(
+            last_okp_serilog_error_line(output).as_deref(),
+            Some("[14:19:42 ERR] 发布失败")
+        );
+        assert_eq!(last_okp_serilog_error_line("[14:19:39 INF] ok"), None);
+    }
+
+    #[test]
+    fn test_evaluate_okp_process_outcome_fails_closed_on_serilog_err() {
+        let missing_log = Path::new("okp-missing.log");
+        let (success, message, keep_log) = evaluate_okp_process_outcome(
+            "萌番组",
+            true,
+            Some(0),
+            Some("[14:19:40 ERR] bangumi login failed"),
+            missing_log,
+        );
+        assert!(!success);
+        assert!(keep_log);
+        assert_eq!(message, "萌番组 发布失败: bangumi login failed");
+
+        let (success, message, keep_log) =
+            evaluate_okp_process_outcome("萌番组", true, Some(0), None, missing_log);
+        assert!(success);
+        assert!(!keep_log);
+        assert_eq!(message, "萌番组 发布完成");
+
+        let (success, message, keep_log) =
+            evaluate_okp_process_outcome("萌番组", false, Some(1), None, missing_log);
+        assert!(!success);
+        assert!(keep_log);
+        assert!(message.contains("退出码: 1"));
+    }
+
+    #[test]
+    fn test_evaluate_okp_process_outcome_prefers_serilog_err_over_exit_code() {
+        let (success, message, keep_log) = evaluate_okp_process_outcome(
+            "萌番组",
+            false,
+            Some(1),
+            Some("[14:19:40 ERR] bangumi login failed"),
+            Path::new("okp-missing.log"),
+        );
+        assert!(!success);
+        assert!(keep_log);
+        assert_eq!(message, "萌番组 发布失败: bangumi login failed");
+        assert!(!message.contains("退出码"));
+    }
+
+    #[test]
+    fn test_select_okp_serilog_error_line_prefers_stdout() {
+        assert_eq!(
+            select_okp_serilog_error_line(
+                Some("[14:19:40 ERR] from stdout".to_string()),
+                Some("[14:19:40 ERR] from stderr".to_string()),
+                Some("[ERR] from log".to_string()),
+            ),
+            Some("[14:19:40 ERR] from stdout".to_string())
+        );
+        assert_eq!(
+            select_okp_serilog_error_line(
+                None,
+                None,
+                Some("2024-08-31 14:19:40.123 +08:00 [ERR] from log".to_string()),
+            ),
+            Some("2024-08-31 14:19:40.123 +08:00 [ERR] from log".to_string())
+        );
+    }
+
+    #[test]
+    fn test_read_okp_log_serilog_error_finds_rolled_filename() {
+        let artifacts = create_test_publish_artifacts("okp-rolled-log");
+        let rolled_log = artifacts.workspace_dir.join("okp202608.log");
+        std::fs::write(
+            &rolled_log,
+            "2024-08-31 14:19:40.123 +08:00 [ERR] bangumi login failed\n",
+        )
+        .expect("expected rolled log to be written");
+
+        assert!(!artifacts.log_path.exists());
+        assert_eq!(
+            read_okp_log_serilog_error(&artifacts.log_path).as_deref(),
+            Some("2024-08-31 14:19:40.123 +08:00 [ERR] bangumi login failed")
+        );
+        assert_eq!(
+            resolve_okp_log_path(&artifacts.log_path).as_deref(),
+            Some(rolled_log.as_path())
+        );
+
+        let (success, message, keep_log) = evaluate_okp_process_outcome(
+            "萌番组",
+            true,
+            Some(0),
+            Some("[14:19:40 ERR] bangumi login failed"),
+            &rolled_log,
+        );
+        assert!(!success);
+        assert!(keep_log);
+        assert!(message.contains("bangumi login failed"));
+        assert!(message.contains(&rolled_log.display().to_string()));
+
+        let _ = std::fs::remove_dir_all(&artifacts.workspace_dir);
+    }
+
+    #[test]
+    fn test_build_publish_summary_rejects_partial_serilog_failures() {
+        let results = vec![
+            SitePublishResult {
+                site_code: "dmhy".to_string(),
+                site_label: "动漫花园".to_string(),
+                success: true,
+                message: "动漫花园 发布完成".to_string(),
+                updated_cookie_text: None,
+            },
+            SitePublishResult {
+                site_code: "bangumi".to_string(),
+                site_label: "萌番组".to_string(),
+                success: false,
+                message: "萌番组: bangumi login failed".to_string(),
+                updated_cookie_text: None,
+            },
+        ];
+
+        let (success, message) = publish_history::build_publish_summary(&results);
+        assert!(!success);
+        assert_eq!(message, "以下站点发布失败: 萌番组");
     }
 
     #[test]
