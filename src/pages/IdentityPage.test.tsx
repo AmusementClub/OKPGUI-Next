@@ -78,7 +78,7 @@ describe('IdentityPage duplicate-name save guard', () => {
 
         const nameInput = Array.from(
             container.querySelectorAll('input'),
-        ).find((input) => input.placeholder === '新配置名称（失焦自动创建）') as HTMLInputElement;
+        ).find((input) => input.placeholder === '新建配置名称（失焦自动创建）') as HTMLInputElement;
         expect(nameInput).toBeTruthy();
 
         // Type an existing profile name and blur to trigger the auto-create save.
@@ -102,6 +102,149 @@ describe('IdentityPage duplicate-name save guard', () => {
         // ...and the form is neither cleared nor switched to another profile.
         expect(nameInput.value).toBe('beta');
         expect(select.value).toBe('alpha');
+    });
+});
+
+describe('IdentityPage create/rename separation', () => {
+    let container: HTMLDivElement;
+    let root: Root;
+
+    const valueSetter = Object.getOwnPropertyDescriptor(
+        window.HTMLInputElement.prototype,
+        'value',
+    )!.set!;
+
+    async function typeInto(input: HTMLInputElement, value: string) {
+        await act(async () => {
+            valueSetter.call(input, value);
+            input.dispatchEvent(new Event('input', { bubbles: true }));
+        });
+    }
+
+    async function click(element: HTMLElement) {
+        await act(async () => {
+            element.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            await Promise.resolve();
+        });
+    }
+
+    function findNewProfileNameInput(): HTMLInputElement {
+        const input = container.querySelector<HTMLInputElement>('input[aria-label="新建配置名称"]');
+        expect(input).not.toBeNull();
+        return input!;
+    }
+
+    function findRenameProfileNameInput(): HTMLInputElement {
+        const input = document.querySelector<HTMLInputElement>('input[aria-label="配置名称"]');
+        expect(input).not.toBeNull();
+        return input!;
+    }
+
+    function findButton(text: string, scope: ParentNode = container): HTMLButtonElement {
+        const button = Array.from(scope.querySelectorAll('button')).find(
+            (candidate) => candidate.textContent?.trim() === text,
+        );
+        expect(button).toBeTruthy();
+        return button as HTMLButtonElement;
+    }
+
+    function setupInvoke(profiles: Record<string, ReturnType<typeof makeProfile>>) {
+        const saveRequests: Record<string, unknown>[] = [];
+        invokeMock.mockImplementation((command: string, args) => {
+            const typedArgs = args as Record<string, unknown> | undefined;
+            switch (command) {
+                case 'get_profile_list':
+                    return Promise.resolve(Object.keys(profiles));
+                case 'get_profiles':
+                    return Promise.resolve({ last_used: 'alpha', profiles });
+                case 'save_profile': {
+                    const request = typedArgs ?? {};
+                    saveRequests.push(request);
+                    profiles[String(request.name)] = request.profile as ReturnType<typeof makeProfile>;
+                    return Promise.resolve({ name: request.name, profile: request.profile });
+                }
+                default:
+                    return Promise.resolve(null);
+            }
+        });
+        return saveRequests;
+    }
+
+    beforeEach(() => {
+        invokeMock.mockReset();
+        container = document.createElement('div');
+        document.body.appendChild(container);
+        root = createRoot(container);
+    });
+
+    afterEach(async () => {
+        await act(async () => {
+            root.unmount();
+        });
+        container.remove();
+        document.body.innerHTML = '';
+    });
+
+    it('creates B without renaming A when the new-profile input loses focus', async () => {
+        const profiles = { alpha: makeProfile() };
+        const saveRequests = setupInvoke(profiles);
+
+        await act(async () => {
+            root.render(<IdentityPage />);
+        });
+
+        const select = container.querySelector('select') as HTMLSelectElement;
+        expect(select.value).toBe('alpha');
+
+        const input = findNewProfileNameInput();
+        await typeInto(input, 'beta');
+        await act(async () => {
+            input.dispatchEvent(new FocusEvent('focusout', { bubbles: true }));
+            await Promise.resolve();
+        });
+
+        expect(saveRequests).toHaveLength(1);
+        expect(saveRequests[0]).toMatchObject({ name: 'beta' });
+        expect(saveRequests[0]).not.toHaveProperty('previousName');
+        expect(Object.keys(profiles).sort()).toEqual(['alpha', 'beta']);
+    });
+
+    it('renames the selected profile only after confirming the rename dialog', async () => {
+        const profiles = { alpha: makeProfile() };
+        const saveRequests = setupInvoke(profiles);
+
+        await act(async () => {
+            root.render(<IdentityPage />);
+        });
+
+        await click(findButton('重命名'));
+        const nameInput = findRenameProfileNameInput();
+        expect(nameInput.value).toBe('alpha');
+        await typeInto(nameInput, 'renamed');
+        await click(findButton('确认重命名', document));
+
+        expect(saveRequests).toHaveLength(1);
+        expect(saveRequests[0]).toMatchObject({ name: 'renamed', previousName: 'alpha' });
+    });
+
+    it('does not rename the selected profile when the dialog is cancelled', async () => {
+        const profiles = { alpha: makeProfile() };
+        const saveRequests = setupInvoke(profiles);
+
+        await act(async () => {
+            root.render(<IdentityPage />);
+        });
+
+        const renameButton = findButton('重命名');
+        await click(renameButton);
+        await typeInto(findRenameProfileNameInput(), 'cancelled-name');
+        await click(findButton('取消', document));
+
+        expect(saveRequests).toHaveLength(0);
+
+        // Reopening the dialog starts from the current profile name again.
+        await click(renameButton);
+        expect(findRenameProfileNameInput().value).toBe('alpha');
     });
 });
 
