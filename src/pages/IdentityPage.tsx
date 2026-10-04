@@ -9,6 +9,7 @@ import {
     Upload,
     Loader2,
     LogIn,
+    Pencil,
     Trash2,
     UserCircle,
 } from 'lucide-react';
@@ -17,6 +18,7 @@ import CookieCaptureDialog, {
     CookieCaptureDialogMode,
     getCapturedCookieKey,
 } from '../components/CookieCaptureDialog';
+import RenameProfileDialog from '../components/RenameProfileDialog';
 import { useNoticeDialog } from '../hooks/useNoticeDialog';
 import {
     buildCookieTextFromCapturedCookies,
@@ -197,6 +199,9 @@ export default function IdentityPage() {
     const [profileList, setProfileList] = useState<string[]>([]);
     const [currentProfileName, setCurrentProfileName] = useState('');
     const [newProfileName, setNewProfileName] = useState('');
+    const [profileNameDraft, setProfileNameDraft] = useState('');
+    const [isRenameDialogOpen, setIsRenameDialogOpen] = useState(false);
+    const [isRenamingProfile, setIsRenamingProfile] = useState(false);
     const [profile, setProfile] = useState<Profile>(defaultProfile);
     const [loginSite, setLoginSite] = useState<string | null>(null);
     const [cookieDialog, setCookieDialog] = useState<CookieDialogState | null>(null);
@@ -287,7 +292,11 @@ export default function IdentityPage() {
         }
     };
 
-    const persistProfileToDisk = async (profileToSave: Profile, explicitName?: string) => {
+    const persistProfileToDisk = async (
+        profileToSave: Profile,
+        explicitName?: string,
+        identityMode: 'save' | 'create' = 'save',
+    ) => {
         const name =
             trimEntityName(explicitName ?? '') ||
             trimEntityName(currentProfileName) ||
@@ -300,7 +309,9 @@ export default function IdentityPage() {
             const saved = await invoke<SavedProfilePayload>('save_profile', {
                 name,
                 profile: profileToSave,
-                previousName: capturedProfileName || undefined,
+                ...(identityMode === 'create'
+                    ? {}
+                    : { previousName: capturedProfileName || undefined }),
             });
             if (currentProfileNameRef.current === capturedProfileName) {
                 // Only apply the saved profile when the form was not touched while the
@@ -332,17 +343,52 @@ export default function IdentityPage() {
         }
     };
 
+    const withMergedCookies = (profileToSave: Profile): Profile => ({
+        ...profileToSave,
+        cookies: buildMergedCookieText(profileToSave.site_cookies, profileToSave.user_agent),
+    });
+
     const autosaveProfile = (profileToSave: Profile = profile, explicitName?: string) => {
-        void persistProfileToDisk(
-            {
-                ...profileToSave,
-                cookies: buildMergedCookieText(
-                    profileToSave.site_cookies,
-                    profileToSave.user_agent,
-                ),
-            },
-            explicitName,
-        );
+        void persistProfileToDisk(withMergedCookies(profileToSave), explicitName);
+    };
+
+    const openProfileRenameDialog = () => {
+        if (!currentProfileNameRef.current) return;
+        setProfileNameDraft(currentProfileNameRef.current);
+        setIsRenameDialogOpen(true);
+    };
+
+    const closeProfileRenameDialog = () => {
+        if (isRenamingProfile) return;
+        setProfileNameDraft(currentProfileNameRef.current);
+        setIsRenameDialogOpen(false);
+    };
+
+    const handleProfileRenameConfirm = async () => {
+        const nextName = trimEntityName(profileNameDraft);
+        const previousName = currentProfileNameRef.current;
+        if (!previousName || !nextName || nextName === previousName) {
+            setProfileNameDraft(previousName);
+            setIsRenameDialogOpen(false);
+            return;
+        }
+
+        setIsRenamingProfile(true);
+        try {
+            const saved = await persistProfileToDisk(withMergedCookies(profileRef.current), nextName);
+            if (saved) setIsRenameDialogOpen(false);
+        } finally {
+            setIsRenamingProfile(false);
+        }
+    };
+
+    const handleCreateProfileBlur = (value: string) => {
+        const name = trimEntityName(value);
+        if (!name) {
+            return;
+        }
+
+        void persistProfileToDisk(withMergedCookies(profileRef.current), name, 'create');
     };
 
     const getProfileWithFieldValue = (field: keyof Profile, value: string): Profile =>
@@ -642,11 +688,11 @@ export default function IdentityPage() {
                             <UserCircle size={16} />
                             身份配置管理
                         </h2>
-                        <div className="flex gap-2">
+                        <div className="space-y-2">
                             <select
                                 value={currentProfileName}
                                 onChange={(event) => loadProfile(event.target.value)}
-                                className="flex-1 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                className="w-full rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
                             >
                                 <option value="">选择配置...</option>
                                 {profileList.map((name) => (
@@ -655,28 +701,38 @@ export default function IdentityPage() {
                                     </option>
                                 ))}
                             </select>
-                            <input
-                                type="text"
-                                value={newProfileName}
-                                maxLength={ENTITY_NAME_MAX_LENGTH}
-                                onChange={(event) => setNewProfileName(sanitizeEntityNameInput(event.target.value))}
-                                onBlur={(event) => {
-                                    const trimmedName = trimEntityName(event.target.value);
-                                    if (trimmedName) {
-                                        autosaveProfile(profile, trimmedName);
-                                    }
-                                }}
-                                placeholder="新配置名称（失焦自动创建）"
-                                className="w-52 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
-                            />
-                            <button
-                                onClick={deleteProfile}
-                                disabled={!currentProfileName}
-                                className="flex items-center gap-1.5 rounded-lg bg-red-600/80 px-3 py-2 text-sm text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-40"
-                            >
-                                <Trash2 size={14} />
-                                删除
-                            </button>
+                            <div className="grid gap-2 lg:grid-cols-[minmax(0,1fr)_auto]">
+                                <input
+                                    type="text"
+                                    aria-label="新建配置名称"
+                                    value={newProfileName}
+                                    maxLength={ENTITY_NAME_MAX_LENGTH}
+                                    onChange={(event) => setNewProfileName(sanitizeEntityNameInput(event.target.value))}
+                                    onBlur={(event) => handleCreateProfileBlur(event.target.value)}
+                                    placeholder="新建配置名称（失焦自动创建）"
+                                    className="min-w-0 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                                />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button
+                                        type="button"
+                                        onClick={openProfileRenameDialog}
+                                        disabled={!currentProfileName}
+                                        className="flex items-center justify-center gap-1.5 rounded-lg border border-slate-700 bg-slate-800 px-3 py-2 text-sm text-slate-200 transition-colors hover:bg-slate-700 disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                        <Pencil size={14} />
+                                        重命名
+                                    </button>
+                                    <button
+                                        type="button"
+                                        onClick={deleteProfile}
+                                        disabled={!currentProfileName}
+                                        className="flex items-center justify-center gap-1.5 rounded-lg bg-red-600/80 px-3 py-2 text-sm text-white transition-colors hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-40"
+                                    >
+                                        <Trash2 size={14} />
+                                        删除
+                                    </button>
+                                </div>
+                            </div>
                         </div>
                     </section>
 
@@ -942,6 +998,17 @@ export default function IdentityPage() {
                 onToggleAll={toggleAllCookies}
                 onToggleCookie={toggleCookieSelection}
                 onSubmitSelection={saveSelectedCookies}
+            />
+            <RenameProfileDialog
+                isOpen={isRenameDialogOpen}
+                value={profileNameDraft}
+                maxLength={ENTITY_NAME_MAX_LENGTH}
+                isSaving={isRenamingProfile}
+                onChange={(value) => setProfileNameDraft(sanitizeEntityNameInput(value))}
+                onConfirm={() => {
+                    void handleProfileRenameConfirm();
+                }}
+                onCancel={closeProfileRenameDialog}
             />
             {noticeDialog}
         </>
